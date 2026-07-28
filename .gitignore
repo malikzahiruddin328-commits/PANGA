@@ -1,0 +1,15 @@
+# Private user data — resume, interview answers, job/application history. Never committed.
+data/
+
+# Secrets
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# OS
+Thumbs.db
+.DS_Store
