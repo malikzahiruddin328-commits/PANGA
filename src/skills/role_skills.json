@@ -1,0 +1,21 @@
+{
+  "_meta": {
+    "description": "Industry/role -> expected skill/keyword lookup table (PRD §4). Grows over time as new roles/industries are encountered; populated via reasoning (Claude), not hardcoded permanently.",
+    "schema": "industry -> role -> [{ skill, why_it_matters }]"
+  },
+  "Lifesciences/Pharma": {
+    "Head of IT / CIO": [
+      { "skill": "21 CFR Part 11 / GxP computer system validation (CSV)", "why_it_matters": "Core regulatory requirement for any validated system in a pharma environment." },
+      { "skill": "Electronic signature validated state (e.g. DocuSign under Part 11)", "why_it_matters": "PRD's own example — common gap between 'used e-signature' and 'maintained validated state through releases'." },
+      { "skill": "SSO / identity provider specifics (Okta, MS Authenticator, Azure AD)", "why_it_matters": "Generic 'IAM' on a resume hides which specific tooling and migrations were actually owned." },
+      { "skill": "SOX ITGC (IT general controls) and audit readiness", "why_it_matters": "Required for public-company or public-company-readiness environments." },
+      { "skill": "Veeva CRM / Veeva R&D Suite ownership", "why_it_matters": "Industry-standard commercial/R&D platform in pharma; depth of ownership vs. peripheral exposure matters." },
+      { "skill": "Drug serialization / track-and-trace compliance", "why_it_matters": "DSCSA-driven requirement for commercial pharma product launches." },
+      { "skill": "GxP change control and system lifecycle management", "why_it_matters": "Distinguishes 'implemented' from 'implemented and maintained under ongoing change control'." },
+      { "skill": "Master Data Management (MDM) governance model", "why_it_matters": "Resume shows heavy MDM delivery experience — worth confirming ownership of the governance model vs. just implementation." },
+      { "skill": "Cloud/SaaS vendor governance and cost optimization", "why_it_matters": "Resume claims 30% opex reduction — worth probing the specific levers used." },
+      { "skill": "AI-enabled analytics adoption in a regulated environment", "why_it_matters": "Newer area; regulated-industry AI adoption has specific validation/compliance nuances worth capturing in detail." },
+      { "skill": "M&A / Day-1 technology integration", "why_it_matters": "Resume mentions two SK Life Science integration initiatives — worth capturing what specifically was owned (systems, data, cybersecurity, vendor contracts)." }
+    ]
+  }
+}
