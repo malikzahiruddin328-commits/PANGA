@@ -1,0 +1,28 @@
+# Lists the source documents that feed the master profile.
+# category: resume | context | reference
+#   resume    -> structured ingestion now (task #2)
+#   context   -> narrative background for the gap-probing interview (task #3)
+#   reference -> example of previously-tailored output, used by tailoring (task #6)
+# target_title: filled in once we confirm which title each resume version targets.
+
+source_folder: "C:/Users/User/Desktop/GAND"
+
+documents:
+  - file: "Zahir Resume.docx"
+    category: resume
+    target_title: "Head of IT / Enterprise IT Executive"
+  - file: "Zahir Uddin_Resume.docx"
+    category: resume
+    target_title: "Technical Architect / Initiative Lead"
+  - file: "Executive Bio.docx"
+    category: context
+  - file: "Leadership Summary.docx"
+    category: context
+  - file: "Zahir Uddin – Enterprise Program Portfolio_TIM.docx"
+    category: context
+  - file: "JD & CV_ Zahir.docx"
+    category: reference
+    note: "Example of a previously-tailored application package (specific past JD pairing)."
+  - file: "Zahir CIO Updated.docx"
+    category: reference
+    note: "CIO-framed resume tailored specifically to Kiniksa Pharmaceuticals; example of previously-tailored output, not a generic base resume."

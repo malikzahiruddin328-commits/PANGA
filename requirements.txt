@@ -2,3 +2,4 @@ streamlit
 pyyaml
 python-dotenv
 requests
+python-docx
