@@ -116,6 +116,56 @@ general_job_aggregators:
     access_method: public_html
     status: candidate
 
+# Retained executive search firms - sourced 2026-07-28 from a personal contact
+# (Dave Walko, PharmTALENT), not a web search like the rest of this file. These
+# don't work like job boards - firms don't post CIO/C-suite roles publicly,
+# they fill them confidentially by searching their own network. So there is
+# nothing here for Panga to search programmatically; the "action" is Zahir
+# personally reaching out / registering, same as Category A (BlueSteps etc.)
+# in the PRD. Kept here for status tracking consistency, not because a scraper
+# will ever be built against them.
+retained_search_firms:
+  - name: Korn Ferry
+    url: "https://www.kornferry.com/"
+    note: "One of the largest global retained search firms (\"Global Giants\" tier)."
+    access_method: not_applicable
+    status: candidate
+  - name: Heidrick & Struggles
+    url: "https://www.heidrick.com/en"
+    access_method: not_applicable
+    status: candidate
+  - name: Spencer Stuart
+    url: null
+    access_method: not_applicable
+    status: candidate
+  - name: Russell Reynolds
+    url: null
+    access_method: not_applicable
+    status: candidate
+  - name: CIO Partners
+    url: "https://www.ciopartners.com/"
+    note: "Boutique firm specializing specifically in CIO-level placements - closest direct fit to Zahir's target role."
+    access_method: not_applicable
+    status: candidate
+  - name: The Good Search
+    url: "https://tgsus.com/technology-executive-search/"
+    access_method: not_applicable
+    status: candidate
+  - name: Cowen Partners
+    url: "https://cowenpartners.com/"
+    access_method: not_applicable
+    status: candidate
+  - name: IT LeaderBoard (via CIO Partners)
+    url: "https://www.ciopartners.com/contact/find-a-technology-leadership-role/"
+    note: "Niche platform to register a profile for curated executive technology searches."
+    access_method: not_applicable
+    status: candidate
+  - name: Pinnacle Society member directory
+    url: "https://pinnaclesociety.org/directory/"
+    note: "Directory of individual top recruiters (high bar to join: $500K+ personally-generated placement revenue/yr). Searchable by keyword - Dave provided pre-filtered links for keyword=CIO and keyword=IT. Useful to find individual recruiters to contact directly, not a job board."
+    access_method: not_applicable
+    status: candidate
+
 # Paid candidate-database platforms (BlueSteps, ExecuNet, NetShare) are
 # deliberately NOT listed here - they work in reverse (recruiters search
 # member profiles; there's nothing for Panga to search). See PRD §13 backlog
