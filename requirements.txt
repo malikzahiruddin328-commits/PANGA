@@ -3,4 +3,5 @@ pandas
 pyyaml
 python-dotenv
 requests
+beautifulsoup4
 python-docx
