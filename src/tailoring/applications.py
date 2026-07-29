@@ -37,7 +37,11 @@ def upsert_application(
     skip_reason: str | None = None,
 ) -> None:
     """Creates or updates the application record for (source, job_id).
-    Fields left as None don't overwrite previously saved values."""
+    Fields left as None don't overwrite previously saved values. Setting a
+    skip_reason marks it unreviewed (skip_reason_reviewed=False) - Claude
+    evaluates unreviewed reasons for what they imply about future searches
+    (per PRD §13's non-applied-job feedback loop) and marks them reviewed
+    via mark_skip_reason_reviewed()."""
     applications = load_applications()
     for app in applications:
         if app["source"] == source and app["job_id"] == job_id:
@@ -48,6 +52,7 @@ def upsert_application(
                 app["cover_letter_text"] = cover_letter_text
             if skip_reason is not None:
                 app["skip_reason"] = skip_reason
+                app["skip_reason_reviewed"] = False
             _save_all(applications)
             return
 
@@ -58,5 +63,19 @@ def upsert_application(
         "resume_text": resume_text,
         "cover_letter_text": cover_letter_text,
         "skip_reason": skip_reason,
+        "skip_reason_reviewed": False if skip_reason is not None else None,
     })
     _save_all(applications)
+
+
+def mark_skip_reason_reviewed(source: str, job_id: str) -> None:
+    applications = load_applications()
+    for app in applications:
+        if app["source"] == source and app["job_id"] == job_id:
+            app["skip_reason_reviewed"] = True
+            _save_all(applications)
+            return
+
+
+def get_unreviewed_skip_reasons() -> list[dict]:
+    return [a for a in load_applications() if a.get("skip_reason") and a.get("skip_reason_reviewed") is False]

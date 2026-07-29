@@ -122,13 +122,29 @@ else:
 
     ranked = sorted(jobs, key=sort_key, reverse=True)
 
-    scored_count = sum(1 for j in jobs if "fit_score" in j)
+    unscored_count = sum(1 for j in jobs if "fit_score" not in j)
+    scored_count = len(jobs) - unscored_count
     min_score = st.slider(
         "Minimum compatibility score",
         0, 100, 30,
-        help=f"Hides low-fit results (e.g. unrelated roles pulled in by broad keyword matches). {scored_count}/{len(jobs)} jobs have been scored so far - unscored jobs are always shown, since we can't yet judge their fit.",
+        help="Hides low-fit results (e.g. unrelated roles pulled in by broad keyword matches).",
     )
-    ranked = [j for j in ranked if "fit_score" not in j or j["fit_score"] >= min_score]
+    # Unscored jobs are hidden by default, NOT always shown - showing
+    # unscored jobs regardless of the slider defeated the purpose of scoring
+    # (e.g. a fresh "Run now" search returning an unscored Physician role
+    # would display no matter how high the threshold was set). Scoring only
+    # happens via the daily scheduled task or a manual Claude pass, so new
+    # jobs from "Run now" won't show here until one of those has run.
+    ranked = [j for j in ranked if "fit_score" in j and j["fit_score"] >= min_score]
+
+    NOT_INTERESTED = ("not interested", "not-interested")  # handle both forms - see applications.py note
+    not_interested_count = sum(1 for j in ranked if application_status(j) in NOT_INTERESTED)
+    show_not_interested = st.checkbox(f"Show {not_interested_count} job(s) marked 'not interested' (hidden by default, nothing is deleted)")
+    if not show_not_interested:
+        ranked = [j for j in ranked if application_status(j) not in NOT_INTERESTED]
+
+    if unscored_count:
+        st.caption(f"{unscored_count} job(s) found but not yet compatibility-scored - hidden until the next scoring pass (daily scheduled task, or ask Claude to score them now).")
 
     st.subheader(f"{len(ranked)} job(s)")
 

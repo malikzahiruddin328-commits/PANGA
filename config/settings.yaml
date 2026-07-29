@@ -12,14 +12,7 @@ target_roles:
 industries:
 - Lifesciences/Pharma
 - Federal Government
-
-# USAJOBS job series codes (see "Occupations and job series" on usajobs.gov
-# for the full list) - much more precise than keyword search, which matches
-# any federal role with that word in the title regardless of field (e.g.
-# keyword "Director" also returns Director of Real Estate).
-# 2210 = Information Technology Management.
 usajobs_job_series:
-- "2210"
-
+- '2210'
 search_cadence:
   scheduled_runs_per_day: 3

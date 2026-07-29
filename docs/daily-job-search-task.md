@@ -15,8 +15,10 @@ the master profile, not a keyword heuristic (per PRD §11 LLM architecture).
      `data/profile/structured/master_profile.json` (seniority, domain,
      the CISO/security-officer disqualification - see below), writes
      `fit_score` (0-100) + a plain-language `fit_rationale` to each.
-  3. Sends one push notification only if a new job scores 60+; stays silent
-     otherwise.
+  3. Checks for any unreviewed "not interested" reasons (see below) - just
+     detects, doesn't evaluate them itself.
+  4. Sends one push notification if a new job scored 60+ and/or unreviewed
+     rejection reasons exist; stays silent if neither applies.
 - **Cost tradeoff:** runs once/day, not multiple times, since scoring is
   real reasoning work per job, not a cheap mechanical check - matching
   Zahir's own framing ("jobs that come on daily basis need to be validated
@@ -45,6 +47,21 @@ qualifications those roles require. This is saved as a
 `gap_interview_answers` entry in the master profile (dated 2026-07-29) and
 referenced explicitly in the scheduled task's scoring instructions - score
 these low regardless of subject-matter proximity.
+
+## "Not interested" feedback loop (PRD §13, built 2026-07-29)
+
+Marking a job "not interested" in the app hides it from the Results screen
+immediately (there's a checkbox to unhide - nothing is deleted). If Zahir
+gives a reason, `applications.upsert_application()` marks it
+`skip_reason_reviewed: False`. The scheduled task only *detects* unreviewed
+reasons and mentions the count in its notification - it deliberately does
+NOT evaluate them itself, since that needs genuine back-and-forth reasoning
+(what the reason implies for future searches, presented as ranked options
+with a recommendation) that only makes sense in a live conversation. To
+actually get that evaluation: bring it up with Claude directly, or wait for
+the scheduled task's notification to prompt you to. Claude calls
+`applications.mark_skip_reason_reviewed()` once it's actually walked through
+the recommendation with Zahir, not before.
 
 ## Manually re-running or adjusting the score
 
