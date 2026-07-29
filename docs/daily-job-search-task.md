@@ -11,13 +11,21 @@ the master profile, not a keyword heuristic (per PRD §11 LLM architecture).
   1. Searches USAJOBS by target-role keyword (wide net, not restricted to
      any job category - see below) plus job-series codes as a supplementary
      net, saves new results to `data/jobs/jobs.json` (deduped automatically).
-  2. Searches ZipRecruiter and Dice (MCP connector tools, added 2026-07-29)
-     by target-role keyword, normalizes via `search/boards.py`, saves same
-     as USAJOBS. This is the "hook" for those channels - the Streamlit "Run
-     now" button still can't reach them directly (no LLM/connector access
-     from Streamlit), same constraint as ever; skips a connector gracefully
-     if it's not connected rather than failing the whole run.
-  3. Finds jobs missing a `fit_score` (from any of the three sources),
+  2. Searches ZipRecruiter, Dice, and Indeed (MCP connector tools, added
+     2026-07-29) by target-role keyword, normalizes via `search/boards.py`,
+     saves same as USAJOBS. This is the "hook" for those channels - the
+     Streamlit "Run now" button still can't reach them directly (no
+     LLM/connector access from Streamlit), same constraint as ever; skips a
+     connector gracefully if it's not connected rather than failing the
+     whole run. Indeed's tool returns one formatted markdown blob instead of
+     structured JSON like the other two, and its "Job Id" field isn't stable
+     across searches - `normalize_indeed_jobs()` parses the blob and uses the
+     short code in the posting URL as the stable dedup key instead. The
+     "Jobs and Careers" community connector (a different tool, canonical
+     "job-search") was evaluated and rejected for this pipeline - its
+     results have no posting URL or stable ID, so there's nothing to dedupe
+     on or link to.
+  3. Finds jobs missing a `fit_score` (from any of the four sources),
      reasons about fit against `data/profile/structured/master_profile.json`
      (seniority, domain, the CISO/security-officer disqualification - see
      below), writes `fit_score` (0-100) + a plain-language `fit_rationale`

@@ -3,7 +3,7 @@
 Run with: venv/Scripts/streamlit.exe run src/ui/app.py
 
 Only USAJOBS.gov can be searched directly from the "Run now" button, since
-it's a plain HTTP API. ZipRecruiter/Dice are MCP connector tools, not
+it's a plain HTTP API. ZipRecruiter/Dice/Indeed are MCP connector tools, not
 reachable from a standalone script - they're searched daily by the
 panga-daily-job-search scheduled task instead (see
 docs/daily-job-search-task.md), not this button.
@@ -130,7 +130,7 @@ else:
                 except USAJobsNotConfigured as e:
                     st.error(str(e))
     with col2:
-        st.caption("This button only covers USAJOBS.gov directly. ZipRecruiter and Dice are searched automatically once a day by the scheduled task instead (they're MCP connector tools, not reachable from this button).")
+        st.caption("This button only covers USAJOBS.gov directly. ZipRecruiter, Dice, and Indeed are searched automatically once a day by the scheduled task instead (they're MCP connector tools, not reachable from this button).")
 
     jobs = load_jobs()
     target_roles = settings.get("target_roles", [])
