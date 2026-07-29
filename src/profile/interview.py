@@ -14,10 +14,10 @@ from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from skills.lookup import skills_for  # noqa: E402
+from profile.storage import MASTER_PROFILE_PATH, load_profile, save_profile  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RAW_DIR = PROJECT_ROOT / "data" / "profile" / "raw"
-MASTER_PROFILE_PATH = PROJECT_ROOT / "data" / "profile" / "structured" / "master_profile.json"
 
 
 def _resume_text() -> str:
@@ -32,7 +32,7 @@ def _resume_text() -> str:
 def _already_answered(skill: str) -> bool:
     if not MASTER_PROFILE_PATH.exists():
         return False
-    profile = json.loads(MASTER_PROFILE_PATH.read_text(encoding="utf-8"))
+    profile = load_profile()
     return any(a["skill"] == skill for a in profile.get("gap_interview_answers", []))
 
 
@@ -49,14 +49,14 @@ def detect_gaps(industry: str, role: str) -> list[dict]:
 
 
 def save_answer(skill: str, role_context: str, answer: str, date_captured: str) -> None:
-    profile = json.loads(MASTER_PROFILE_PATH.read_text(encoding="utf-8"))
+    profile = load_profile()
     profile.setdefault("gap_interview_answers", []).append({
         "skill": skill,
         "role_context": role_context,
         "answer": answer,
         "date_captured": date_captured,
     })
-    MASTER_PROFILE_PATH.write_text(json.dumps(profile, indent=2), encoding="utf-8")
+    save_profile(profile)
 
 
 if __name__ == "__main__":
