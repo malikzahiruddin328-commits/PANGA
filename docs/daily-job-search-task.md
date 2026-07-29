@@ -11,13 +11,20 @@ the master profile, not a keyword heuristic (per PRD §11 LLM architecture).
   1. Searches USAJOBS by target-role keyword (wide net, not restricted to
      any job category - see below) plus job-series codes as a supplementary
      net, saves new results to `data/jobs/jobs.json` (deduped automatically).
-  2. Finds jobs missing a `fit_score`, reasons about fit against
-     `data/profile/structured/master_profile.json` (seniority, domain,
-     the CISO/security-officer disqualification - see below), writes
-     `fit_score` (0-100) + a plain-language `fit_rationale` to each.
-  3. Checks for any unreviewed "not interested" reasons (see below) - just
+  2. Searches ZipRecruiter and Dice (MCP connector tools, added 2026-07-29)
+     by target-role keyword, normalizes via `search/boards.py`, saves same
+     as USAJOBS. This is the "hook" for those channels - the Streamlit "Run
+     now" button still can't reach them directly (no LLM/connector access
+     from Streamlit), same constraint as ever; skips a connector gracefully
+     if it's not connected rather than failing the whole run.
+  3. Finds jobs missing a `fit_score` (from any of the three sources),
+     reasons about fit against `data/profile/structured/master_profile.json`
+     (seniority, domain, the CISO/security-officer disqualification - see
+     below), writes `fit_score` (0-100) + a plain-language `fit_rationale`
+     to each.
+  4. Checks for any unreviewed "not interested" reasons (see below) - just
      detects, doesn't evaluate them itself.
-  4. Sends one push notification if a new job scored 60+ and/or unreviewed
+  5. Sends one push notification if a new job scored 60+ and/or unreviewed
      rejection reasons exist; stays silent if neither applies.
 - **Cost tradeoff:** runs once/day, not multiple times, since scoring is
   real reasoning work per job, not a cheap mechanical check - matching

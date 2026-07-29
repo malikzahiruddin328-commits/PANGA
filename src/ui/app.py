@@ -2,11 +2,11 @@
 
 Run with: venv/Scripts/streamlit.exe run src/ui/app.py
 
-Only USAJOBS.gov can be searched directly from this button, since it's a
-plain HTTP API. ZipRecruiter/Dice/Gmail results only appear here after
-Claude adds them during a live session (they're MCP connector tools, not
-reachable from a standalone script) - see docs/email-monitoring-task.md and
-the note in search/boards.py for why.
+Only USAJOBS.gov can be searched directly from the "Run now" button, since
+it's a plain HTTP API. ZipRecruiter/Dice are MCP connector tools, not
+reachable from a standalone script - they're searched daily by the
+panga-daily-job-search scheduled task instead (see
+docs/daily-job-search-task.md), not this button.
 """
 
 import sys
@@ -15,6 +15,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+import pandas as pd
 import streamlit as st
 import yaml
 
@@ -129,7 +130,7 @@ else:
                 except USAJobsNotConfigured as e:
                     st.error(str(e))
     with col2:
-        st.caption("ZipRecruiter, Dice, and other connector-based sources only update here when Claude runs a search during a session - this button only covers USAJOBS.gov directly.")
+        st.caption("This button only covers USAJOBS.gov directly. ZipRecruiter and Dice are searched automatically once a day by the scheduled task instead (they're MCP connector tools, not reachable from this button).")
 
     jobs = load_jobs()
     target_roles = settings.get("target_roles", [])
@@ -193,31 +194,47 @@ else:
         deduped = [postings[0] for postings in groups.values()]  # first (highest-ranked) as primary
         postings_by_primary = {id(postings[0]): postings for postings in groups.values()}
 
-        st.markdown(f"**{channel}** ({len(deduped)}{f', {len(channel_jobs) - len(deduped)} duplicate posting(s) merged' if len(deduped) < len(channel_jobs) else ''})")
+        dup_note = f", {len(channel_jobs) - len(deduped)} duplicate posting(s) merged" if len(deduped) < len(channel_jobs) else ""
+        with st.expander(f"{channel} ({len(deduped)}{dup_note})", expanded=True):
+            table_rows = []
+            for job in deduped:
+                pay = f"${job.get('pay_min') or '?'}-{job.get('pay_max') or '?'}" if (job.get("pay_min") or job.get("pay_max")) else (job.get("salary_text") or "")
+                table_rows.append({
+                    "Role": job.get("title"),
+                    "Organization": job.get("organization"),
+                    "Pay": pay,
+                    "Score": job.get("fit_score"),
+                    "Status": application_status(job) or "-",
+                    "Posting": job.get("posting_url"),
+                })
+            df = pd.DataFrame(table_rows)
 
-        for job in deduped:
-            status = application_status(job) or "-"
-            score_display = f"{job['fit_score']}" if "fit_score" in job else "?"
-            pay = f"${job.get('pay_min') or '?'}-{job.get('pay_max') or '?'}" if (job.get("pay_min") or job.get("pay_max")) else (job.get("salary_text") or "")
-            label = f"{score_display} | {job.get('title')} - {job.get('organization')} | {pay} | {status}"
+            event = st.dataframe(
+                df,
+                hide_index=True,
+                use_container_width=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                column_config={"Posting": st.column_config.LinkColumn(display_text="Open")},
+                key=f"table_{channel}",
+            )
 
-            with st.expander(label):
+            selected_rows = event.selection.rows if event and event.selection else []
+            if selected_rows:
+                job = deduped[selected_rows[0]]
+                postings = postings_by_primary[id(job)]
+
                 st.caption(f"{job.get('location') or 'Location not listed'}")
                 if "fit_score" in job:
                     st.caption(job.get("fit_rationale") or "")
                 else:
                     st.caption("Compatibility: not yet scored")
+                if len(postings) > 1:
+                    for i, posting in enumerate(postings, start=1):
+                        if posting.get("posting_url"):
+                            st.link_button(f"Open posting ({i} of {len(postings)})", posting["posting_url"], key=f"open_{posting.get('source')}_{posting.get('job_id')}")
 
-                postings = postings_by_primary[id(job)]
-                b1, b2, b3 = st.columns(3)
-                with b1:
-                    if len(postings) == 1:
-                        if job.get("posting_url"):
-                            st.link_button("Open posting", job["posting_url"])
-                    else:
-                        for i, posting in enumerate(postings, start=1):
-                            if posting.get("posting_url"):
-                                st.link_button(f"Open posting ({i} of {len(postings)})", posting["posting_url"], key=f"open_{posting.get('source')}_{posting.get('job_id')}")
+                b2, b3 = st.columns(2)
                 with b2:
                     if st.button("Start tailoring", key=f"tailor_{job.get('source')}_{job.get('job_id')}"):
                         upsert_application(job["source"], job["job_id"], status="under review")
