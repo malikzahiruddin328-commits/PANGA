@@ -1,0 +1,115 @@
+# Extensible list of industry-specific job sources (PRD §13), beyond the
+# generic boards already covered by connectors (ZipRecruiter, Dice) and the
+# USAJOBS API client. Grows over time as new sources are researched/vetted -
+# same "ever-growing lookup" pattern as config/role_skills lookups.
+#
+# access_method values:
+#   public_html   -> no API/RSS found; would mean fetching public search-result
+#                    pages (no login required, low ToS risk, but fragile/breaks
+#                    if the site's HTML changes - build only when worth the effort)
+#   freemium      -> free to browse, paid tier unlocks more (e.g. full apply access)
+# status: candidate (researched, not yet built against) | built | rejected
+
+pharma_job_boards:
+  - name: Planet Pharma
+    url: "https://www.planet-pharma.com/"
+    note: "Life sciences staffing firm; careers site supports category filtering, e.g. ?_job_category=technology"
+    access_method: public_html
+    status: candidate
+
+  - name: BioSpace
+    url: "https://jobs.biospace.com/searchjobs/"
+    note: "Largest pharma/biotech board; has a strong IT/digital leadership section. Checked 2026-07-28: no job-listings RSS/API, only an unrelated 'Job Trends' articles feed."
+    access_method: public_html
+    status: candidate
+
+  - name: RAPS Career Center
+    url: "https://regulatorycareers.raps.org/"
+    note: "Regulatory affairs focused, but crosses into IT/quality-governance roles relevant to GxP/CSV background."
+    access_method: public_html
+    status: candidate
+
+  - name: FierceBiotech Jobs
+    url: "https://jobs.fiercebiotech.com/"
+    note: "Runs on the shared 'Life Sciences Job Network.'"
+    access_method: public_html
+    status: candidate
+
+life_sciences_recruitment_firms:
+  # IT/tech-focused within life sciences - highest relevance to CIO/Head of IT target roles
+  - name: Life Search Technologies
+    url: "https://lifesearchtech.com/"
+    note: "Places IT professionals specifically within life sciences/biopharma."
+    access_method: public_html
+    status: candidate
+
+  - name: TSP Life Sciences
+    url: "https://tsptalent.com/services/executive-professional-search/"
+    note: "Executive search for Health IT execs up through C-suite in pharma/biotech/med device."
+    access_method: public_html
+    status: candidate
+
+  - name: Frontline Source Group
+    url: "https://www.frontlinesourcegroup.com/executive-search-life-sciences.html"
+    note: "Runs both Tech/IT and Life Sciences executive search practices."
+    access_method: public_html
+    status: candidate
+
+  - name: Slone Partners
+    url: "https://www.slonepartners.com/"
+    note: "Places biopharma/healthcare IT/diagnostics executives (Boston, NYC, DC, SF)."
+    access_method: public_html
+    status: candidate
+
+  - name: Pender & Howe
+    url: "https://penderhowe.com/en/life-sciences/"
+    note: "Pairs AI-focused companies in life sciences with talent."
+    access_method: public_html
+    status: candidate
+
+  # Broader life-sciences recruiters (mixed roles - R&D/clinical/scientific,
+  # not IT-specific, but worth keeping for cross-industry fit checks per PRD §4)
+  - name: Barrington James
+    url: "https://www.barringtonjames.com/"
+    access_method: public_html
+    status: candidate
+  - name: EPM Scientific
+    url: "https://www.epmscientific.com/en-us"
+    access_method: public_html
+    status: candidate
+  - name: SRG
+    url: "https://www.srgtalent.com/us"
+    access_method: public_html
+    status: candidate
+  - name: SEC Life Sciences
+    url: "https://www.seclifesciences.com/"
+    access_method: public_html
+    status: candidate
+  - name: Beacon Hill Life Sciences
+    url: "https://bhsg.com/bh-life-sciences"
+    access_method: public_html
+    status: candidate
+  - name: Atrium
+    url: "https://www.atriumglobal.com/talent-solutions/life-sciences-talent-solutions/"
+    access_method: public_html
+    status: candidate
+  - name: GForce Life Sciences
+    url: "https://www.gforcelifesciences.com/client-services/executive-search/"
+    access_method: public_html
+    status: candidate
+  - name: Sci.bio
+    url: "https://www.sci.bio/"
+    access_method: public_html
+    status: candidate
+
+general_executive_boards:
+  - name: The Ladders
+    url: "https://www.theladders.com"
+    note: "$100K+ roles. Free to browse/apply to jobs marked 'Apply for Free'; $29.99/mo unlocks full access."
+    access_method: freemium
+    status: candidate
+
+# Paid candidate-database platforms (BlueSteps, ExecuNet, NetShare) are
+# deliberately NOT listed here - they work in reverse (recruiters search
+# member profiles; there's nothing for Panga to search). See PRD §13 backlog
+# item on executive candidate-network membership value.
