@@ -23,6 +23,7 @@ from search.usajobs import search_jobs, USAJobsNotConfigured
 from search.job_store import load_jobs
 from ranking.prioritize import weight_for
 from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion
+from tailoring.cta_emails import get_active_cta_emails, dismiss_cta_email
 
 SETTINGS_PATH = PROJECT_ROOT / "config" / "settings.yaml"
 
@@ -85,6 +86,31 @@ if page == "Settings":
 
 else:
     settings = load_settings()
+
+    cta_emails = get_active_cta_emails()
+    if cta_emails:
+        st.warning(f"{len(cta_emails)} email(s) from your inbox need attention (found by the Gmail scan).")
+        CATEGORY_LABELS = {
+            "rejection": "Rejection",
+            "interview_request": "Interview request",
+            "assessment_request": "Assessment / take-home task",
+            "offer": "Offer",
+            "recruiter_question": "Recruiter question",
+        }
+        for email in cta_emails:
+            label = CATEGORY_LABELS.get(email.get("category"), email.get("category") or "")
+            st.markdown(f"**{label}** - {email.get('subject')}")
+            st.caption(f"{email.get('sender')} - {email.get('date')}")
+            if email.get("snippet"):
+                st.caption(email["snippet"])
+            e1, e2 = st.columns([1, 1])
+            with e1:
+                st.link_button("Open in Gmail", email["gmail_link"], key=f"open_cta_{email['thread_id']}")
+            with e2:
+                if st.button("Dismiss", key=f"dismiss_cta_{email['thread_id']}"):
+                    dismiss_cta_email(email["thread_id"])
+                    st.rerun()
+            st.divider()
 
     pending_suggestions = get_pending_status_suggestions()
     if pending_suggestions:
