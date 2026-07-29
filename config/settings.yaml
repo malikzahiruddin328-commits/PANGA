@@ -1,19 +1,16 @@
-# Human-editable settings — tweak these without touching code.
-# This file gets filled in during onboarding (target roles come from you directly).
-
-target_roles: []
-# Example, once filled in:
-# target_roles:
-#   - name: CIO
-#     priority_weight: 10
-#   - name: SVP
-#     priority_weight: 9
-
-industries: []
-# Example:
-# industries:
-#   - Lifesciences/Pharma
-
+target_roles:
+- name: CIO
+  priority_weight: 10
+- name: SVP
+  priority_weight: 9
+- name: VP
+  priority_weight: 9
+- name: Head of IT
+  priority_weight: 9
+- name: Director
+  priority_weight: 6
+industries:
+- Lifesciences/Pharma
+- Federal Government
 search_cadence:
   scheduled_runs_per_day: 3
-  # Self-adjusting cadence (per PRD §8) is a later refinement — fixed cadence for v0.
