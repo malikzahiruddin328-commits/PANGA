@@ -34,3 +34,18 @@ def save_jobs(new_jobs: list[dict]) -> int:
     JOBS_PATH.parent.mkdir(parents=True, exist_ok=True)
     JOBS_PATH.write_text(json.dumps(existing, indent=2), encoding="utf-8")
     return added
+
+
+def update_job_score(source: str, job_id: str, fit_score: int, fit_rationale: str) -> None:
+    """fit_score is 0-100: how well this job matches the master profile,
+    per PRD §3 "Fit + Tailoring". Computed by Claude reasoning over the job
+    + master profile, not a keyword heuristic - this function only persists
+    the result, matching the mechanical/reasoning split used elsewhere
+    (interview.py, tailor.py)."""
+    jobs = load_jobs()
+    for job in jobs:
+        if job.get("source") == source and job.get("job_id") == job_id:
+            job["fit_score"] = fit_score
+            job["fit_rationale"] = fit_rationale
+            break
+    JOBS_PATH.write_text(json.dumps(jobs, indent=2), encoding="utf-8")

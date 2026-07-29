@@ -36,12 +36,31 @@ def _headers() -> dict:
     }
 
 
-def search_jobs(keyword: str | None = None, location: str | None = None, results_per_page: int = 25) -> list[dict]:
+def search_jobs(
+    keyword: str | None = None,
+    location: str | None = None,
+    results_per_page: int = 25,
+    who_may_apply: str | None = "public",
+    job_category_code: str | None = None,
+) -> list[dict]:
+    """who_may_apply defaults to "public" (matches the "Open to the public"
+    filter on USAJOBS.gov) since Zahir isn't a current federal employee -
+    "status" (internal-only) postings aren't ones he's eligible for anyway.
+    Pass None to remove the filter and see everything.
+
+    job_category_code filters by USAJOBS job series (e.g. "2210" =
+    Information Technology Management) - much more precise than a keyword
+    like "Director", which matches any federal director role regardless of
+    field (real estate, communications, etc.)."""
     params = {"ResultsPerPage": results_per_page}
     if keyword:
         params["Keyword"] = keyword
     if location:
         params["LocationName"] = location
+    if who_may_apply:
+        params["WhoMayApply"] = who_may_apply
+    if job_category_code:
+        params["JobCategoryCode"] = job_category_code
 
     response = requests.get(API_URL, headers=_headers(), params=params, timeout=30)
     response.raise_for_status()
@@ -64,10 +83,11 @@ def search_jobs(keyword: str | None = None, location: str | None = None, results
             "pay_max": pay.get("MaximumRange"),
             "posting_url": d.get("PositionURI"),
             "apply_url": apply_uris[0],
+            "qualification_summary": d.get("QualificationSummary"),
         })
     return jobs
 
 
 if __name__ == "__main__":
-    for job in search_jobs(keyword="Chief Information Officer", results_per_page=5):
+    for job in search_jobs(job_category_code="2210", results_per_page=5):
         print(f"{job['title']} - {job['organization']} - {job['location']}")

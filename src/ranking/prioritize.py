@@ -4,7 +4,7 @@ for each role.
 """
 
 
-def _weight_for(job_title: str, target_roles: list[dict]) -> int:
+def weight_for(job_title: str, target_roles: list[dict]) -> int:
     if not job_title:
         return 0
     title_lower = job_title.lower()

@@ -20,7 +20,7 @@ import yaml
 
 from search.usajobs import search_jobs, USAJobsNotConfigured
 from search.job_store import load_jobs
-from ranking.prioritize import sort_by_priority
+from ranking.prioritize import weight_for
 from tailoring.applications import load_applications, upsert_application, get_application
 
 SETTINGS_PATH = PROJECT_ROOT / "config" / "settings.yaml"
@@ -68,9 +68,17 @@ if page == "Settings":
         value="\n".join(settings.get("industries", [])),
     )
 
+    st.subheader("USAJOBS job series")
+    st.caption("See \"Occupations and job series\" on usajobs.gov for codes. This runs alongside keyword search (not instead of it) - government classification is inconsistent, so restricting to one series alone would miss real matches filed under a different code. The compatibility score, not this filter, is what actually screens for relevance.")
+    job_series_text = st.text_area(
+        "One code per line, e.g. 2210 for Information Technology Management",
+        value="\n".join(settings.get("usajobs_job_series", [])),
+    )
+
     if st.button("Save settings"):
         settings["target_roles"] = roles_df
         settings["industries"] = [line.strip() for line in industries_text.splitlines() if line.strip()]
+        settings["usajobs_job_series"] = [line.strip() for line in job_series_text.splitlines() if line.strip()]
         save_settings(settings)
         st.success("Saved.")
 
@@ -84,8 +92,20 @@ else:
                 try:
                     from search.job_store import save_jobs
                     total_new = 0
+                    # Keyword search per target role, not restricted to any one
+                    # job category - USAJOBS classification is inconsistent
+                    # relative to actual job content (e.g. "Audit Director (IT)"
+                    # and "Head of Innovation" are filed as Auditing/Program
+                    # Management, not IT Management), so a hard category filter
+                    # would silently exclude good matches. The compatibility
+                    # score, not the search itself, is what filters for quality.
                     for role in settings.get("target_roles", []):
-                        results = search_jobs(keyword=role["name"], results_per_page=25)
+                        results = search_jobs(keyword=role["name"], results_per_page=50)
+                        total_new += save_jobs(results)
+                    # Job series search as a supplementary net, for roles a
+                    # role-name keyword wouldn't catch (e.g. "IT Specialist (AI)").
+                    for code in settings.get("usajobs_job_series", []):
+                        results = search_jobs(job_category_code=code, results_per_page=100)
                         total_new += save_jobs(results)
                     st.success(f"Found {total_new} new job(s).")
                 except USAJobsNotConfigured as e:
@@ -94,7 +114,21 @@ else:
         st.caption("ZipRecruiter, Dice, and other connector-based sources only update here when Claude runs a search during a session - this button only covers USAJOBS.gov directly.")
 
     jobs = load_jobs()
-    ranked = sort_by_priority(jobs, settings.get("target_roles", []))
+    target_roles = settings.get("target_roles", [])
+
+    def sort_key(job):
+        has_score = "fit_score" in job
+        return (has_score, job.get("fit_score", -1), weight_for(job.get("title"), target_roles))
+
+    ranked = sorted(jobs, key=sort_key, reverse=True)
+
+    scored_count = sum(1 for j in jobs if "fit_score" in j)
+    min_score = st.slider(
+        "Minimum compatibility score",
+        0, 100, 30,
+        help=f"Hides low-fit results (e.g. unrelated roles pulled in by broad keyword matches). {scored_count}/{len(jobs)} jobs have been scored so far - unscored jobs are always shown, since we can't yet judge their fit.",
+    )
+    ranked = [j for j in ranked if "fit_score" not in j or j["fit_score"] >= min_score]
 
     st.subheader(f"{len(ranked)} job(s)")
 
@@ -108,6 +142,12 @@ else:
                     st.caption(f"Pay: {job.get('pay_min') or '?'} - {job.get('pay_max') or '?'}")
                 elif job.get("salary_text"):
                     st.caption(f"Pay: {job.get('salary_text')}")
+
+                if "fit_score" in job:
+                    st.markdown(f"**Compatibility: {job['fit_score']}/100**")
+                    st.caption(job.get("fit_rationale") or "")
+                else:
+                    st.caption("Compatibility: not yet scored")
 
                 status = application_status(job)
                 if status:
