@@ -8,111 +8,132 @@
 #                    pages (no login required, low ToS risk, but fragile/breaks
 #                    if the site's HTML changes - build only when worth the effort)
 #   freemium      -> free to browse, paid tier unlocks more (e.g. full apply access)
+#   js_rendered   -> confirmed 2026-07-29: raw HTML has no listing data, needs a
+#                    headless browser (e.g. Playwright) to render - not attempted,
+#                    plain requests/BeautifulSoup won't work here
+#   blocked       -> confirmed 2026-07-29: 403/429 on repeated attempts, active
+#                    bot-blocking - not a plain-requests target
 # status: candidate (researched, not yet built against) | built | rejected
+#
+# Full-site reconnaissance done 2026-07-29 (19 sites checked for scrapeability
+# before writing any scraper code) - see docs/daily-job-search-task.md for the
+# summary. Notably: the 3 sites originally flagged as most IT-relevant (Life
+# Search Technologies, TSP Life Sciences, Frontline Source Group) all turned
+# out blocked or JS-only - don't assume "most relevant" means "easiest to build."
 
 pharma_job_boards:
   - name: Planet Pharma
-    url: "https://www.planet-pharma.com/"
-    note: "Life sciences staffing firm; careers site supports category filtering, e.g. ?_job_category=technology"
+    url: "https://careers.planet-pharma.com/job-search/"
+    note: "Life sciences staffing firm. BUILT 2026-07-29 (src/search/industry_boards.py fetch_planet_pharma_jobs) - WordPress/FacetWP site; category filtering (?_job_category=) only applies via JS-triggered AJAX, not a plain URL param, so the scraper fetches the default listing and lets compatibility scoring filter for relevance, same pattern as USAJOBS/ZipRecruiter/Dice. Confirmed working: 10 real jobs pulled and saved."
     access_method: public_html
-    status: candidate
+    status: built
 
   - name: BioSpace
-    url: "https://jobs.biospace.com/searchjobs/"
-    note: "Largest pharma/biotech board; has a strong IT/digital leadership section. Checked 2026-07-28: no job-listings RSS/API, only an unrelated 'Job Trends' articles feed."
+    url: "https://jobs.biospace.com/searchjobs/?countrycode=US&Page=1"
+    note: "Largest pharma/biotech board (3,800+ jobs); has a strong IT/digital leadership section. No job-listings RSS/API (checked 2026-07-28). Confirmed scrapeable 2026-07-29: server-rendered HTML, clean ?countrycode=US&Page=N pagination, no blocking. Not yet built - next candidate after Planet Pharma."
     access_method: public_html
     status: candidate
 
   - name: RAPS Career Center
     url: "https://regulatorycareers.raps.org/"
-    note: "Regulatory affairs focused, but crosses into IT/quality-governance roles relevant to GxP/CSV background."
-    access_method: public_html
-    status: candidate
+    note: "Regulatory affairs focused, crosses into IT/quality-governance roles relevant to GxP/CSV background. Confirmed BLOCKED 2026-07-29 - 403 Forbidden on root and /jobs."
+    access_method: blocked
+    status: rejected
 
   - name: FierceBiotech Jobs
     url: "https://jobs.fiercebiotech.com/"
-    note: "Runs on the shared 'Life Sciences Job Network.'"
-    access_method: public_html
-    status: candidate
+    note: "Runs on the shared 'Life Sciences Job Network.' Confirmed BLOCKED 2026-07-29 - 403 Forbidden on root and /jobs."
+    access_method: blocked
+    status: rejected
 
 life_sciences_recruitment_firms:
-  # IT/tech-focused within life sciences - highest relevance to CIO/Head of IT target roles
+  # IT/tech-focused within life sciences - highest relevance to CIO/Head of IT
+  # target roles. Reconnaissance 2026-07-29: unfortunately ALL THREE of these
+  # turned out blocked or JS-only - "most relevant" didn't mean "easiest."
   - name: Life Search Technologies
-    url: "https://lifesearchtech.com/"
-    note: "Places IT professionals specifically within life sciences/biopharma."
-    access_method: public_html
+    url: "https://lifesearchtech.com/job-opportunities/it-jobs/"
+    note: "Places IT professionals specifically within life sciences/biopharma. Confirmed JS-RENDERED 2026-07-29 - homepage and /job-opportunities/it-jobs/ both show no listing data in raw HTML."
+    access_method: js_rendered
     status: candidate
 
   - name: TSP Life Sciences
     url: "https://tsptalent.com/services/executive-professional-search/"
-    note: "Executive search for Health IT execs up through C-suite in pharma/biotech/med device."
-    access_method: public_html
-    status: candidate
+    note: "Executive search for Health IT execs up through C-suite in pharma/biotech/med device. Confirmed 2026-07-29: TSP's own site is marketing-only; actual listings are hosted off-domain at careers.taylor-strategy.com, which is BLOCKED (403)."
+    access_method: blocked
+    status: rejected
 
   - name: Frontline Source Group
     url: "https://www.frontlinesourcegroup.com/executive-search-life-sciences.html"
-    note: "Runs both Tech/IT and Life Sciences executive search practices."
-    access_method: public_html
-    status: candidate
+    note: "Runs both Tech/IT and Life Sciences executive search practices. Confirmed BLOCKED 2026-07-29 - 403 Forbidden, repeated."
+    access_method: blocked
+    status: rejected
 
   - name: Slone Partners
-    url: "https://www.slonepartners.com/"
-    note: "Places biopharma/healthcare IT/diagnostics executives (Boston, NYC, DC, SF)."
-    access_method: public_html
+    url: "https://www.slonepartners.com/for-candidates/active-searches/"
+    note: "Places biopharma/healthcare IT/diagnostics executives (Boston, NYC, DC, SF). Confirmed JS-RENDERED 2026-07-29 - /for-candidates/active-searches/ is a JS shell, no listings in raw HTML."
+    access_method: js_rendered
     status: candidate
 
   - name: Pender & Howe
     url: "https://penderhowe.com/en/life-sciences/"
-    note: "Pairs AI-focused companies in life sciences with talent."
+    note: "Pairs AI-focused companies in life sciences with talent. Confirmed 2026-07-29: pure marketing page, no jobs board link found anywhere on the site."
     access_method: public_html
-    status: candidate
+    status: rejected
 
   # Broader life-sciences recruiters (mixed roles - R&D/clinical/scientific,
   # not IT-specific, but worth keeping for cross-industry fit checks per PRD §4)
   - name: Barrington James
-    url: "https://www.barringtonjames.com/"
-    access_method: public_html
+    url: "https://www.barringtonjames.com/job-search/"
+    note: "Confirmed UNCLEAR 2026-07-29 - link exists but sub-page fetch returned no listing content, likely JS/AJAX search."
+    access_method: js_rendered
     status: candidate
   - name: EPM Scientific
-    url: "https://www.epmscientific.com/en-us"
-    access_method: public_html
-    status: candidate
+    url: "https://www.epmscientific.com/en-us/jobs"
+    note: "Confirmed RATE-LIMITED 2026-07-29 - repeated 429 responses on both attempts, actively throttling automated requests. Could be scrapeable with slower/careful requests, not attempted."
+    access_method: blocked
+    status: rejected
   - name: SRG
-    url: "https://www.srgtalent.com/us"
-    access_method: public_html
-    status: candidate
+    url: "https://www.srgtalent.com/us/jobs"
+    note: "Confirmed JS-RENDERED (SPA) 2026-07-29 - hash-fragment routing (#/clinical style), 'couldn't find jobs' placeholder in raw HTML, no server-rendered results."
+    access_method: js_rendered
+    status: rejected
   - name: SEC Life Sciences
     url: "https://www.seclifesciences.com/"
+    note: "Confirmed 2026-07-29: no jobs board found anywhere on the site - recruiter-contact-only model."
     access_method: public_html
-    status: candidate
+    status: rejected
   - name: Beacon Hill Life Sciences
-    url: "https://bhsg.com/bh-life-sciences"
+    url: "https://bhsg.com/jobs/job-search/?_categories=life-sciences"
+    note: "Confirmed SCRAPEABLE 2026-07-29 - real listings server-rendered (title/location/salary), clean ?_categories= query pattern, no blocking. Reconnaissance agent's top pick - not yet built, good next candidate."
     access_method: public_html
     status: candidate
   - name: Atrium
-    url: "https://www.atriumglobal.com/talent-solutions/life-sciences-talent-solutions/"
+    url: "https://atriumstaff.com/jobs/"
+    note: "Confirmed SCRAPEABLE 2026-07-29 - server-rendered listings with title/location/type/date, explicit Information Technology category filter. Not yet built."
     access_method: public_html
     status: candidate
   - name: GForce Life Sciences
-    url: "https://www.gforcelifesciences.com/client-services/executive-search/"
+    url: "https://www.gforcelifesciences.com/candidate-careers/"
+    note: "Confirmed SCRAPEABLE 2026-07-29 - static HTML, 39 jobs, explicit IT category filter, page-number pagination (/candidate-careers/page/2/...). Not yet built."
     access_method: public_html
     status: candidate
   - name: Sci.bio
-    url: "https://www.sci.bio/"
-    access_method: public_html
-    status: candidate
+    url: "https://www.sci.bio/job-search/"
+    note: "Confirmed JS/AJAX 2026-07-29 - 'Load more listings' button pattern, no static results in raw HTML."
+    access_method: js_rendered
+    status: rejected
 
 general_executive_boards:
   - name: The Ladders
     url: "https://www.theladders.com"
-    note: "$100K+ roles. Free to browse/apply to jobs marked 'Apply for Free'; $29.99/mo unlocks full access."
-    access_method: freemium
-    status: candidate
+    note: "$100K+ roles. Free to browse/apply to jobs marked 'Apply for Free'; $29.99/mo unlocks full access. Confirmed BLOCKED 2026-07-29 - 403 Forbidden."
+    access_method: blocked
+    status: rejected
 
 general_job_aggregators:
   - name: Lensa
     url: "https://career.lensa.com/"
-    note: "Free for job seekers (monetized via ads/affiliate traffic). Aggregates and republishes listings pulled from other sources, so results likely overlap with ZipRecruiter/Dice/Indeed - dedup by posting URL if built. 'Lensa Connect' API exists but is a paid partner/publisher integration, not an open jobseeker-side API - would still mean fetching public search-result pages."
+    note: "Free for job seekers (monetized via ads/affiliate traffic). Aggregates and republishes listings pulled from other sources, so results likely overlap with ZipRecruiter/Dice/Indeed - dedup by posting URL if built. 'Lensa Connect' API exists but is a paid partner/publisher integration, not an open jobseeker-side API. Reconnaissance 2026-07-29: root lensa.com returned 402; career.lensa.com rendered a couple of listings server-side but looked like Lensa's own corporate careers page, not their aggregator job board - needs manual verification before building."
     access_method: public_html
     status: candidate
 

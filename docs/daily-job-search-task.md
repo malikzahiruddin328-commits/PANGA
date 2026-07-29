@@ -25,19 +25,55 @@ the master profile, not a keyword heuristic (per PRD §11 LLM architecture).
      "job-search") was evaluated and rejected for this pipeline - its
      results have no posting URL or stable ID, so there's nothing to dedupe
      on or link to.
-  3. Finds jobs missing a `fit_score` (from any of the four sources),
+  3. Searches company career sites via ATS APIs, not scraping (added
+     2026-07-29, `search/company_sites.py`) - `search_workday_jobs()` and
+     `search_smartrecruiters_jobs()` call the same JSON endpoints a
+     company's own careers page JavaScript calls (Workday's CXS API,
+     SmartRecruiters' public posting API), zero HTML parsing, zero
+     scraping risk. Confirmed against Eisai/IQVIA (Workday) and AbbVie
+     (SmartRecruiters) - real companies from Zahir's own background. Not
+     every company uses one of these two ATS platforms, but it covers a
+     large share of large employers. More companies can be added by
+     finding their tenant/site (Workday) or company-id (SmartRecruiters)
+     via web search.
+  4. Searches Planet Pharma (added 2026-07-29, `search/industry_boards.py`)
+     - genuine HTML scraping (no API), the one board built so far out of
+     19 researched (see "Industry board reconnaissance" below for why only
+     one). Fetches the general listing, no server-side category filter
+     (FacetWP's filter only applies via JS, not a URL param) - relevance
+     filtering happens via compatibility scoring like every other source.
+  5. Finds jobs missing a `fit_score` (from any source),
      reasons about fit against `data/profile/structured/master_profile.json`
      (seniority, domain, the CISO/security-officer disqualification - see
      below), writes `fit_score` (0-100) + a plain-language `fit_rationale`
      to each.
-  4. Checks for any unreviewed "not interested" reasons (see below) - just
+  6. Checks for any unreviewed "not interested" reasons (see below) - just
      detects, doesn't evaluate them itself.
-  5. Sends one push notification if a new job scored 60+ and/or unreviewed
+  7. Sends one push notification if a new job scored 60+ and/or unreviewed
      rejection reasons exist; stays silent if neither applies.
 - **Cost tradeoff:** runs once/day, not multiple times, since scoring is
   real reasoning work per job, not a cheap mechanical check - matching
   Zahir's own framing ("jobs that come on daily basis need to be validated
   like this").
+
+## Industry board reconnaissance (2026-07-29)
+
+Before writing any scraper code against the 19 candidate boards in
+`config/industry_job_boards.yaml`, checked each for actual scrapeability
+(does raw HTML contain listing data, or is it JS-rendered / bot-blocked).
+Result: **5 confirmed scrapeable** (Planet Pharma, BioSpace, Beacon Hill
+Life Sciences, Atrium, GForce Life Sciences), **10 rejected** (403/429
+blocking, or no jobs board exists at all), **4 need a headless browser**
+(JS-rendered, not attempted with plain requests). Built so far: Planet
+Pharma only, as a proof of the pattern - the other 4 confirmed-scrapeable
+ones are documented in the YAML with their confirmed-working URLs, ready to
+build the same way when there's time.
+
+Notable finding: the three sites originally flagged as most IT-relevant
+(Life Search Technologies, TSP Life Sciences, Frontline Source Group) all
+turned out blocked or JS-only. Relevance and ease-of-scraping are
+independent - don't assume the most relevant source is also the easiest
+to build against.
 
 ## Why keyword search, not a job-category filter
 
