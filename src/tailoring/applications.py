@@ -1,6 +1,9 @@
 """Local JSON-backed store for the `applications` table (PRD §4): one record
-per job the user has started tailoring or set a status on. Status values per
-PRD §9: drafted, reviewed, submitted-by-user, not-interested, save-for-later.
+per job the user has started tailoring or set a status on. Status values in
+practice: "under review" (set automatically by "Start tailoring" - the app
+has no way to know a job was actually submitted), "applied" (the user
+confirms this themselves, or accepts a suggestion below), "not interested",
+"save for later".
 """
 
 import json
@@ -79,3 +82,36 @@ def mark_skip_reason_reviewed(source: str, job_id: str) -> None:
 
 def get_unreviewed_skip_reasons() -> list[dict]:
     return [a for a in load_applications() if a.get("skip_reason") and a.get("skip_reason_reviewed") is False]
+
+
+def suggest_status(source: str, job_id: str, suggested_status: str, reason: str) -> None:
+    """Claude calls this (from the Gmail scan) when an email looks like an
+    application-confirmation match for a job currently "under review" - it
+    does NOT change the real status. The user confirms or rejects it
+    (confirm_status_suggestion), since matching an email to the right job
+    record is a best guess, not a certainty (e.g. duplicate-titled postings)."""
+    applications = load_applications()
+    for app in applications:
+        if app["source"] == source and app["job_id"] == job_id:
+            app["suggested_status"] = suggested_status
+            app["suggested_status_reason"] = reason
+            _save_all(applications)
+            return
+
+
+def get_pending_status_suggestions() -> list[dict]:
+    return [a for a in load_applications() if a.get("suggested_status")]
+
+
+def confirm_status_suggestion(source: str, job_id: str, accept: bool) -> None:
+    """accept=True applies the suggested_status as the real status; either
+    way, clears the suggestion so it isn't asked about again."""
+    applications = load_applications()
+    for app in applications:
+        if app["source"] == source and app["job_id"] == job_id:
+            if accept and app.get("suggested_status"):
+                app["status"] = app["suggested_status"]
+            app["suggested_status"] = None
+            app["suggested_status_reason"] = None
+            _save_all(applications)
+            return

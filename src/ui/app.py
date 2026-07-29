@@ -21,7 +21,7 @@ import yaml
 from search.usajobs import search_jobs, USAJobsNotConfigured
 from search.job_store import load_jobs
 from ranking.prioritize import weight_for
-from tailoring.applications import load_applications, upsert_application, get_application
+from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion
 
 SETTINGS_PATH = PROJECT_ROOT / "config" / "settings.yaml"
 
@@ -84,6 +84,24 @@ if page == "Settings":
 
 else:
     settings = load_settings()
+
+    pending_suggestions = get_pending_status_suggestions()
+    if pending_suggestions:
+        st.warning(f"{len(pending_suggestions)} application match(es) found from your inbox - confirm or dismiss below.")
+        for sugg in pending_suggestions:
+            job = next((j for j in load_jobs() if j["source"] == sugg["source"] and j["job_id"] == sugg["job_id"]), None)
+            job_label = job["title"] if job else f"{sugg['source']} {sugg['job_id']}"
+            st.markdown(f"**{job_label}** -> mark as \"{sugg['suggested_status']}\"?")
+            st.caption(sugg.get("suggested_status_reason") or "")
+            s1, s2 = st.columns(2)
+            with s1:
+                if st.button("Confirm", key=f"confirm_{sugg['source']}_{sugg['job_id']}"):
+                    confirm_status_suggestion(sugg["source"], sugg["job_id"], accept=True)
+                    st.rerun()
+            with s2:
+                if st.button("Dismiss", key=f"dismiss_{sugg['source']}_{sugg['job_id']}"):
+                    confirm_status_suggestion(sugg["source"], sugg["job_id"], accept=False)
+                    st.rerun()
 
     col1, col2 = st.columns([1, 3])
     with col1:
@@ -148,45 +166,74 @@ else:
 
     st.subheader(f"{len(ranked)} job(s)")
 
-    for job in ranked:
-        with st.container(border=True):
-            c1, c2 = st.columns([3, 1])
-            with c1:
-                st.markdown(f"**{job.get('title')}** - {job.get('organization')}")
-                st.caption(f"{job.get('location') or 'Location not listed'} | Source: {job.get('source')}")
-                if job.get("pay_min") or job.get("pay_max"):
-                    st.caption(f"Pay: {job.get('pay_min') or '?'} - {job.get('pay_max') or '?'}")
-                elif job.get("salary_text"):
-                    st.caption(f"Pay: {job.get('salary_text')}")
+    # Grouped by channel (source) per Zahir's request 2026-07-29 - each
+    # channel (USAJOBS, Dice, ZipRecruiter, etc.) gets its own section.
+    # Dedup only happens WITHIN a channel (job_store keys on source+job_id) -
+    # the same real job posted on two different channels shows once per
+    # channel, since they're technically distinct postings (different links,
+    # sometimes different pay listed), not auto-merged.
+    channels = list(dict.fromkeys(j["source"] for j in ranked))  # first-appearance order, dedup'd
 
+    def dedupe_key(job):
+        # Same title+org+location+pay within a channel = almost certainly the
+        # same real job posted under two announcements (e.g. merit-promotion
+        # + open-competitive on USAJOBS) - confirmed 2026-07-29 with the two
+        # identical "Audit Director (IT)" postings. Cross-channel matching
+        # isn't attempted here - different platforms format titles/orgs too
+        # differently for exact matching to be reliable, and the risk of
+        # wrongly merging two different jobs is higher than the clutter cost.
+        return (job.get("title"), job.get("organization"), job.get("location"), job.get("pay_min"), job.get("pay_max"))
+
+    for channel in channels:
+        channel_jobs = [j for j in ranked if j["source"] == channel]
+
+        groups = {}
+        for job in channel_jobs:
+            groups.setdefault(dedupe_key(job), []).append(job)
+        deduped = [postings[0] for postings in groups.values()]  # first (highest-ranked) as primary
+        postings_by_primary = {id(postings[0]): postings for postings in groups.values()}
+
+        st.markdown(f"**{channel}** ({len(deduped)}{f', {len(channel_jobs) - len(deduped)} duplicate posting(s) merged' if len(deduped) < len(channel_jobs) else ''})")
+
+        for job in deduped:
+            status = application_status(job) or "-"
+            score_display = f"{job['fit_score']}" if "fit_score" in job else "?"
+            pay = f"${job.get('pay_min') or '?'}-{job.get('pay_max') or '?'}" if (job.get("pay_min") or job.get("pay_max")) else (job.get("salary_text") or "")
+            label = f"{score_display} | {job.get('title')} - {job.get('organization')} | {pay} | {status}"
+
+            with st.expander(label):
+                st.caption(f"{job.get('location') or 'Location not listed'}")
                 if "fit_score" in job:
-                    st.markdown(f"**Compatibility: {job['fit_score']}/100**")
                     st.caption(job.get("fit_rationale") or "")
                 else:
                     st.caption("Compatibility: not yet scored")
 
-                status = application_status(job)
-                if status:
-                    st.caption(f"Status: {status}")
-
-            with c2:
-                if job.get("posting_url"):
-                    st.link_button("Open posting", job["posting_url"])
-
-                if st.button("Start tailoring", key=f"tailor_{job.get('source')}_{job.get('job_id')}"):
-                    upsert_application(job["source"], job["job_id"], status="drafted")
-                    st.info("Marked as drafted. Go to Claude Code and ask to tailor this job - that's where the actual resume/cover letter drafting happens (per the PRD's LLM architecture, not inside this app).")
-
-                new_status = st.selectbox(
-                    "Mark status",
-                    ["-", "applied", "not interested", "save for later"],
-                    key=f"status_{job.get('source')}_{job.get('job_id')}",
-                )
-                if new_status != "-":
-                    skip_reason = None
-                    if new_status == "not interested":
-                        skip_reason = st.text_input("Why not interested? (optional)", key=f"reason_{job.get('source')}_{job.get('job_id')}")
-                    if st.button("Save status", key=f"save_status_{job.get('source')}_{job.get('job_id')}"):
-                        upsert_application(job["source"], job["job_id"], status=new_status, skip_reason=skip_reason)
-                        st.success("Status saved.")
+                postings = postings_by_primary[id(job)]
+                b1, b2, b3 = st.columns(3)
+                with b1:
+                    if len(postings) == 1:
+                        if job.get("posting_url"):
+                            st.link_button("Open posting", job["posting_url"])
+                    else:
+                        for i, posting in enumerate(postings, start=1):
+                            if posting.get("posting_url"):
+                                st.link_button(f"Open posting ({i} of {len(postings)})", posting["posting_url"], key=f"open_{posting.get('source')}_{posting.get('job_id')}")
+                with b2:
+                    if st.button("Start tailoring", key=f"tailor_{job.get('source')}_{job.get('job_id')}"):
+                        upsert_application(job["source"], job["job_id"], status="under review")
+                        st.info("Marked \"under review.\" Go to Claude Code and ask to tailor this job - that's where the actual resume/cover letter drafting happens (per the PRD's LLM architecture, not inside this app). Once you've actually submitted it, come back and mark it \"applied.\"")
                         st.rerun()
+                with b3:
+                    new_status = st.selectbox(
+                        "Mark status",
+                        ["-", "applied", "not interested", "save for later"],
+                        key=f"status_{job.get('source')}_{job.get('job_id')}",
+                    )
+                    if new_status != "-":
+                        skip_reason = None
+                        if new_status == "not interested":
+                            skip_reason = st.text_input("Why not interested? (optional)", key=f"reason_{job.get('source')}_{job.get('job_id')}")
+                        if st.button("Save status", key=f"save_status_{job.get('source')}_{job.get('job_id')}"):
+                            upsert_application(job["source"], job["job_id"], status=new_status, skip_reason=skip_reason)
+                            st.success("Status saved.")
+                            st.rerun()

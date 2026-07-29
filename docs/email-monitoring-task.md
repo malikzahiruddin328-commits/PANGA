@@ -1,4 +1,4 @@
-# Gmail call-to-action monitoring (email monitoring, simple-scan version)
+# Gmail call-to-action monitoring + application-match detection
 
 Not a Python build step - this runs as a Claude scheduled task (not a script in
 `src/`), because Gmail is only reachable as an MCP connector tool inside a live
@@ -8,20 +8,25 @@ Claude session, the same constraint documented for boards.py (build step 4b).
 - **Schedule:** 4x/day - 8am, 12pm, 4pm, 8pm local (`7 8,12,16,20 * * *`)
 - **Task file (lives outside this repo):** `C:\Users\User\.claude\scheduled-tasks\panga-gmail-cta-scan\SKILL.md`
 - **State tracking:** Gmail labels `Panga/Reviewed` and `Panga/Call-to-Action` -
-  no local database. Visible directly in Zahir's inbox.
-- **Notification:** one push notification per run, only when a genuine
-  call-to-action is found (interview invite, assessment/task request, offer,
-  rejection, or a recruiter asking a direct question). Silent otherwise.
+  no local database for email state. Visible directly in Zahir's inbox.
+- **Notification:** one push notification per run, combining any genuine
+  call-to-action found (interview invite, assessment/task request, offer,
+  rejection, recruiter question) and/or a count of new application-match
+  suggestions (see below). Silent if neither applies.
 - **Safety:** read + label only. Never sends, replies to, or drafts a reply to
   any email.
 
-## Scope note
+## Application-match detection - built 2026-07-29
 
-This is the "simple scan" version agreed on 2026-07-28: flags call-to-action
-emails generically, without linking each one to a specific job record. The
-richer version - tagging a flagged email to the exact job it's about - depends
-on the `applications` table (PRD §4), which doesn't exist until build steps
-4c/5/6 are done. Revisit then.
+When an email looks like an application-received/confirmation (bucket d in
+the prompt), the task checks `tailoring.applications.load_applications()` for
+any job with status "under review" and tries to match it by title/org/req
+number. A confident match calls `applications.suggest_status(source, job_id,
+"applied", reason)` - this does NOT change the real status. The Results
+screen shows pending suggestions at the top with Confirm/Dismiss buttons
+(`applications.confirm_status_suggestion()`); Zahir always makes the final
+call, since matching an email to the right job is a best guess (e.g. two
+identical-titled duplicate postings can't be told apart from an email alone).
 
 ## Prompt (reference copy - the live version lives in the SKILL.md above)
 
