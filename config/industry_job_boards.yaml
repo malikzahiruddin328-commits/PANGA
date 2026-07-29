@@ -109,6 +109,13 @@ general_executive_boards:
     access_method: freemium
     status: candidate
 
+general_job_aggregators:
+  - name: Lensa
+    url: "https://career.lensa.com/"
+    note: "Free for job seekers (monetized via ads/affiliate traffic). Aggregates and republishes listings pulled from other sources, so results likely overlap with ZipRecruiter/Dice/Indeed - dedup by posting URL if built. 'Lensa Connect' API exists but is a paid partner/publisher integration, not an open jobseeker-side API - would still mean fetching public search-result pages."
+    access_method: public_html
+    status: candidate
+
 # Paid candidate-database platforms (BlueSteps, ExecuNet, NetShare) are
 # deliberately NOT listed here - they work in reverse (recruiters search
 # member profiles; there's nothing for Panga to search). See PRD §13 backlog
