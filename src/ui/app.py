@@ -426,13 +426,45 @@ elif active_tab == "results":
                         if posting.get("posting_url"):
                             st.link_button(f"Open posting ({i} of {len(postings)})", posting["posting_url"], key=f"open_{posting.get('source')}_{posting.get('job_id')}")
 
-                status = application_status(job)
-                b1, b2, b3 = st.columns(3)
-                with b1:
-                    if st.button("Start tailoring", key=f"tailor_{job.get('source')}_{job.get('job_id')}"):
-                        upsert_application(job["source"], job["job_id"], status="under review")
-                        st.info("Marked \"under review.\" Go to Claude Code and ask to tailor this job - that's where the actual resume/cover letter drafting happens (per the PRD's LLM architecture, not inside this app). Once you've actually submitted it, come back and mark it \"applied.\"")
-                        st.rerun()
+                app_record = get_application(job.get("source"), job.get("job_id")) or {}
+                requested = app_record.get("documents_requested") or []
+                status = app_record.get("status")
+
+                st.markdown("**Documents for this application**")
+                doc_types = [
+                    ("resume", "Resume"),
+                    ("cover_letter", "Cover letter"),
+                    ("exec_bio", "Executive bio"),
+                    ("leadership_summary", "Leadership summary"),
+                ]
+                doc_cols = st.columns(4)
+                checked = {}
+                for col, (doc_key, doc_label) in zip(doc_cols, doc_types):
+                    with col:
+                        checked[doc_key] = st.checkbox(
+                            doc_label,
+                            value=doc_key in requested,
+                            key=f"doc_{doc_key}_{job.get('source')}_{job.get('job_id')}",
+                        )
+                if st.button("Request documents", key=f"reqdocs_{job.get('source')}_{job.get('job_id')}"):
+                    selected = [k for k, v in checked.items() if v]
+                    upsert_application(job["source"], job["job_id"], status="under review", documents_requested=selected)
+                    st.info("Saved. Go to Claude Code and ask to draft the documents for this job - it'll generate exactly what's checked (per the PRD's LLM architecture, not inside this app). Once you've actually submitted it, come back and mark it \"applied.\"")
+                    st.rerun()
+
+                doc_field_map = {
+                    "resume": "resume_text",
+                    "cover_letter": "cover_letter_text",
+                    "exec_bio": "exec_bio_text",
+                    "leadership_summary": "leadership_summary_text",
+                }
+                for doc_key, doc_label in doc_types:
+                    drafted_text = app_record.get(doc_field_map[doc_key])
+                    if drafted_text:
+                        with st.expander(f"{doc_label} (drafted)"):
+                            st.code(drafted_text, language=None)
+
+                b2, b3 = st.columns(2)
                 with b2:
                     if status == "applied":
                         if st.button("Prep for interview", key=f"prep_results_{job.get('source')}_{job.get('job_id')}"):

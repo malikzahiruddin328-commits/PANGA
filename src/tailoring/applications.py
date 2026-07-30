@@ -35,10 +35,16 @@ def upsert_application(
     status: str,
     resume_text: str | None = None,
     cover_letter_text: str | None = None,
+    exec_bio_text: str | None = None,
+    leadership_summary_text: str | None = None,
+    documents_requested: list[str] | None = None,
     skip_reason: str | None = None,
 ) -> None:
     """Creates or updates the application record for (source, job_id).
-    Fields left as None don't overwrite previously saved values. Setting a
+    Fields left as None don't overwrite previously saved values -
+    documents_requested is the full desired set each time it's passed (the
+    Results tab checkboxes always submit the complete current selection, not
+    a delta), so it's replaced rather than merged, same as status. Setting a
     skip_reason marks it unreviewed (skip_reason_reviewed=False) - Claude
     evaluates unreviewed reasons for what they imply about future searches
     (per PRD §13's non-applied-job feedback loop) and marks them reviewed
@@ -51,6 +57,12 @@ def upsert_application(
                 app["resume_text"] = resume_text
             if cover_letter_text is not None:
                 app["cover_letter_text"] = cover_letter_text
+            if exec_bio_text is not None:
+                app["exec_bio_text"] = exec_bio_text
+            if leadership_summary_text is not None:
+                app["leadership_summary_text"] = leadership_summary_text
+            if documents_requested is not None:
+                app["documents_requested"] = documents_requested
             if skip_reason is not None:
                 app["skip_reason"] = skip_reason
                 app["skip_reason_reviewed"] = False
@@ -63,6 +75,9 @@ def upsert_application(
         "status": status,
         "resume_text": resume_text,
         "cover_letter_text": cover_letter_text,
+        "exec_bio_text": exec_bio_text,
+        "leadership_summary_text": leadership_summary_text,
+        "documents_requested": documents_requested if documents_requested is not None else [],
         "skip_reason": skip_reason,
         "skip_reason_reviewed": False if skip_reason is not None else None,
     })
