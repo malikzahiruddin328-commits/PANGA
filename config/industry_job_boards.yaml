@@ -30,9 +30,9 @@ pharma_job_boards:
 
   - name: BioSpace
     url: "https://jobs.biospace.com/searchjobs/?countrycode=US&Page=1"
-    note: "Largest pharma/biotech board (3,800+ jobs); has a strong IT/digital leadership section. No job-listings RSS/API (checked 2026-07-28). Confirmed scrapeable 2026-07-29: server-rendered HTML, clean ?countrycode=US&Page=N pagination, no blocking. Not yet built - next candidate after Planet Pharma."
+    note: "Largest pharma/biotech board (3,800+ jobs); has a strong IT/digital leadership section. No job-listings RSS/API (checked 2026-07-28). Confirmed scrapeable 2026-07-29: server-rendered HTML, clean ?countrycode=US&Page=N pagination, no blocking. BUILT 2026-07-30 (src/search/industry_boards.py fetch_biospace_jobs) - unlike the staffing-firm sources below, each listing's \"recruiter\" meta field names the real hiring company (e.g. Sanofi), so organization is set from that instead of a staffing-brand placeholder."
     access_method: public_html
-    status: candidate
+    status: built
 
   - name: RAPS Career Center
     url: "https://regulatorycareers.raps.org/"
@@ -104,19 +104,19 @@ life_sciences_recruitment_firms:
     status: rejected
   - name: Beacon Hill Life Sciences
     url: "https://bhsg.com/jobs/job-search/?_categories=life-sciences"
-    note: "Confirmed SCRAPEABLE 2026-07-29 - real listings server-rendered (title/location/salary), clean ?_categories= query pattern, no blocking. Reconnaissance agent's top pick - not yet built, good next candidate."
+    note: "Confirmed SCRAPEABLE 2026-07-29 - real listings server-rendered (title/location/salary), clean ?_categories= query pattern, no blocking. BUILT 2026-07-30 (src/search/industry_boards.py fetch_beacon_hill_jobs) - staffing firm, single fetch of the life-sciences-filtered default listing (~20 jobs), no client company named in listings."
     access_method: public_html
-    status: candidate
+    status: built
   - name: Atrium
     url: "https://atriumstaff.com/jobs/"
-    note: "Confirmed SCRAPEABLE 2026-07-29 - server-rendered listings with title/location/type/date, explicit Information Technology category filter. Not yet built."
+    note: "Confirmed SCRAPEABLE 2026-07-29 - server-rendered listings with title/location/type/date, explicit Information Technology category filter. BUILT 2026-07-30 (src/search/industry_boards.py fetch_atrium_jobs) - the generic /jobs/ homepage only shows a handful of unrelated featured roles; the real IT-tagged listings live at the dedicated /jobs/information-technology/ category page (only ~3 jobs at a time, confirmed correct - that's just how few IT roles this staffing firm has open)."
     access_method: public_html
-    status: candidate
+    status: built
   - name: GForce Life Sciences
     url: "https://www.gforcelifesciences.com/candidate-careers/"
-    note: "Confirmed SCRAPEABLE 2026-07-29 - static HTML, 39 jobs, explicit IT category filter, page-number pagination (/candidate-careers/page/2/...). Not yet built."
+    note: "Confirmed SCRAPEABLE 2026-07-29 - static HTML, 39 jobs, page-number pagination (/candidate-careers/page/2/...). BUILT 2026-07-30 (src/search/industry_boards.py fetch_gforce_jobs) - no working IT-only category URL was found on this site (unlike Atrium), so it paginates the general listing and lets compatibility scoring filter for relevance, same pattern as Planet Pharma."
     access_method: public_html
-    status: candidate
+    status: built
   - name: Sci.bio
     url: "https://www.sci.bio/job-search/"
     note: "Confirmed JS/AJAX 2026-07-29 - 'Load more listings' button pattern, no static results in raw HTML."
