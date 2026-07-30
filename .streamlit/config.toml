@@ -1,0 +1,33 @@
+[theme.light]
+primaryColor = "#0B5FA5"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f5f7fa"
+textColor = "#1a2027"
+borderColor = "#dde3ea"
+linkColor = "#0B5FA5"
+greenColor = "#1a7f37"
+redColor = "#cf222e"
+yellowColor = "#bf8700"
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+headingFont = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@600;700&display=swap"
+baseFontSize = 15
+baseRadius = "8px"
+showWidgetBorder = true
+linkUnderline = false
+
+[theme.dark]
+primaryColor = "#5B9BD5"
+backgroundColor = "#0e1420"
+secondaryBackgroundColor = "#161e2c"
+textColor = "#e6ecf3"
+borderColor = "#2a3444"
+linkColor = "#5B9BD5"
+greenColor = "#3fb950"
+redColor = "#f85149"
+yellowColor = "#d29922"
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+headingFont = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@600;700&display=swap"
+baseFontSize = 15
+baseRadius = "8px"
+showWidgetBorder = true
+linkUnderline = false
