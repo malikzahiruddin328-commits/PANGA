@@ -23,9 +23,14 @@ NON_COMPANY_KEYWORDS = (
 MEGA_PHARMA_KEYWORDS = (
     "pfizer", "merck", "novartis", "roche", "genentech", "sanofi",
     "glaxosmithkline", " gsk", "astrazeneca", "johnson & johnson", "janssen",
-    "eli lilly", "abbvie", "bristol-myers", "bristol myers", "bayer",
-    "takeda", "gilead", "amgen", "biogen", "novo nordisk", "boehringer",
-    "teva", "viatris", "regeneron", "hoffmann-la roche",
+    "eli lilly", "abbvie", "bristol-myers", "bristol myers", " bristol ",
+    "bayer", "takeda", "gilead", "amgen", "biogen", "novo nordisk", " novo ",
+    "boehringer", "teva", "viatris", "regeneron", "hoffmann-la roche",
+    # Added 2026-07-30 after a real openFDA batch surfaced these under
+    # abbreviated/short sponsor names ("BRISTOL", "NOVO") or ones not on
+    # the original US/EU-household-name-biased list - large, established
+    # multinationals, same exclusion logic as the rest of this list.
+    "sun pharm", "zydus", "amneal", "servier",
 )
 
 # Well-known formerly-independent life-sciences companies absorbed via

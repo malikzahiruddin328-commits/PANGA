@@ -508,11 +508,12 @@ elif active_tab == "prospector":
 
     st.subheader("Target accounts")
     st.caption(
-        "Sourced from ClinicalTrials.gov Phase 3 activity (PRD §16a, signal 1 of 4). Filtered to "
-        "exclude obvious non-companies (universities, hospitals, government) and known mega-pharma "
-        "majors - but not every remaining entry is a great fit (a research consortium or an "
-        "already-acquired company can still slip through), so treat \"watching\" as a starting "
-        "point to review, not a verified lead. Mark anything wrong as \"disqualified\" below."
+        "Sourced from ClinicalTrials.gov Phase 3 activity and recent openFDA drug approvals "
+        "(PRD §16a, signals 1-2 of 4). Filtered to exclude obvious non-companies (universities, "
+        "hospitals, government), known mega-pharma majors, and known-acquired companies - but not "
+        "every remaining entry is a great fit (a research consortium or an unusual NDA holder can "
+        "still slip through), so treat \"watching\" as a starting point to review, not a verified "
+        "lead. Mark anything wrong as \"disqualified\" below."
     )
     if not target_accounts:
         st.info("No target accounts yet.")

@@ -115,7 +115,7 @@ Not a script — a simple results-driven interface (built with Streamlit, opens 
 | Retained executive search firm outreach | Surfaced to user | N/A | Not automatable (confidential firm-side search); already flagged to user once per his request, his call on timing. |
 | UI polish: pay column formatting | Not started | 0% | `$151661-228000` should render as `$151,661-$228,000`. Small, deferred. |
 | Direct LLM API integration (replace Claude Code orchestration) | Deliberately deferred | 0% | Sequenced last on purpose — revisit only at multi-user scale (§12 trigger), not before. |
-| **Prospector** — personal marketing/sales-funnel layer (KPIs, rejection-pattern diagnosis, proactive FDA/ClinicalTrials/PubMed-based company targeting, strategy-tagging/learning loop) | In progress (steps 1-3 of 8 built) | ~37% | Added 2026-07-29, designed 2026-07-30 — see §16 for the full design (data models, signal sources, UI placement, build sequencing), including LinkedIn-connections contact sourcing (§16b). KPI dashboard (step 1), rejection-pattern diagnosis data-gathering (step 2), and `target_accounts` + late-stage-trial signal (step 3, §16a) all built 2026-07-30 in the new "Prospector" tab — 10 real companies populated from a live ClinicalTrials.gov query, filtered for non-companies/mega-pharma/known M&A. |
+| **Prospector** — personal marketing/sales-funnel layer (KPIs, rejection-pattern diagnosis, proactive FDA/ClinicalTrials/PubMed-based company targeting, strategy-tagging/learning loop) | In progress (steps 1-4 of 8 built) | 50% | Added 2026-07-29, designed 2026-07-30 — see §16 for the full design (data models, signal sources, UI placement, build sequencing), including LinkedIn-connections contact sourcing (§16b). KPI dashboard (step 1), rejection-pattern diagnosis data-gathering (step 2), `target_accounts` + late-stage-trial signal (step 3), and + regulatory-filing signal (step 4, §16a) all built 2026-07-30 — 40 real companies now populated across both signal sources (ClinicalTrials.gov + openFDA), filtered for non-companies/mega-pharma/known M&A. |
 | **Learn Engine** — cross-cutting feedback loop over every prediction/outcome pair in Panga (scoring, cadence, target accounts, outreach, strategy tags, LinkedIn edits, interview prep) | Designed, not built | 0% | Added 2026-07-30, generalized from Prospector's Learn stage (§16d) at Zahir's request — see §17. Recommend-only, never auto-applies changes (confirmed 2026-07-30). |
 | Application status lifecycle extension (interview scheduled / offer / rejected) | Built | 100% | 2026-07-30. Prerequisite identified while scoping Prospector's KPI dashboard (§16c) — without real interview/offer/rejection outcomes, "interview rate"/"rejection rate" would have nothing to compute from. `suggest_status()`/`confirm_status_suggestion()` in `applications.py` were already generic (no code change needed there); what changed: the "Mark status" dropdown in `src/ui/app.py` now offers the 3 new values, "Prep for interview" now shows for "interview scheduled" too (not just "applied"), and `panga-gmail-cta-scan`'s SKILL.md gained step 3C — the scan already classified emails into rejection/interview_request/offer/assessment_request/recruiter_question (for the dashboard mirror, §14) but never matched rejection/interview/offer against a specific application to suggest a status change; now it does, same confidence bar and confirm-don't-guess rule as the existing "applied" matching. |
 | LinkedIn manual job intake + document checklist | Built | 100% | 2026-07-30. Since LinkedIn has no public jobs API and blocks scraping/bot logins (ToS), the user browses LinkedIn himself and hands Claude a posting URL directly in conversation instead of an automated search channel finding it. `search/job_store.add_manual_job()` creates the job record (`source="linkedin"`, job_id parsed from the LinkedIn `/jobs/view/<id>/` URL pattern so re-pasting the same posting dedupes correctly even with different tracking params); if the URL can't be read (login wall/bot-check), Claude asks the user to paste the job description text instead — either way the description is captured at intake time rather than re-fetched later, unlike other channels. `tailoring/applications.py` gained `exec_bio_text`/`leadership_summary_text` (two new senior-exec-specific document types, alongside the existing resume/cover letter, fully tailored per job — not a single reused core version) and a `documents_requested` list. The Results tab's per-job detail panel (`ui/app.py`) replaced the old single "Start tailoring" button with 4 checkboxes + a "Request documents" button (applies to every job source, not just LinkedIn) plus expanders showing already-drafted document text in a copyable block, matching the pattern used for LinkedIn profile suggestions. Verified live: app loads clean, a real manually-added job correctly appeared as its own dynamically-grouped "linkedin" channel section with no code changes needed for that grouping. The checkbox/button click path itself was verified against the exact data layer it calls (`upsert_application`/`get_application`) rather than by mouse click — the Browser pane couldn't visually composite in this session (screenshot/canvas-click unavailable), so genuine mouse-driven row-selection in the dataframe grid wasn't possible; worth a quick manual click-through next time the app is open normally to confirm the on-screen behavior matches. |
@@ -283,6 +283,45 @@ proven first):**
    in openFDA. Source: extend `src/search/company_sites.py`, which already
    pulls openFDA sponsor data for a different purpose (§4c) — same API,
    new query shape.
+
+   **Built 2026-07-30 (`src/prospector/regulatory_filings.py`, plain HTTP
+   API - no MCP connector needed, unlike signal 1, so this can run
+   standalone/scheduled later):** lives in `prospector/` rather than
+   literally extending `company_sites.py` as sketched above - that file's
+   purpose is job/company sourcing for the reactive Results pipeline, a
+   different concern, and `prospector/` didn't exist when this line was
+   written. Query: original (`submissions.submission_type:"ORIG"`),
+   approved (`submission_status:"AP"`) applications, restricted to
+   `application_number` prefixes NDA*/BLA* only - a broader ORIG+AP search
+   also matches ANDA (generic drug) approvals, which aren't a "approaching
+   commercial launch" signal (generic manufacturers are already
+   commodity-scale). **Real finding:** openFDA's date-range filter doesn't
+   reliably scope to the same nested submission that matched the
+   type/status filter (a range query for 2023-2026 still returned 1950s/
+   1990s approvals) - a known Elasticsearch nested-field limitation, not a
+   query mistake. Recency filtering (default 3-year window) is done
+   entirely client-side on one fetched page (limit=1000, openFDA's max) -
+   a real, disclosed coverage gap: this sees one page of ~5,800+ total
+   matches, not a true global "most recent N."
+
+   **Real finding that improved the shared filter:** this signal's live
+   data surfaced large/established companies the mega-pharma keyword list
+   missed - either abbreviated openFDA sponsor names ("BRISTOL", "NOVO"
+   instead of full names) or companies outside the original US/EU-biased
+   list (Sun Pharma, Zydus, Amneal, Servier - all large, established
+   multinationals). Added to `company_filters.MEGA_PHARMA_KEYWORDS`,
+   confirmed against real data, not guessed. Two categories of noise left
+   as known, undocumented-away gaps rather than over-fit: a couple of NDA
+   holders that aren't typical pharma companies at all (industrial gas
+   suppliers holding an NDA for a medical gas product), and any
+   established company not on the keyword list at all - Zahir's manual
+   disqualify remains the real correction mechanism.
+
+   Regression-tested (recency window, mega-pharma/company filtering,
+   detail-string formatting) with synthetic data. Real target_accounts.json
+   now holds 40 companies across both signal types (0 yet reach
+   `qualified` - no overlap between the two signal sources' companies so
+   far, expected this early).
 3. **Commercial-build hiring elsewhere** — the company posting roles like
    VP Commercial, Market Access, or Commercial Operations on the job boards
    Panga already searches (§4b/§4c). This isn't a new external source at
