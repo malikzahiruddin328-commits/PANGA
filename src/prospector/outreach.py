@@ -96,6 +96,16 @@ def update_status(outreach_id: str, status: str, notes: str | None = None) -> No
         _save_all(records)
 
 
+def set_strategy_tag(outreach_id: str, strategy_tag: str) -> None:
+    """PRD §16d/§17 - same idea as applications.set_strategy_tag(), same
+    field already reserved on every outreach record (see add_outreach)."""
+    records = load_outreach()
+    r = _find(records, outreach_id)
+    if r:
+        r["strategy_tag"] = strategy_tag
+        _save_all(records)
+
+
 def request_draft(outreach_id: str) -> None:
     """Flags an email-channel outreach record for the panga-cta-fulfillment
     scheduled task to compose and create a real Gmail draft on its next

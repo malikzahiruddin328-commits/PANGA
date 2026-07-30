@@ -115,8 +115,8 @@ Not a script — a simple results-driven interface (built with Streamlit, opens 
 | Retained executive search firm outreach | Surfaced to user | N/A | Not automatable (confidential firm-side search); already flagged to user once per his request, his call on timing. |
 | UI polish: pay column formatting | Not started | 0% | `$151661-228000` should render as `$151,661-$228,000`. Small, deferred. |
 | Direct LLM API integration (replace Claude Code orchestration) | Deliberately deferred | 0% | Sequenced last on purpose — revisit only at multi-user scale (§12 trigger), not before. |
-| **Prospector** — personal marketing/sales-funnel layer (KPIs, rejection-pattern diagnosis, proactive FDA/ClinicalTrials/PubMed-based company targeting, strategy-tagging/learning loop) | In progress (steps 1-7 of 8 built) | ~87% | Added 2026-07-29, designed 2026-07-30 — see §16 for the full design. Steps 1-7 built 2026-07-30: KPI dashboard, rejection-pattern diagnosis, all 4 target_accounts signals (late-stage-trial/regulatory-filing/commercial-hiring/funding-IPO via SEC EDGAR), and outreach logging/drafting + LinkedIn-connections contact sourcing (§16b). 78 real target accounts populated. Remaining: strategy tags/Learn Engine (step 8, §16d/§17). |
-| **Learn Engine** — cross-cutting feedback loop over every prediction/outcome pair in Panga (scoring, cadence, target accounts, outreach, strategy tags, LinkedIn edits, interview prep) | Designed, not built | 0% | Added 2026-07-30, generalized from Prospector's Learn stage (§16d) at Zahir's request — see §17. Recommend-only, never auto-applies changes (confirmed 2026-07-30). |
+| **Prospector** — personal marketing/sales-funnel layer (KPIs, rejection-pattern diagnosis, proactive FDA/ClinicalTrials/PubMed-based company targeting, strategy-tagging/learning loop) | Built | 100% | Added 2026-07-29, designed 2026-07-30, all 8 build steps built 2026-07-30 (same day) — see §16 for the full design/build detail. New "Prospector" tab: target accounts (78 real companies, all 4 signal sources), outreach logging/drafting + LinkedIn-connections contact sourcing, KPI dashboard, rejection-pattern diagnosis, strategy tags, and the Learn Engine's data-gathering half (§17). Known gaps disclosed in-app rather than hidden: LinkedIn recruiter-contact-rate has no capture mechanism, search-cadence metrics were never built, LinkedIn connections CSV parsing is untested against a real export. |
+| **Learn Engine** — cross-cutting feedback loop over every prediction/outcome pair in Panga (scoring, cadence, target accounts, outreach, strategy tags, LinkedIn edits, interview prep) | Built (data-gathering half) | 100% | Added 2026-07-30, generalized from Prospector's Learn stage (§16d) at Zahir's request — see §17. Recommend-only, never auto-applies changes (confirmed 2026-07-30). `src/prospector/learn_engine.py` + "Insights" section on the Prospector tab built 2026-07-30 - gathers cross-table decision/outcome data; the actual pattern-finding reasoning happens live in a Claude Code conversation, same split as rejection diagnosis. |
 | Application status lifecycle extension (interview scheduled / offer / rejected) | Built | 100% | 2026-07-30. Prerequisite identified while scoping Prospector's KPI dashboard (§16c) — without real interview/offer/rejection outcomes, "interview rate"/"rejection rate" would have nothing to compute from. `suggest_status()`/`confirm_status_suggestion()` in `applications.py` were already generic (no code change needed there); what changed: the "Mark status" dropdown in `src/ui/app.py` now offers the 3 new values, "Prep for interview" now shows for "interview scheduled" too (not just "applied"), and `panga-gmail-cta-scan`'s SKILL.md gained step 3C — the scan already classified emails into rejection/interview_request/offer/assessment_request/recruiter_question (for the dashboard mirror, §14) but never matched rejection/interview/offer against a specific application to suggest a status change; now it does, same confidence bar and confirm-don't-guess rule as the existing "applied" matching. |
 | LinkedIn manual job intake + document checklist | Built | 100% | 2026-07-30. Since LinkedIn has no public jobs API and blocks scraping/bot logins (ToS), the user browses LinkedIn himself and hands Claude a posting URL directly in conversation instead of an automated search channel finding it. `search/job_store.add_manual_job()` creates the job record (`source="linkedin"`, job_id parsed from the LinkedIn `/jobs/view/<id>/` URL pattern so re-pasting the same posting dedupes correctly even with different tracking params); if the URL can't be read (login wall/bot-check), Claude asks the user to paste the job description text instead — either way the description is captured at intake time rather than re-fetched later, unlike other channels. `tailoring/applications.py` gained `exec_bio_text`/`leadership_summary_text` (two new senior-exec-specific document types, alongside the existing resume/cover letter, fully tailored per job — not a single reused core version) and a `documents_requested` list. The Results tab's per-job detail panel (`ui/app.py`) replaced the old single "Start tailoring" button with 4 checkboxes + a "Request documents" button (applies to every job source, not just LinkedIn) plus expanders showing already-drafted document text in a copyable block, matching the pattern used for LinkedIn profile suggestions. Verified live: app loads clean, a real manually-added job correctly appeared as its own dynamically-grouped "linkedin" channel section with no code changes needed for that grouping. The checkbox/button click path itself was verified against the exact data layer it calls (`upsert_application`/`get_application`) rather than by mouse click — the Browser pane couldn't visually composite in this session (screenshot/canvas-click unavailable), so genuine mouse-driven row-selection in the dataframe grid wasn't possible; worth a quick manual click-through next time the app is open normally to confirm the on-screen behavior matches. |
 
@@ -633,6 +633,14 @@ section's strategy-tag correlation are both absorbed into that single
 cross-cutting mechanism — see **§17, Learn Engine** — rather than being
 three separate analysis passes bolted onto different tables.
 
+**Tagging built 2026-07-30 (build step 8 of 8):** `applications.set_strategy_tag()`
+and `outreach.set_strategy_tag()` (the field was already reserved on every
+outreach record from §16b's build), plus a small text input near each
+record's status controls in `src/ui/app.py` — no suggestion engine wired
+up yet (that's Claude's live-reasoning call per a conversation, not a
+hardcoded UI prompt), just the mechanical set/store/display half, same
+split as everywhere else.
+
 ### UI placement
 
 New **"Prospector" tab** in the Streamlit sidebar, alongside Results / Call
@@ -724,6 +732,40 @@ decision-outcome pairs before a pattern is more than noise. Early runs may
 legitimately say "not enough data yet on X" rather than force a finding —
 that's correct behavior, not a bug, and shouldn't be read as the feature
 being broken.
+
+**Built 2026-07-30 (build step 8 of 8, data-gathering half —
+`src/prospector/learn_engine.py` + "Insights" section on the Prospector
+tab):** `gather_learn_engine_input()` joins scoring-vs-outcome
+(applications × jobs), target-account-vs-real-posting (cross-referencing
+`target_accounts` company names against `jobs.organization`, with light
+punctuation normalization), outreach-vs-response, and interview-outcomes
+(the new self-reported "how did it go?" field on `interview_prep.py`
+rounds, added this same build step) into one structure. Same "Python
+gathers, Claude reasons" split as `rejection_diagnosis.py` - this module
+makes no pattern-finding judgment itself.
+
+**One input from the original table above is honestly absent, not
+silently faked:** LinkedIn profile edits vs. recruiter-contact-rate has no
+capture mechanism anywhere in Panga - there's no way today to log "got
+contacted on LinkedIn after a profile edit." The gathered data structure
+includes an explicit `known_gaps` list saying so, surfaced directly in the
+UI, rather than pretending that row of the design table is covered.
+Closing it would need a small new manual-log feature - flagged as future
+work, not attempted here. Search-cadence metrics (§8's row) are similarly
+absent - never built, as already noted in §17's own design table above.
+
+Regression-tested (cross-table joins, company-name-normalized matching,
+the interview-outcome filter excluding rounds with no outcome recorded)
+with synthetic data. Verified live: real data flows through correctly (78
+target accounts, 2 scored applications, 0 outreach/interview-outcomes
+since none exist yet) with no errors, on a fresh isolated Streamlit
+instance (see the port-8501-stale-process note under §16b — verifying
+UI-heavy changes on an isolated port is now the established fallback when
+the shared long-running dev server's cached modules are suspect).
+
+**This closes out Prospector's full build sequencing (steps 1-8).** What
+was designed 2026-07-30 is now built 2026-07-30, same day - see §13's
+backlog table for the final status.
 
 **UI placement:** lives inside the existing **Prospector tab** (§16) as an
 "Insights" or "Learn" section with a "Run analysis" button, even though the

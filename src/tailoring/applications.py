@@ -100,6 +100,20 @@ def upsert_application(
     _save_all(applications)
 
 
+def set_strategy_tag(source: str, job_id: str, strategy_tag: str) -> None:
+    """PRD §16d/§17: a short tag describing what's different about this
+    application's approach (e.g. "concise-1-page", "leadership-narrative-
+    focus") - set at drafting time so the Learn Engine can later correlate
+    tags with outcomes. No fixed taxonomy - Claude suggests one based on
+    what's actually different about this draft, Zahir confirms/edits."""
+    applications = load_applications()
+    for app in applications:
+        if app["source"] == source and app["job_id"] == job_id:
+            app["strategy_tag"] = strategy_tag
+            _save_all(applications)
+            return
+
+
 def mark_skip_reason_reviewed(source: str, job_id: str) -> None:
     applications = load_applications()
     for app in applications:

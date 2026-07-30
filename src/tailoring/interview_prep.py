@@ -60,9 +60,25 @@ def _get_or_create_round(record: dict, round_label: str) -> dict:
         "likely_questions": [],
         "questions_to_ask": [],
         "status": "in_progress",
+        "outcome": None,
+        "outcome_notes": None,
     }
     record["rounds"].append(round_)
     return round_
+
+
+def record_round_outcome(source: str, job_id: str, round_label: str, outcome: str, notes: str | None = None) -> None:
+    """PRD §16d/§17: how the round actually went, self-reported by Zahir -
+    the ONLY way this can ever be known, there's no automated signal for
+    it. outcome is one of "went well", "went okay", "went poorly" (no
+    fixed enum enforced, just the convention the UI offers). Feeds the
+    Learn Engine's interview-prep-approach-vs-outcome input; added 2026-07-30,
+    doesn't exist on rounds created before then."""
+    records = load_interview_prep()
+    round_ = _get_or_create_round(_get_or_create_record(records, source, job_id), round_label)
+    round_["outcome"] = outcome
+    round_["outcome_notes"] = notes
+    _save_all(records)
 
 
 def start_round(

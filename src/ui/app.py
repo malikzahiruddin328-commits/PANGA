@@ -34,16 +34,18 @@ import yaml
 from search.usajobs import search_jobs, USAJobsNotConfigured
 from search.job_store import load_jobs
 from ranking.prioritize import weight_for
-from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion
+from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion, set_strategy_tag
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
-from tailoring.interview_prep import load_interview_prep
+from tailoring.interview_prep import load_interview_prep, record_round_outcome
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
 from prospector.rejection_diagnosis import gather_diagnosis_input
 from prospector.target_accounts import load_target_accounts, set_status as set_target_account_status
 from prospector.outreach import (
     add_outreach, update_status as update_outreach_status, request_draft,
-    get_outreach_for_target_account, get_outreach_for_job,
+    get_outreach_for_target_account, get_outreach_for_job, load_outreach,
+    set_strategy_tag as set_outreach_strategy_tag,
 )
+from prospector.learn_engine import gather_learn_engine_input
 from linkedin.storage import load_linkedin_profile, save_snapshot, mark_suggestion_status, get_active_suggestions, SECTIONS as LINKEDIN_SECTIONS
 from linkedin.ingest import extract_text_from_pdf
 from linkedin.connections import parse_connections_csv, looks_like_recruiter, cross_reference_target_accounts
@@ -126,6 +128,14 @@ def render_outreach_section(key_prefix: str, target_account_name: str | None = N
         with oc3:
             if o.get("gmail_draft_link"):
                 st.link_button("Open draft", o["gmail_draft_link"], key=f"{key_prefix}_opendraft_{o['outreach_id']}")
+        new_o_tag = st.text_input(
+            "Strategy tag (optional)", value=o.get("strategy_tag") or "",
+            key=f"{key_prefix}_otag_{o['outreach_id']}", label_visibility="collapsed",
+            placeholder="Strategy tag (optional)",
+        )
+        if new_o_tag != (o.get("strategy_tag") or "") and st.button("Save tag", key=f"{key_prefix}_osavetag_{o['outreach_id']}"):
+            set_outreach_strategy_tag(o["outreach_id"], new_o_tag)
+            st.rerun()
 
     with st.expander("Log new outreach"):
         oc_name = st.text_input("Contact name", key=f"{key_prefix}_new_contact_name")
@@ -552,15 +562,21 @@ elif active_tab == "results":
                             upsert_application(job["source"], job["job_id"], status=new_status, skip_reason=skip_reason)
                             st.success("Status saved.")
                             st.rerun()
+                new_tag = st.text_input(
+                    "Strategy tag (optional - what's different about this draft, e.g. \"concise-1-page\")",
+                    value=app_record.get("strategy_tag") or "", key=f"tag_{job.get('source')}_{job.get('job_id')}",
+                )
+                if new_tag != (app_record.get("strategy_tag") or "") and st.button("Save tag", key=f"savetag_{job.get('source')}_{job.get('job_id')}"):
+                    set_strategy_tag(job["source"], job["job_id"], new_tag)
+                    st.rerun()
                 st.divider()
                 render_outreach_section(f"job_{job.get('source')}_{job.get('job_id')}", job_source=job.get("source"), job_id=job.get("job_id"))
 
 elif active_tab == "prospector":
     st.header("Prospector")
     st.caption(
-        "Companies worth watching before they've posted a role, outreach logging, plus "
-        "coverage/activity/outcome numbers from your job search so far. The Learn Engine (PRD §17) "
-        "isn't built yet."
+        "Companies worth watching before they've posted a role, outreach logging, coverage/"
+        "activity/outcome numbers, and cross-cutting insights (PRD §16/§17) from your job search."
     )
 
     settings = load_settings()
@@ -707,6 +723,44 @@ elif active_tab == "prospector":
                     st.markdown("**Not interested (with reason)**")
                     st.dataframe(pd.DataFrame(diagnosis_input["not_interested_with_reason"]), hide_index=True, use_container_width=True)
 
+    st.subheader("Insights (Learn Engine)")
+    st.caption(
+        "Cross-cutting feedback loop over every prediction Panga makes - scoring, target-account "
+        "qualification, outreach channel, strategy tags, interview outcomes (PRD §17). Same as "
+        "rejection-pattern diagnosis above: this button only gathers the data across all of these "
+        "tables - come back to Claude Code and ask it to run the analysis. Recommend-only, always - "
+        "it never changes a score threshold or any setting on its own."
+    )
+    if st.button("Prepare Learn Engine data"):
+        st.session_state["learn_engine_input"] = gather_learn_engine_input(
+            applications, jobs, target_accounts, load_outreach(), prep_records,
+        )
+
+    learn_input = st.session_state.get("learn_engine_input")
+    if learn_input:
+        l1, l2, l3, l4 = st.columns(4)
+        l1.metric("Scored applications", len(learn_input["scoring_vs_outcome"]))
+        l2.metric("Target accounts", len(learn_input["target_account_vs_outcome"]))
+        l3.metric("Outreach records", len(learn_input["outreach_vs_outcome"]))
+        l4.metric("Interview outcomes", len(learn_input["interview_outcomes"]))
+        total_inputs = sum(len(learn_input[k]) for k in ("scoring_vs_outcome", "target_account_vs_outcome", "outreach_vs_outcome", "interview_outcomes"))
+        if total_inputs == 0:
+            st.info("Nothing to analyze yet - come back once there's more history across scoring, target accounts, outreach, or interviews.")
+        else:
+            st.success("Data's ready. Go to Claude Code and ask it to run the Learn Engine analysis.")
+            for gap in learn_input["known_gaps"]:
+                st.caption(f"Known gap: {gap}")
+            with st.expander("What it'll be looking at"):
+                for key, title in [
+                    ("scoring_vs_outcome", "Scoring vs. application outcome"),
+                    ("target_account_vs_outcome", "Target accounts vs. real postings"),
+                    ("outreach_vs_outcome", "Outreach vs. response"),
+                    ("interview_outcomes", "Interview outcomes"),
+                ]:
+                    if learn_input[key]:
+                        st.markdown(f"**{title}**")
+                        st.dataframe(pd.DataFrame(learn_input[key]), hide_index=True, use_container_width=True)
+
 elif active_tab == "prep":
     st.header("Interview Prep")
 
@@ -766,6 +820,23 @@ elif active_tab == "prep":
                     for q in round_["questions_to_ask"]:
                         best_for = f" (best for {q['best_for']})" if q.get("best_for") else ""
                         st.markdown(f"- {q.get('question')}{best_for}")
+
+                st.divider()
+                OUTCOME_OPTIONS = ["not yet", "went well", "went okay", "went poorly"]
+                current_outcome = round_.get("outcome") or "not yet"
+                new_outcome = st.selectbox(
+                    "How did it go? (PRD §17 - feeds the Learn Engine)", OUTCOME_OPTIONS,
+                    index=OUTCOME_OPTIONS.index(current_outcome) if current_outcome in OUTCOME_OPTIONS else 0,
+                    key=f"outcome_{record['source']}_{record['job_id']}_{round_['round_label']}",
+                )
+                outcome_notes = st.text_input(
+                    "Notes (optional)", value=round_.get("outcome_notes") or "",
+                    key=f"outcome_notes_{record['source']}_{record['job_id']}_{round_['round_label']}",
+                )
+                if st.button("Save outcome", key=f"save_outcome_{record['source']}_{record['job_id']}_{round_['round_label']}"):
+                    record_round_outcome(record["source"], record["job_id"], round_["round_label"], new_outcome, outcome_notes or None)
+                    st.success("Saved.")
+                    st.rerun()
 
 elif active_tab == "linkedin":
     st.header("LinkedIn Profile Enhancement")
