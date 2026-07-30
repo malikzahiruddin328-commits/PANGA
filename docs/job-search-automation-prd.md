@@ -115,7 +115,7 @@ Not a script — a simple results-driven interface (built with Streamlit, opens 
 | Retained executive search firm outreach | Surfaced to user | N/A | Not automatable (confidential firm-side search); already flagged to user once per his request, his call on timing. |
 | UI polish: pay column formatting | Not started | 0% | `$151661-228000` should render as `$151,661-$228,000`. Small, deferred. |
 | Direct LLM API integration (replace Claude Code orchestration) | Deliberately deferred | 0% | Sequenced last on purpose — revisit only at multi-user scale (§12 trigger), not before. |
-| **Prospector** — personal marketing/sales-funnel layer (KPIs, rejection-pattern diagnosis, proactive FDA/ClinicalTrials/PubMed-based company targeting, strategy-tagging/learning loop) | In progress (steps 1-2 of 8 built) | 25% | Added 2026-07-29, designed 2026-07-30 — see §16 for the full design (data models, signal sources, UI placement, build sequencing), including LinkedIn-connections contact sourcing (§16b). KPI dashboard (§16c, step 1) and rejection-pattern diagnosis data-gathering (§16c, step 2) both built 2026-07-30 in the new "Prospector" tab, jobs/applications data only (target accounts/outreach come later). |
+| **Prospector** — personal marketing/sales-funnel layer (KPIs, rejection-pattern diagnosis, proactive FDA/ClinicalTrials/PubMed-based company targeting, strategy-tagging/learning loop) | In progress (steps 1-3 of 8 built) | ~37% | Added 2026-07-29, designed 2026-07-30 — see §16 for the full design (data models, signal sources, UI placement, build sequencing), including LinkedIn-connections contact sourcing (§16b). KPI dashboard (step 1), rejection-pattern diagnosis data-gathering (step 2), and `target_accounts` + late-stage-trial signal (step 3, §16a) all built 2026-07-30 in the new "Prospector" tab — 10 real companies populated from a live ClinicalTrials.gov query, filtered for non-companies/mega-pharma/known M&A. |
 | **Learn Engine** — cross-cutting feedback loop over every prediction/outcome pair in Panga (scoring, cadence, target accounts, outreach, strategy tags, LinkedIn edits, interview prep) | Designed, not built | 0% | Added 2026-07-30, generalized from Prospector's Learn stage (§16d) at Zahir's request — see §17. Recommend-only, never auto-applies changes (confirmed 2026-07-30). |
 | Application status lifecycle extension (interview scheduled / offer / rejected) | Built | 100% | 2026-07-30. Prerequisite identified while scoping Prospector's KPI dashboard (§16c) — without real interview/offer/rejection outcomes, "interview rate"/"rejection rate" would have nothing to compute from. `suggest_status()`/`confirm_status_suggestion()` in `applications.py` were already generic (no code change needed there); what changed: the "Mark status" dropdown in `src/ui/app.py` now offers the 3 new values, "Prep for interview" now shows for "interview scheduled" too (not just "applied"), and `panga-gmail-cta-scan`'s SKILL.md gained step 3C — the scan already classified emails into rejection/interview_request/offer/assessment_request/recruiter_question (for the dashboard mirror, §14) but never matched rejection/interview/offer against a specific application to suggest a status change; now it does, same confidence bar and confirm-don't-guess rule as the existing "applied" matching. |
 | LinkedIn manual job intake + document checklist | Built | 100% | 2026-07-30. Since LinkedIn has no public jobs API and blocks scraping/bot logins (ToS), the user browses LinkedIn himself and hands Claude a posting URL directly in conversation instead of an automated search channel finding it. `search/job_store.add_manual_job()` creates the job record (`source="linkedin"`, job_id parsed from the LinkedIn `/jobs/view/<id>/` URL pattern so re-pasting the same posting dedupes correctly even with different tracking params); if the URL can't be read (login wall/bot-check), Claude asks the user to paste the job description text instead — either way the description is captured at intake time rather than re-fetched later, unlike other channels. `tailoring/applications.py` gained `exec_bio_text`/`leadership_summary_text` (two new senior-exec-specific document types, alongside the existing resume/cover letter, fully tailored per job — not a single reused core version) and a `documents_requested` list. The Results tab's per-job detail panel (`ui/app.py`) replaced the old single "Start tailoring" button with 4 checkboxes + a "Request documents" button (applies to every job source, not just LinkedIn) plus expanders showing already-drafted document text in a copyable block, matching the pattern used for LinkedIn profile suggestions. Verified live: app loads clean, a real manually-added job correctly appeared as its own dynamically-grouped "linkedin" channel section with no code changes needed for that grouping. The checkbox/button click path itself was verified against the exact data layer it calls (`upsert_application`/`get_application`) rather than by mouse click — the Browser pane couldn't visually composite in this session (screenshot/canvas-click unavailable), so genuine mouse-driven row-selection in the dataframe grid wasn't possible; worth a quick manual click-through next time the app is open normally to confirm the on-screen behavior matches. |
@@ -296,11 +296,62 @@ proven first):**
    mechanism — same "Claude reasons live, Python just stores the result"
    split as tailoring/scoring — rather than standing up a paid data feed).
 
-**Qualification rule (v0, expected to be revised once tested):** 1 signal
-= `watching`, 2+ signals = `qualified`. Deliberately simple to start, same
-spirit as the original job-priority weighting (§9) and compatibility
+**Qualification rule (v0, expected to be revised once tested):** 1
+DISTINCT signal type = `watching`, 2+ distinct signal types = `qualified`
+(clarified during build - two trials of the *same* type is still one kind
+of evidence, not stronger corroboration). Deliberately simple to start,
+same spirit as the original job-priority weighting (§9) and compatibility
 scoring (§9/79fd4c3) — both started crude and were tuned against real
-results rather than designed perfectly upfront.
+results rather than designed perfectly upfront. Manual statuses
+(`contacted`/`stale`/`disqualified`) are sticky - a new signal arriving
+later never silently overwrites a status Zahir set himself.
+
+**Built 2026-07-30 (signal 1 of 4, `src/prospector/target_accounts.py` +
+`clinical_trials.py` + `company_filters.py`, new "Target accounts" section
+on the Prospector tab):** storage module with add_signal()/set_status(),
+a ClinicalTrials.gov normalizer, and a shared company-quality filter
+module (built shared on purpose - signals 2/3 will need the same company
+filtering, not a copy per source).
+
+**Real finding that changed the plan:** `search_trials` requires at least
+one of condition/intervention/location/sponsor - there's no "browse
+everything" mode. A location="United States" + phase=PHASE3 +
+status=[ACTIVE_NOT_RECRUITING, COMPLETED] query matched **13,659** trials,
+dominated by mega-pharma (Sanofi, Novartis, GSK, AstraZeneca, Amgen,
+Biogen...) and non-company sponsors (universities, hospitals, government,
+individual physicians) - ClinicalTrials.gov has no company-size/commercial-
+maturity field, so phase/status alone can't isolate "approaching first
+launch" from "established multinational's routine pipeline." Applied two
+filters in `company_filters.py`: exclude obvious non-companies (keyword
+match), and exclude ~20 universally-recognized mega-pharma majors (common
+knowledge, not a fragile guess - same spirit as the CISO-disqualification
+rule Zahir gave elsewhere). From a real 30-trial sample, 12 survived;
+populated as genuine first data (not test fixtures).
+
+**Zahir caught a real gap live 2026-07-30:** "Forest Laboratories" (acquired
+by Actavis in 2014) survived the filter, since being a "company" and not
+being mega-pharma doesn't mean still independent. Added a third filter,
+`KNOWN_ACQUIRED_KEYWORDS`, for well-known formerly-independent companies
+absorbed via M&A - also caught "C. R. Bard" (acquired by Becton Dickinson,
+2017), which had been flagged as a judgment-call uncertainty during the
+original build. Both removed from the real data via filter-and-resave.
+**Explicitly not exhaustive** (manually curated from general knowledge, no
+live-verified source, won't catch acquisitions after this knowledge's
+cutoff or smaller/obscure deals) - same "review and disqualify" safety net
+as everything else in target_accounts is the real correction mechanism,
+not a claim this list is complete. Two other imperfect survivors are
+already known and left as-is on purpose: "Gustave Roussy, Cancer Campus,
+Grand Paris" and "Radiation Therapy Oncology Group" are research
+institutions the keyword list didn't catch (no "university"/"hospital" in
+the name) - a separate, not-yet-addressed gap, not conflated with the
+M&A one.
+
+Regression-tested (filter heuristics, signal normalization, dedup-by-ref,
+qualification-by-distinct-type, sticky manual status) with synthetic data,
+cleaned up via filter-and-resave. Real target_accounts.json now holds 10
+companies, all `watching` (single signal type each, as expected this
+early). Verified live in the running Streamlit session - Target accounts
+table renders with no console errors.
 
 ### 16b. Outreach (new funnel stage)
 

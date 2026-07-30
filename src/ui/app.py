@@ -39,6 +39,7 @@ from tailoring.cta_emails import get_active_cta_emails, request_archive, request
 from tailoring.interview_prep import load_interview_prep
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
 from prospector.rejection_diagnosis import gather_diagnosis_input
+from prospector.target_accounts import load_target_accounts, set_status as set_target_account_status
 from linkedin.storage import load_linkedin_profile, save_snapshot, mark_suggestion_status, get_active_suggestions, SECTIONS as LINKEDIN_SECTIONS
 from linkedin.ingest import extract_text_from_pdf
 from security.crypto_store import has_recovery_code, generate_recovery_code
@@ -495,14 +496,56 @@ elif active_tab == "results":
 elif active_tab == "prospector":
     st.header("Prospector")
     st.caption(
-        "Coverage, activity, and outcome numbers from your job search so far. "
-        "Target-account tracking, outreach logging, and the Learn Engine (PRD §16/§17) "
-        "aren't built yet - this is the first piece."
+        "Companies worth watching before they've posted a role, plus coverage/activity/outcome "
+        "numbers from your job search so far. Outreach logging and the Learn Engine (PRD §16b/§17) "
+        "aren't built yet."
     )
 
     settings = load_settings()
     target_roles = settings.get("target_roles", [])
     applications = load_applications()
+    target_accounts = load_target_accounts()
+
+    st.subheader("Target accounts")
+    st.caption(
+        "Sourced from ClinicalTrials.gov Phase 3 activity (PRD §16a, signal 1 of 4). Filtered to "
+        "exclude obvious non-companies (universities, hospitals, government) and known mega-pharma "
+        "majors - but not every remaining entry is a great fit (a research consortium or an "
+        "already-acquired company can still slip through), so treat \"watching\" as a starting "
+        "point to review, not a verified lead. Mark anything wrong as \"disqualified\" below."
+    )
+    if not target_accounts:
+        st.info("No target accounts yet.")
+    else:
+        ta_rows = [{
+            "Company": a["company_name"],
+            "Status": a["status"],
+            "Signals": len(a["signals"]),
+            "Industry": a.get("industry") or "-",
+        } for a in target_accounts]
+        ta_df = pd.DataFrame(ta_rows)
+        ta_event = st.dataframe(
+            ta_df, hide_index=True, use_container_width=True,
+            on_select="rerun", selection_mode="single-row", key="target_accounts_table",
+        )
+        selected_ta_rows = ta_event.selection.rows if ta_event and ta_event.selection else []
+        if selected_ta_rows:
+            acc = target_accounts[selected_ta_rows[0]]
+            st.markdown(f"**{acc['company_name']}**")
+            for sig in acc["signals"]:
+                st.caption(f"[{sig['signal_type']}, {sig['source']}] {sig['detail']} (observed {sig['date_observed'][:10]})")
+            if acc.get("notes"):
+                st.caption(f"Notes: {acc['notes']}")
+            new_ta_status = st.selectbox(
+                "Status", ["watching", "qualified", "contacted", "stale", "disqualified"],
+                index=["watching", "qualified", "contacted", "stale", "disqualified"].index(acc["status"]),
+                key=f"ta_status_{acc['company_name']}",
+            )
+            ta_notes = st.text_input("Notes (optional)", value=acc.get("notes") or "", key=f"ta_notes_{acc['company_name']}")
+            if st.button("Save", key=f"ta_save_{acc['company_name']}"):
+                set_target_account_status(acc["company_name"], new_ta_status, notes=ta_notes or None)
+                st.success("Saved.")
+                st.rerun()
 
     coverage = coverage_summary(jobs)
     activity = activity_summary(applications)
