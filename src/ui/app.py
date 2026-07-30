@@ -7,6 +7,17 @@ it's a plain HTTP API. ZipRecruiter/Dice/Indeed are MCP connector tools, not
 reachable from a standalone script - they're searched daily by the
 panga-daily-job-search scheduled task instead (see
 docs/daily-job-search-task.md), not this button.
+
+Navigation is a custom top tab bar (Call to Action / Results / Interview Prep
+/ Settings) bound to st.session_state, not Streamlit's native st.tabs -
+native tabs have no API to switch programmatically, and cross-navigation
+(e.g. "Prep for this interview" jumping from Call to Action straight to
+Interview Prep with context) needs that. Call to Action is the default/home
+tab since that's where things needing a timely reaction actually surface
+(design decision 2026-07-30). A persistent alert strip above the tabs
+carries the two cross-cutting things that used to live on a single page
+(inbox application-match confirmations, drafts waiting to be sent) so they're
+visible no matter which tab is open.
 """
 
 import sys
@@ -24,7 +35,7 @@ from search.job_store import load_jobs
 from ranking.prioritize import weight_for
 from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
-from security.crypto_store import has_recovery_code, generate_recovery_code
+from tailoring.interview_prep import load_interview_prep
 
 CATEGORY_LABELS = {
     "rejection": "Rejection",
@@ -33,7 +44,7 @@ CATEGORY_LABELS = {
     "offer": "Offer",
     "recruiter_question": "Recruiter question",
 }
-# Order sections appear in on the Call to Action page - lead with the ones
+# Order sections appear in on the Call to Action tab - lead with the ones
 # that gain from a fast reply (offers, interviews), rejections last since
 # they only need a short acknowledgment, not urgency.
 CATEGORY_ORDER = ["offer", "interview_request", "assessment_request", "recruiter_question", "rejection"]
@@ -56,15 +67,81 @@ def application_status(job: dict) -> str | None:
     return app["status"] if app else None
 
 
+def job_label(job: dict) -> str:
+    return f"{job.get('title')} - {job.get('organization')}"
+
+
+def go_to_prep(target: dict) -> None:
+    """Jumps to the Interview Prep tab with enough context to hand off to
+    Claude Code - the tab itself doesn't generate anything, it just shows
+    what to ask for. target is either {"kind": "job", "source", "job_id",
+    "job_label"} (from Results, where the job is known for certain) or
+    {"kind": "email", "thread_id", "subject", "sender", "gmail_link"} (from
+    Call to Action, where the email might not be linked to a tracked
+    application yet - Claude resolves that ambiguity in conversation, same
+    as the existing suggest_status matching does)."""
+    st.session_state["active_tab"] = "prep"
+    st.session_state["prep_target"] = target
+    st.rerun()
+
+
 st.title("Panga - Job Search")
 
-cta_count = len(get_active_cta_emails())
-cta_page_label = f"Call to Action ({cta_count})" if cta_count else "Call to Action"
-page = st.sidebar.radio("View", ["Results", cta_page_label, "Settings"])
+jobs = load_jobs()
+all_cta = get_active_cta_emails()
+prep_records = load_interview_prep()
 
-if page == "Settings":
+cta_count = len(all_cta)
+results_count = len(jobs)
+prep_in_progress_count = sum(1 for r in prep_records for round_ in r["rounds"] if round_["status"] == "in_progress")
+
+st.session_state.setdefault("active_tab", "cta")
+
+# --- Persistent alert strip: shown above the tabs on every tab, since these
+# are time-sensitive and easy to miss if buried under whichever tab happens
+# to be open (design decision 2026-07-30, see module docstring). ---
+pending_suggestions = get_pending_status_suggestions()
+outstanding_drafts = get_awaiting_draft_send()
+
+if pending_suggestions or outstanding_drafts:
+    with st.container(border=True):
+        for sugg in pending_suggestions:
+            job = next((j for j in jobs if j["source"] == sugg["source"] and j["job_id"] == sugg["job_id"]), None)
+            label = job_label(job) if job else f"{sugg['source']} {sugg['job_id']}"
+            st.markdown(f"Inbox match: mark **{label}** as \"{sugg['suggested_status']}\"?")
+            st.caption(sugg.get("suggested_status_reason") or "")
+            s1, s2, _ = st.columns([1, 1, 6])
+            with s1:
+                if st.button("Confirm", key=f"confirm_{sugg['source']}_{sugg['job_id']}"):
+                    confirm_status_suggestion(sugg["source"], sugg["job_id"], accept=True)
+                    st.rerun()
+            with s2:
+                if st.button("Dismiss", key=f"dismiss_{sugg['source']}_{sugg['job_id']}"):
+                    confirm_status_suggestion(sugg["source"], sugg["job_id"], accept=False)
+                    st.rerun()
+        if outstanding_drafts:
+            st.caption(f"{len(outstanding_drafts)} draft(s) created and waiting in Gmail for you to review and send - this clears itself once you send them.")
+
+# --- Tab bar ---
+TABS = [
+    ("cta", f"Call to action ({cta_count})" if cta_count else "Call to action"),
+    ("results", f"Results ({results_count})"),
+    ("prep", f"Interview prep ({prep_in_progress_count})" if prep_in_progress_count else "Interview prep"),
+    ("settings", "Settings"),
+]
+tab_cols = st.columns(len(TABS))
+for col, (key, label) in zip(tab_cols, TABS):
+    with col:
+        if st.button(label, key=f"tab_{key}", type="primary" if st.session_state["active_tab"] == key else "secondary", use_container_width=True):
+            st.session_state["active_tab"] = key
+            st.rerun()
+st.divider()
+
+active_tab = st.session_state["active_tab"]
+
+if active_tab == "settings":
     st.header("Target roles and industries")
-    st.caption("These control sort order on the Results screen - higher weight surfaces first. Not a search filter; every source is still searched the same way.")
+    st.caption("These control sort order on the Results tab - higher weight surfaces first. Not a search filter; every source is still searched the same way.")
 
     settings = load_settings()
 
@@ -99,39 +176,7 @@ if page == "Settings":
         save_settings(settings)
         st.success("Saved.")
 
-    st.divider()
-    st.header("Data Recovery")
-    st.caption(
-        "Your resume, job history, and applications are encrypted on this "
-        "computer using a key stored in this Windows account - not a "
-        "password you type in. If this Windows account/profile is ever "
-        "lost, or this data is moved to a new computer, that key goes with "
-        "it and there's normally no way back in. A recovery code fixes "
-        "that: generate one below, and it'll let you regain access without "
-        "the original key."
-    )
-
-    if has_recovery_code():
-        st.caption("A recovery code already exists for this data. Generating a new one below replaces it - the old code stops working.")
-    else:
-        st.caption("No recovery code has been generated yet - your data has no recovery path if this Windows account is lost.")
-
-    if st.button("Generate recovery code"):
-        st.session_state["new_recovery_code"] = generate_recovery_code()
-
-    if st.session_state.get("new_recovery_code"):
-        st.warning(
-            "Write this down now and save it somewhere OTHER than this "
-            "computer - a password manager on your phone, or printed and "
-            "filed away. It will not be shown again after you leave this "
-            "page."
-        )
-        st.code(st.session_state["new_recovery_code"], language=None)
-        if st.button("I've saved this somewhere safe"):
-            del st.session_state["new_recovery_code"]
-            st.rerun()
-
-elif page.startswith("Call to Action"):
+elif active_tab == "cta":
     st.header("Call to Action")
     st.caption("Emails the Gmail scan flagged as needing a reply or a decision.")
 
@@ -139,20 +184,6 @@ elif page.startswith("Call to Action"):
     with r1:
         if st.button("Refresh"):
             st.rerun()
-
-    # A background task (panga-cta-fulfillment, runs every ~10 min while the
-    # app is open) does the actual Gmail work behind Dismiss/Draft reply, and
-    # checks whether drafts it created have since been sent. Refresh just
-    # re-reads that outcome from disk - it can't reach Gmail live itself
-    # (Streamlit has no MCP/Claude access) - so this always shows the picture
-    # as of the last fulfillment run, not the literal instant you click.
-    outstanding_drafts = get_awaiting_draft_send()
-    if outstanding_drafts:
-        st.info(f"{len(outstanding_drafts)} draft(s) created and waiting in Gmail for you to review and send. This count updates automatically once you send them - no need to come back and dismiss them yourself.")
-    else:
-        st.caption("No drafts outstanding - everything's either dismissed or sent.")
-
-    all_cta = get_active_cta_emails()
 
     counts = {cat: sum(1 for e in all_cta if e.get("category") == cat) for cat in CATEGORY_ORDER}
     stat_cols = st.columns(len(CATEGORY_ORDER))
@@ -189,10 +220,10 @@ elif page.startswith("Call to Action"):
             if email.get("snippet"):
                 st.caption(email["snippet"])
 
-            c1, c2, c3 = st.columns([1, 1, 1])
-            with c1:
+            actions = st.columns(4 if cat == "interview_request" else 3)
+            with actions[0]:
                 st.link_button("Open in Gmail", email["gmail_link"], key=f"open_cta_{email['thread_id']}")
-            with c2:
+            with actions[1]:
                 if email.get("draft_created"):
                     st.link_button("Open draft", email["draft_link"], key=f"draft_link_{email['thread_id']}")
                 elif email.get("draft_requested"):
@@ -202,32 +233,24 @@ elif page.startswith("Call to Action"):
                         request_draft(email["thread_id"])
                         st.success("Draft requested - will be created in Gmail on the next scan run.")
                         st.rerun()
-            with c3:
+            with actions[2]:
                 if st.button("Dismiss", key=f"dismiss_cta_{email['thread_id']}"):
                     request_archive(email["thread_id"])
                     st.rerun()
+            if cat == "interview_request":
+                with actions[3]:
+                    if st.button("Prep for this interview", key=f"prep_cta_{email['thread_id']}"):
+                        go_to_prep({
+                            "kind": "email",
+                            "thread_id": email["thread_id"],
+                            "subject": email.get("subject"),
+                            "sender": email.get("sender"),
+                            "gmail_link": email["gmail_link"],
+                        })
             st.divider()
 
-elif page == "Results":
+elif active_tab == "results":
     settings = load_settings()
-
-    pending_suggestions = get_pending_status_suggestions()
-    if pending_suggestions:
-        st.warning(f"{len(pending_suggestions)} application match(es) found from your inbox - confirm or dismiss below.")
-        for sugg in pending_suggestions:
-            job = next((j for j in load_jobs() if j["source"] == sugg["source"] and j["job_id"] == sugg["job_id"]), None)
-            job_label = job["title"] if job else f"{sugg['source']} {sugg['job_id']}"
-            st.markdown(f"**{job_label}** -> mark as \"{sugg['suggested_status']}\"?")
-            st.caption(sugg.get("suggested_status_reason") or "")
-            s1, s2 = st.columns(2)
-            with s1:
-                if st.button("Confirm", key=f"confirm_{sugg['source']}_{sugg['job_id']}"):
-                    confirm_status_suggestion(sugg["source"], sugg["job_id"], accept=True)
-                    st.rerun()
-            with s2:
-                if st.button("Dismiss", key=f"dismiss_{sugg['source']}_{sugg['job_id']}"):
-                    confirm_status_suggestion(sugg["source"], sugg["job_id"], accept=False)
-                    st.rerun()
 
     col1, col2 = st.columns([1, 3])
     with col1:
@@ -257,7 +280,6 @@ elif page == "Results":
     with col2:
         st.caption("This button only covers USAJOBS.gov directly. ZipRecruiter, Dice, and Indeed are searched automatically once a day by the scheduled task instead (they're MCP connector tools, not reachable from this button).")
 
-    jobs = load_jobs()
     target_roles = settings.get("target_roles", [])
 
     def sort_key(job):
@@ -359,12 +381,22 @@ elif page == "Results":
                         if posting.get("posting_url"):
                             st.link_button(f"Open posting ({i} of {len(postings)})", posting["posting_url"], key=f"open_{posting.get('source')}_{posting.get('job_id')}")
 
-                b2, b3 = st.columns(2)
-                with b2:
+                status = application_status(job)
+                b1, b2, b3 = st.columns(3)
+                with b1:
                     if st.button("Start tailoring", key=f"tailor_{job.get('source')}_{job.get('job_id')}"):
                         upsert_application(job["source"], job["job_id"], status="under review")
                         st.info("Marked \"under review.\" Go to Claude Code and ask to tailor this job - that's where the actual resume/cover letter drafting happens (per the PRD's LLM architecture, not inside this app). Once you've actually submitted it, come back and mark it \"applied.\"")
                         st.rerun()
+                with b2:
+                    if status == "applied":
+                        if st.button("Prep for interview", key=f"prep_results_{job.get('source')}_{job.get('job_id')}"):
+                            go_to_prep({
+                                "kind": "job",
+                                "source": job["source"],
+                                "job_id": job["job_id"],
+                                "job_label": job_label(job),
+                            })
                 with b3:
                     new_status = st.selectbox(
                         "Mark status",
@@ -379,3 +411,63 @@ elif page == "Results":
                             upsert_application(job["source"], job["job_id"], status=new_status, skip_reason=skip_reason)
                             st.success("Status saved.")
                             st.rerun()
+
+elif active_tab == "prep":
+    st.header("Interview Prep")
+
+    prep_target = st.session_state.get("prep_target")
+    if prep_target:
+        with st.container(border=True):
+            if prep_target["kind"] == "job":
+                st.markdown(f"**Ready to prep: {prep_target['job_label']}**")
+                st.caption("Go to Claude Code and ask to prep for this interview - it'll research the interviewer(s)/company and draft persona-aware questions and talking points from your master profile.")
+            else:
+                st.markdown(f"**Ready to prep: \"{prep_target['subject']}\"** from {prep_target['sender']}")
+                st.caption("Go to Claude Code and ask to prep for this interview. It'll read the full email thread first to find interviewer/panel names, match it to the right application, then research from there.")
+            if st.button("Clear", key="clear_prep_target"):
+                st.session_state["prep_target"] = None
+                st.rerun()
+
+    if not prep_records:
+        st.caption("No interview prep started yet. Use \"Prep for this interview\" on Results or Call to Action once you're past the applied stage.")
+
+    for record in prep_records:
+        job = next((j for j in jobs if j["source"] == record["source"] and j["job_id"] == record["job_id"]), None)
+        label = job_label(job) if job else f"{record['source']} {record['job_id']}"
+        st.subheader(label)
+
+        for round_ in record["rounds"]:
+            status_note = "in progress" if round_["status"] == "in_progress" else round_["status"]
+            with st.expander(f"{round_['round_label']} - {status_note}", expanded=(round_["status"] == "in_progress")):
+                logistics = " - ".join(v for v in [round_.get("date"), round_.get("format")] if v)
+                if logistics:
+                    st.caption(logistics)
+
+                if round_.get("interviewers"):
+                    for person in round_["interviewers"]:
+                        st.markdown(f"**{person.get('name')}**" + (f", {person.get('title')}" if person.get("title") else ""))
+                        if person.get("research_summary"):
+                            st.caption(person["research_summary"])
+                        if person.get("persona"):
+                            st.markdown(f"_Likely focus:_ {person['persona']}")
+                        for link in person.get("research_links") or []:
+                            st.caption(link)
+
+                if round_.get("company_snapshot"):
+                    st.markdown(f"**Company snapshot:** {round_['company_snapshot']}")
+
+                if round_.get("likely_questions"):
+                    st.markdown("**Likely questions**")
+                    for q in round_["likely_questions"]:
+                        asked_by = f" ({q['asked_by']})" if q.get("asked_by") else ""
+                        st.markdown(f"- {q.get('question')}{asked_by}")
+                        if q.get("why"):
+                            st.caption(q["why"])
+                        if q.get("talking_point"):
+                            st.markdown(f"  > {q['talking_point']}")
+
+                if round_.get("questions_to_ask"):
+                    st.markdown("**Questions to ask them**")
+                    for q in round_["questions_to_ask"]:
+                        best_for = f" (best for {q['best_for']})" if q.get("best_for") else ""
+                        st.markdown(f"- {q.get('question')}{best_for}")
