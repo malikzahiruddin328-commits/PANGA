@@ -46,11 +46,15 @@ from prospector.outreach import (
     set_strategy_tag as set_outreach_strategy_tag,
 )
 from prospector.learn_engine import gather_learn_engine_input
+from prospector.prospector_score import load_prospector_score, gather_prospector_score_input
 from linkedin.storage import load_linkedin_profile, save_snapshot, mark_suggestion_status, get_active_suggestions, SECTIONS as LINKEDIN_SECTIONS
 from linkedin.ingest import extract_text_from_pdf
 from linkedin.connections import parse_connections_csv, looks_like_recruiter, cross_reference_target_accounts
 from linkedin.connections_store import load_connections_snapshot, save_connections
 from security.crypto_store import has_recovery_code, generate_recovery_code
+from feedback.ui_feedback import get_open_feedback, mark_resolved
+from ui.feedback_widget import render_feedback_widget
+from profile.ingest import load_manifest_result, remove_document, ingest_uploaded_document
 
 CATEGORY_LABELS = {
     "rejection": "Rejection",
@@ -64,6 +68,24 @@ CATEGORY_LABELS = {
 # they only need a short acknowledgment, not urgency.
 CATEGORY_ORDER = ["offer", "interview_request", "assessment_request", "recruiter_question", "rejection"]
 
+# Color-coding for the Call to Action tab (feedback from Zahir 2026-07-30:
+# the higher-stakes/time-sensitive categories should stand out from routine
+# ones). Uses only native st.badge semantic colors, no custom CSS.
+CATEGORY_COLORS = {
+    "offer": "green",
+    "interview_request": "violet",
+    "assessment_request": "orange",
+    "recruiter_question": "gray",
+    "rejection": "gray",
+}
+CATEGORY_URGENCY = {
+    "offer": "Act now",
+    "interview_request": "Time-sensitive",
+    "assessment_request": "Time-sensitive",
+    "recruiter_question": "Routine",
+    "rejection": "No action needed",
+}
+
 LINKEDIN_SECTION_LABELS = {
     "headline": "Headline",
     "about": "About / Summary",
@@ -74,7 +96,7 @@ LINKEDIN_SECTION_LABELS = {
 
 SETTINGS_PATH = PROJECT_ROOT / "config" / "settings.yaml"
 
-st.set_page_config(page_title="Panga - Job Search", layout="wide")
+st.set_page_config(page_title="Panga - Job Search", page_icon=":material/work:", layout="wide")
 
 
 def load_settings() -> dict:
@@ -94,6 +116,20 @@ def job_label(job: dict) -> str:
     return f"{job.get('title')} - {job.get('organization')}"
 
 
+def format_pay(value) -> str | None:
+    """pay_min/pay_max come from several sources (USAJOBS numeric strings,
+    Indeed's parsed compensation text, SmartRecruiters custom fields) - not
+    guaranteed to be clean digits, so a value that doesn't parse as a number
+    is shown as-is rather than crashing."""
+    if value in (None, ""):
+        return None
+    try:
+        num = float(str(value).replace(",", "").replace("$", ""))
+    except ValueError:
+        return str(value)
+    return f"{num:,.0f}" if num == int(num) else f"{num:,.2f}"
+
+
 OUTREACH_STATUSES = ["planned", "drafted", "sent", "responded", "no_response"]
 
 
@@ -107,7 +143,7 @@ def render_outreach_section(key_prefix: str, target_account_name: str | None = N
     st.markdown("**Outreach**")
     for o in existing:
         label = o["contact_name"] + (f", {o['contact_title']}" if o.get("contact_title") else "")
-        st.caption(f"{label} — {o['channel']}" + (f" — {o['notes']}" if o.get("notes") else ""))
+        st.markdown(f"{label} — {o['channel']}" + (f" — {o['notes']}" if o.get("notes") else ""))
         oc1, oc2, oc3 = st.columns([2, 2, 1])
         with oc1:
             new_o_status = st.selectbox(
@@ -121,10 +157,10 @@ def render_outreach_section(key_prefix: str, target_account_name: str | None = N
             if o["channel"] == "email" and o.get("contact_email") and not o.get("gmail_draft_id") and not o.get("draft_requested"):
                 if st.button("Request draft", key=f"{key_prefix}_reqdraft_{o['outreach_id']}"):
                     request_draft(o["outreach_id"])
-                    st.info("Flagged - the background fulfillment task will create a real Gmail draft shortly.")
+                    st.toast("Flagged - the background fulfillment task will create a real Gmail draft shortly.", icon=":material/check_circle:")
                     st.rerun()
             elif o.get("draft_requested"):
-                st.caption("Draft requested, not yet created")
+                st.markdown("Draft requested, not yet created")
         with oc3:
             if o.get("gmail_draft_link"):
                 st.link_button("Open draft", o["gmail_draft_link"], key=f"{key_prefix}_opendraft_{o['outreach_id']}")
@@ -150,7 +186,7 @@ def render_outreach_section(key_prefix: str, target_account_name: str | None = N
                     target_account_name=target_account_name, contact_title=oc_title or None,
                     contact_email=oc_email or None, notes=oc_notes or None,
                 )
-                st.success("Logged.")
+                st.toast("Logged.", icon=":material/check_circle:")
                 st.rerun()
             else:
                 st.warning("Contact name is required.")
@@ -194,7 +230,7 @@ if pending_suggestions or outstanding_drafts:
             job = next((j for j in jobs if j["source"] == sugg["source"] and j["job_id"] == sugg["job_id"]), None)
             label = job_label(job) if job else f"{sugg['source']} {sugg['job_id']}"
             st.markdown(f"Inbox match: mark **{label}** as \"{sugg['suggested_status']}\"?")
-            st.caption(sugg.get("suggested_status_reason") or "")
+            st.markdown(sugg.get("suggested_status_reason") or "")
             s1, s2, _ = st.columns([1, 1, 6])
             with s1:
                 if st.button("Confirm", key=f"confirm_{sugg['source']}_{sugg['job_id']}"):
@@ -205,9 +241,17 @@ if pending_suggestions or outstanding_drafts:
                     confirm_status_suggestion(sugg["source"], sugg["job_id"], accept=False)
                     st.rerun()
         if outstanding_drafts:
-            st.caption(f"{len(outstanding_drafts)} draft(s) created and waiting in Gmail for you to review and send - this clears itself once you send them.")
+            st.markdown(f"{len(outstanding_drafts)} draft(s) created and waiting in Gmail for you to review and send - this clears itself once you send them.")
 
 # --- Tab bar ---
+TAB_ICONS = {
+    "cta": ":material/notifications_active:",
+    "results": ":material/work:",
+    "prospector": ":material/travel_explore:",
+    "prep": ":material/school:",
+    "linkedin": ":material/badge:",
+    "settings": ":material/settings:",
+}
 TABS = [
     ("cta", f"Call to action ({cta_count})" if cta_count else "Call to action"),
     ("results", f"Results ({results_count})"),
@@ -219,7 +263,7 @@ TABS = [
 tab_cols = st.columns(len(TABS))
 for col, (key, label) in zip(tab_cols, TABS):
     with col:
-        if st.button(label, key=f"tab_{key}", type="primary" if st.session_state["active_tab"] == key else "secondary", use_container_width=True):
+        if st.button(label, key=f"tab_{key}", icon=TAB_ICONS[key], type="primary" if st.session_state["active_tab"] == key else "secondary", width="stretch"):
             st.session_state["active_tab"] = key
             st.rerun()
 st.divider()
@@ -227,8 +271,114 @@ st.divider()
 active_tab = st.session_state["active_tab"]
 
 if active_tab == "settings":
+    render_feedback_widget("settings")
+
+    st.header("Your documents")
+    st.markdown(
+        "One shared place to manage everything Panga reads from - your "
+        "resume and other background documents, your LinkedIn profile "
+        "export, and your LinkedIn connections export."
+    )
+
+    st.subheader("Resume & other source documents")
+    st.markdown(
+        "\"Resume\" feeds the gap-probing interview directly. \"Context\" is "
+        "background material like an executive bio or leadership summary. "
+        "\"Reference\" is an example of a previously-tailored application - "
+        "used as a style example, not copied verbatim."
+    )
+    manifest_entries = load_manifest_result()
+    if manifest_entries:
+        st.dataframe(
+            pd.DataFrame([{
+                "File": e["source_file"],
+                "Category": e["category"],
+                "Target title": e.get("target_title") or "-",
+                "Words": e["word_count"],
+            } for e in manifest_entries]),
+            hide_index=True, width="stretch",
+        )
+        remove_choice = st.selectbox(
+            "Remove a document", ["-"] + [e["source_file"] for e in manifest_entries],
+            key="remove_doc_choice",
+        )
+        if remove_choice != "-" and st.button("Remove selected document"):
+            remove_document(remove_choice)
+            st.toast(f"Removed {remove_choice}.", icon=":material/check_circle:")
+            st.rerun()
+    else:
+        st.markdown("No documents uploaded yet.")
+
+    doc_category = st.selectbox(
+        "Document type", ["resume", "context", "reference"], key="new_doc_category",
+    )
+    doc_target_title = None
+    doc_note = None
+    if doc_category == "resume":
+        doc_target_title = st.text_input("Which title does this resume version target? (optional)", key="new_doc_title")
+    elif doc_category == "reference":
+        doc_note = st.text_input("What was this tailored for? (optional)", key="new_doc_note")
+    new_doc_file = st.file_uploader("Upload a .docx or .pdf", type=["docx", "pdf"], key="new_doc_file")
+    if st.button("Save document", type="primary", disabled=not new_doc_file):
+        entry = ingest_uploaded_document(
+            new_doc_file, new_doc_file.name, doc_category,
+            target_title=doc_target_title or None, note=doc_note or None,
+        )
+        st.toast(f"Saved {entry['source_file']} ({entry['word_count']} words).", icon=":material/check_circle:")
+        st.rerun()
+
+    st.divider()
+    st.subheader("LinkedIn profile")
+    st.markdown(
+        "Upload a PDF export of your current LinkedIn profile - either "
+        "LinkedIn's own \"Save to PDF\" (from your profile page: click "
+        "\"More\" under your name, then \"Save to PDF\"), or a browser "
+        "print-to-PDF of the profile page. Both are things you export "
+        "yourself from your own logged-in session - Panga never logs into "
+        "LinkedIn, scrapes it, or posts anything there itself. Analysis and "
+        "suggestions show up on the LinkedIn tab."
+    )
+    linkedin_data = load_linkedin_profile()
+    uploaded_linkedin_files = st.file_uploader(
+        "LinkedIn profile PDF(s)", type=["pdf"], accept_multiple_files=True, key="settings_linkedin_pdf",
+        help="You can upload one file or several (e.g. the LinkedIn export and a printed profile page) - text from all of them is combined.",
+    )
+    if st.button("Save LinkedIn profile", type="primary", disabled=not uploaded_linkedin_files):
+        parts = []
+        source_files = []
+        for f in uploaded_linkedin_files:
+            text = extract_text_from_pdf(f)
+            parts.append(f"--- {f.name} ---\n{text}")
+            source_files.append(f.name)
+        save_snapshot("\n\n".join(parts), source_files, saved_at=datetime.now().isoformat(timespec="seconds"))
+        st.toast("Saved. Go to the LinkedIn tab, or ask Claude Code to analyze/enhance your profile.", icon=":material/check_circle:")
+        st.rerun()
+    if linkedin_data.get("last_saved"):
+        st.markdown(f"Last saved: {linkedin_data['last_saved']} (from {', '.join(linkedin_data.get('source_files', []))})")
+
+    st.divider()
+    st.subheader("LinkedIn connections")
+    st.markdown(
+        "Upload your LinkedIn connections export (Settings > Data Privacy > "
+        "\"Get a copy of your data\" > check Connections only, then download "
+        "the resulting CSV) to help find who to reach out to on the "
+        "Prospector tab: connections whose title looks like a recruiter, and "
+        "connections who work at a company already in your target accounts "
+        "list."
+    )
+    connections_snapshot = load_connections_snapshot()
+    uploaded_connections_csv = st.file_uploader("LinkedIn connections CSV", type=["csv"], key="settings_connections_csv")
+    if st.button("Save connections", type="primary", disabled=not uploaded_connections_csv):
+        parsed = parse_connections_csv(uploaded_connections_csv)
+        save_connections(parsed, uploaded_connections_csv.name, saved_at=datetime.now().isoformat(timespec="seconds"))
+        st.toast(f"Saved {len(parsed)} connection(s).", icon=":material/check_circle:")
+        st.rerun()
+    if connections_snapshot.get("last_saved"):
+        st.markdown(f"Last saved: {connections_snapshot['last_saved']} ({len(connections_snapshot['connections'])} connections from {connections_snapshot.get('source_file')})")
+
+    st.divider()
     st.header("Target roles and industries")
-    st.caption("These control sort order on the Results tab - higher weight surfaces first. Not a search filter; every source is still searched the same way.")
+    st.markdown("These control sort order on the Results tab - higher weight surfaces first. Not a search filter; every source is still searched the same way.")
 
     settings = load_settings()
 
@@ -250,7 +400,7 @@ if active_tab == "settings":
     )
 
     st.subheader("USAJOBS job series")
-    st.caption("See \"Occupations and job series\" on usajobs.gov for codes. This runs alongside keyword search (not instead of it) - government classification is inconsistent, so restricting to one series alone would miss real matches filed under a different code. The compatibility score, not this filter, is what actually screens for relevance.")
+    st.markdown("See \"Occupations and job series\" on usajobs.gov for codes. This runs alongside keyword search (not instead of it) - government classification is inconsistent, so restricting to one series alone would miss real matches filed under a different code. The compatibility score, not this filter, is what actually screens for relevance.")
     job_series_text = st.text_area(
         "One code per line, e.g. 2210 for Information Technology Management",
         value="\n".join(settings.get("usajobs_job_series", [])),
@@ -264,8 +414,8 @@ if active_tab == "settings":
         st.success("Saved.")
 
     st.divider()
-    st.header("Data Recovery")
-    st.caption(
+    st.header("Data recovery")
+    st.markdown(
         "Your resume, job history, and applications are encrypted on this "
         "computer using a key stored in this Windows account - not a "
         "password you type in. If this Windows account/profile is ever "
@@ -276,9 +426,9 @@ if active_tab == "settings":
     )
 
     if has_recovery_code():
-        st.caption("A recovery code already exists for this data. Generating a new one below replaces it - the old code stops working.")
+        st.markdown("A recovery code already exists for this data. Generating a new one below replaces it - the old code stops working.")
     else:
-        st.caption("No recovery code has been generated yet - your data has no recovery path if this Windows account is lost.")
+        st.markdown("No recovery code has been generated yet - your data has no recovery path if this Windows account is lost.")
 
     if st.button("Generate recovery code"):
         st.session_state["new_recovery_code"] = generate_recovery_code()
@@ -295,9 +445,34 @@ if active_tab == "settings":
             del st.session_state["new_recovery_code"]
             st.rerun()
 
+    st.divider()
+    st.header("UI feedback")
+    st.markdown(
+        "Voice/text notes left on any screen via \"Leave feedback on this "
+        "screen\" - come back to Claude Code and ask it to work through "
+        "these. Mark one reviewed once it's been acted on (or you've "
+        "decided against it)."
+    )
+    open_feedback = get_open_feedback()
+    if not open_feedback:
+        st.markdown("Nothing queued right now.")
+    else:
+        for fb in open_feedback:
+            fc1, fc2 = st.columns([5, 1])
+            with fc1:
+                st.markdown(f"**{fb['section']}** — {fb['created_at']}")
+                st.markdown(fb["note"])
+            with fc2:
+                if st.button("Mark reviewed", key=f"fb_resolve_{fb['id']}"):
+                    mark_resolved(fb["id"])
+                    st.rerun()
+            st.divider()
+
 elif active_tab == "cta":
-    st.header("Call to Action")
-    st.caption("Emails the Gmail scan flagged as needing a reply or a decision.")
+    render_feedback_widget("cta")
+
+    st.header("Call to action")
+    st.markdown("Emails the Gmail scan flagged as needing a reply or a decision.")
 
     r1, r2 = st.columns([1, 5])
     with r1:
@@ -308,7 +483,8 @@ elif active_tab == "cta":
     stat_cols = st.columns(len(CATEGORY_ORDER))
     for col, cat in zip(stat_cols, CATEGORY_ORDER):
         with col:
-            st.metric(CATEGORY_LABELS[cat], counts[cat])
+            st.badge(CATEGORY_LABELS[cat], color=CATEGORY_COLORS[cat])
+            st.metric("Count", counts[cat], label_visibility="collapsed")
 
     f1, f2 = st.columns([1, 2])
     with f1:
@@ -324,20 +500,21 @@ elif active_tab == "cta":
         filtered = [e for e in filtered if needle in (e.get("subject") or "").lower() or needle in (e.get("sender") or "").lower()]
 
     if not all_cta:
-        st.caption("Nothing needs attention right now.")
+        st.markdown("Nothing needs attention right now.")
     elif not filtered:
-        st.caption("No matches for that filter/search.")
+        st.markdown("No matches for that filter/search.")
 
     for cat in CATEGORY_ORDER:
         cat_emails = [e for e in filtered if e.get("category") == cat]
         if not cat_emails:
             continue
+        st.badge(CATEGORY_URGENCY[cat], color=CATEGORY_COLORS[cat])
         st.subheader(CATEGORY_LABELS[cat])
         for email in cat_emails:
             st.markdown(f"**{email.get('subject')}**")
-            st.caption(f"{email.get('sender')} - {email.get('date')}")
+            st.markdown(f"{email.get('sender')} - {email.get('date')}")
             if email.get("snippet"):
-                st.caption(email["snippet"])
+                st.markdown(email["snippet"])
 
             actions = st.columns(4 if cat == "interview_request" else 3)
             with actions[0]:
@@ -350,7 +527,7 @@ elif active_tab == "cta":
                 else:
                     if st.button("Draft reply", key=f"draft_cta_{email['thread_id']}"):
                         request_draft(email["thread_id"])
-                        st.success("Draft requested - will be created in Gmail on the next scan run.")
+                        st.toast("Draft requested - will be created in Gmail on the next scan run.", icon=":material/check_circle:")
                         st.rerun()
             with actions[2]:
                 if st.button("Dismiss", key=f"dismiss_cta_{email['thread_id']}"):
@@ -369,6 +546,8 @@ elif active_tab == "cta":
             st.divider()
 
 elif active_tab == "results":
+    render_feedback_widget("results")
+
     settings = load_settings()
 
     col1, col2 = st.columns([1, 3])
@@ -397,7 +576,43 @@ elif active_tab == "results":
                 except USAJobsNotConfigured as e:
                     st.error(str(e))
     with col2:
-        st.caption("This button only covers USAJOBS.gov directly. ZipRecruiter, Dice, and Indeed are searched automatically once a day by the scheduled task instead (they're MCP connector tools, not reachable from this button).")
+        st.markdown("This button only covers USAJOBS.gov directly. ZipRecruiter, Dice, and Indeed are searched automatically once a day by the scheduled task instead (they're MCP connector tools, not reachable from this button).")
+
+    with st.expander("Add a job manually (e.g. from LinkedIn)"):
+        st.markdown(
+            "LinkedIn has no public search API and blocks scraping, so this "
+            "is the one channel that works by pasting the posting yourself "
+            "instead of an automated search. The description is saved now "
+            "rather than fetched live later like other channels, since "
+            "LinkedIn URLs often can't be reliably refetched (login wall/"
+            "bot-check)."
+        )
+        manual_job_fields = ["manual_job_title", "manual_job_org", "manual_job_location", "manual_job_url", "manual_job_description"]
+        # Same pattern as the feedback widget's clear-after-save: a widget's
+        # own session_state key can only be reset BEFORE that widget is
+        # instantiated in a given run, so the save handler below only sets
+        # a pending flag - the actual clear happens here, at the top of the
+        # next run.
+        if st.session_state.pop("manual_job_clear_pending", False):
+            for field in manual_job_fields:
+                st.session_state[field] = ""
+        manual_title = st.text_input("Job title", key="manual_job_title")
+        manual_org = st.text_input("Organization", key="manual_job_org")
+        manual_location = st.text_input("Location", key="manual_job_location")
+        manual_url = st.text_input("Posting URL", key="manual_job_url")
+        manual_source = st.text_input("Source", value="linkedin", key="manual_job_source")
+        manual_description = st.text_area(
+            "Paste the job description text", key="manual_job_description", height=200,
+        )
+        if st.button("Save job", type="primary", disabled=not (manual_title and manual_org and manual_url)):
+            from search.job_store import add_manual_job
+            job = add_manual_job(
+                title=manual_title, organization=manual_org, location=manual_location,
+                description=manual_description, posting_url=manual_url, source=manual_source or "linkedin",
+            )
+            st.toast(f"Saved \"{job['title']}\" at {job['organization']}.", icon=":material/check_circle:")
+            st.session_state["manual_job_clear_pending"] = True
+            st.rerun()
 
     target_roles = settings.get("target_roles", [])
 
@@ -411,7 +626,7 @@ elif active_tab == "results":
     scored_count = len(jobs) - unscored_count
     min_score = st.slider(
         "Minimum compatibility score",
-        0, 100, 30,
+        0, 100, 70,
         help="Hides low-fit results (e.g. unrelated roles pulled in by broad keyword matches).",
     )
     # Unscored jobs are hidden by default, NOT always shown - showing
@@ -436,7 +651,7 @@ elif active_tab == "results":
     ranked = dedupe_across_sources(ranked)
 
     if unscored_count:
-        st.caption(f"{unscored_count} job(s) found but not yet compatibility-scored - hidden until the next scoring pass (daily scheduled task, or ask Claude to score them now).")
+        st.markdown(f"{unscored_count} job(s) found but not yet compatibility-scored - hidden until the next scoring pass (daily scheduled task, or ask Claude to score them now).")
 
     st.subheader(f"{len(ranked)} job(s)")
 
@@ -484,7 +699,8 @@ elif active_tab == "results":
         with st.expander(f"{channel} ({len(deduped)}{dup_note})", expanded=True):
             table_rows = []
             for job in deduped:
-                pay = f"${job.get('pay_min') or '?'}-{job.get('pay_max') or '?'}" if (job.get("pay_min") or job.get("pay_max")) else (job.get("salary_text") or "")
+                pay_min, pay_max = format_pay(job.get("pay_min")), format_pay(job.get("pay_max"))
+                pay = f"${pay_min or '?'}-${pay_max or '?'}" if (pay_min or pay_max) else (job.get("salary_text") or "")
                 table_rows.append({
                     "Role": job.get("title"),
                     "Organization": job.get("organization"),
@@ -498,23 +714,32 @@ elif active_tab == "results":
             event = st.dataframe(
                 df,
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
                 on_select="rerun",
                 selection_mode="single-row",
                 column_config={"Posting": st.column_config.LinkColumn(display_text="Open")},
                 key=f"table_{channel}",
             )
 
+            # st.dataframe's on_select state persists across reruns (keyed by
+            # the widget's `key`), but the row-count of `deduped` can shrink
+            # between reruns (e.g. moving the compatibility slider re-filters
+            # `ranked`/`deduped` this same run) - a previously selected index
+            # can point past the end of the new, shorter list. Bounds-check
+            # rather than crash; a selection that no longer exists just shows
+            # no detail panel, which is correct since that row may no longer
+            # be visible at all.
             selected_rows = event.selection.rows if event and event.selection else []
+            selected_rows = [i for i in selected_rows if i < len(deduped)]
             if selected_rows:
                 job = deduped[selected_rows[0]]
                 postings = postings_by_primary[id(job)]
 
-                st.caption(f"{job.get('location') or 'Location not listed'}")
+                st.markdown(f"{job.get('location') or 'Location not listed'}")
                 if "fit_score" in job:
-                    st.caption(job.get("fit_rationale") or "")
+                    st.markdown(job.get("fit_rationale") or "")
                 else:
-                    st.caption("Compatibility: not yet scored")
+                    st.markdown("Compatibility: not yet scored")
                 if len(postings) > 1:
                     for i, posting in enumerate(postings, start=1):
                         if posting.get("posting_url"):
@@ -543,7 +768,7 @@ elif active_tab == "results":
                 if st.button("Request documents", key=f"reqdocs_{job.get('source')}_{job.get('job_id')}"):
                     selected = [k for k, v in checked.items() if v]
                     upsert_application(job["source"], job["job_id"], status="under review", documents_requested=selected)
-                    st.info("Saved. Go to Claude Code and ask to draft the documents for this job - it'll generate exactly what's checked (per the PRD's LLM architecture, not inside this app). Once you've actually submitted it, come back and mark it \"applied.\"")
+                    st.toast("Saved. Go to Claude Code and ask to draft the documents for this job - it'll generate exactly what's checked. Once you've actually submitted it, come back and mark it \"applied.\"", icon=":material/check_circle:")
                     st.rerun()
 
                 doc_field_map = {
@@ -593,8 +818,10 @@ elif active_tab == "results":
                 render_outreach_section(f"job_{job.get('source')}_{job.get('job_id')}", job_source=job.get("source"), job_id=job.get("job_id"))
 
 elif active_tab == "prospector":
+    render_feedback_widget("prospector")
+
     st.header("Prospector")
-    st.caption(
+    st.markdown(
         "Companies worth watching before they've posted a role, outreach logging, coverage/"
         "activity/outcome numbers, and cross-cutting insights (PRD §16/§17) from your job search."
     )
@@ -603,9 +830,40 @@ elif active_tab == "prospector":
     target_roles = settings.get("target_roles", [])
     applications = load_applications()
     target_accounts = load_target_accounts()
+    outreach_records = load_outreach()
+
+    st.subheader("Prospector Score")
+    st.markdown(
+        "One headline number for how well your proactive search is working - "
+        "target accounts, outreach, and real outcomes combined. This is "
+        "self-learning by design: Claude recomputes it by reasoning over "
+        "your actual results rather than a fixed formula, so it gets "
+        "sharper as more real outcomes accumulate instead of staying static."
+    )
+    prospector_score = load_prospector_score()
+    with st.container(border=True):
+        if prospector_score["score"] is None:
+            st.info("Not yet computed - click \"Prepare Prospector Score data\" below, then ask Claude Code to compute it.")
+        else:
+            st.metric("Prospector Score", f"{prospector_score['score']}/100")
+            st.markdown("**Why this score:**")
+            st.markdown(prospector_score["rationale"])
+            if prospector_score.get("next_actions"):
+                st.markdown("**How to raise it:**")
+                for action in prospector_score["next_actions"]:
+                    st.markdown(f"- {action}")
+            st.markdown(f"Based on {prospector_score['data_points']} real outcome data point(s) as of {prospector_score['computed_at']} - recompute anytime, it re-reads your actual data fresh so real progress is reflected automatically.")
+    if st.button("Prepare Prospector Score data"):
+        st.session_state["prospector_score_input"] = gather_prospector_score_input(
+            applications, jobs, target_accounts, outreach_records, prep_records, target_roles,
+        )
+    prospector_score_input = st.session_state.get("prospector_score_input")
+    if prospector_score_input:
+        st.success("Data's ready. Go to Claude Code and ask it to compute the Prospector Score.")
+        st.markdown(f"{prospector_score_input['data_points']} outcome data point(s) currently available to reason over.")
 
     st.subheader("Target accounts")
-    st.caption(
+    st.markdown(
         "Sourced from ClinicalTrials.gov Phase 3 activity, recent openFDA drug approvals, "
         "commercial-hiring job postings already in Results, and SEC S-1/IPO filings mentioning "
         "Phase 3 activity (PRD §16a, all 4 signals). Filtered to exclude obvious non-companies "
@@ -626,17 +884,18 @@ elif active_tab == "prospector":
         } for a in target_accounts]
         ta_df = pd.DataFrame(ta_rows)
         ta_event = st.dataframe(
-            ta_df, hide_index=True, use_container_width=True,
+            ta_df, hide_index=True, width="stretch",
             on_select="rerun", selection_mode="single-row", key="target_accounts_table",
         )
         selected_ta_rows = ta_event.selection.rows if ta_event and ta_event.selection else []
+        selected_ta_rows = [i for i in selected_ta_rows if i < len(target_accounts)]
         if selected_ta_rows:
             acc = target_accounts[selected_ta_rows[0]]
             st.markdown(f"**{acc['company_name']}**")
             for sig in acc["signals"]:
-                st.caption(f"[{sig['signal_type']}, {sig['source']}] {sig['detail']} (observed {sig['date_observed'][:10]})")
+                st.markdown(f"[{sig['signal_type']}, {sig['source']}] {sig['detail']} (observed {sig['date_observed'][:10]})")
             if acc.get("notes"):
-                st.caption(f"Notes: {acc['notes']}")
+                st.markdown(f"Notes: {acc['notes']}")
             new_ta_status = st.selectbox(
                 "Status", ["watching", "qualified", "contacted", "stale", "disqualified"],
                 index=["watching", "qualified", "contacted", "stale", "disqualified"].index(acc["status"]),
@@ -661,10 +920,10 @@ elif active_tab == "prospector":
     c3.metric("Channels", len(coverage["by_channel"]))
     st.dataframe(
         pd.DataFrame(sorted(coverage["by_channel"].items()), columns=["Channel", "Jobs"]),
-        hide_index=True, use_container_width=True,
+        hide_index=True, width="stretch",
     )
     if coverage["untimestamped"]:
-        st.caption(f"{coverage['untimestamped']} job(s) predate 2026-07-30 and have no discovery date, so they're in the total but not the 7-day count.")
+        st.markdown(f"{coverage['untimestamped']} job(s) predate 2026-07-30 and have no discovery date, so they're in the total but not the 7-day count.")
 
     st.subheader("Activity")
     a1, a2 = st.columns(2)
@@ -672,13 +931,13 @@ elif active_tab == "prospector":
     a2.metric("Started in last 7 days", activity["created_last_7_days"])
     st.dataframe(
         pd.DataFrame(sorted(activity["by_status"].items()), columns=["Status", "Count"]),
-        hide_index=True, use_container_width=True,
+        hide_index=True, width="stretch",
     )
     if activity["untimestamped"]:
-        st.caption(f"{activity['untimestamped']} application(s) predate 2026-07-30 and have no start date, so they're in the total but not the 7-day count.")
+        st.markdown(f"{activity['untimestamped']} application(s) predate 2026-07-30 and have no start date, so they're in the total but not the 7-day count.")
 
     st.subheader("Outcome")
-    st.caption(
+    st.markdown(
         "Rates are out of applications that reached \"applied\" or later, using each "
         "application's CURRENT status - an application that was briefly \"interview "
         "scheduled\" before becoming \"offer\" only counts under offer, not both."
@@ -692,7 +951,7 @@ elif active_tab == "prospector":
         o2.metric("Interview rate", f"{overall['interview_rate']:.0%}")
         o3.metric("Offer rate", f"{overall['offer_rate']:.0%}")
         o4.metric("Rejection rate", f"{overall['rejection_rate']:.0%}")
-        st.caption(f"Based on {overall['applied']} application(s) that reached \"applied\" or later.")
+        st.markdown(f"Based on {overall['applied']} application(s) that reached \"applied\" or later.")
 
         def rates_table(by_dimension: dict, dim_label: str) -> pd.DataFrame:
             rows = []
@@ -708,15 +967,15 @@ elif active_tab == "prospector":
             return pd.DataFrame(rows)
 
         with st.expander("By channel"):
-            st.dataframe(rates_table(outcome["by_channel"], "Channel"), hide_index=True, use_container_width=True)
+            st.dataframe(rates_table(outcome["by_channel"], "Channel"), hide_index=True, width="stretch")
         with st.expander("By fit-score band"):
-            st.dataframe(rates_table(outcome["by_score_band"], "Score band"), hide_index=True, use_container_width=True)
+            st.dataframe(rates_table(outcome["by_score_band"], "Score band"), hide_index=True, width="stretch")
         with st.expander("By target-role priority weight"):
-            st.caption("Weight comes from Settings > target roles - higher weight roles are the ones you prioritized.")
-            st.dataframe(rates_table(outcome["by_role_weight"], "Priority weight"), hide_index=True, use_container_width=True)
+            st.markdown("Weight comes from Settings > target roles - higher weight roles are the ones you prioritized.")
+            st.dataframe(rates_table(outcome["by_role_weight"], "Priority weight"), hide_index=True, width="stretch")
 
     st.subheader("Rejection-pattern diagnosis")
-    st.caption(
+    st.markdown(
         "Looks for clustering in why applications aren't landing - by score band, channel, "
         "role type, or the reasons you've given for marking something not interested. This "
         "needs Claude's live reasoning, not a canned report, so this button only gathers the "
@@ -738,13 +997,13 @@ elif active_tab == "prospector":
             with st.expander("What it'll be looking at"):
                 if diagnosis_input["rejected"]:
                     st.markdown("**Rejected**")
-                    st.dataframe(pd.DataFrame(diagnosis_input["rejected"]), hide_index=True, use_container_width=True)
+                    st.dataframe(pd.DataFrame(diagnosis_input["rejected"]), hide_index=True, width="stretch")
                 if diagnosis_input["not_interested_with_reason"]:
                     st.markdown("**Not interested (with reason)**")
-                    st.dataframe(pd.DataFrame(diagnosis_input["not_interested_with_reason"]), hide_index=True, use_container_width=True)
+                    st.dataframe(pd.DataFrame(diagnosis_input["not_interested_with_reason"]), hide_index=True, width="stretch")
 
     st.subheader("Insights (Learn Engine)")
-    st.caption(
+    st.markdown(
         "Cross-cutting feedback loop over every prediction Panga makes - scoring, target-account "
         "qualification, outreach channel, strategy tags, interview outcomes (PRD §17). Same as "
         "rejection-pattern diagnosis above: this button only gathers the data across all of these "
@@ -753,7 +1012,7 @@ elif active_tab == "prospector":
     )
     if st.button("Prepare Learn Engine data"):
         st.session_state["learn_engine_input"] = gather_learn_engine_input(
-            applications, jobs, target_accounts, load_outreach(), prep_records,
+            applications, jobs, target_accounts, outreach_records, prep_records,
         )
 
     learn_input = st.session_state.get("learn_engine_input")
@@ -769,7 +1028,7 @@ elif active_tab == "prospector":
         else:
             st.success("Data's ready. Go to Claude Code and ask it to run the Learn Engine analysis.")
             for gap in learn_input["known_gaps"]:
-                st.caption(f"Known gap: {gap}")
+                st.markdown(f"**Known gap:** {gap}")
             with st.expander("What it'll be looking at"):
                 for key, title in [
                     ("scoring_vs_outcome", "Scoring vs. application outcome"),
@@ -779,26 +1038,28 @@ elif active_tab == "prospector":
                 ]:
                     if learn_input[key]:
                         st.markdown(f"**{title}**")
-                        st.dataframe(pd.DataFrame(learn_input[key]), hide_index=True, use_container_width=True)
+                        st.dataframe(pd.DataFrame(learn_input[key]), hide_index=True, width="stretch")
 
 elif active_tab == "prep":
-    st.header("Interview Prep")
+    render_feedback_widget("prep")
+
+    st.header("Interview prep")
 
     prep_target = st.session_state.get("prep_target")
     if prep_target:
         with st.container(border=True):
             if prep_target["kind"] == "job":
                 st.markdown(f"**Ready to prep: {prep_target['job_label']}**")
-                st.caption("Go to Claude Code and ask to prep for this interview - it'll research the interviewer(s)/company and draft persona-aware questions and talking points from your master profile.")
+                st.markdown("Go to Claude Code and ask to prep for this interview - it'll research the interviewer(s)/company and draft persona-aware questions and talking points from your master profile.")
             else:
                 st.markdown(f"**Ready to prep: \"{prep_target['subject']}\"** from {prep_target['sender']}")
-                st.caption("Go to Claude Code and ask to prep for this interview. It'll read the full email thread first to find interviewer/panel names, match it to the right application, then research from there.")
+                st.markdown("Go to Claude Code and ask to prep for this interview. It'll read the full email thread first to find interviewer/panel names, match it to the right application, then research from there.")
             if st.button("Clear", key="clear_prep_target"):
                 st.session_state["prep_target"] = None
                 st.rerun()
 
     if not prep_records:
-        st.caption("No interview prep started yet. Use \"Prep for this interview\" on Results or Call to Action once you're past the applied stage.")
+        st.markdown("No interview prep started yet. Use \"Prep for this interview\" on Results or Call to Action once you're past the applied stage.")
 
     for record in prep_records:
         job = next((j for j in jobs if j["source"] == record["source"] and j["job_id"] == record["job_id"]), None)
@@ -810,17 +1071,17 @@ elif active_tab == "prep":
             with st.expander(f"{round_['round_label']} - {status_note}", expanded=(round_["status"] == "in_progress")):
                 logistics = " - ".join(v for v in [round_.get("date"), round_.get("format")] if v)
                 if logistics:
-                    st.caption(logistics)
+                    st.markdown(logistics)
 
                 if round_.get("interviewers"):
                     for person in round_["interviewers"]:
                         st.markdown(f"**{person.get('name')}**" + (f", {person.get('title')}" if person.get("title") else ""))
                         if person.get("research_summary"):
-                            st.caption(person["research_summary"])
+                            st.markdown(person["research_summary"])
                         if person.get("persona"):
                             st.markdown(f"_Likely focus:_ {person['persona']}")
                         for link in person.get("research_links") or []:
-                            st.caption(link)
+                            st.markdown(link)
 
                 if round_.get("company_snapshot"):
                     st.markdown(f"**Company snapshot:** {round_['company_snapshot']}")
@@ -831,7 +1092,7 @@ elif active_tab == "prep":
                         asked_by = f" ({q['asked_by']})" if q.get("asked_by") else ""
                         st.markdown(f"- {q.get('question')}{asked_by}")
                         if q.get("why"):
-                            st.caption(q["why"])
+                            st.markdown(q["why"])
                         if q.get("talking_point"):
                             st.markdown(f"  > {q['talking_point']}")
 
@@ -859,54 +1120,43 @@ elif active_tab == "prep":
                     st.rerun()
 
 elif active_tab == "linkedin":
-    st.header("LinkedIn Profile Enhancement")
-    st.caption(
-        "Upload a PDF export of your current LinkedIn profile below - either "
-        "LinkedIn's own \"Save to PDF\" (from your profile page: click \"More\" "
-        "under your name, then \"Save to PDF\"), or a browser print-to-PDF of "
-        "the profile page. Both are things you export yourself from your own "
-        "logged-in session - Panga never logs into LinkedIn, scrapes it, or "
-        "posts anything there itself. Then go to Claude Code and ask to "
-        "analyze/enhance your LinkedIn profile - that's where the comparison "
+    render_feedback_widget("linkedin")
+
+    st.header("LinkedIn profile enhancement")
+    st.markdown(
+        "Uploads for your LinkedIn profile and connections live in Settings "
+        "now, alongside your resume and other source documents - one shared "
+        "place to manage everything Panga reads from. This tab shows the "
+        "analysis and suggestions once you've uploaded there and asked "
+        "Claude Code to review your profile - that's where the comparison "
         "against your master profile and target-role skills happens, and "
-        "where suggested rewrites get drafted. Suggestions below are yours to "
-        "copy and paste into LinkedIn's own edit screens."
+        "where suggested rewrites get drafted. Suggestions below are yours "
+        "to copy and paste into LinkedIn's own edit screens."
     )
+    if st.button("Go to Settings to upload/update", icon=":material/upload_file:"):
+        st.session_state["active_tab"] = "settings"
+        st.rerun()
 
     linkedin_data = load_linkedin_profile()
 
-    uploaded_files = st.file_uploader(
-        "LinkedIn profile PDF(s)", type=["pdf"], accept_multiple_files=True,
-        help="You can upload one file or several (e.g. the LinkedIn export and a printed profile page) - text from all of them is combined.",
-    )
-
-    if st.button("Save profile", type="primary", disabled=not uploaded_files):
-        parts = []
-        source_files = []
-        for f in uploaded_files:
-            text = extract_text_from_pdf(f)
-            parts.append(f"--- {f.name} ---\n{text}")
-            source_files.append(f.name)
-        save_snapshot("\n\n".join(parts), source_files, saved_at=datetime.now().isoformat(timespec="seconds"))
-        st.success("Saved. Go to Claude Code and ask to analyze/enhance your LinkedIn profile.")
-        st.rerun()
-
     if linkedin_data.get("last_saved"):
-        st.caption(f"Last saved: {linkedin_data['last_saved']} (from {', '.join(linkedin_data.get('source_files', []))})")
+        st.markdown(f"Last saved: {linkedin_data['last_saved']} (from {', '.join(linkedin_data.get('source_files', []))})")
 
     st.divider()
 
     if linkedin_data.get("last_analyzed"):
         score = linkedin_data.get("profile_strength_score")
         if score is not None:
-            st.metric("Profile strength", f"{score}/100")
-            if linkedin_data.get("profile_strength_rationale"):
-                st.caption(linkedin_data["profile_strength_rationale"])
-        st.caption(f"Last analyzed: {linkedin_data['last_analyzed']}")
+            with st.container(border=True):
+                st.metric("Profile strength", f"{score}/100")
+                if linkedin_data.get("profile_strength_rationale"):
+                    st.markdown("**Why this score, and what would improve it:**")
+                    st.markdown(linkedin_data["profile_strength_rationale"])
+        st.markdown(f"Last analyzed: {linkedin_data['last_analyzed']}")
 
         active_suggestions = get_active_suggestions()
         if not active_suggestions:
-            st.caption("No open suggestions - everything's either applied or dismissed.")
+            st.markdown("No open suggestions - everything's either applied or dismissed.")
         for section in LINKEDIN_SECTIONS:
             section_suggestions = [s for s in active_suggestions if s["section"] == section]
             if not section_suggestions:
@@ -914,9 +1164,9 @@ elif active_tab == "linkedin":
             st.subheader(LINKEDIN_SECTION_LABELS[section])
             for s in section_suggestions:
                 if s.get("rationale"):
-                    st.caption(s["rationale"])
-                st.markdown("Suggested text (copy this into LinkedIn):")
-                st.code(s["suggested_text"], language=None)
+                    st.markdown(s["rationale"])
+                st.markdown("**Suggested text (copy this into LinkedIn):**")
+                st.code(s["suggested_text"], language=None, wrap_lines=True)
                 b1, b2 = st.columns([1, 1])
                 with b1:
                     if st.button("Mark updated on LinkedIn", key=f"applied_{s['id']}"):
@@ -928,30 +1178,21 @@ elif active_tab == "linkedin":
                         st.rerun()
                 st.divider()
     else:
-        st.caption("Not yet analyzed - upload your profile PDF(s) above, save, then ask Claude to analyze it.")
+        st.markdown("Not yet analyzed - upload your profile PDF(s) in Settings, then ask Claude to analyze it.")
 
     st.divider()
     st.subheader("Connections (for Prospector outreach)")
-    st.caption(
-        "Upload your LinkedIn connections export (Settings > Data Privacy > "
-        "\"Get a copy of your data\" > check Connections only, then download "
-        "the resulting CSV) to help find who to reach out to on the "
-        "Prospector tab (§16b): connections whose title looks like a "
-        "recruiter, and connections who work at a company already in your "
-        "target accounts list. Same manual-export-only rule as everything "
-        "else here - nothing is ever scraped or pulled automatically."
+    st.markdown(
+        "Connections whose title looks like a recruiter, and connections "
+        "who work at a company already in your target accounts list - "
+        "upload your connections export in Settings to populate this."
     )
     connections_snapshot = load_connections_snapshot()
-    uploaded_csv = st.file_uploader("LinkedIn connections CSV", type=["csv"], key="connections_csv")
-    if st.button("Save connections", type="primary", disabled=not uploaded_csv):
-        parsed = parse_connections_csv(uploaded_csv)
-        save_connections(parsed, uploaded_csv.name, saved_at=datetime.now().isoformat(timespec="seconds"))
-        st.success(f"Saved {len(parsed)} connection(s).")
-        st.rerun()
-
-    if connections_snapshot.get("last_saved"):
+    if not connections_snapshot.get("last_saved"):
+        st.markdown("No connections uploaded yet - add them in Settings.")
+    else:
         conns = connections_snapshot["connections"]
-        st.caption(f"Last saved: {connections_snapshot['last_saved']} ({len(conns)} connections from {connections_snapshot.get('source_file')})")
+        st.markdown(f"Last saved: {connections_snapshot['last_saved']} ({len(conns)} connections from {connections_snapshot.get('source_file')})")
 
         recruiters = [c for c in conns if looks_like_recruiter(c.get("position"))]
         target_names = [a["company_name"] for a in load_target_accounts()]
@@ -963,7 +1204,7 @@ elif active_tab == "linkedin":
 
         if recruiters:
             with st.expander("Recruiter connections"):
-                st.dataframe(pd.DataFrame(recruiters)[["first_name", "last_name", "company", "position"]], hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(recruiters)[["first_name", "last_name", "company", "position"]], hide_index=True, width="stretch")
         if target_matches:
             with st.expander("Connections at a target account"):
-                st.dataframe(pd.DataFrame(target_matches)[["first_name", "last_name", "company", "position", "matched_target_account"]], hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(target_matches)[["first_name", "last_name", "company", "position", "matched_target_account"]], hide_index=True, width="stretch")
