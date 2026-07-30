@@ -92,10 +92,72 @@ key unlocks for them the same way. Confirmed via the Streamlit app
 Call to Action, and Settings pages all load correctly against the
 now-encrypted files, no errors in console or server logs.
 
+## Recovery (built 2026-07-30, closes the "Windows-account-loss recovery" backlog item)
+
+Envelope encryption on top of the same key above - the AES-256-GCM key
+protecting `data/` doesn't change, and no already-encrypted file needs
+re-encrypting for this. Instead, a second, recoverable copy of that same
+key is wrapped under a recovery code the user generates and saves
+themselves.
+
+- **Recovery code:** 20 random bytes (160 bits) from `secrets.token_bytes`,
+  displayed as base32 in hyphenated groups of 4 (e.g.
+  `URPH-3Y2W-V2VJ-J45C-HSZB-MI7Q-2QFO-E2I4`). High-entropy and random, not
+  a memorized passphrase, so KDF slowness below is defense-in-depth rather
+  than the primary defense against guessing.
+- **Wrapping:** PBKDF2-HMAC-SHA256 (600,000 iterations, random 16-byte
+  salt) derives a wrapping key from the recovery code's raw bytes: the
+  data-encryption key is AES-256-GCM-encrypted under that wrapping key and
+  saved to `data/security/recovery_envelope.json` (salt, iteration count,
+  nonce, wrapped key - all safe to store as-is; useless without the code).
+  Since `data/` is already gitignored/local-only, this file gets the same
+  handling as everything else in it.
+- **Generating a code:** Settings page, "Data Recovery" section -
+  `generate_recovery_code()` in `crypto_store.py`. Shown exactly once, in
+  the browser, with a "write this down now, save it somewhere other than
+  this computer" warning; nothing about the plain code is ever written to
+  disk. Generating again replaces the envelope and invalidates the
+  previous code.
+- **Recovering:** `scripts/recover_access.py` (double-click
+  `recover_access.vbs` - no terminal, same pattern as the desktop
+  shortcut's `run_app.vbs`/`run_app.bat`) - a small tkinter dialog that
+  takes the code and calls `recover_key_with_code()`, which unwraps the
+  key and reinstalls it into this account's credential store. Deliberately
+  separate from the Streamlit app itself, since the app needs the key just
+  to load its pages - it can't be the tool that recovers a missing one.
+- **Safety fix bundled in:** before this, if the credential-store key ever
+  went missing, `_get_or_create_key()` silently minted a brand-new random
+  key and pressed on - meaning a lost/corrupted profile would produce
+  confusing `InvalidTag` decrypt errors later instead of a clear signal
+  up front. Now, a missing key is checked against whether a recovery
+  envelope already exists: if one does, that's proof a real key was
+  deliberately set up before, so this is unambiguously a recovery
+  situation, not a fresh install - it raises a clear `RuntimeError`
+  pointing at `recover_access.py` instead of fabricating a new key that
+  could never have decrypted the existing files.
+- **What this doesn't cover:** if the entire disk/machine is lost (not
+  just the Windows account/profile), there's nothing to recover regardless
+  of any of this - the code only helps when `data/` itself (including
+  `recovery_envelope.json`) survives but the credential store doesn't
+  (profile corruption/reset, or a deliberate move of `data/` to a new
+  machine/account).
+- **Verified 2026-07-30:** generated a code, deleted the real credential-store
+  entry to simulate account loss, confirmed a normal read now fails loudly
+  with the new RuntimeError (not a silent wrong key), confirmed a wrong
+  recovery code is rejected without touching the credential store,
+  confirmed the correct code restores the exact original key, and
+  confirmed jobs/applications/cta_emails/profile all read back correctly
+  afterward - tested both through `crypto_store.recover_key_with_code()`
+  directly and through `recover_access.py`'s actual button-handler
+  function (real `tkinter.Tk` instance, messagebox calls captured instead
+  of shown).
+
 ## Known limits
 
-- Losing this Windows user account/profile (corruption, reinstall) loses
-  the credential-store key and therefore the data, with no recovery path
-  today - re-scoped backlog item, PRD §13 ("Windows-account-loss
-  recovery").
-- Single-machine only (see "Not a multi-machine sync solution" above).
+- Single-machine only (see "Not a multi-machine sync solution" above) -
+  the recovery code doesn't change this; it restores the same key on the
+  same OS's credential store, not a way to read `data/` on a different OS
+  without transferring the key some other way.
+- The recovery code is only as safe as wherever the user stores it - if
+  it's saved only on the same computer it's meant to recover, it doesn't
+  survive whatever that computer loses.

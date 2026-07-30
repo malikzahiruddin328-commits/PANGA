@@ -67,7 +67,8 @@ Important build constraint: **not a hands-on developer** (last coded in 2006; ra
 - **Built (2026-07-30)**: all of `data/` (master profile, raw resume text, interview answers, job history, applications, CTA emails) is encrypted at rest — AES-256-GCM via `src/security/crypto_store.py`. Full detail in `docs/encryption-at-rest.md`; summary below.
 - **Key model, revised from the original "user passphrase" plan**: the original spec below (a typed passphrase, "the only key for now") turned out to be incompatible with the scheduled tasks built after this section was written (§14, §13's daily search task) — those run unattended, several times a day, with no one present to type anything. Instead, the AES key is a random 256-bit value generated on first use and held in the OS credential store via the `keyring` library (Windows Credential Manager/DPAPI on this machine; Keychain if this ever runs on a Mac) — it unlocks automatically for this Windows login, for both the interactive Streamlit app and unattended scheduled tasks. This protects `data/` if the files are copied off this machine or the disk is stolen/imaged; it does **not** protect against someone else using this same Windows login — narrower than a passphrase would be, but a passphrase model isn't actually usable given the automation already built.
 - **Original plan (superseded by the above):** user sets a passphrase correctly at first setup; this is the only key. Kept here for history — no passphrase exists in the shipped design.
-- **Backlog**: since there's no passphrase in the current design, "passphrase recovery" as originally scoped no longer applies. What *is* still a real risk: losing access to this Windows user account (profile corruption, reinstall, etc.) loses the credential-store key and therefore the data, with no recovery path today. Re-scoped backlog item tracks this instead (see §13).
+- **Built (2026-07-30)**: recovery for the risk above — a one-time-generated recovery code (Settings page, "Data Recovery" section) unwraps a saved copy of the same key if this Windows account's credential store ever loses it. Full detail in `docs/encryption-at-rest.md` §"Recovery"; summary below.
+- **Backlog**: since there's no passphrase in the current design, "passphrase recovery" as originally scoped no longer applies — see §13, now marked built under its re-scoped name.
 
 ## 8. Job Search Cadence
 - Target: **2–3 scheduled runs per day**, plus an **on-demand "run now" button**.
@@ -104,7 +105,7 @@ Not a script — a simple results-driven interface (built with Streamlit, opens 
 | MCP connector vetting pipeline | Ongoing practice | N/A | Test → validate → productionalize before relying on any new connector live. |
 | Interview prep module | Not started | 0% | Carried over from §10. |
 | Encryption at rest for `data/` | Built | 100% | 2026-07-30. AES-256-GCM, key in OS credential store via `keyring` (no typed passphrase — see §7). `docs/encryption-at-rest.md` has full detail. |
-| Windows-account-loss recovery (re-scoped from "passphrase recovery mechanism") | Not started | 0% | Carried over from §7, re-scoped once §7's key model changed from passphrase to OS-credential-store. No passphrase exists to recover; the real gap now is "what happens if this Windows account/profile is lost." |
+| Windows-account-loss recovery (re-scoped from "passphrase recovery mechanism") | Built | 100% | 2026-07-30. Recovery code (Settings page) wraps a recoverable copy of the encryption key via PBKDF2 + AES-GCM; standalone `scripts/recover_access.py` (no-terminal launcher `recover_access.vbs`) restores it into a new/repaired Windows account's credential store. `docs/encryption-at-rest.md` §"Recovery" has full detail. |
 | Email monitoring — simple scan | Built | 100% | Superseded by the full version in §14. `panga-gmail-cta-scan`, 4x/day, Gmail-label state, push notification on CTA emails. |
 | Non-applied-job feedback loop | Built | 100% | Skip-reason capture + hide-from-results done; detection of unreviewed reasons wired into the daily task; live evaluation happens in conversation, not automated by design. |
 | LinkedIn profile enhancement | Built | 100% | Manual-paste only, no scraping (ToS risk). New "LinkedIn" Streamlit page: paste current Headline/About/Experience/Skills, save, then ask Claude to analyze against the master profile + role_skills — produces a 0-100 profile strength score + per-section suggested rewrites, shown as copyable text blocks with Mark-updated/Dismiss actions. Nothing is ever posted to LinkedIn automatically. Awaiting Zahir's real profile paste to run a live analysis pass. |
@@ -116,7 +117,7 @@ Not a script — a simple results-driven interface (built with Streamlit, opens 
 | Direct LLM API integration (replace Claude Code orchestration) | Deliberately deferred | 0% | Sequenced last on purpose — revisit only at multi-user scale (§12 trigger), not before. |
 | **Prospector** — personal marketing/sales-funnel layer (KPIs, rejection-pattern diagnosis, proactive FDA/ClinicalTrials/PubMed-based company targeting, strategy-tagging/learning loop) | Named, design not started | 0% | Added 2026-07-29. Reframes the project from job-matching/coverage to a full Prospect→Research→Outreach→Application→Response→Outcome→Learn lifecycle. `target_accounts` data model planned, parallel to `jobs`/`applications`. Claude drafts outreach content; user always sends it himself. |
 
-**Already fully built (for reference, not backlog):** resume ingestion, gap-probing interview, USAJOBS/ZipRecruiter/Dice/Indeed search, company-site search via Workday/SmartRecruiters ATS APIs, tailoring context bundling, applications tracking, Streamlit Results UI with per-channel tables, compatibility scoring, daily scheduled search+score task, desktop shortcut, Gmail call-to-action monitoring (full version, see §14), encryption at rest for `data/` (see §7, `docs/encryption-at-rest.md`).
+**Already fully built (for reference, not backlog):** resume ingestion, gap-probing interview, USAJOBS/ZipRecruiter/Dice/Indeed search, company-site search via Workday/SmartRecruiters ATS APIs, tailoring context bundling, applications tracking, Streamlit Results UI with per-channel tables, compatibility scoring, daily scheduled search+score task, desktop shortcut, Gmail call-to-action monitoring (full version, see §14), encryption at rest for `data/` plus its key-recovery flow (see §7/§15, `docs/encryption-at-rest.md`).
 
 ## 14. Gmail Call-to-Action Handling (built 2026-07-28 through 2026-07-29)
 
@@ -205,4 +206,36 @@ scope while §12 keeps this single-machine/single-user.
 
 **Backlog impact:** §7's "passphrase recovery" backlog item no longer
 applies as originally scoped, since there's no passphrase to recover — see
-§13's re-scoped "Windows-account-loss recovery" item instead.
+§13's re-scoped "Windows-account-loss recovery" item, now also built (see
+below).
+
+### 15a. Recovery (built 2026-07-30)
+
+Envelope encryption on top of the same key, not a second copy of the
+encrypted files: a recovery code (20 random bytes, shown once as a
+hyphenated base32 string) wraps the existing data-encryption key via
+PBKDF2 + AES-GCM, saved to `data/security/recovery_envelope.json`. Two
+pieces:
+
+1. **Generate** — Settings page, "Data Recovery" section. Shows the code
+   exactly once with a "save it somewhere other than this computer"
+   warning; nothing about the plain code is ever written to disk.
+2. **Recover** — `scripts/recover_access.py` (double-click
+   `recover_access.vbs`, no terminal, same pattern as the desktop
+   shortcut), a small tkinter prompt for the code that reinstalls the
+   unwrapped key into this account's credential store. Deliberately
+   separate from the Streamlit app, since the app needs the key just to
+   load its own pages.
+
+Also closed a related gap while building this: previously, a missing
+credential-store key silently produced a *new* random key rather than
+signaling a problem. Now, a missing key is checked against whether a
+recovery envelope already exists — if one does, that's proof a real key
+was set up before, so it fails loudly and points at
+`scripts/recover_access.py` instead of minting a key that could never
+decrypt the existing files.
+
+**Not covered:** losing the entire disk/machine, not just the Windows
+account/profile — there's nothing to recover from that regardless. See
+`docs/encryption-at-rest.md` for full detail including how this was
+verified.

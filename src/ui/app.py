@@ -24,6 +24,7 @@ from search.job_store import load_jobs
 from ranking.prioritize import weight_for
 from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
+from security.crypto_store import has_recovery_code, generate_recovery_code
 
 CATEGORY_LABELS = {
     "rejection": "Rejection",
@@ -97,6 +98,38 @@ if page == "Settings":
         settings["usajobs_job_series"] = [line.strip() for line in job_series_text.splitlines() if line.strip()]
         save_settings(settings)
         st.success("Saved.")
+
+    st.divider()
+    st.header("Data Recovery")
+    st.caption(
+        "Your resume, job history, and applications are encrypted on this "
+        "computer using a key stored in this Windows account - not a "
+        "password you type in. If this Windows account/profile is ever "
+        "lost, or this data is moved to a new computer, that key goes with "
+        "it and there's normally no way back in. A recovery code fixes "
+        "that: generate one below, and it'll let you regain access without "
+        "the original key."
+    )
+
+    if has_recovery_code():
+        st.caption("A recovery code already exists for this data. Generating a new one below replaces it - the old code stops working.")
+    else:
+        st.caption("No recovery code has been generated yet - your data has no recovery path if this Windows account is lost.")
+
+    if st.button("Generate recovery code"):
+        st.session_state["new_recovery_code"] = generate_recovery_code()
+
+    if st.session_state.get("new_recovery_code"):
+        st.warning(
+            "Write this down now and save it somewhere OTHER than this "
+            "computer - a password manager on your phone, or printed and "
+            "filed away. It will not be shown again after you leave this "
+            "page."
+        )
+        st.code(st.session_state["new_recovery_code"], language=None)
+        if st.button("I've saved this somewhere safe"):
+            del st.session_state["new_recovery_code"]
+            st.rerun()
 
 elif page.startswith("Call to Action"):
     st.header("Call to Action")
