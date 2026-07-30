@@ -101,7 +101,7 @@ Not a script — a simple results-driven interface (built with Streamlit, opens 
 - **Industry-specific job boards**: beyond generic boards (Indeed, LinkedIn, etc.), maintain an extensible list of specialized boards per industry (e.g. life sciences/pharma-specific boards) — same "ever-growing lookup" pattern as the industry/role/skill table in §4.
 - **Interview prep module** (carried over from §10).
 - **Passphrase recovery mechanism** (carried over from §7).
-- **Email monitoring — simple-scan version BUILT 2026-07-28** (moved up from backlog at the user's request — see `docs/email-monitoring-task.md`): a scheduled Claude task (`panga-gmail-cta-scan`, 4x/day) scans Gmail for call-to-action emails (interview invites, rejections, recruiter follow-ups) and sends a push notification when it finds one, using Gmail labels for state instead of a database. Flags emails generically — does NOT yet link a flagged email to a specific job record. **Still backlogged:** the richer version (tagging each flagged email to its specific `applications` table row and surfacing it in the results UI) still depends on the `applications` table, so it can't be built before search + tailoring + results UI exist (steps 4c/5/6).
+- **Email monitoring — simple-scan version BUILT 2026-07-28**, superseded by the full version in **§14** below (moved up from backlog at the user's request — see `docs/email-monitoring-task.md`): a scheduled Claude task (`panga-gmail-cta-scan`, 4x/day) scans Gmail for call-to-action emails (interview invites, rejections, recruiter follow-ups) and sends a push notification when it finds one, using Gmail labels for state instead of a database.
 - **Non-applied-job feedback loop — BUILT 2026-07-29** (added 2026-07-27): when the user marks a job "not interested" (§9), a reason can be given via the skip-reason field (§4); the job is hidden from Results either way (checkbox to unhide, nothing deleted). A reason marks the record for review (`applications.get_unreviewed_skip_reasons()`); the daily scheduled task detects and surfaces the count but does not evaluate reasons itself — that needs live back-and-forth with Claude (what the reason implies for future search params, presented as ranked options with a recommendation), done in conversation, then `mark_skip_reason_reviewed()` once walked through.
 - **LinkedIn profile enhancement** (added 2026-07-27): cross-examine the resume/master profile against the user's LinkedIn profile and suggest improvements, including a collaborative marketing-style graphic-generation step. **Safe approach only**: the user manually pastes or exports their LinkedIn profile text into the tool — no automated login or scraping of linkedin.com, since that would violate LinkedIn's Terms of Service and risk account restriction (same class of risk already excluded for auto-submission in §2). Steps for the user must be written as plainly as possible ("idiot-proof"), consistent with §6's non-developer constraint.
 - **Recruiter mail-blast / marketing outreach** (added 2026-07-27): send marketing material (e.g. about the user's candidacy) to recruiter contacts the user has accumulated. This sends messages to real third parties on the user's behalf — every use requires the user's explicit, per-instance sign-off (reviewing the message and recipient list before anything sends), never automatic or scheduled without confirmation.
@@ -110,3 +110,49 @@ Not a script — a simple results-driven interface (built with Streamlit, opens 
 - **Retained executive search firm outreach** (added 2026-07-28, sourced from a personal email from Dave Walko/PharmTALENT — a 10+ year friend of the user's, not a cold contact): Korn Ferry, Heidrick & Struggles, Spencer Stuart, Russell Reynolds (top-tier global retained search), plus CIO-specific boutique CIO Partners, The Good Search, Cowen Partners, the IT LeaderBoard profile registration, and the Pinnacle Society recruiter directory (searchable by keyword, e.g. CIO/IT). Same non-automatable shape as Category A above — these firms fill roles confidentially from their own network, there's nothing for Panga to search, the action is the user personally reaching out/registering. Captured in `config/industry_job_boards.yaml` under `retained_search_firms`. **Claude: prompt the user about this backlog item once the first working version of Panga (steps 4c/5/6) is done** — the user explicitly asked to be reminded then rather than act on it now.
 - **UI polish: Pay column formatting** (added 2026-07-29): currently renders as `$151661-228000` (`src/ui/app.py`, the `pay` line in the Results table build) — should be `$151,661-$228,000` (thousands separators, `$` on both numbers). Small, deferred rather than fixed immediately.
 - **Embed direct LLM API calls in the app, replacing Claude Code orchestration for reasoning tasks — FINAL backlog item, added 2026-07-29**: today, all reasoning (scoring, tailoring, feedback-loop evaluation) runs through Claude Code (this conversation + scheduled tasks), with Streamlit as a thin display/data-entry layer — a deliberate §11 decision, not a limitation of Streamlit itself (any framework has the same non-issue; the real lever is whether the app calls an LLM API directly). Explicitly sequenced LAST, evaluated only once the core loop and other backlog items are settled, because: (1) single-user + evolving requirements + async-acceptable latency + flat-subscription cost all favor the current setup for now, and every one of those signals flips once this goes multi-user (§12's own stated trigger for bigger architecture questions); (2) building the API integration now (separate billing, cost monitoring, rate limiting, error handling) would be complexity spent solving a problem that doesn't exist yet — nothing today is waiting on instant in-app reasoning. When revisited: cost-assess actual API usage volume against the current flat-subscription cost first; prefer the smaller move (direct API calls added to the same Streamlit app) over the larger one (full framework replacement), and only consider replacing Streamlit itself if the trigger is multi-user scale or UI needs Streamlit's component model can't meet — not the API-calling question, which is separable.
+
+## 14. Gmail Call-to-Action Handling (built 2026-07-28 through 2026-07-29)
+
+Full technical detail lives in `docs/email-monitoring-task.md`; this section
+records the product decision and shape for the working spec.
+
+**Problem:** email is where recruiters/ATS systems actually reach Zahir —
+interview invites, offers, rejections, take-home assessments, direct
+questions — mixed into his normal personal inbox (not a dedicated job
+mailbox). Missing or forgetting to act on one of these costs more than a
+missed job listing. §9's results-driven UI doesn't see any of this unless
+it's explicitly wired in.
+
+**Shape, in three layers:**
+1. **Scan** (`panga-gmail-cta-scan`, 4x/day) — reads Zahir's inbox, classifies
+   each new thread, and applies Gmail labels for state (no database). Also
+   tries to auto-match "application received" confirmations to a specific
+   `applications` row (§4) via `applications.suggest_status()`, so Zahir
+   doesn't have to remember to mark a job "applied" himself — he still
+   confirms every suggestion.
+2. **Dashboard mirror** — call-to-action emails are written to a local JSON
+   store (`src/tailoring/cta_emails.py`) and shown on a dedicated **Call to
+   Action** page in the Streamlit UI (§9), grouped by category, so Zahir has
+   one place to work through everything instead of hunting through his inbox
+   for a `Panga/Call-to-Action` label.
+3. **Fulfillment loop** (`panga-cta-fulfillment`, every 10 min) — executes
+   what Zahir clicks on that page. **Dismiss** archives the email in Gmail
+   and labels it `Panga/Handled`. **Draft reply** has Claude compose a real
+   Gmail draft tailored to the email (category + content), created via the
+   Gmail connector but **never auto-sent** — Zahir reviews and sends it
+   himself, same "prepare but don't submit" principle as §2's application
+   packages. The loop also runs in reverse: once Zahir sends a draft it
+   created, it notices (by checking Gmail's live Drafts list) and clears that
+   item from the dashboard automatically, so he never has to remember to come
+   back and mark it done.
+
+**Deliberate constraint carried over from §2/§3:** Panga never sends anything
+without a human in the loop. The scan task only reads and labels; drafting
+only happens because Zahir explicitly clicked a button, and even then a
+draft just waits in Gmail until he sends it himself.
+
+**Known limits:** both tasks require the Claude app to be open to run. The
+dashboard has no live Gmail access of its own (Streamlit can't reach MCP
+connectors) — it only ever reflects what the fulfillment task last wrote, so
+there's up to a ~10-minute lag between clicking a button and seeing it
+resolved, never truly instant.
