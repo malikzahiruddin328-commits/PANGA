@@ -466,7 +466,7 @@ elif active_tab == "results":
 
                 b2, b3 = st.columns(2)
                 with b2:
-                    if status == "applied":
+                    if status in ("applied", "interview scheduled"):
                         if st.button("Prep for interview", key=f"prep_results_{job.get('source')}_{job.get('job_id')}"):
                             go_to_prep({
                                 "kind": "job",
@@ -477,7 +477,7 @@ elif active_tab == "results":
                 with b3:
                     new_status = st.selectbox(
                         "Mark status",
-                        ["-", "applied", "not interested", "save for later"],
+                        ["-", "applied", "interview scheduled", "offer", "rejected", "not interested", "save for later"],
                         key=f"status_{job.get('source')}_{job.get('job_id')}",
                     )
                     if new_status != "-":

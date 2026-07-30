@@ -44,7 +44,7 @@ This needs to be **industry-agnostic and ever-growing**, not hardcoded to pharma
 - **`user_profile`** — parsed resume + all confirmed gap-interview answers (the master profile)
 - **`user_profile_skills`** — join of user_profile to role_skills, with the *detailed* qualifying answer attached (not just a checkbox)
 - **`jobs`** — scraped/sourced listings (board + company-site origin tagged)
-- **`applications`** — tailored package per job + status (drafted, reviewed, submitted-by-user, not-interested, save-for-later) + optional skip-reason text when status is not-interested (feeds §13 feedback loop)
+- **`applications`** — tailored package per job + status. Shipped status values (`src/tailoring/applications.py`): "under review", "applied", "interview scheduled", "offer", "rejected" (last three added 2026-07-30, see §16c), "not interested", "save for later" + optional skip-reason text when status is not-interested (feeds §13 feedback loop)
 
 Mechanism for populating `role_skills`: reasoned out (via search/LLM) at the time a new role/industry is first encountered, then persisted — so the system doesn't re-derive it from scratch every time, but keeps refining as more users/roles are added.
 
@@ -115,7 +115,9 @@ Not a script — a simple results-driven interface (built with Streamlit, opens 
 | Retained executive search firm outreach | Surfaced to user | N/A | Not automatable (confidential firm-side search); already flagged to user once per his request, his call on timing. |
 | UI polish: pay column formatting | Not started | 0% | `$151661-228000` should render as `$151,661-$228,000`. Small, deferred. |
 | Direct LLM API integration (replace Claude Code orchestration) | Deliberately deferred | 0% | Sequenced last on purpose — revisit only at multi-user scale (§12 trigger), not before. |
-| **Prospector** — personal marketing/sales-funnel layer (KPIs, rejection-pattern diagnosis, proactive FDA/ClinicalTrials/PubMed-based company targeting, strategy-tagging/learning loop) | Named, design not started | 0% | Added 2026-07-29. Reframes the project from job-matching/coverage to a full Prospect→Research→Outreach→Application→Response→Outcome→Learn lifecycle. `target_accounts` data model planned, parallel to `jobs`/`applications`. Claude drafts outreach content; user always sends it himself. |
+| **Prospector** — personal marketing/sales-funnel layer (KPIs, rejection-pattern diagnosis, proactive FDA/ClinicalTrials/PubMed-based company targeting, strategy-tagging/learning loop) | Designed, not built | 0% | Added 2026-07-29, designed 2026-07-30 — see §16 for the full design (data models, signal sources, UI placement, build sequencing), including LinkedIn-connections contact sourcing (§16b). |
+| **Learn Engine** — cross-cutting feedback loop over every prediction/outcome pair in Panga (scoring, cadence, target accounts, outreach, strategy tags, LinkedIn edits, interview prep) | Designed, not built | 0% | Added 2026-07-30, generalized from Prospector's Learn stage (§16d) at Zahir's request — see §17. Recommend-only, never auto-applies changes (confirmed 2026-07-30). |
+| Application status lifecycle extension (interview scheduled / offer / rejected) | Built | 100% | 2026-07-30. Prerequisite identified while scoping Prospector's KPI dashboard (§16c) — without real interview/offer/rejection outcomes, "interview rate"/"rejection rate" would have nothing to compute from. `suggest_status()`/`confirm_status_suggestion()` in `applications.py` were already generic (no code change needed there); what changed: the "Mark status" dropdown in `src/ui/app.py` now offers the 3 new values, "Prep for interview" now shows for "interview scheduled" too (not just "applied"), and `panga-gmail-cta-scan`'s SKILL.md gained step 3C — the scan already classified emails into rejection/interview_request/offer/assessment_request/recruiter_question (for the dashboard mirror, §14) but never matched rejection/interview/offer against a specific application to suggest a status change; now it does, same confidence bar and confirm-don't-guess rule as the existing "applied" matching. |
 | LinkedIn manual job intake + document checklist | Built | 100% | 2026-07-30. Since LinkedIn has no public jobs API and blocks scraping/bot logins (ToS), the user browses LinkedIn himself and hands Claude a posting URL directly in conversation instead of an automated search channel finding it. `search/job_store.add_manual_job()` creates the job record (`source="linkedin"`, job_id parsed from the LinkedIn `/jobs/view/<id>/` URL pattern so re-pasting the same posting dedupes correctly even with different tracking params); if the URL can't be read (login wall/bot-check), Claude asks the user to paste the job description text instead — either way the description is captured at intake time rather than re-fetched later, unlike other channels. `tailoring/applications.py` gained `exec_bio_text`/`leadership_summary_text` (two new senior-exec-specific document types, alongside the existing resume/cover letter, fully tailored per job — not a single reused core version) and a `documents_requested` list. The Results tab's per-job detail panel (`ui/app.py`) replaced the old single "Start tailoring" button with 4 checkboxes + a "Request documents" button (applies to every job source, not just LinkedIn) plus expanders showing already-drafted document text in a copyable block, matching the pattern used for LinkedIn profile suggestions. Verified live: app loads clean, a real manually-added job correctly appeared as its own dynamically-grouped "linkedin" channel section with no code changes needed for that grouping. The checkbox/button click path itself was verified against the exact data layer it calls (`upsert_application`/`get_application`) rather than by mouse click — the Browser pane couldn't visually composite in this session (screenshot/canvas-click unavailable), so genuine mouse-driven row-selection in the dataframe grid wasn't possible; worth a quick manual click-through next time the app is open normally to confirm the on-screen behavior matches. |
 
 **Already fully built (for reference, not backlog):** resume ingestion, gap-probing interview, USAJOBS/ZipRecruiter/Dice/Indeed search, company-site search via Workday/SmartRecruiters ATS APIs, tailoring context bundling, applications tracking, Streamlit Results UI with per-channel tables, compatibility scoring, daily scheduled search+score task, desktop shortcut, Gmail call-to-action monitoring (full version, see §14), encryption at rest for `data/` plus its key-recovery flow (see §7/§15, `docs/encryption-at-rest.md`).
@@ -240,3 +242,255 @@ decrypt the existing files.
 account/profile — there's nothing to recover from that regardless. See
 `docs/encryption-at-rest.md` for full detail including how this was
 verified.
+
+## 16. Prospector — Personal Marketing / Sales-Funnel Layer (Design, 2026-07-30)
+
+Reframes Panga from a job-matching tool into a full sales-funnel-style
+lifecycle: **Prospect → Research → Outreach → Application → Response →
+Outcome → Learn.** The middle three stages (Research, Application, Response)
+are already built (§4/§9/§14) and unchanged by this design. Prospector adds
+or upgrades four stages, detailed below. Zahir confirmed scope 2026-07-30:
+build all four pieces, and all four candidate signal types for company
+targeting (§16a) — no scope was cut.
+
+**Deliberate constraint, unchanged from the rest of Panga:** nothing is ever
+sent, submitted, or contacted automatically. Claude drafts; Zahir sends.
+This applies to outreach messages (§16b) exactly as it already applies to
+application packages (§2/§9) and Gmail replies (§14).
+
+### 16a. Target Accounts (Prospect stage)
+
+New data model, `target_accounts` — parallel to `jobs`, but for companies
+worth watching *before* they've posted a role. Same store pattern as the
+other tables (JSON, encrypted at rest via `security.crypto_store`, §7/§15).
+
+Fields (draft): `company_name`, `industry`, `status` (watching / qualified /
+contacted / stale / disqualified), `signals` (a list of `{signal_type,
+source, detail, date_observed}`), `notes`. No fit-score formula yet — start
+simple (see qualification rule below) and refine once there's real signal
+data to look at, same approach used for job compatibility scoring (§9).
+
+**Four signal types, all in scope, roughly in build order (cheapest/most
+proven first):**
+
+1. **Late-stage trial progress** — Phase 3 trials completing, or with
+   recent results posted, on ClinicalTrials.gov. Source: the already-
+   connected ClinicalTrials.gov MCP connector (`search_by_sponsor`,
+   `search_trials` filtered by phase/status) — reuse it rather than write a
+   new HTTP client, same principle as reusing ZipRecruiter/Dice/Indeed as
+   connectors instead of scraping them (§4b, "Channel expansion").
+2. **Regulatory filing activity** — NDA/BLA submissions or status changes
+   in openFDA. Source: extend `src/search/company_sites.py`, which already
+   pulls openFDA sponsor data for a different purpose (§4c) — same API,
+   new query shape.
+3. **Commercial-build hiring elsewhere** — the company posting roles like
+   VP Commercial, Market Access, or Commercial Operations on the job boards
+   Panga already searches (§4b/§4c). This isn't a new external source at
+   all — it's a new *lens* over jobs Panga is already ingesting: tag a job
+   as a signal about its posting company, separate from scoring it as a fit
+   for Zahir.
+4. **Funding or IPO activity** — no existing source covers this. Needs
+   source research before it's buildable (candidates to evaluate when this
+   signal is picked up: SEC EDGAR filings for S-1/IPO activity, which is
+   free and public; general web search as a live, reasoning-driven v0
+   mechanism — same "Claude reasons live, Python just stores the result"
+   split as tailoring/scoring — rather than standing up a paid data feed).
+
+**Qualification rule (v0, expected to be revised once tested):** 1 signal
+= `watching`, 2+ signals = `qualified`. Deliberately simple to start, same
+spirit as the original job-priority weighting (§9) and compatibility
+scoring (§9/79fd4c3) — both started crude and were tuned against real
+results rather than designed perfectly upfront.
+
+### 16b. Outreach (new funnel stage)
+
+New data model, `outreach`, linked to *either* a `job_id` or a
+`target_account_id` (at least one required, not both necessarily) — outreach
+can happen against a posted job (e.g. contacting the hiring manager) or a
+target account with no posting yet at all.
+
+Fields (draft): `contact_name`, `contact_title`, `channel` (email / LinkedIn
+/ phone / in-person), `status` (drafted / sent / responded / no-response),
+`sent_date`, `content` (the drafted text), `strategy_tag` (§16d).
+
+**Mechanism:** for email outreach specifically, reuse the Gmail-draft
+mechanism already built for CTA fulfillment (§14, `create_draft` via the
+Gmail connector) rather than building a second drafting pathway — same
+"prepare but don't submit" rule, same connector, different trigger. For
+LinkedIn/phone/in-person, Panga logs the outreach record (so it counts
+toward KPIs/learning) but can't draft or send on those channels itself.
+
+**Contact sourcing — LinkedIn connections (added 2026-07-30, Zahir's
+suggestion):** the open question in the above design was *who* to log
+outreach against in the first place. Answer: cross-reference Zahir's
+existing LinkedIn network. LinkedIn has no API and blocks scraping/login
+automation, so this uses the same manual-export pattern already proven for
+his profile PDF and job postings (§13) — Settings → Data Privacy → "Get a
+copy of your data" → Connections, which produces a CSV (name, company,
+position, connected-on date). Zahir uploads it once (and refreshes
+periodically) via the existing LinkedIn page in `src/ui/app.py`, alongside
+the profile-PDF uploader. New sibling module to `src/linkedin/ingest.py`
+parses the CSV and stores connection rows through `security.crypto_store`
+like every other store (§7/§15) — this is PII about other people, not just
+Zahir.
+
+Two things get flagged automatically, not hand-searched by Zahir:
+1. **Recruiter-titled connections** — keyword match on the position column
+   (recruiter, talent acquisition, executive search, headhunter, etc.).
+2. **Connections at a `target_account`** — company name cross-referenced
+   against §16a's list, case-insensitive/fuzzy match.
+
+Either flag surfaces the connection as a **suggested contact** when Zahir
+starts logging outreach against a job or target account, pre-filling
+`contact_name`/`contact_title` instead of him having to remember who he
+knows there. This is a sourcing/suggestion layer only — it doesn't change
+the "Claude drafts, Zahir sends" rule above.
+
+### 16c. KPI Layer + Rejection-Pattern Diagnosis (Outcome stage)
+
+Both read existing data — no new store beyond §16a/§16b's additions.
+
+**KPI dashboard:** computed, not stored — Coverage (jobs found, target
+accounts identified, per week/channel), Activity (applications submitted,
+outreach sent, per week), Outcome (response rate, interview rate, offer
+rate, rejection rate — sliceable by channel/role/score-band). **Dependency
+resolved 2026-07-30:** these Outcome rates need `applications.status` to
+actually distinguish interview/offer/rejected, not just applied — see the
+"Application status lifecycle extension" backlog row (§13), built the same
+day this was identified as a blocker for building the dashboard itself.
+
+**Rejection-pattern diagnosis:** an on-demand pass (a button, not a
+scheduled task — this needs Zahir to actually read and react to it, unlike
+the daily search task) over rejected/no-response applications, looking for
+clustering by score band, channel, role type, or recorded skip-reasons.
+This is a direct extension of the already-built "non-applied-job feedback
+loop" (§13) — same live-reasoning mechanism, wider input (rejections too,
+not just self-marked "not interested"), and it produces a plain-language
+write-up + suggested adjustments rather than a raw count.
+
+**What changed 2026-07-30:** this diagnosis pass is now one input into the
+cross-cutting **Learn Engine (§17)** rather than a standalone analysis —
+its output (patterns among applications) gets joined with patterns from
+target accounts, outreach, search cadence, LinkedIn, and interview prep,
+instead of living in isolation. The KPI dashboard above is unaffected —
+it's a straightforward display of existing numbers, not an analysis pass.
+
+### 16d. Learning Loop (Learn stage) — generalized into §17
+
+`strategy_tags` — short tags attached to an application or outreach record
+at drafting time (e.g. `concise-1-page`, `leadership-narrative-focus`,
+`warm-intro-mentioned`). No upfront taxonomy needed: Claude suggests a tag
+based on what's actually different about *this* draft versus past ones,
+Zahir confirms or edits it — same confirm-don't-guess pattern as the
+gap-probing interview (§3) and skip-reason review (§13). This tagging
+mechanism stays local to applications/outreach as described here.
+
+**What changed 2026-07-30:** Zahir asked for the *analysis* side of Learn
+(not this tagging step) to stop being Prospector-only and become an
+overarching engine reading across all of Panga, not just
+applications/outreach outcomes. §16c's rejection diagnosis and this
+section's strategy-tag correlation are both absorbed into that single
+cross-cutting mechanism — see **§17, Learn Engine** — rather than being
+three separate analysis passes bolted onto different tables.
+
+### UI placement
+
+New **"Prospector" tab** in the Streamlit sidebar, alongside Results / Call
+to Action / Settings — target accounts list, the outreach log, and the KPI
+dashboard all live there. Mirrors how Call to Action (§14) got its own tab
+rather than being folded into Results; the same reasoning applies here —
+this is a genuinely different mode of work (proactive targeting, not
+reacting to a posted job), not a variation on the existing Results screen.
+
+### Proposed build sequencing
+
+Ordered by dependency + fastest-to-value, not by the order listed above:
+
+1. KPI dashboard (§16c) — 100% existing data, no new integration.
+2. Rejection-pattern diagnosis (§16c) — same.
+3. `target_accounts` + late-stage-trial signal (§16a.1) — connector already
+   available.
+4. `target_accounts` + regulatory-filing signal (§16a.2) — API already
+   integrated elsewhere.
+5. `target_accounts` + commercial-hiring signal (§16a.3) — reuses existing
+   job data, no new source.
+6. Outreach logging + drafting (§16b), including the LinkedIn-connections
+   contact-sourcing layer — needs `jobs`/`target_accounts` to link against,
+   so it naturally follows them.
+7. `target_accounts` + funding/IPO signal (§16a.4) — needs source research
+   first (see above).
+8. Strategy tagging (§16d) + the cross-cutting **Learn Engine (§17)** —
+   needs outreach + applications records to tag, and benefits from every
+   other subsystem above having real usage history, so it's last by
+   construction.
+
+This surfaces value early (KPIs and diagnosis on data already in hand)
+while working toward the flagship proactive-targeting piece that motivated
+the Prospector name in the first place.
+
+## 17. Learn Engine — Cross-Cutting Feedback Loop (Design, 2026-07-30)
+
+**What changed:** Learn started as one Prospector funnel stage (§16d),
+scoped to correlating strategy tags with application/outreach outcomes.
+Zahir asked to broaden it: every part of Panga that makes a prediction or a
+judgment call should feed the *same* feedback loop, not just Prospector's
+own new tables. This section replaces §16c/§16d's analysis pieces with one
+mechanism spanning the whole app.
+
+**No new mandatory logging table.** Rather than adding a universal
+"decisions" ledger that every module has to remember to write to (real
+abstraction cost for a non-developer-maintained codebase, and a departure
+from how every other Panga feature was built — see the general
+no-premature-abstraction principle in `CLAUDE.md`), the Learn Engine reads
+the *prediction* and the *outcome* each subsystem already stores in its own
+natural place:
+
+| Subsystem | "Decision" it already records | "Outcome" it already records |
+|---|---|---|
+| Compatibility scoring (§9) | `jobs.fit_score` | `applications.status` (applied → interview → offer/rejected) |
+| Search channels/cadence (§8) | which channels searched, how often | new-listings-found-per-run, cost-per-run (§8 already planned tracking this) |
+| Target-account qualification (§16a) | `target_accounts.signals` / `status` | whether that company later posts a real job Zahir applies to |
+| Outreach (§16b) | `channel`, cold vs. LinkedIn-connection-sourced contact | `outreach.status` (responded / no-response) |
+| Strategy tags (§16d) | `strategy_tag` on an application/outreach record | that record's downstream outcome |
+| LinkedIn profile (§13) | which suggested edits Zahir accepted vs. dismissed | recruiter contact rate after the edit (self-reported/observed) |
+| Interview prep (§13) | persona/question approach used for a round | how the interview actually went (a lightweight optional "how did it go?" field to add to `interview_prep.py`, since this outcome can only ever be self-reported) |
+
+**Mechanism:** an on-demand reasoning pass — not scheduled, since (like
+rejection diagnosis) it needs Zahir to read and react, not just receive a
+silent notification. Claude reads across the tables above, joins decisions
+to outcomes, and looks for patterns a single-table view can't show — e.g.
+"jobs scored 70+ get interviews at 3x the rate of 30–49, the default
+30-point display threshold may be hiding a lot of noise," or "warm-intro
+outreach sourced from your LinkedIn connections gets responses 4x more
+than cold outreach — worth prioritizing," or "the funding/IPO signal type
+has never once led to a real application — not yet worth the build effort
+it'd take." Output format matches what Zahir already asked for in the
+skip-reason feedback loop (§13): plain-language findings, then "Option 1
+(Recommended) + description, Option 2, Option 3..." — never a raw dashboard
+of numbers with no interpretation.
+
+**Autonomy boundary (confirmed 2026-07-30):** the Learn Engine only ever
+recommends — it never changes a score threshold, search weighting,
+qualification rule, or anything else on its own. Zahir confirms every
+change, same rule as every other judgment call in Panga (skip-reason
+review, rejection diagnosis, CTA drafting). This was a deliberate choice
+over letting it auto-tune mechanical parameters like §8's search cadence,
+to keep exactly one trust model across the whole app rather than a
+patchwork of which parts are allowed to self-adjust.
+
+**Expect thin output early.** Like `role_skills` (§4, "grows over time as
+new roles/industries are encountered"), the Learn Engine needs enough
+decision-outcome pairs before a pattern is more than noise. Early runs may
+legitimately say "not enough data yet on X" rather than force a finding —
+that's correct behavior, not a bug, and shouldn't be read as the feature
+being broken.
+
+**UI placement:** lives inside the existing **Prospector tab** (§16) as an
+"Insights" or "Learn" section with a "Run analysis" button, even though the
+data it reads spans the whole app, not just Prospector's own tables — it
+doesn't need a separate tab of its own, since it's a report-and-recommend
+tool rather than something used moment-to-moment.
+
+**Build sequencing:** last, by construction — it needs real outcome
+history from scoring, target accounts, and outreach to have anything to
+say. Folded into build step 8 above, not a separate step.

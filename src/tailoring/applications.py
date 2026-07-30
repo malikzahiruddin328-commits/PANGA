@@ -3,7 +3,15 @@ per job the user has started tailoring or set a status on. Status values in
 practice: "under review" (set automatically by "Start tailoring" - the app
 has no way to know a job was actually submitted), "applied" (the user
 confirms this themselves, or accepts a suggestion below), "not interested",
-"save for later". Encrypted at rest (PRD §7) via security.crypto_store.
+"save for later", plus three added 2026-07-30 (PRD §16c/§17 - needed so the
+Prospector KPI dashboard and Learn Engine have real outcomes to compute
+rates from, not just applied/not-interested): "interview scheduled",
+"offer", "rejected". All are free-form strings, not an enforced enum -
+suggest_status()/confirm_status_suggestion() below accept any status value,
+so adding these required no code change here, only in the Gmail scan
+(panga-gmail-cta-scan) that proposes them and the Streamlit dropdown that
+lets Zahir set them manually. Encrypted at rest (PRD §7) via
+security.crypto_store.
 """
 
 from pathlib import Path
