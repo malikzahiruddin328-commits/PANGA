@@ -558,9 +558,9 @@ elif active_tab == "results":
 elif active_tab == "prospector":
     st.header("Prospector")
     st.caption(
-        "Companies worth watching before they've posted a role, plus coverage/activity/outcome "
-        "numbers from your job search so far. Outreach logging and the Learn Engine (PRD §16b/§17) "
-        "aren't built yet."
+        "Companies worth watching before they've posted a role, outreach logging, plus "
+        "coverage/activity/outcome numbers from your job search so far. The Learn Engine (PRD §17) "
+        "isn't built yet."
     )
 
     settings = load_settings()
