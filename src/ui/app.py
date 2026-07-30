@@ -21,6 +21,7 @@ visible no matter which tab is open.
 """
 
 import sys
+from datetime import datetime
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -36,6 +37,9 @@ from ranking.prioritize import weight_for
 from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
 from tailoring.interview_prep import load_interview_prep
+from linkedin.storage import load_linkedin_profile, save_snapshot, mark_suggestion_status, get_active_suggestions, SECTIONS as LINKEDIN_SECTIONS
+from linkedin.ingest import extract_text_from_pdf
+from security.crypto_store import has_recovery_code, generate_recovery_code
 
 CATEGORY_LABELS = {
     "rejection": "Rejection",
@@ -48,6 +52,14 @@ CATEGORY_LABELS = {
 # that gain from a fast reply (offers, interviews), rejections last since
 # they only need a short acknowledgment, not urgency.
 CATEGORY_ORDER = ["offer", "interview_request", "assessment_request", "recruiter_question", "rejection"]
+
+LINKEDIN_SECTION_LABELS = {
+    "headline": "Headline",
+    "about": "About / Summary",
+    "experience": "Experience",
+    "skills": "Skills",
+    "certifications": "Certifications",
+}
 
 SETTINGS_PATH = PROJECT_ROOT / "config" / "settings.yaml"
 
@@ -127,6 +139,7 @@ TABS = [
     ("cta", f"Call to action ({cta_count})" if cta_count else "Call to action"),
     ("results", f"Results ({results_count})"),
     ("prep", f"Interview prep ({prep_in_progress_count})" if prep_in_progress_count else "Interview prep"),
+    ("linkedin", "LinkedIn"),
     ("settings", "Settings"),
 ]
 tab_cols = st.columns(len(TABS))
@@ -175,6 +188,38 @@ if active_tab == "settings":
         settings["usajobs_job_series"] = [line.strip() for line in job_series_text.splitlines() if line.strip()]
         save_settings(settings)
         st.success("Saved.")
+
+    st.divider()
+    st.header("Data Recovery")
+    st.caption(
+        "Your resume, job history, and applications are encrypted on this "
+        "computer using a key stored in this Windows account - not a "
+        "password you type in. If this Windows account/profile is ever "
+        "lost, or this data is moved to a new computer, that key goes with "
+        "it and there's normally no way back in. A recovery code fixes "
+        "that: generate one below, and it'll let you regain access without "
+        "the original key."
+    )
+
+    if has_recovery_code():
+        st.caption("A recovery code already exists for this data. Generating a new one below replaces it - the old code stops working.")
+    else:
+        st.caption("No recovery code has been generated yet - your data has no recovery path if this Windows account is lost.")
+
+    if st.button("Generate recovery code"):
+        st.session_state["new_recovery_code"] = generate_recovery_code()
+
+    if st.session_state.get("new_recovery_code"):
+        st.warning(
+            "Write this down now and save it somewhere OTHER than this "
+            "computer - a password manager on your phone, or printed and "
+            "filed away. It will not be shown again after you leave this "
+            "page."
+        )
+        st.code(st.session_state["new_recovery_code"], language=None)
+        if st.button("I've saved this somewhere safe"):
+            del st.session_state["new_recovery_code"]
+            st.rerun()
 
 elif active_tab == "cta":
     st.header("Call to Action")
@@ -471,3 +516,75 @@ elif active_tab == "prep":
                     for q in round_["questions_to_ask"]:
                         best_for = f" (best for {q['best_for']})" if q.get("best_for") else ""
                         st.markdown(f"- {q.get('question')}{best_for}")
+
+elif active_tab == "linkedin":
+    st.header("LinkedIn Profile Enhancement")
+    st.caption(
+        "Upload a PDF export of your current LinkedIn profile below - either "
+        "LinkedIn's own \"Save to PDF\" (from your profile page: click \"More\" "
+        "under your name, then \"Save to PDF\"), or a browser print-to-PDF of "
+        "the profile page. Both are things you export yourself from your own "
+        "logged-in session - Panga never logs into LinkedIn, scrapes it, or "
+        "posts anything there itself. Then go to Claude Code and ask to "
+        "analyze/enhance your LinkedIn profile - that's where the comparison "
+        "against your master profile and target-role skills happens, and "
+        "where suggested rewrites get drafted. Suggestions below are yours to "
+        "copy and paste into LinkedIn's own edit screens."
+    )
+
+    linkedin_data = load_linkedin_profile()
+
+    uploaded_files = st.file_uploader(
+        "LinkedIn profile PDF(s)", type=["pdf"], accept_multiple_files=True,
+        help="You can upload one file or several (e.g. the LinkedIn export and a printed profile page) - text from all of them is combined.",
+    )
+
+    if st.button("Save profile", type="primary", disabled=not uploaded_files):
+        parts = []
+        source_files = []
+        for f in uploaded_files:
+            text = extract_text_from_pdf(f)
+            parts.append(f"--- {f.name} ---\n{text}")
+            source_files.append(f.name)
+        save_snapshot("\n\n".join(parts), source_files, saved_at=datetime.now().isoformat(timespec="seconds"))
+        st.success("Saved. Go to Claude Code and ask to analyze/enhance your LinkedIn profile.")
+        st.rerun()
+
+    if linkedin_data.get("last_saved"):
+        st.caption(f"Last saved: {linkedin_data['last_saved']} (from {', '.join(linkedin_data.get('source_files', []))})")
+
+    st.divider()
+
+    if linkedin_data.get("last_analyzed"):
+        score = linkedin_data.get("profile_strength_score")
+        if score is not None:
+            st.metric("Profile strength", f"{score}/100")
+            if linkedin_data.get("profile_strength_rationale"):
+                st.caption(linkedin_data["profile_strength_rationale"])
+        st.caption(f"Last analyzed: {linkedin_data['last_analyzed']}")
+
+        active_suggestions = get_active_suggestions()
+        if not active_suggestions:
+            st.caption("No open suggestions - everything's either applied or dismissed.")
+        for section in LINKEDIN_SECTIONS:
+            section_suggestions = [s for s in active_suggestions if s["section"] == section]
+            if not section_suggestions:
+                continue
+            st.subheader(LINKEDIN_SECTION_LABELS[section])
+            for s in section_suggestions:
+                if s.get("rationale"):
+                    st.caption(s["rationale"])
+                st.markdown("Suggested text (copy this into LinkedIn):")
+                st.code(s["suggested_text"], language=None)
+                b1, b2 = st.columns([1, 1])
+                with b1:
+                    if st.button("Mark updated on LinkedIn", key=f"applied_{s['id']}"):
+                        mark_suggestion_status(s["id"], "applied")
+                        st.rerun()
+                with b2:
+                    if st.button("Dismiss", key=f"dismissed_{s['id']}"):
+                        mark_suggestion_status(s["id"], "dismissed")
+                        st.rerun()
+                st.divider()
+    else:
+        st.caption("Not yet analyzed - upload your profile PDF(s) above, save, then ask Claude to analyze it.")
