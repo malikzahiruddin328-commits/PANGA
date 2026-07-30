@@ -23,7 +23,19 @@ from search.usajobs import search_jobs, USAJobsNotConfigured
 from search.job_store import load_jobs
 from ranking.prioritize import weight_for
 from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion
-from tailoring.cta_emails import get_active_cta_emails, dismiss_cta_email
+from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
+
+CATEGORY_LABELS = {
+    "rejection": "Rejection",
+    "interview_request": "Interview request",
+    "assessment_request": "Assessment / take-home task",
+    "offer": "Offer",
+    "recruiter_question": "Recruiter question",
+}
+# Order sections appear in on the Call to Action page - lead with the ones
+# that gain from a fast reply (offers, interviews), rejections last since
+# they only need a short acknowledgment, not urgency.
+CATEGORY_ORDER = ["offer", "interview_request", "assessment_request", "recruiter_question", "rejection"]
 
 SETTINGS_PATH = PROJECT_ROOT / "config" / "settings.yaml"
 
@@ -45,7 +57,9 @@ def application_status(job: dict) -> str | None:
 
 st.title("Panga - Job Search")
 
-page = st.sidebar.radio("View", ["Results", "Settings"])
+cta_count = len(get_active_cta_emails())
+cta_page_label = f"Call to Action ({cta_count})" if cta_count else "Call to Action"
+page = st.sidebar.radio("View", ["Results", cta_page_label, "Settings"])
 
 if page == "Settings":
     st.header("Target roles and industries")
@@ -84,33 +98,85 @@ if page == "Settings":
         save_settings(settings)
         st.success("Saved.")
 
-else:
-    settings = load_settings()
+elif page.startswith("Call to Action"):
+    st.header("Call to Action")
+    st.caption("Emails the Gmail scan flagged as needing a reply or a decision.")
 
-    cta_emails = get_active_cta_emails()
-    if cta_emails:
-        st.warning(f"{len(cta_emails)} email(s) from your inbox need attention (found by the Gmail scan).")
-        CATEGORY_LABELS = {
-            "rejection": "Rejection",
-            "interview_request": "Interview request",
-            "assessment_request": "Assessment / take-home task",
-            "offer": "Offer",
-            "recruiter_question": "Recruiter question",
-        }
-        for email in cta_emails:
-            label = CATEGORY_LABELS.get(email.get("category"), email.get("category") or "")
-            st.markdown(f"**{label}** - {email.get('subject')}")
+    r1, r2 = st.columns([1, 5])
+    with r1:
+        if st.button("Refresh"):
+            st.rerun()
+
+    # A background task (panga-cta-fulfillment, runs every ~10 min while the
+    # app is open) does the actual Gmail work behind Dismiss/Draft reply, and
+    # checks whether drafts it created have since been sent. Refresh just
+    # re-reads that outcome from disk - it can't reach Gmail live itself
+    # (Streamlit has no MCP/Claude access) - so this always shows the picture
+    # as of the last fulfillment run, not the literal instant you click.
+    outstanding_drafts = get_awaiting_draft_send()
+    if outstanding_drafts:
+        st.info(f"{len(outstanding_drafts)} draft(s) created and waiting in Gmail for you to review and send. This count updates automatically once you send them - no need to come back and dismiss them yourself.")
+    else:
+        st.caption("No drafts outstanding - everything's either dismissed or sent.")
+
+    all_cta = get_active_cta_emails()
+
+    counts = {cat: sum(1 for e in all_cta if e.get("category") == cat) for cat in CATEGORY_ORDER}
+    stat_cols = st.columns(len(CATEGORY_ORDER))
+    for col, cat in zip(stat_cols, CATEGORY_ORDER):
+        with col:
+            st.metric(CATEGORY_LABELS[cat], counts[cat])
+
+    f1, f2 = st.columns([1, 2])
+    with f1:
+        category_filter = st.selectbox("Category", ["All categories"] + [CATEGORY_LABELS[c] for c in CATEGORY_ORDER])
+    with f2:
+        search_text = st.text_input("Search subject or sender", "")
+
+    filtered = all_cta
+    if category_filter != "All categories":
+        filtered = [e for e in filtered if CATEGORY_LABELS.get(e.get("category")) == category_filter]
+    if search_text.strip():
+        needle = search_text.strip().lower()
+        filtered = [e for e in filtered if needle in (e.get("subject") or "").lower() or needle in (e.get("sender") or "").lower()]
+
+    if not all_cta:
+        st.caption("Nothing needs attention right now.")
+    elif not filtered:
+        st.caption("No matches for that filter/search.")
+
+    for cat in CATEGORY_ORDER:
+        cat_emails = [e for e in filtered if e.get("category") == cat]
+        if not cat_emails:
+            continue
+        st.subheader(CATEGORY_LABELS[cat])
+        for email in cat_emails:
+            st.markdown(f"**{email.get('subject')}**")
             st.caption(f"{email.get('sender')} - {email.get('date')}")
             if email.get("snippet"):
                 st.caption(email["snippet"])
-            e1, e2 = st.columns([1, 1])
-            with e1:
+
+            c1, c2, c3 = st.columns([1, 1, 1])
+            with c1:
                 st.link_button("Open in Gmail", email["gmail_link"], key=f"open_cta_{email['thread_id']}")
-            with e2:
+            with c2:
+                if email.get("draft_created"):
+                    st.link_button("Open draft", email["draft_link"], key=f"draft_link_{email['thread_id']}")
+                elif email.get("draft_requested"):
+                    st.button("Draft requested...", key=f"draft_pending_{email['thread_id']}", disabled=True)
+                else:
+                    if st.button("Draft reply", key=f"draft_cta_{email['thread_id']}"):
+                        request_draft(email["thread_id"])
+                        st.success("Draft requested - will be created in Gmail on the next scan run.")
+                        st.rerun()
+            with c3:
                 if st.button("Dismiss", key=f"dismiss_cta_{email['thread_id']}"):
-                    dismiss_cta_email(email["thread_id"])
+                    request_archive(email["thread_id"])
                     st.rerun()
             st.divider()
+
+elif page == "Results":
+    settings = load_settings()
 
     pending_suggestions = get_pending_status_suggestions()
     if pending_suggestions:
