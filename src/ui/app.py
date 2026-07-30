@@ -37,6 +37,7 @@ from ranking.prioritize import weight_for
 from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
 from tailoring.interview_prep import load_interview_prep
+from prospector.kpis import coverage_summary, activity_summary, outcome_summary
 from linkedin.storage import load_linkedin_profile, save_snapshot, mark_suggestion_status, get_active_suggestions, SECTIONS as LINKEDIN_SECTIONS
 from linkedin.ingest import extract_text_from_pdf
 from security.crypto_store import has_recovery_code, generate_recovery_code
@@ -138,6 +139,7 @@ if pending_suggestions or outstanding_drafts:
 TABS = [
     ("cta", f"Call to action ({cta_count})" if cta_count else "Call to action"),
     ("results", f"Results ({results_count})"),
+    ("prospector", "Prospector"),
     ("prep", f"Interview prep ({prep_in_progress_count})" if prep_in_progress_count else "Interview prep"),
     ("linkedin", "LinkedIn"),
     ("settings", "Settings"),
@@ -488,6 +490,83 @@ elif active_tab == "results":
                             upsert_application(job["source"], job["job_id"], status=new_status, skip_reason=skip_reason)
                             st.success("Status saved.")
                             st.rerun()
+
+elif active_tab == "prospector":
+    st.header("Prospector")
+    st.caption(
+        "Coverage, activity, and outcome numbers from your job search so far. "
+        "Target-account tracking, outreach logging, and the Learn Engine (PRD §16/§17) "
+        "aren't built yet - this is the first piece."
+    )
+
+    settings = load_settings()
+    target_roles = settings.get("target_roles", [])
+    applications = load_applications()
+
+    coverage = coverage_summary(jobs)
+    activity = activity_summary(applications)
+    outcome = outcome_summary(applications, jobs, target_roles)
+
+    st.subheader("Coverage")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Jobs found (total)", coverage["total_jobs"])
+    c2.metric("Added in last 7 days", coverage["added_last_7_days"])
+    c3.metric("Channels", len(coverage["by_channel"]))
+    st.dataframe(
+        pd.DataFrame(sorted(coverage["by_channel"].items()), columns=["Channel", "Jobs"]),
+        hide_index=True, use_container_width=True,
+    )
+    if coverage["untimestamped"]:
+        st.caption(f"{coverage['untimestamped']} job(s) predate 2026-07-30 and have no discovery date, so they're in the total but not the 7-day count.")
+
+    st.subheader("Activity")
+    a1, a2 = st.columns(2)
+    a1.metric("Applications tracked (total)", activity["total_applications"])
+    a2.metric("Started in last 7 days", activity["created_last_7_days"])
+    st.dataframe(
+        pd.DataFrame(sorted(activity["by_status"].items()), columns=["Status", "Count"]),
+        hide_index=True, use_container_width=True,
+    )
+    if activity["untimestamped"]:
+        st.caption(f"{activity['untimestamped']} application(s) predate 2026-07-30 and have no start date, so they're in the total but not the 7-day count.")
+
+    st.subheader("Outcome")
+    st.caption(
+        "Rates are out of applications that reached \"applied\" or later, using each "
+        "application's CURRENT status - an application that was briefly \"interview "
+        "scheduled\" before becoming \"offer\" only counts under offer, not both."
+    )
+    overall = outcome["overall"]
+    if overall["applied"] == 0:
+        st.info("No applications marked \"applied\" yet - rates will show up here once at least one does.")
+    else:
+        o1, o2, o3, o4 = st.columns(4)
+        o1.metric("Response rate", f"{overall['response_rate']:.0%}")
+        o2.metric("Interview rate", f"{overall['interview_rate']:.0%}")
+        o3.metric("Offer rate", f"{overall['offer_rate']:.0%}")
+        o4.metric("Rejection rate", f"{overall['rejection_rate']:.0%}")
+        st.caption(f"Based on {overall['applied']} application(s) that reached \"applied\" or later.")
+
+        def rates_table(by_dimension: dict, dim_label: str) -> pd.DataFrame:
+            rows = []
+            for key, r in sorted(by_dimension.items(), key=lambda kv: str(kv[0])):
+                rows.append({
+                    dim_label: key,
+                    "Applied": r["applied"],
+                    "Response %": r["response_rate"],
+                    "Interview %": r["interview_rate"],
+                    "Offer %": r["offer_rate"],
+                    "Rejection %": r["rejection_rate"],
+                })
+            return pd.DataFrame(rows)
+
+        with st.expander("By channel"):
+            st.dataframe(rates_table(outcome["by_channel"], "Channel"), hide_index=True, use_container_width=True)
+        with st.expander("By fit-score band"):
+            st.dataframe(rates_table(outcome["by_score_band"], "Score band"), hide_index=True, use_container_width=True)
+        with st.expander("By target-role priority weight"):
+            st.caption("Weight comes from Settings > target roles - higher weight roles are the ones you prioritized.")
+            st.dataframe(rates_table(outcome["by_role_weight"], "Priority weight"), hide_index=True, use_container_width=True)
 
 elif active_tab == "prep":
     st.header("Interview Prep")

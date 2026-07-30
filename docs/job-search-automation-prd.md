@@ -115,7 +115,7 @@ Not a script — a simple results-driven interface (built with Streamlit, opens 
 | Retained executive search firm outreach | Surfaced to user | N/A | Not automatable (confidential firm-side search); already flagged to user once per his request, his call on timing. |
 | UI polish: pay column formatting | Not started | 0% | `$151661-228000` should render as `$151,661-$228,000`. Small, deferred. |
 | Direct LLM API integration (replace Claude Code orchestration) | Deliberately deferred | 0% | Sequenced last on purpose — revisit only at multi-user scale (§12 trigger), not before. |
-| **Prospector** — personal marketing/sales-funnel layer (KPIs, rejection-pattern diagnosis, proactive FDA/ClinicalTrials/PubMed-based company targeting, strategy-tagging/learning loop) | Designed, not built | 0% | Added 2026-07-29, designed 2026-07-30 — see §16 for the full design (data models, signal sources, UI placement, build sequencing), including LinkedIn-connections contact sourcing (§16b). |
+| **Prospector** — personal marketing/sales-funnel layer (KPIs, rejection-pattern diagnosis, proactive FDA/ClinicalTrials/PubMed-based company targeting, strategy-tagging/learning loop) | In progress (step 1 of 8 built) | ~12% | Added 2026-07-29, designed 2026-07-30 — see §16 for the full design (data models, signal sources, UI placement, build sequencing), including LinkedIn-connections contact sourcing (§16b). KPI dashboard (§16c, build step 1) built 2026-07-30 — new "Prospector" tab, jobs/applications data only (target accounts/outreach come later). |
 | **Learn Engine** — cross-cutting feedback loop over every prediction/outcome pair in Panga (scoring, cadence, target accounts, outreach, strategy tags, LinkedIn edits, interview prep) | Designed, not built | 0% | Added 2026-07-30, generalized from Prospector's Learn stage (§16d) at Zahir's request — see §17. Recommend-only, never auto-applies changes (confirmed 2026-07-30). |
 | Application status lifecycle extension (interview scheduled / offer / rejected) | Built | 100% | 2026-07-30. Prerequisite identified while scoping Prospector's KPI dashboard (§16c) — without real interview/offer/rejection outcomes, "interview rate"/"rejection rate" would have nothing to compute from. `suggest_status()`/`confirm_status_suggestion()` in `applications.py` were already generic (no code change needed there); what changed: the "Mark status" dropdown in `src/ui/app.py` now offers the 3 new values, "Prep for interview" now shows for "interview scheduled" too (not just "applied"), and `panga-gmail-cta-scan`'s SKILL.md gained step 3C — the scan already classified emails into rejection/interview_request/offer/assessment_request/recruiter_question (for the dashboard mirror, §14) but never matched rejection/interview/offer against a specific application to suggest a status change; now it does, same confidence bar and confirm-don't-guess rule as the existing "applied" matching. |
 | LinkedIn manual job intake + document checklist | Built | 100% | 2026-07-30. Since LinkedIn has no public jobs API and blocks scraping/bot logins (ToS), the user browses LinkedIn himself and hands Claude a posting URL directly in conversation instead of an automated search channel finding it. `search/job_store.add_manual_job()` creates the job record (`source="linkedin"`, job_id parsed from the LinkedIn `/jobs/view/<id>/` URL pattern so re-pasting the same posting dedupes correctly even with different tracking params); if the URL can't be read (login wall/bot-check), Claude asks the user to paste the job description text instead — either way the description is captured at intake time rather than re-fetched later, unlike other channels. `tailoring/applications.py` gained `exec_bio_text`/`leadership_summary_text` (two new senior-exec-specific document types, alongside the existing resume/cover letter, fully tailored per job — not a single reused core version) and a `documents_requested` list. The Results tab's per-job detail panel (`ui/app.py`) replaced the old single "Start tailoring" button with 4 checkboxes + a "Request documents" button (applies to every job source, not just LinkedIn) plus expanders showing already-drafted document text in a copyable block, matching the pattern used for LinkedIn profile suggestions. Verified live: app loads clean, a real manually-added job correctly appeared as its own dynamically-grouped "linkedin" channel section with no code changes needed for that grouping. The checkbox/button click path itself was verified against the exact data layer it calls (`upsert_application`/`get_application`) rather than by mouse click — the Browser pane couldn't visually composite in this session (screenshot/canvas-click unavailable), so genuine mouse-driven row-selection in the dataframe grid wasn't possible; worth a quick manual click-through next time the app is open normally to confirm the on-screen behavior matches. |
@@ -358,6 +358,31 @@ resolved 2026-07-30:** these Outcome rates need `applications.status` to
 actually distinguish interview/offer/rejected, not just applied — see the
 "Application status lifecycle extension" backlog row (§13), built the same
 day this was identified as a blocker for building the dashboard itself.
+
+**Built 2026-07-30 (v1 — jobs/applications only, `src/prospector/kpis.py`
++ new "Prospector" tab in `src/ui/app.py`):** Coverage (total jobs +
+per-channel breakdown) and Activity (total applications + by-status
+breakdown) sections, plus Outcome rates (response/interview/offer/rejection,
+overall and sliced by channel, fit-score band, and target-role priority
+weight via the existing `weight_for()` lookup). Target-accounts and
+outreach counts aren't in the dashboard yet since those tables don't exist
+until §16a/§16b are built — the tab says so explicitly rather than showing
+silent zeros with no explanation.
+
+Two new fields needed first, since neither existed anywhere in the
+codebase: `jobs.date_added` (stamped once, in `job_store.save_jobs()`, only
+for genuinely new records) and `applications.created_at`/
+`status_updated_at` (stamped in `applications.py`'s `upsert_application()`/
+`confirm_status_suggestion()` — `status_updated_at` only bumps on an actual
+status change, not on every call, since e.g. "Request documents" re-sends
+the current status every time). Records that predate 2026-07-30 have
+neither field — counted in totals, excluded from any "last 7 days"/trend
+number, and the dashboard says so rather than silently showing 0. Verified
+via a regression script (synthetic job + application records exercised
+through both timestamp behaviors and all three KPI functions, cleaned up
+via filter-and-resave afterward — real data confirmed unchanged before and
+after) and live against the already-running Streamlit session (hot-reload,
+no console errors, real numbers: 620 jobs, 2 applications, 1 "applied").
 
 **Rejection-pattern diagnosis:** an on-demand pass (a button, not a
 scheduled task — this needs Zahir to actually read and react to it, unlike

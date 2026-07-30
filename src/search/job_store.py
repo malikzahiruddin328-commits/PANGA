@@ -6,6 +6,7 @@ Encrypted at rest (PRD §7) via security.crypto_store.
 
 import hashlib
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 from security.crypto_store import read_json, write_json
@@ -22,7 +23,13 @@ def load_jobs() -> list[dict]:
 
 def save_jobs(new_jobs: list[dict]) -> int:
     """Merges new_jobs into the store, keyed by (source, job_id). Returns the
-    number of genuinely new jobs added (existing ones are left untouched)."""
+    number of genuinely new jobs added (existing ones are left untouched).
+
+    Stamps date_added on genuinely new records only (added 2026-07-30, PRD
+    §16c - the Prospector KPI dashboard needs a discovery timestamp to
+    report "jobs found this week"). Jobs saved before this date have no
+    date_added and are counted in totals but not in any date-based slice -
+    there's no real discovery date to recover for them."""
     existing = load_jobs()
     seen = {(j.get("source"), j.get("job_id")) for j in existing}
 
@@ -31,6 +38,7 @@ def save_jobs(new_jobs: list[dict]) -> int:
         key = (job.get("source"), job.get("job_id"))
         if key in seen:
             continue
+        job.setdefault("date_added", datetime.now(timezone.utc).isoformat())
         existing.append(job)
         seen.add(key)
         added += 1

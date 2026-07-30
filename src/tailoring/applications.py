@@ -10,10 +10,14 @@ rates from, not just applied/not-interested): "interview scheduled",
 suggest_status()/confirm_status_suggestion() below accept any status value,
 so adding these required no code change here, only in the Gmail scan
 (panga-gmail-cta-scan) that proposes them and the Streamlit dropdown that
-lets Zahir set them manually. Encrypted at rest (PRD §7) via
-security.crypto_store.
+lets Zahir set them manually. Records also carry created_at (set once) and
+status_updated_at (bumped only when status actually changes, not on every
+upsert - added 2026-07-30, PRD §16c) so the Prospector KPI dashboard has
+timestamps to slice "activity" by; records created before that date have
+neither field. Encrypted at rest (PRD §7) via security.crypto_store.
 """
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 from security.crypto_store import read_json, write_json
@@ -60,6 +64,8 @@ def upsert_application(
     applications = load_applications()
     for app in applications:
         if app["source"] == source and app["job_id"] == job_id:
+            if app.get("status") != status:
+                app["status_updated_at"] = datetime.now(timezone.utc).isoformat()
             app["status"] = status
             if resume_text is not None:
                 app["resume_text"] = resume_text
@@ -81,6 +87,8 @@ def upsert_application(
         "source": source,
         "job_id": job_id,
         "status": status,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "status_updated_at": datetime.now(timezone.utc).isoformat(),
         "resume_text": resume_text,
         "cover_letter_text": cover_letter_text,
         "exec_bio_text": exec_bio_text,
@@ -131,6 +139,8 @@ def confirm_status_suggestion(source: str, job_id: str, accept: bool) -> None:
     for app in applications:
         if app["source"] == source and app["job_id"] == job_id:
             if accept and app.get("suggested_status"):
+                if app.get("status") != app["suggested_status"]:
+                    app["status_updated_at"] = datetime.now(timezone.utc).isoformat()
                 app["status"] = app["suggested_status"]
             app["suggested_status"] = None
             app["suggested_status_reason"] = None
