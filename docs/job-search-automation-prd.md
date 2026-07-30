@@ -64,9 +64,10 @@ Important build constraint: **not a hands-on developer** (last coded in 2006; ra
 
 ## 7. Data Security / Storage
 - Resume/PII master profile stored in an **encrypted file, local-only, on the user's machine** (no external/support-side copy for now).
-- User sets a passphrase correctly at first setup; this is the only key for now.
-- **Backlog**: real recovery mechanism (e.g. recovery code, or a support-assisted decrypt flow for a future multi-user version) — deferred. For now, losing the passphrase means losing the profile, so this is a real risk to be aware of during v0 use.
-- **v0 kickoff decision (2026-07-27)**: encryption implementation itself is deferred to backlog for this phase (see §13) — `data/` still stays local-only and gitignored (never committed to version history), but the profile file is stored unencrypted at rest for now. Revisit before this leaves this machine or if others gain access to this Windows account.
+- **Built (2026-07-30)**: all of `data/` (master profile, raw resume text, interview answers, job history, applications, CTA emails) is encrypted at rest — AES-256-GCM via `src/security/crypto_store.py`. Full detail in `docs/encryption-at-rest.md`; summary below.
+- **Key model, revised from the original "user passphrase" plan**: the original spec below (a typed passphrase, "the only key for now") turned out to be incompatible with the scheduled tasks built after this section was written (§14, §13's daily search task) — those run unattended, several times a day, with no one present to type anything. Instead, the AES key is a random 256-bit value generated on first use and held in the OS credential store via the `keyring` library (Windows Credential Manager/DPAPI on this machine; Keychain if this ever runs on a Mac) — it unlocks automatically for this Windows login, for both the interactive Streamlit app and unattended scheduled tasks. This protects `data/` if the files are copied off this machine or the disk is stolen/imaged; it does **not** protect against someone else using this same Windows login — narrower than a passphrase would be, but a passphrase model isn't actually usable given the automation already built.
+- **Original plan (superseded by the above):** user sets a passphrase correctly at first setup; this is the only key. Kept here for history — no passphrase exists in the shipped design.
+- **Backlog**: since there's no passphrase in the current design, "passphrase recovery" as originally scoped no longer applies. What *is* still a real risk: losing access to this Windows user account (profile corruption, reinstall, etc.) loses the credential-store key and therefore the data, with no recovery path today. Re-scoped backlog item tracks this instead (see §13).
 
 ## 8. Job Search Cadence
 - Target: **2–3 scheduled runs per day**, plus an **on-demand "run now" button**.
@@ -97,19 +98,25 @@ Not a script — a simple results-driven interface (built with Streamlit, opens 
 - Multi-user support is a **later-stage aspiration**, contingent on validating the concept (e.g. VC backing) — not a near-term build target. Architecture should avoid unnecessary lock-in to single-user assumptions where it's free to do so, but should not be over-engineered for scale it doesn't need yet.
 
 ## 13. Backlog Additions
-- **MCP connector pipeline**: as new job-board/company-data MCP connectors become available, follow a test → validate → productionalize process before relying on them in the live workflow (don't wire in unvetted connectors directly).
-- **Industry-specific job boards**: beyond generic boards (Indeed, LinkedIn, etc.), maintain an extensible list of specialized boards per industry (e.g. life sciences/pharma-specific boards) — same "ever-growing lookup" pattern as the industry/role/skill table in §4.
-- **Interview prep module** (carried over from §10).
-- **Passphrase recovery mechanism** (carried over from §7).
-- **Email monitoring — simple-scan version BUILT 2026-07-28**, superseded by the full version in **§14** below (moved up from backlog at the user's request — see `docs/email-monitoring-task.md`): a scheduled Claude task (`panga-gmail-cta-scan`, 4x/day) scans Gmail for call-to-action emails (interview invites, rejections, recruiter follow-ups) and sends a push notification when it finds one, using Gmail labels for state instead of a database.
-- **Non-applied-job feedback loop — BUILT 2026-07-29** (added 2026-07-27): when the user marks a job "not interested" (§9), a reason can be given via the skip-reason field (§4); the job is hidden from Results either way (checkbox to unhide, nothing deleted). A reason marks the record for review (`applications.get_unreviewed_skip_reasons()`); the daily scheduled task detects and surfaces the count but does not evaluate reasons itself — that needs live back-and-forth with Claude (what the reason implies for future search params, presented as ranked options with a recommendation), done in conversation, then `mark_skip_reason_reviewed()` once walked through.
-- **LinkedIn profile enhancement** (added 2026-07-27): cross-examine the resume/master profile against the user's LinkedIn profile and suggest improvements, including a collaborative marketing-style graphic-generation step. **Safe approach only**: the user manually pastes or exports their LinkedIn profile text into the tool — no automated login or scraping of linkedin.com, since that would violate LinkedIn's Terms of Service and risk account restriction (same class of risk already excluded for auto-submission in §2). Steps for the user must be written as plainly as possible ("idiot-proof"), consistent with §6's non-developer constraint.
-- **Recruiter mail-blast / marketing outreach** (added 2026-07-27): send marketing material (e.g. about the user's candidacy) to recruiter contacts the user has accumulated. This sends messages to real third parties on the user's behalf — every use requires the user's explicit, per-instance sign-off (reviewing the message and recipient list before anything sends), never automatic or scheduled without confirmation.
-- **Industry-specific job boards — Category B, public postings** (added 2026-07-28): 18 pharma-specific job boards and life-sciences/IT recruitment-firm career pages researched and captured in `config/industry_job_boards.yaml` (Planet Pharma, BioSpace, RAPS Career Center, FierceBiotech Jobs, Life Search Technologies, TSP Life Sciences, and others), status `candidate` — none have a documented API, so building against any of them means fetching public search-result pages (no login, low ToS risk, but fragile). Prioritize by relevance to CIO/Head-of-IT roles when this gets built.
-- **Paid executive candidate-network membership — Category A** (added 2026-07-28): BlueSteps ($329 one-time + $89/yr, feeds profile to 16,000+ AESC-vetted retained-search recruiters) and ExecuNet (free profile, ~$39+/mo for full access) work in reverse from a job board — recruiters search the user's profile rather than the user searching listings, since much of the C-suite/VP-level market is filled via confidential retained searches never posted publicly. Not something Panga automates — the user creates/pays for the profile themselves. **Status: user is checking with personal HR contacts before committing spend** — revisit once that feedback is in.
-- **Retained executive search firm outreach** (added 2026-07-28, sourced from a personal email from Dave Walko/PharmTALENT — a 10+ year friend of the user's, not a cold contact): Korn Ferry, Heidrick & Struggles, Spencer Stuart, Russell Reynolds (top-tier global retained search), plus CIO-specific boutique CIO Partners, The Good Search, Cowen Partners, the IT LeaderBoard profile registration, and the Pinnacle Society recruiter directory (searchable by keyword, e.g. CIO/IT). Same non-automatable shape as Category A above — these firms fill roles confidentially from their own network, there's nothing for Panga to search, the action is the user personally reaching out/registering. Captured in `config/industry_job_boards.yaml` under `retained_search_firms`. **Claude: prompt the user about this backlog item once the first working version of Panga (steps 4c/5/6) is done** — the user explicitly asked to be reminded then rather than act on it now.
-- **UI polish: Pay column formatting** (added 2026-07-29): currently renders as `$151661-228000` (`src/ui/app.py`, the `pay` line in the Results table build) — should be `$151,661-$228,000` (thousands separators, `$` on both numbers). Small, deferred rather than fixed immediately.
-- **Embed direct LLM API calls in the app, replacing Claude Code orchestration for reasoning tasks — FINAL backlog item, added 2026-07-29**: today, all reasoning (scoring, tailoring, feedback-loop evaluation) runs through Claude Code (this conversation + scheduled tasks), with Streamlit as a thin display/data-entry layer — a deliberate §11 decision, not a limitation of Streamlit itself (any framework has the same non-issue; the real lever is whether the app calls an LLM API directly). Explicitly sequenced LAST, evaluated only once the core loop and other backlog items are settled, because: (1) single-user + evolving requirements + async-acceptable latency + flat-subscription cost all favor the current setup for now, and every one of those signals flips once this goes multi-user (§12's own stated trigger for bigger architecture questions); (2) building the API integration now (separate billing, cost monitoring, rate limiting, error handling) would be complexity spent solving a problem that doesn't exist yet — nothing today is waiting on instant in-app reasoning. When revisited: cost-assess actual API usage volume against the current flat-subscription cost first; prefer the smaller move (direct API calls added to the same Streamlit app) over the larger one (full framework replacement), and only consider replacing Streamlit itself if the trigger is multi-user scale or UI needs Streamlit's component model can't meet — not the API-calling question, which is separable.
+
+| Item | Status | % Complete | Notes |
+|---|---|---|---|
+| MCP connector vetting pipeline | Ongoing practice | N/A | Test → validate → productionalize before relying on any new connector live. |
+| Interview prep module | Not started | 0% | Carried over from §10. |
+| Encryption at rest for `data/` | Built | 100% | 2026-07-30. AES-256-GCM, key in OS credential store via `keyring` (no typed passphrase — see §7). `docs/encryption-at-rest.md` has full detail. |
+| Windows-account-loss recovery (re-scoped from "passphrase recovery mechanism") | Not started | 0% | Carried over from §7, re-scoped once §7's key model changed from passphrase to OS-credential-store. No passphrase exists to recover; the real gap now is "what happens if this Windows account/profile is lost." |
+| Email monitoring — simple scan | Built | 100% | Superseded by the full version in §14. `panga-gmail-cta-scan`, 4x/day, Gmail-label state, push notification on CTA emails. |
+| Non-applied-job feedback loop | Built | 100% | Skip-reason capture + hide-from-results done; detection of unreviewed reasons wired into the daily task; live evaluation happens in conversation, not automated by design. |
+| LinkedIn profile enhancement | Built | 100% | Manual-paste only, no scraping (ToS risk). New "LinkedIn" Streamlit page: paste current Headline/About/Experience/Skills, save, then ask Claude to analyze against the master profile + role_skills — produces a 0-100 profile strength score + per-section suggested rewrites, shown as copyable text blocks with Mark-updated/Dismiss actions. Nothing is ever posted to LinkedIn automatically. Awaiting Zahir's real profile paste to run a live analysis pass. |
+| Recruiter mail-blast / marketing outreach | Not started | 0% | Requires per-instance user sign-off before any send, by design. |
+| Industry-specific job boards (Category B, public postings) | In progress | 30% | 19 candidates researched; 5 confirmed scrapeable, 1 built (Planet Pharma), 4 confirmed-scrapeable ones not yet built (BioSpace, Beacon Hill, Atrium, GForce). |
+| Paid candidate-network membership (BlueSteps/ExecuNet) | On hold — user decision | N/A | Not a Panga build item; user checking with personal HR contacts before spend. |
+| Retained executive search firm outreach | Surfaced to user | N/A | Not automatable (confidential firm-side search); already flagged to user once per his request, his call on timing. |
+| UI polish: pay column formatting | Not started | 0% | `$151661-228000` should render as `$151,661-$228,000`. Small, deferred. |
+| Direct LLM API integration (replace Claude Code orchestration) | Deliberately deferred | 0% | Sequenced last on purpose — revisit only at multi-user scale (§12 trigger), not before. |
+| **Prospector** — personal marketing/sales-funnel layer (KPIs, rejection-pattern diagnosis, proactive FDA/ClinicalTrials/PubMed-based company targeting, strategy-tagging/learning loop) | Named, design not started | 0% | Added 2026-07-29. Reframes the project from job-matching/coverage to a full Prospect→Research→Outreach→Application→Response→Outcome→Learn lifecycle. `target_accounts` data model planned, parallel to `jobs`/`applications`. Claude drafts outreach content; user always sends it himself. |
+
+**Already fully built (for reference, not backlog):** resume ingestion, gap-probing interview, USAJOBS/ZipRecruiter/Dice/Indeed search, company-site search via Workday/SmartRecruiters ATS APIs, tailoring context bundling, applications tracking, Streamlit Results UI with per-channel tables, compatibility scoring, daily scheduled search+score task, desktop shortcut, Gmail call-to-action monitoring (full version, see §14), encryption at rest for `data/` (see §7, `docs/encryption-at-rest.md`).
 
 ## 14. Gmail Call-to-Action Handling (built 2026-07-28 through 2026-07-29)
 
@@ -156,3 +163,46 @@ dashboard has no live Gmail access of its own (Streamlit can't reach MCP
 connectors) — it only ever reflects what the fulfillment task last wrote, so
 there's up to a ~10-minute lag between clicking a button and seeing it
 resolved, never truly instant.
+
+## 15. Encryption at Rest (built 2026-07-30)
+
+Full technical detail lives in `docs/encryption-at-rest.md`; this section
+records the product decision and shape for the working spec, and supersedes
+§7's original passphrase plan.
+
+**Problem:** §7 originally called for a user-typed passphrase as "the only
+key." By the time this was actually built, that plan conflicted with
+automation added afterward (§13's daily search task, §14's Gmail tasks) —
+those run unattended, several times a day, with no one present to type a
+passphrase. A pure passphrase model would have broken every scheduled run.
+
+**What shipped instead:** all of `data/` (master profile, raw resume text,
+interview answers, jobs, applications, CTA emails) is encrypted with
+AES-256-GCM. The key is a random 256-bit value generated once and stored in
+this Windows account's credential store via the `keyring` library — no
+passphrase, unlocks automatically for both the Streamlit app and the
+scheduled tasks. `src/security/crypto_store.py` is the single point that
+does this; the existing store modules (`profile/storage.py`,
+`search/job_store.py`, `tailoring/applications.py`,
+`tailoring/cta_emails.py`) call it instead of raw file I/O, so nothing
+about their own interface changed. Existing plaintext data was migrated in
+place via `scripts/encrypt_existing_data.py` (idempotent — safe to re-run,
+skips files already encrypted).
+
+**Threat model, stated plainly:** this protects `data/` if the files are
+copied off this machine, or the disk is stolen/imaged. It does **not**
+protect against someone else using this same Windows login — that's a
+narrower guarantee than a passphrase would give, accepted deliberately
+because a passphrase isn't compatible with unattended automation.
+
+**Cross-platform note:** `keyring` was chosen over calling Windows'
+DPAPI directly because it also targets macOS Keychain (and Linux Secret
+Service) with the same code path — relevant given §5's Mac-port plan. It
+does *not* by itself let the same encrypted `data/` directory be read on
+both a Windows machine and a Mac at once (each OS's credential store holds
+its own copy of the key) — that's a multi-machine sync problem, out of
+scope while §12 keeps this single-machine/single-user.
+
+**Backlog impact:** §7's "passphrase recovery" backlog item no longer
+applies as originally scoped, since there's no passphrase to recover — see
+§13's re-scoped "Windows-account-loss recovery" item instead.

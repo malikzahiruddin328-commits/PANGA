@@ -2,13 +2,17 @@
 into raw text, saved locally under data/profile/raw/. This is a text-extraction
 pass only — turning the extracted text into structured fields (roles, dates,
 skills) happens via the gap-probing interview and later reasoning, not here.
+Raw text is encrypted at rest (PRD §7) via security.crypto_store.
 """
 
 from pathlib import Path
-import json
 
 import yaml
 from docx import Document
+
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from security.crypto_store import write_text, write_json  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MANIFEST_PATH = PROJECT_ROOT / "config" / "document_manifest.yaml"
@@ -34,7 +38,6 @@ def slugify(filename: str) -> str:
 def ingest_all() -> list[dict]:
     manifest = yaml.safe_load(MANIFEST_PATH.read_text(encoding="utf-8"))
     source_folder = Path(manifest["source_folder"])
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     results = []
     for entry in manifest["documents"]:
@@ -42,7 +45,7 @@ def ingest_all() -> list[dict]:
         text = extract_text(source_path)
         slug = slugify(entry["file"])
         out_path = OUTPUT_DIR / f"{slug}.txt"
-        out_path.write_text(text, encoding="utf-8")
+        write_text(out_path, text)
 
         results.append({
             "source_file": entry["file"],
@@ -52,9 +55,7 @@ def ingest_all() -> list[dict]:
             "extracted_to": str(out_path.relative_to(PROJECT_ROOT)),
         })
 
-    (OUTPUT_DIR / "manifest_result.json").write_text(
-        json.dumps(results, indent=2), encoding="utf-8"
-    )
+    write_json(OUTPUT_DIR / "manifest_result.json", results)
     return results
 
 

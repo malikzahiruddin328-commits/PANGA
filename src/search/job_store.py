@@ -1,19 +1,19 @@
 """Local JSON-backed store for the `jobs` table (PRD §4) - no real database
 for v0, matching the plain-JSON pattern already used for the master profile.
 Dedupes by (source, job_id) so repeated searches don't create duplicates.
+Encrypted at rest (PRD §7) via security.crypto_store.
 """
 
-import json
 from pathlib import Path
+
+from security.crypto_store import read_json, write_json
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 JOBS_PATH = PROJECT_ROOT / "data" / "jobs" / "jobs.json"
 
 
 def load_jobs() -> list[dict]:
-    if not JOBS_PATH.exists():
-        return []
-    return json.loads(JOBS_PATH.read_text(encoding="utf-8"))
+    return read_json(JOBS_PATH, default=[])
 
 
 def save_jobs(new_jobs: list[dict]) -> int:
@@ -31,8 +31,7 @@ def save_jobs(new_jobs: list[dict]) -> int:
         seen.add(key)
         added += 1
 
-    JOBS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    JOBS_PATH.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    write_json(JOBS_PATH, existing)
     return added
 
 
@@ -48,4 +47,4 @@ def update_job_score(source: str, job_id: str, fit_score: int, fit_rationale: st
             job["fit_score"] = fit_score
             job["fit_rationale"] = fit_rationale
             break
-    JOBS_PATH.write_text(json.dumps(jobs, indent=2), encoding="utf-8")
+    write_json(JOBS_PATH, jobs)

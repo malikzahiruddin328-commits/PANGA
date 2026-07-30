@@ -8,24 +8,24 @@ architecture) — this module handles the mechanical parts: gap detection
 against resume text, and persisting confirmed answers to the master profile.
 """
 
-import json
 from pathlib import Path
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from skills.lookup import skills_for  # noqa: E402
 from profile.storage import MASTER_PROFILE_PATH, load_profile, save_profile  # noqa: E402
+from security.crypto_store import read_json, read_text  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RAW_DIR = PROJECT_ROOT / "data" / "profile" / "raw"
 
 
 def _resume_text() -> str:
-    manifest_result = json.loads((RAW_DIR / "manifest_result.json").read_text(encoding="utf-8"))
+    manifest_result = read_json(RAW_DIR / "manifest_result.json", default=[])
     chunks = []
     for entry in manifest_result:
         if entry["category"] == "resume":
-            chunks.append(Path(PROJECT_ROOT / entry["extracted_to"]).read_text(encoding="utf-8"))
+            chunks.append(read_text(PROJECT_ROOT / entry["extracted_to"]))
     return "\n".join(chunks).lower()
 
 

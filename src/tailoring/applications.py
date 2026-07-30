@@ -3,25 +3,23 @@ per job the user has started tailoring or set a status on. Status values in
 practice: "under review" (set automatically by "Start tailoring" - the app
 has no way to know a job was actually submitted), "applied" (the user
 confirms this themselves, or accepts a suggestion below), "not interested",
-"save for later".
+"save for later". Encrypted at rest (PRD §7) via security.crypto_store.
 """
 
-import json
 from pathlib import Path
+
+from security.crypto_store import read_json, write_json
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 APPLICATIONS_PATH = PROJECT_ROOT / "data" / "applications" / "applications.json"
 
 
 def load_applications() -> list[dict]:
-    if not APPLICATIONS_PATH.exists():
-        return []
-    return json.loads(APPLICATIONS_PATH.read_text(encoding="utf-8"))
+    return read_json(APPLICATIONS_PATH, default=[])
 
 
 def _save_all(applications: list[dict]) -> None:
-    APPLICATIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    APPLICATIONS_PATH.write_text(json.dumps(applications, indent=2), encoding="utf-8")
+    write_json(APPLICATIONS_PATH, applications)
 
 
 def get_application(source: str, job_id: str) -> dict | None:

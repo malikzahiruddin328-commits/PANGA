@@ -5,3 +5,5 @@ python-dotenv
 requests
 beautifulsoup4
 python-docx
+cryptography
+keyring

@@ -1,15 +1,16 @@
-"""Reads/writes the local master profile file. Encryption is backlogged (see docs/job-search-automation-prd.md §7)."""
+"""Reads/writes the local master profile file, encrypted at rest (PRD §7)."""
 
-import json
 from pathlib import Path
+
+from security.crypto_store import read_json, write_json
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MASTER_PROFILE_PATH = PROJECT_ROOT / "data" / "profile" / "structured" / "master_profile.json"
 
 
 def load_profile() -> dict:
-    return json.loads(MASTER_PROFILE_PATH.read_text(encoding="utf-8"))
+    return read_json(MASTER_PROFILE_PATH)
 
 
 def save_profile(profile: dict) -> None:
-    MASTER_PROFILE_PATH.write_text(json.dumps(profile, indent=2), encoding="utf-8")
+    write_json(MASTER_PROFILE_PATH, profile)

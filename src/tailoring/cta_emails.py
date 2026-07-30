@@ -16,24 +16,24 @@ drafts it created are still sitting in Gmail's Drafts folder. Once Zahir
 sends (or deletes) one himself, get_awaiting_draft_send()/mark_draft_sent()
 let that resolve itself on the dashboard - Zahir never has to remember to
 come back and click Dismiss for those.
+
+Encrypted at rest (PRD §7) via security.crypto_store.
 """
 
-import json
 from pathlib import Path
+
+from security.crypto_store import read_json, write_json
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CTA_EMAILS_PATH = PROJECT_ROOT / "data" / "cta_emails" / "cta_emails.json"
 
 
 def load_cta_emails() -> list[dict]:
-    if not CTA_EMAILS_PATH.exists():
-        return []
-    return json.loads(CTA_EMAILS_PATH.read_text(encoding="utf-8"))
+    return read_json(CTA_EMAILS_PATH, default=[])
 
 
 def _save_all(emails: list[dict]) -> None:
-    CTA_EMAILS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CTA_EMAILS_PATH.write_text(json.dumps(emails, indent=2), encoding="utf-8")
+    write_json(CTA_EMAILS_PATH, emails)
 
 
 def _find(emails: list[dict], thread_id: str) -> dict | None:
