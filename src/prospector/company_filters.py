@@ -31,6 +31,12 @@ MEGA_PHARMA_KEYWORDS = (
     # the original US/EU-household-name-biased list - large, established
     # multinationals, same exclusion logic as the rest of this list.
     "sun pharm", "zydus", "amneal", "servier",
+    # Added 2026-07-30 (commercial-hiring signal): large, established
+    # life-sciences-ADJACENT companies, not pharma manufacturers
+    # themselves, but just as clearly not "pre-commercial" - IQVIA
+    # (~$15B contract-research/data-analytics giant) matched repeatedly
+    # in real data.
+    "iqvia",
 )
 
 # Well-known formerly-independent life-sciences companies absorbed via

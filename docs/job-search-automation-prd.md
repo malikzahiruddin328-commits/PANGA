@@ -115,7 +115,7 @@ Not a script — a simple results-driven interface (built with Streamlit, opens 
 | Retained executive search firm outreach | Surfaced to user | N/A | Not automatable (confidential firm-side search); already flagged to user once per his request, his call on timing. |
 | UI polish: pay column formatting | Not started | 0% | `$151661-228000` should render as `$151,661-$228,000`. Small, deferred. |
 | Direct LLM API integration (replace Claude Code orchestration) | Deliberately deferred | 0% | Sequenced last on purpose — revisit only at multi-user scale (§12 trigger), not before. |
-| **Prospector** — personal marketing/sales-funnel layer (KPIs, rejection-pattern diagnosis, proactive FDA/ClinicalTrials/PubMed-based company targeting, strategy-tagging/learning loop) | In progress (steps 1-4 of 8 built) | 50% | Added 2026-07-29, designed 2026-07-30 — see §16 for the full design (data models, signal sources, UI placement, build sequencing), including LinkedIn-connections contact sourcing (§16b). KPI dashboard (step 1), rejection-pattern diagnosis data-gathering (step 2), `target_accounts` + late-stage-trial signal (step 3), and + regulatory-filing signal (step 4, §16a) all built 2026-07-30 — 40 real companies now populated across both signal sources (ClinicalTrials.gov + openFDA), filtered for non-companies/mega-pharma/known M&A. |
+| **Prospector** — personal marketing/sales-funnel layer (KPIs, rejection-pattern diagnosis, proactive FDA/ClinicalTrials/PubMed-based company targeting, strategy-tagging/learning loop) | In progress (steps 1-5 of 8 built) | ~62% | Added 2026-07-29, designed 2026-07-30 — see §16 for the full design (data models, signal sources, UI placement, build sequencing), including LinkedIn-connections contact sourcing (§16b). Steps 1-5 built 2026-07-30: KPI dashboard, rejection-pattern diagnosis, and all 3 currently-buildable target_accounts signals (late-stage-trial, regulatory-filing, commercial-hiring — signal 4/funding-IPO still needs source research, §16a). 41 real companies populated (1 disqualified as a known false positive). |
 | **Learn Engine** — cross-cutting feedback loop over every prediction/outcome pair in Panga (scoring, cadence, target accounts, outreach, strategy tags, LinkedIn edits, interview prep) | Designed, not built | 0% | Added 2026-07-30, generalized from Prospector's Learn stage (§16d) at Zahir's request — see §17. Recommend-only, never auto-applies changes (confirmed 2026-07-30). |
 | Application status lifecycle extension (interview scheduled / offer / rejected) | Built | 100% | 2026-07-30. Prerequisite identified while scoping Prospector's KPI dashboard (§16c) — without real interview/offer/rejection outcomes, "interview rate"/"rejection rate" would have nothing to compute from. `suggest_status()`/`confirm_status_suggestion()` in `applications.py` were already generic (no code change needed there); what changed: the "Mark status" dropdown in `src/ui/app.py` now offers the 3 new values, "Prep for interview" now shows for "interview scheduled" too (not just "applied"), and `panga-gmail-cta-scan`'s SKILL.md gained step 3C — the scan already classified emails into rejection/interview_request/offer/assessment_request/recruiter_question (for the dashboard mirror, §14) but never matched rejection/interview/offer against a specific application to suggest a status change; now it does, same confidence bar and confirm-don't-guess rule as the existing "applied" matching. |
 | LinkedIn manual job intake + document checklist | Built | 100% | 2026-07-30. Since LinkedIn has no public jobs API and blocks scraping/bot logins (ToS), the user browses LinkedIn himself and hands Claude a posting URL directly in conversation instead of an automated search channel finding it. `search/job_store.add_manual_job()` creates the job record (`source="linkedin"`, job_id parsed from the LinkedIn `/jobs/view/<id>/` URL pattern so re-pasting the same posting dedupes correctly even with different tracking params); if the URL can't be read (login wall/bot-check), Claude asks the user to paste the job description text instead — either way the description is captured at intake time rather than re-fetched later, unlike other channels. `tailoring/applications.py` gained `exec_bio_text`/`leadership_summary_text` (two new senior-exec-specific document types, alongside the existing resume/cover letter, fully tailored per job — not a single reused core version) and a `documents_requested` list. The Results tab's per-job detail panel (`ui/app.py`) replaced the old single "Start tailoring" button with 4 checkboxes + a "Request documents" button (applies to every job source, not just LinkedIn) plus expanders showing already-drafted document text in a copyable block, matching the pattern used for LinkedIn profile suggestions. Verified live: app loads clean, a real manually-added job correctly appeared as its own dynamically-grouped "linkedin" channel section with no code changes needed for that grouping. The checkbox/button click path itself was verified against the exact data layer it calls (`upsert_application`/`get_application`) rather than by mouse click — the Browser pane couldn't visually composite in this session (screenshot/canvas-click unavailable), so genuine mouse-driven row-selection in the dataframe grid wasn't possible; worth a quick manual click-through next time the app is open normally to confirm the on-screen behavior matches. |
@@ -328,6 +328,34 @@ proven first):**
    all — it's a new *lens* over jobs Panga is already ingesting: tag a job
    as a signal about its posting company, separate from scoring it as a fit
    for Zahir.
+
+   **Built 2026-07-30 (`src/prospector/commercial_hiring.py`):** curated
+   keyword list (VP Commercial, Chief Commercial Officer, Market Access,
+   Commercial Operations, etc.) rather than a bare "commercial" substring
+   match - a broad probe of real data showed plain "commercial" matches
+   noise like "Semester of Service Volunteer - Commercial Diplomacy
+   Analyst" (a Dept. of State internship). USAJOBS excluded entirely for
+   this signal - government postings aren't a company signal. One signal
+   per company (dedup) rather than one per matching posting.
+
+   **Real result was thin, and for a structural reason worth naming
+   explicitly:** only 1 of 620 real jobs matched - "Securitas" (an SVP
+   Commercial Growth posting), which is itself a known false positive
+   (a security-services company, completely unrelated to pharma/life
+   sciences - disqualified immediately, not left for review). The
+   underlying cause: `jobs.json` was collected to find roles *for Zahir*
+   (CIO/Director/etc., via keyword search and a handful of directly-
+   integrated company ATS feeds), not to broadly survey every company's
+   commercial hiring - so it only incidentally contains other companies'
+   commercial-titled postings. Making this signal genuinely useful would
+   need broader company-site ATS coverage or a dedicated commercial-title
+   search across ZipRecruiter/Dice/Indeed, independent of Zahir's own
+   target roles - a real future expansion, not attempted here. Also added
+   `iqvia` to `company_filters.py`'s exclusions (a ~$15B contract-research
+   company, not pre-commercial, matched repeatedly before being excluded).
+
+   Regression-tested (keyword matching, USAJOBS exclusion, per-company
+   dedup) with synthetic data.
 4. **Funding or IPO activity** — no existing source covers this. Needs
    source research before it's buildable (candidates to evaluate when this
    signal is picked up: SEC EDGAR filings for S-1/IPO activity, which is
