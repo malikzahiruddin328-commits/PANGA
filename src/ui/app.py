@@ -40,8 +40,14 @@ from tailoring.interview_prep import load_interview_prep
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
 from prospector.rejection_diagnosis import gather_diagnosis_input
 from prospector.target_accounts import load_target_accounts, set_status as set_target_account_status
+from prospector.outreach import (
+    add_outreach, update_status as update_outreach_status, request_draft,
+    get_outreach_for_target_account, get_outreach_for_job,
+)
 from linkedin.storage import load_linkedin_profile, save_snapshot, mark_suggestion_status, get_active_suggestions, SECTIONS as LINKEDIN_SECTIONS
 from linkedin.ingest import extract_text_from_pdf
+from linkedin.connections import parse_connections_csv, looks_like_recruiter, cross_reference_target_accounts
+from linkedin.connections_store import load_connections_snapshot, save_connections
 from security.crypto_store import has_recovery_code, generate_recovery_code
 
 CATEGORY_LABELS = {
@@ -84,6 +90,60 @@ def application_status(job: dict) -> str | None:
 
 def job_label(job: dict) -> str:
     return f"{job.get('title')} - {job.get('organization')}"
+
+
+OUTREACH_STATUSES = ["planned", "drafted", "sent", "responded", "no_response"]
+
+
+def render_outreach_section(key_prefix: str, target_account_name: str | None = None, job_source: str | None = None, job_id: str | None = None) -> None:
+    """Shared outreach UI (PRD §16b) - called from both the target-account
+    detail panel and a job's detail panel, since outreach anchors to
+    either one. Logging is manual; email drafting only flags a request -
+    the actual Gmail draft is created by the panga-cta-fulfillment
+    scheduled task (reused, not a second drafting pathway)."""
+    existing = get_outreach_for_target_account(target_account_name) if target_account_name else get_outreach_for_job(job_source, job_id)
+    st.markdown("**Outreach**")
+    for o in existing:
+        label = o["contact_name"] + (f", {o['contact_title']}" if o.get("contact_title") else "")
+        st.caption(f"{label} — {o['channel']}" + (f" — {o['notes']}" if o.get("notes") else ""))
+        oc1, oc2, oc3 = st.columns([2, 2, 1])
+        with oc1:
+            new_o_status = st.selectbox(
+                "Status", OUTREACH_STATUSES, index=OUTREACH_STATUSES.index(o["status"]),
+                key=f"{key_prefix}_ostatus_{o['outreach_id']}", label_visibility="collapsed",
+            )
+            if new_o_status != o["status"] and st.button("Update", key=f"{key_prefix}_oupdate_{o['outreach_id']}"):
+                update_outreach_status(o["outreach_id"], new_o_status)
+                st.rerun()
+        with oc2:
+            if o["channel"] == "email" and o.get("contact_email") and not o.get("gmail_draft_id") and not o.get("draft_requested"):
+                if st.button("Request draft", key=f"{key_prefix}_reqdraft_{o['outreach_id']}"):
+                    request_draft(o["outreach_id"])
+                    st.info("Flagged - the background fulfillment task will create a real Gmail draft shortly.")
+                    st.rerun()
+            elif o.get("draft_requested"):
+                st.caption("Draft requested, not yet created")
+        with oc3:
+            if o.get("gmail_draft_link"):
+                st.link_button("Open draft", o["gmail_draft_link"], key=f"{key_prefix}_opendraft_{o['outreach_id']}")
+
+    with st.expander("Log new outreach"):
+        oc_name = st.text_input("Contact name", key=f"{key_prefix}_new_contact_name")
+        oc_title = st.text_input("Contact title (optional)", key=f"{key_prefix}_new_contact_title")
+        oc_channel = st.selectbox("Channel", ["email", "linkedin", "phone", "in_person"], key=f"{key_prefix}_new_channel")
+        oc_email = st.text_input("Contact email (optional, needed to request a drafted email)", key=f"{key_prefix}_new_email") if oc_channel == "email" else None
+        oc_notes = st.text_input("Notes (optional)", key=f"{key_prefix}_new_notes")
+        if st.button("Log outreach", key=f"{key_prefix}_new_save"):
+            if oc_name:
+                add_outreach(
+                    oc_name, oc_channel, job_source=job_source, job_id=job_id,
+                    target_account_name=target_account_name, contact_title=oc_title or None,
+                    contact_email=oc_email or None, notes=oc_notes or None,
+                )
+                st.success("Logged.")
+                st.rerun()
+            else:
+                st.warning("Contact name is required.")
 
 
 def go_to_prep(target: dict) -> None:
@@ -492,6 +552,8 @@ elif active_tab == "results":
                             upsert_application(job["source"], job["job_id"], status=new_status, skip_reason=skip_reason)
                             st.success("Status saved.")
                             st.rerun()
+                st.divider()
+                render_outreach_section(f"job_{job.get('source')}_{job.get('job_id')}", job_source=job.get("source"), job_id=job.get("job_id"))
 
 elif active_tab == "prospector":
     st.header("Prospector")
@@ -548,6 +610,8 @@ elif active_tab == "prospector":
                 set_target_account_status(acc["company_name"], new_ta_status, notes=ta_notes or None)
                 st.success("Saved.")
                 st.rerun()
+            st.divider()
+            render_outreach_section(f"ta_{acc['company_name']}", target_account_name=acc["company_name"])
 
     coverage = coverage_summary(jobs)
     activity = activity_summary(applications)
@@ -773,3 +837,41 @@ elif active_tab == "linkedin":
                 st.divider()
     else:
         st.caption("Not yet analyzed - upload your profile PDF(s) above, save, then ask Claude to analyze it.")
+
+    st.divider()
+    st.subheader("Connections (for Prospector outreach)")
+    st.caption(
+        "Upload your LinkedIn connections export (Settings > Data Privacy > "
+        "\"Get a copy of your data\" > check Connections only, then download "
+        "the resulting CSV) to help find who to reach out to on the "
+        "Prospector tab (§16b): connections whose title looks like a "
+        "recruiter, and connections who work at a company already in your "
+        "target accounts list. Same manual-export-only rule as everything "
+        "else here - nothing is ever scraped or pulled automatically."
+    )
+    connections_snapshot = load_connections_snapshot()
+    uploaded_csv = st.file_uploader("LinkedIn connections CSV", type=["csv"], key="connections_csv")
+    if st.button("Save connections", type="primary", disabled=not uploaded_csv):
+        parsed = parse_connections_csv(uploaded_csv)
+        save_connections(parsed, uploaded_csv.name, saved_at=datetime.now().isoformat(timespec="seconds"))
+        st.success(f"Saved {len(parsed)} connection(s).")
+        st.rerun()
+
+    if connections_snapshot.get("last_saved"):
+        conns = connections_snapshot["connections"]
+        st.caption(f"Last saved: {connections_snapshot['last_saved']} ({len(conns)} connections from {connections_snapshot.get('source_file')})")
+
+        recruiters = [c for c in conns if looks_like_recruiter(c.get("position"))]
+        target_names = [a["company_name"] for a in load_target_accounts()]
+        target_matches = cross_reference_target_accounts(conns, target_names)
+
+        rc1, rc2 = st.columns(2)
+        rc1.metric("Recruiter connections", len(recruiters))
+        rc2.metric("Connections at a target account", len(target_matches))
+
+        if recruiters:
+            with st.expander("Recruiter connections"):
+                st.dataframe(pd.DataFrame(recruiters)[["first_name", "last_name", "company", "position"]], hide_index=True, use_container_width=True)
+        if target_matches:
+            with st.expander("Connections at a target account"):
+                st.dataframe(pd.DataFrame(target_matches)[["first_name", "last_name", "company", "position", "matched_target_account"]], hide_index=True, use_container_width=True)

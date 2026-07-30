@@ -15,6 +15,28 @@ live Claude session, the same constraint documented for boards.py (build step
 Both need Zahir to click **Run now** once each so unattended runs can use the
 Gmail connector without pausing on a permission prompt.
 
+## Known gap found and fixed - 2026-07-30: pre-existing history is invisible
+
+`panga-gmail-cta-scan` was first built 2026-07-28 and only ever searches
+`newer_than:2d` from whenever it runs - it has no backfill step, so anything
+that arrived **before** the task existed was never seen, labeled, or
+mirrored, silently. Discovered when Zahir linked a rejection email
+(Kyverna Therapeutics, 2026-07-25) that wasn't on the dashboard; a broader
+search for rejection-shaped language across the inbox turned up a second
+missed one (EarthCam, 2026-07-24) alongside it. Both predate the scan task
+by 3-4 days, outside its lookback window even on day one.
+
+**Fixed by hand, not by code change:** both threads were labeled
+`Panga/Reviewed` + `Panga/Call-to-Action` and mirrored via
+`add_cta_email()` directly, bringing the dashboard from 2 to the correct 4
+rejections. No change was needed to the scan task itself - once it existed,
+every run since has covered its full window correctly; this was a one-time
+bootstrapping blind spot for the handful of days between when Zahir started
+applying and when the scan task was built, not an ongoing bug. If older
+call-to-action emails from earlier in the job search (pre-dating even
+2026-07-24) turn out to matter, that would need a one-off broader historical
+sweep, not a change to the recurring task.
+
 ## 1. Scan (`panga-gmail-cta-scan`)
 
 - **State tracking:** Gmail labels `Panga/Reviewed` and `Panga/Call-to-Action` -
