@@ -44,7 +44,9 @@ This needs to be **industry-agnostic and ever-growing**, not hardcoded to pharma
 - **`user_profile`** — parsed resume + all confirmed gap-interview answers (the master profile)
 - **`user_profile_skills`** — join of user_profile to role_skills, with the *detailed* qualifying answer attached (not just a checkbox)
 - **`jobs`** — scraped/sourced listings (board + company-site origin tagged)
-- **`applications`** — tailored package per job + status. Shipped status values (`src/tailoring/applications.py`): "under review", "applied", "interview scheduled", "offer", "rejected" (last three added 2026-07-30, see §16c), "not interested", "save for later" + optional skip-reason text when status is not-interested (feeds §13 feedback loop)
+- **`applications`** — tailored package per job + status. Shipped status values (`src/tailoring/applications.py`): "under review", "applied", "interview scheduled", "offer", "rejected" (last three added 2026-07-30, see §16c), "not interested", "save for later" + optional skip-reason text when status is not-interested (feeds §13 feedback loop) + `strategy_tag` (§16d/§17, added 2026-07-30)
+- **`target_accounts`** — companies worth watching before they've posted a role (Prospector §16a, built 2026-07-30). `src/prospector/target_accounts.py`: company_name, industry, status (watching/qualified/contacted/stale/disqualified), signals (list of `{signal_type, source, detail, date_observed, ref}`), notes
+- **`outreach`** — direct contact logged against a job or a target account (Prospector §16b, built 2026-07-30). `src/prospector/outreach.py`: contact_name/title/email, channel, status (planned/drafted/sent/responded/no_response), strategy_tag, plus the Gmail-draft request/reconciliation fields shared with the CTA fulfillment mechanism (§14)
 
 Mechanism for populating `role_skills`: reasoned out (via search/LLM) at the time a new role/industry is first encountered, then persisted — so the system doesn't re-derive it from scratch every time, but keeps refining as more users/roles are added.
 
@@ -243,7 +245,7 @@ account/profile — there's nothing to recover from that regardless. See
 `docs/encryption-at-rest.md` for full detail including how this was
 verified.
 
-## 16. Prospector — Personal Marketing / Sales-Funnel Layer (Design, 2026-07-30)
+## 16. Prospector — Personal Marketing / Sales-Funnel Layer (Designed and built 2026-07-30)
 
 Reframes Panga from a job-matching tool into a full sales-funnel-style
 lifecycle: **Prospect → Research → Outreach → Application → Response →
@@ -650,9 +652,10 @@ rather than being folded into Results; the same reasoning applies here —
 this is a genuinely different mode of work (proactive targeting, not
 reacting to a posted job), not a variation on the existing Results screen.
 
-### Proposed build sequencing
+### Build sequencing (completed 2026-07-30, all 8 steps, same day as design)
 
-Ordered by dependency + fastest-to-value, not by the order listed above:
+Ordered by dependency + fastest-to-value, not by the order listed above -
+executed in this exact order, same day:
 
 1. KPI dashboard (§16c) — 100% existing data, no new integration.
 2. Rejection-pattern diagnosis (§16c) — same.
@@ -676,7 +679,7 @@ This surfaces value early (KPIs and diagnosis on data already in hand)
 while working toward the flagship proactive-targeting piece that motivated
 the Prospector name in the first place.
 
-## 17. Learn Engine — Cross-Cutting Feedback Loop (Design, 2026-07-30)
+## 17. Learn Engine — Cross-Cutting Feedback Loop (Designed and built 2026-07-30, data-gathering half)
 
 **What changed:** Learn started as one Prospector funnel stage (§16d),
 scoped to correlating strategy tags with application/outreach outcomes.
