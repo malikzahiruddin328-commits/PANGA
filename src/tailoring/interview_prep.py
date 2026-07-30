@@ -67,6 +67,14 @@ def _get_or_create_round(record: dict, round_label: str) -> dict:
     return round_
 
 
+def _write_dossier(source: str, job_id: str) -> None:
+    # Lazy import - dossier.py reads from this module, so importing it at
+    # the top would be circular. Safe here since both modules are fully
+    # loaded by the time any of these functions actually runs.
+    from tailoring.dossier import write_dossier
+    write_dossier(source, job_id)
+
+
 def record_round_outcome(source: str, job_id: str, round_label: str, outcome: str, notes: str | None = None) -> None:
     """PRD §16d/§17: how the round actually went, self-reported by Zahir -
     the ONLY way this can ever be known, there's no automated signal for
@@ -79,6 +87,7 @@ def record_round_outcome(source: str, job_id: str, round_label: str, outcome: st
     round_["outcome"] = outcome
     round_["outcome_notes"] = notes
     _save_all(records)
+    _write_dossier(source, job_id)
 
 
 def start_round(
@@ -104,6 +113,7 @@ def start_round(
     if interviewers is not None:
         round_["interviewers"] = interviewers
     _save_all(records)
+    _write_dossier(source, job_id)
 
 
 def save_round(
@@ -136,6 +146,7 @@ def save_round(
     if status is not None:
         round_["status"] = status
     _save_all(records)
+    _write_dossier(source, job_id)
 
 
 def build_prep_context(job: dict, profile: dict | None = None) -> dict:

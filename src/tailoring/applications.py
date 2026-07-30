@@ -34,6 +34,14 @@ def _save_all(applications: list[dict]) -> None:
     write_json(APPLICATIONS_PATH, applications)
 
 
+def _write_dossier(source: str, job_id: str) -> None:
+    # Lazy import - dossier.py reads from this module, so importing it at
+    # the top would be circular. Safe here since both modules are fully
+    # loaded by the time any of these functions actually runs.
+    from tailoring.dossier import write_dossier
+    write_dossier(source, job_id)
+
+
 def get_application(source: str, job_id: str) -> dict | None:
     for app in load_applications():
         if app["source"] == source and app["job_id"] == job_id:
@@ -81,6 +89,7 @@ def upsert_application(
                 app["skip_reason"] = skip_reason
                 app["skip_reason_reviewed"] = False
             _save_all(applications)
+            _write_dossier(source, job_id)
             return
 
     applications.append({
@@ -98,6 +107,7 @@ def upsert_application(
         "skip_reason_reviewed": False if skip_reason is not None else None,
     })
     _save_all(applications)
+    _write_dossier(source, job_id)
 
 
 def set_strategy_tag(source: str, job_id: str, strategy_tag: str) -> None:
@@ -111,6 +121,7 @@ def set_strategy_tag(source: str, job_id: str, strategy_tag: str) -> None:
         if app["source"] == source and app["job_id"] == job_id:
             app["strategy_tag"] = strategy_tag
             _save_all(applications)
+            _write_dossier(source, job_id)
             return
 
 
@@ -159,4 +170,5 @@ def confirm_status_suggestion(source: str, job_id: str, accept: bool) -> None:
             app["suggested_status"] = None
             app["suggested_status_reason"] = None
             _save_all(applications)
+            _write_dossier(source, job_id)
             return
