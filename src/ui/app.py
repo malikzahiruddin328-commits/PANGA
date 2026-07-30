@@ -38,6 +38,7 @@ from tailoring.applications import load_applications, upsert_application, get_ap
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
 from tailoring.interview_prep import load_interview_prep
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
+from prospector.rejection_diagnosis import gather_diagnosis_input
 from linkedin.storage import load_linkedin_profile, save_snapshot, mark_suggestion_status, get_active_suggestions, SECTIONS as LINKEDIN_SECTIONS
 from linkedin.ingest import extract_text_from_pdf
 from security.crypto_store import has_recovery_code, generate_recovery_code
@@ -567,6 +568,34 @@ elif active_tab == "prospector":
         with st.expander("By target-role priority weight"):
             st.caption("Weight comes from Settings > target roles - higher weight roles are the ones you prioritized.")
             st.dataframe(rates_table(outcome["by_role_weight"], "Priority weight"), hide_index=True, use_container_width=True)
+
+    st.subheader("Rejection-pattern diagnosis")
+    st.caption(
+        "Looks for clustering in why applications aren't landing - by score band, channel, "
+        "role type, or the reasons you've given for marking something not interested. This "
+        "needs Claude's live reasoning, not a canned report, so this button only gathers the "
+        "data - come back to Claude Code and ask it to run the diagnosis."
+    )
+    if st.button("Prepare diagnosis data"):
+        diagnosis_input = gather_diagnosis_input(applications, jobs)
+        st.session_state["diagnosis_input"] = diagnosis_input
+
+    diagnosis_input = st.session_state.get("diagnosis_input")
+    if diagnosis_input:
+        d1, d2 = st.columns(2)
+        d1.metric("Rejected applications", diagnosis_input["rejected_count"])
+        d2.metric("'Not interested' with a reason given", diagnosis_input["not_interested_with_reason_count"])
+        if diagnosis_input["rejected_count"] == 0 and diagnosis_input["not_interested_with_reason_count"] == 0:
+            st.info("Nothing to diagnose yet - no rejections tracked and no not-interested reasons given so far.")
+        else:
+            st.success("Data's ready. Go to Claude Code and ask it to run the rejection-pattern diagnosis - it'll read this and give you a plain-language write-up with suggestions.")
+            with st.expander("What it'll be looking at"):
+                if diagnosis_input["rejected"]:
+                    st.markdown("**Rejected**")
+                    st.dataframe(pd.DataFrame(diagnosis_input["rejected"]), hide_index=True, use_container_width=True)
+                if diagnosis_input["not_interested_with_reason"]:
+                    st.markdown("**Not interested (with reason)**")
+                    st.dataframe(pd.DataFrame(diagnosis_input["not_interested_with_reason"]), hide_index=True, use_container_width=True)
 
 elif active_tab == "prep":
     st.header("Interview Prep")
