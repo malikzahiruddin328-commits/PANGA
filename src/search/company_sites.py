@@ -68,13 +68,20 @@ def fetch_companies(limit: int = 1000, skip: int = 0, search: str | None = None)
     return list(companies.values())
 
 
-def search_workday_jobs(company_name: str, tenant: str, site: str, wd_number: int, keyword: str = "", limit: int = 20) -> list[dict]:
+def search_workday_jobs(company_name: str, tenant: str, site: str, wd_number: int, keyword: str = "", limit: int = 20, applied_facets: dict | None = None) -> list[dict]:
     """tenant/site/wd_number come from the company's own myworkdayjobs.com
     URL, e.g. "eisai.wd5.myworkdayjobs.com/eisai" -> tenant="eisai", site="eisai",
     wd_number=5. Find these by web-searching "<company> careers myworkdayjobs.com"
-    - there's no directory of which companies use Workday."""
+    - there's no directory of which companies use Workday.
+
+    applied_facets passes through to Workday's own CXS "appliedFacets" filter
+    (server-side, same mechanism the career site's own filter UI uses) - e.g.
+    {"Location_Country": ["<facet-id>"]} to restrict to one country. Facet
+    IDs are tenant-specific and not documented; discover them by POSTing an
+    empty search to the /jobs endpoint above and reading the "facets" list in
+    the response (each facet's "values" gives {descriptor, id, count})."""
     url = f"https://{tenant}.wd{wd_number}.myworkdayjobs.com/wday/cxs/{tenant}/{site}/jobs"
-    body = {"appliedFacets": {}, "limit": limit, "offset": 0, "searchText": keyword}
+    body = {"appliedFacets": applied_facets or {}, "limit": limit, "offset": 0, "searchText": keyword}
     response = requests.post(url, json=body, timeout=20)
     response.raise_for_status()
     data = response.json()

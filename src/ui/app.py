@@ -33,7 +33,7 @@ import yaml
 
 from search.usajobs import search_jobs, USAJobsNotConfigured
 from search.job_store import load_jobs
-from ranking.prioritize import weight_for
+from ranking.prioritize import weight_for, dedupe_across_sources
 from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion, set_strategy_tag
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
 from tailoring.interview_prep import load_interview_prep, record_round_outcome
@@ -428,6 +428,13 @@ elif active_tab == "results":
     if not show_not_interested:
         ranked = [j for j in ranked if application_status(j) not in NOT_INTERESTED]
 
+    # Cross-source dedup (2026-07-30): if a company has a direct-site channel
+    # (Eisai/AbbVie/IQVIA via company_sites.py) and the same real opening also
+    # shows up on a job board (Indeed/ZipRecruiter/Dice/USAJOBS/industry
+    # boards), the direct-site posting is authoritative - show only that one.
+    # See ranking.prioritize.dedupe_across_sources() for the matching rule.
+    ranked = dedupe_across_sources(ranked)
+
     if unscored_count:
         st.caption(f"{unscored_count} job(s) found but not yet compatibility-scored - hidden until the next scoring pass (daily scheduled task, or ask Claude to score them now).")
 
@@ -435,20 +442,24 @@ elif active_tab == "results":
 
     # Grouped by channel (source) per Zahir's request 2026-07-29 - each
     # channel (USAJOBS, Dice, ZipRecruiter, etc.) gets its own section.
-    # Dedup only happens WITHIN a channel (job_store keys on source+job_id) -
-    # the same real job posted on two different channels shows once per
-    # channel, since they're technically distinct postings (different links,
-    # sometimes different pay listed), not auto-merged.
+    # Dedup within a channel happens below (job_store only keys on
+    # source+job_id, so re-announced postings aren't caught there). Dedup
+    # ACROSS channels also now happens, but only for the direct-company-site
+    # case (see dedupe_across_sources() above, called before this point) -
+    # a job board posting matching a company's own direct listing is folded
+    # into it there. Two different job boards showing the same real job
+    # (e.g. Indeed + ZipRecruiter, neither being the company's own site) is
+    # still NOT merged - different platforms format titles/orgs too
+    # differently for exact matching to be reliable without a company-site
+    # anchor to match against, and the risk of wrongly merging two different
+    # jobs is higher than the clutter cost.
     channels = list(dict.fromkeys(j["source"] for j in ranked))  # first-appearance order, dedup'd
 
     def dedupe_key(job):
         # Same title+org+location+pay within a channel = almost certainly the
         # same real job posted under two announcements (e.g. merit-promotion
         # + open-competitive on USAJOBS) - confirmed 2026-07-29 with the two
-        # identical "Audit Director (IT)" postings. Cross-channel matching
-        # isn't attempted here - different platforms format titles/orgs too
-        # differently for exact matching to be reliable, and the risk of
-        # wrongly merging two different jobs is higher than the clutter cost.
+        # identical "Audit Director (IT)" postings.
         return (job.get("title"), job.get("organization"), job.get("location"), job.get("pay_min"), job.get("pay_max"))
 
     for channel in channels:
@@ -458,9 +469,18 @@ elif active_tab == "results":
         for job in channel_jobs:
             groups.setdefault(dedupe_key(job), []).append(job)
         deduped = [postings[0] for postings in groups.values()]  # first (highest-ranked) as primary
-        postings_by_primary = {id(postings[0]): postings for postings in groups.values()}
+        postings_by_primary = {
+            id(postings[0]): postings + postings[0].get("_cross_source_duplicates", [])
+            for postings in groups.values()
+        }
 
-        dup_note = f", {len(channel_jobs) - len(deduped)} duplicate posting(s) merged" if len(deduped) < len(channel_jobs) else ""
+        dup_notes = []
+        if len(deduped) < len(channel_jobs):
+            dup_notes.append(f"{len(channel_jobs) - len(deduped)} duplicate posting(s) merged")
+        cross_source_merged = sum(len(job.get("_cross_source_duplicates", [])) for job in deduped)
+        if cross_source_merged:
+            dup_notes.append(f"{cross_source_merged} job-board posting(s) matched to this direct listing")
+        dup_note = f", {'; '.join(dup_notes)}" if dup_notes else ""
         with st.expander(f"{channel} ({len(deduped)}{dup_note})", expanded=True):
             table_rows = []
             for job in deduped:
