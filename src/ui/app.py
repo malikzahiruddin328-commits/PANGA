@@ -35,10 +35,11 @@ import yaml
 from search.usajobs import search_jobs, USAJobsNotConfigured
 from search.job_store import load_jobs
 from ranking.prioritize import weight_for, dedupe_across_sources
-from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion, set_strategy_tag
+from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion, set_strategy_tag, needs_edit_review, record_document_edit_review
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
 from tailoring.interview_prep import load_interview_prep, record_round_outcome
 from tailoring.docx_export import text_to_docx_bytes, cover_letter_to_docx_bytes
+from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
 from tailoring.drafting import generate_documents, score_job, save_gap_answers, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
 from prospector.rejection_diagnosis import gather_diagnosis_input
@@ -878,6 +879,7 @@ elif active_tab == "results":
                                 leadership_summary_text=drafted.get("leadership_summary"),
                                 apply_answers=drafted.get("apply_answers"),
                             )
+                            sync_workspace_documents(job["source"], job["job_id"], selected, drafted, load_profile(), job)
                             st.toast("Documents drafted. Review and download them below, then use them for the actual application.", icon=":material/check_circle:")
                             st.rerun()
 
@@ -982,6 +984,10 @@ elif active_tab == "results":
                                                         resume_ats_next_actions=new_resume["ats_next_actions"],
                                                         resume_clarifying_questions=new_resume["clarifying_questions"],
                                                     )
+                                                    sync_workspace_documents(
+                                                        job["source"], job["job_id"], ["resume"],
+                                                        {"resume": new_resume["text"]}, load_profile(), job,
+                                                    )
                                                     st.toast(
                                                         f"Resume regenerated - new ATS score {new_resume['ats_score']}/100.",
                                                         icon=":material/check_circle:",
@@ -1007,6 +1013,55 @@ elif active_tab == "results":
                                 key=f"download_{doc_key}_{job.get('source')}_{job.get('job_id')}",
                             )
 
+                has_any_document = any(
+                    app_record.get(f) for f in ("resume_text", "cover_letter_text", "exec_bio_text", "leadership_summary_text")
+                )
+                job_key = f"{job.get('source')}_{job.get('job_id')}"
+                if has_any_document:
+                    workspace_folder = dossier_dir(job.get("source"), job.get("job_id"), job.get("organization"), job.get("title"))
+                    st.markdown("**Your application folder (edit the Word files directly here):**")
+                    st.code(str(workspace_folder), language=None)
+                    st.caption(
+                        "Open this folder in File Explorer and edit resume.docx/cover_letter.docx/etc. "
+                        "directly in Word if you want to change anything, then click \"Check my edited "
+                        "documents\" below - you'll need to do this before marking the job \"applied\"."
+                    )
+                    if st.button("Check my edited documents", key=f"checkedits_{job_key}"):
+                        st.session_state[f"editreport_{job_key}"] = check_for_edits(job["source"], job["job_id"])
+
+                    report_key = f"editreport_{job_key}"
+                    if report_key in st.session_state:
+                        edit_report = st.session_state[report_key]
+                        any_changed = any(r.get("changed") for r in edit_report.values())
+                        missing_files = [k for k, r in edit_report.items() if r.get("no_workspace_file")]
+                        if any_changed:
+                            st.markdown("**Changes found in your working copies:**")
+                            for doc_key2, result in edit_report.items():
+                                if result.get("changed"):
+                                    with st.expander(f"{doc_key2} - changed"):
+                                        st.code("\n".join(result["diff"]), language=None, wrap_lines=True)
+                        elif not missing_files:
+                            st.markdown("No changes found - your working copies match what was drafted.")
+                        if missing_files:
+                            st.markdown(
+                                f"No editable file found yet for: {', '.join(missing_files)} "
+                                "(drafted before this folder feature existed, or not regenerated since) - "
+                                "click \"Generate documents\" above to create it, or note in your reason below "
+                                "that you're using the downloaded copy instead."
+                            )
+
+                        review_reason = st.text_area(
+                            "What did you change, and why? (required - even \"no changes made\" counts)",
+                            key=f"editreason_{job_key}",
+                        )
+                        if st.button("Save review", key=f"savereview_{job_key}"):
+                            if not review_reason.strip():
+                                st.toast("Type a reason first, even a short one.", icon=":material/warning:")
+                            else:
+                                record_document_edit_review(job["source"], job["job_id"], edit_report, review_reason.strip())
+                                st.toast("Saved - you can now mark this job \"applied\".", icon=":material/check_circle:")
+                                st.rerun()
+
                 b2, b3 = st.columns(2)
                 with b2:
                     if status in ("applied", "interview scheduled"):
@@ -1028,9 +1083,15 @@ elif active_tab == "results":
                         if new_status == "not interested":
                             skip_reason = st.text_area("Why not interested? (optional)", key=f"reason_{job.get('source')}_{job.get('job_id')}")
                         if st.button("Save status", key=f"save_status_{job.get('source')}_{job.get('job_id')}"):
-                            upsert_application(job["source"], job["job_id"], status=new_status, skip_reason=skip_reason)
-                            st.toast("Status saved.", icon=":material/check_circle:")
-                            st.rerun()
+                            if new_status == "applied" and needs_edit_review(app_record):
+                                st.error(
+                                    "Check your edited documents and save a change-review note first "
+                                    "(see \"Check my edited documents\" above) before marking this applied."
+                                )
+                            else:
+                                upsert_application(job["source"], job["job_id"], status=new_status, skip_reason=skip_reason)
+                                st.toast("Status saved.", icon=":material/check_circle:")
+                                st.rerun()
                 new_tag = st.text_input(
                     "Strategy tag (optional - what's different about this draft, e.g. \"concise-1-page\")",
                     value=app_record.get("strategy_tag") or "", key=f"tag_{job.get('source')}_{job.get('job_id')}",
