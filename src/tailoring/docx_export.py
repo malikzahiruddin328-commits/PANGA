@@ -47,6 +47,12 @@ def _set_base_font(doc: Document) -> None:
     normal = doc.styles["Normal"]
     normal.font.name = BODY_FONT
     normal.font.size = BODY_SIZE
+    # A blank line in the source text used to ALSO get its own empty
+    # paragraph on top of this - the two stacked, making the document look
+    # sparse ("too many spaces/carriage returns", Zahir's real complaint on
+    # the actual downloaded file). Space-after alone gives clean separation
+    # between paragraphs without a manual blank paragraph in between.
+    normal.paragraph_format.space_after = Pt(4)
 
 
 def text_to_docx_bytes(text: str, author: str | None = None) -> bytes:
@@ -68,8 +74,11 @@ def text_to_docx_bytes(text: str, author: str | None = None) -> bytes:
     for raw_line in lines:
         line = raw_line.strip()
         if not line:
+            # Skip blank lines entirely rather than emitting an empty
+            # paragraph for each one - Normal's space_after (above) already
+            # gives every real paragraph breathing room, so an ALSO-blank
+            # paragraph on top of that doubled the visual gap.
             in_contact_block = False
-            doc.add_paragraph("")
             continue
 
         if not seen_name:
@@ -103,8 +112,14 @@ def text_to_docx_bytes(text: str, author: str | None = None) -> bytes:
         if _looks_like_header(line):
             # Bold, not bigger - his resume distinguishes headers by weight,
             # not size, keeping the document compact and information-dense.
+            # Colored to match his name (his explicit request 2026-07-31),
+            # a deliberate departure from his own resume file (whose actual
+            # headers are plain black) - not a mismatch, an update he asked
+            # for on top of it.
             p = doc.add_paragraph()
-            p.add_run(line).bold = True
+            run = p.add_run(line)
+            run.bold = True
+            run.font.color.rgb = NAME_ACCENT_COLOR
             continue
 
         if _DATE_RANGE_RE.search(line) and len(line) < 120:

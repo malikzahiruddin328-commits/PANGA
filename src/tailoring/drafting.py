@@ -44,9 +44,31 @@ RESUME_SPEC = (
     "chronological work history with month/year date ranges, hours worked "
     "per week, and specific, quantifiable accomplishments for each role - "
     "federal resumes are longer and more detailed than private-sector ones, "
-    "there is no one-page limit. Otherwise write a concise, "
-    "achievement-focused resume. Use plain '- ' dashes for bullet points, "
-    "blank lines between sections."
+    "there is no one-page limit. Otherwise (private-sector, retained-search, "
+    "or direct-company postings), the WHOLE document must fit on roughly 2 "
+    "pages - target a total of about 900-1100 words of body text (excluding "
+    "headers/contact/dates), and treat these as hard caps, not suggestions: "
+    "- Give full bullet-point detail to ONLY the 3 most recent roles: 5-6 "
+    "bullets for the most recent, 4-5 for the 2nd most recent, 3-4 for the "
+    "3rd most recent. "
+    "- If two or more of those 3 recent roles are consecutive promotions at "
+    "the SAME employer, list that employer's name/location ONCE, then list "
+    "each title as its own sub-entry underneath with its own date range and "
+    "bullets - do not repeat the full employer/location block per title. "
+    "- Condense every role beyond the 3 most recent into a single "
+    "'EARLIER CAREER' section: one line per role (title, employer, years, "
+    "one short sentence of summary - no bullets at all), regardless of how "
+    "many years ago it was. "
+    "- Keep the Core Skills / Technical Skills section to a tight, "
+    "scannable list of terms - not full sentences. "
+    "Include a 'TARGET ROLE ALIGNMENT' section directly after the "
+    "professional summary - at most 5 bullets, each mapping a specific "
+    "requirement or theme from THIS job posting to the strongest genuine "
+    "matching experience in the profile, in the posting's own language "
+    "where accurate. Use plain '- ' dashes for bullet points, one blank "
+    "line between sections. If applying these caps would still run "
+    "noticeably over 2 pages, trim bullet wording and cut the least "
+    "job-relevant bullets first - length wins over completeness here."
 )
 
 DOC_SPECS = {
@@ -72,6 +94,7 @@ SYSTEM_PROMPT = """You are drafting real job-application documents for a real ca
 
 Ground rules:
 - Only use employers, titles, dates, degrees, certifications, and accomplishments that are actually present in the candidate's master profile provided below. Never invent or embellish facts, metrics, employers, or credentials that aren't there.
+- Reproduce every date and date range EXACTLY as given in the profile - same month and year, character for character. Never round, smooth, or shift a date to make a timeline look tidier or a transition look gapless - if the profile says a role started in March, write March, even if the prior role's stated end date is February of the same year.
 - If the job posting calls for a qualification the profile doesn't clearly evidence, do not fabricate it - either omit it or honestly bridge from the closest real, transferable experience in the profile.
 - Tailor every document specifically to this job posting and organization - reference the actual role, organization name, and what the posting emphasizes. Do not write generic, could-apply-to-any-job text.
 - Return ONLY the documents requested via the structured output schema. No extra commentary.

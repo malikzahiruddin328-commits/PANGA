@@ -20,6 +20,7 @@ carries the two cross-cutting things that used to live on a single page
 visible no matter which tab is open.
 """
 
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -131,6 +132,34 @@ def format_pay(value) -> str | None:
     except ValueError:
         return str(value)
     return f"{num:,.0f}" if num == int(num) else f"{num:,.2f}"
+
+
+def descriptive_doc_filename(name: str | None, doc_label: str, job: dict) -> str:
+    """'Resume.docx' told you nothing about which application it was for
+    once you had a few downloaded (Zahir's explicit request 2026-07-31) -
+    builds Name_DocType_Title_Organization.docx instead, stripped of
+    characters Windows filenames reject."""
+    parts = [name, doc_label, job.get("title"), job.get("organization")]
+    safe_parts = [re.sub(r'[<>:"/\\|?*]', "", p).strip().replace(" ", "_") for p in parts if p]
+    return "_".join(safe_parts)[:150] + ".docx"
+
+
+def left_aligned_columns(df: pd.DataFrame, extra: dict | None = None) -> dict:
+    """Column config that left-aligns every column of a dataframe (Streamlit
+    right-aligns numeric columns by default) and leaves width unset so each
+    column auto-sizes to its own content - Zahir's explicit request
+    2026-07-31 applied app-wide, not just one table. `extra` lets a call
+    site override specific columns (e.g. a LinkColumn for a URL column) -
+    those win over the plain left-aligned default."""
+    config = {}
+    for col in df.columns:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            config[col] = st.column_config.NumberColumn(alignment="left")
+        else:
+            config[col] = st.column_config.TextColumn(alignment="left")
+    if extra:
+        config.update(extra)
+    return config
 
 
 OUTREACH_STATUSES = ["planned", "drafted", "sent", "responded", "no_response"]
@@ -292,15 +321,13 @@ if active_tab == "settings":
     )
     manifest_entries = load_manifest_result()
     if manifest_entries:
-        st.dataframe(
-            pd.DataFrame([{
-                "File": e["source_file"],
-                "Category": e["category"],
-                "Target title": e.get("target_title") or "-",
-                "Words": e["word_count"],
-            } for e in manifest_entries]),
-            hide_index=True, width="stretch",
-        )
+        manifest_df = pd.DataFrame([{
+            "File": e["source_file"],
+            "Category": e["category"],
+            "Target title": e.get("target_title") or "-",
+            "Words": e["word_count"],
+        } for e in manifest_entries])
+        st.dataframe(manifest_df, hide_index=True, width="stretch", column_config=left_aligned_columns(manifest_df))
         remove_choice = st.selectbox(
             "Remove a document", ["-"] + [e["source_file"] for e in manifest_entries],
             key="remove_doc_choice",
@@ -701,18 +728,6 @@ elif active_tab == "results":
         # identical "Audit Director (IT)" postings.
         return (job.get("title"), job.get("organization"), job.get("location"), job.get("pay_min"), job.get("pay_max"))
 
-    def _select_role_row(event_key, sel_key):
-        # Fires as a real Streamlit on_click callback (runs once, before the
-        # script reruns from the top) - by the time the st.dataframe() call
-        # below executes in that rerun, sel_key already holds the new
-        # selection. sel_key (not event_key) is what persists it: the
-        # ButtonColumn's own click state in st.session_state[event_key]
-        # resets to None right after the click's rerun, same as any other
-        # ButtonColumn per the Streamlit skill's reference docs.
-        click = st.session_state.get(event_key)
-        if click:
-            st.session_state[sel_key] = click["row"]
-
     for channel in channels:
         channel_jobs = [j for j in ranked if j["source"] == channel]
 
@@ -747,42 +762,34 @@ elif active_tab == "results":
                 })
             df = pd.DataFrame(table_rows)
 
-            # Clicking a job's title (Role column, styled as a plain-text
-            # button rather than filled) opens its detail panel below - per
-            # Zahir's explicit ask, replacing Streamlit's native separate
-            # row-selector checkbox column with a click directly on the role
-            # itself. type="tertiary" is the least button-like native style
-            # Streamlit offers for a ButtonColumn (no border/fill) - there is
-            # no way to make a clickable cell render as fully bare text.
-            event_key = f"roleclick_{channel}"
-            sel_key = f"selected_row_{channel}"
-            st.dataframe(
+            # Reverted 2026-07-31 back to Streamlit's native row-selector
+            # (proven reliable for months) from a ButtonColumn-on-Role
+            # experiment - couldn't verify the click actually fires
+            # end-to-end in this environment (canvas-grid clicks aren't
+            # reliably testable here), and Zahir was actively blocked on a
+            # real application when he reported it not working. Not worth
+            # the risk on unverified code. Columns still left-aligned/
+            # auto-sized per his request, via the shared helper.
+            event = st.dataframe(
                 df,
                 hide_index=True,
                 width="stretch",
-                column_config={
-                    "Role": st.column_config.ButtonColumn(
-                        "Role", on_click=_select_role_row, args=(event_key, sel_key),
-                        key=event_key, type="tertiary",
-                    ),
-                    "Posting": st.column_config.LinkColumn(display_text="Open"),
-                },
+                on_select="rerun",
+                selection_mode="single-row",
+                column_config=left_aligned_columns(df, extra={"Posting": st.column_config.LinkColumn("Posting", display_text="Open", alignment="left")}),
                 key=f"table_{channel}",
             )
 
-            # sel_key persists across reruns until a different role is
-            # clicked, but the row-count of `deduped` can shrink between
-            # reruns (e.g. moving the compatibility slider re-filters
+            # st.dataframe's on_select state persists across reruns (keyed by
+            # the widget's `key`), but the row-count of `deduped` can shrink
+            # between reruns (e.g. moving the compatibility slider re-filters
             # `ranked`/`deduped` this same run) - a previously selected index
             # can point past the end of the new, shorter list. Bounds-check
             # rather than crash; a selection that no longer exists just shows
             # no detail panel, which is correct since that row may no longer
-            # be visible at all. Same real bug/fix as before (2026-07-29),
-            # now guarding a different selection source.
-            selected_rows = []
-            sel = st.session_state.get(sel_key)
-            if sel is not None and sel < len(deduped):
-                selected_rows = [sel]
+            # be visible at all.
+            selected_rows = event.selection.rows if event and event.selection else []
+            selected_rows = [i for i in selected_rows if i < len(deduped)]
             if selected_rows:
                 job = deduped[selected_rows[0]]
                 postings = postings_by_primary[id(job)]
@@ -911,11 +918,20 @@ elif active_tab == "results":
                                         )
                                         job_key = f"{job.get('source')}_{job.get('job_id')}"
                                         answer_inputs = {}
-                                        for qi, q in enumerate(clarifying_questions):
+                                        for q in clarifying_questions:
+                                            # Keyed by the question's own content, not its position
+                                            # (qi) - a real bug found 2026-07-31: each regeneration
+                                            # round produces a differently-worded, differently-
+                                            # ordered set of questions, but Streamlit persists a
+                                            # text_area's value across reruns by its key. Keying by
+                                            # position meant a NEW round's box at the same position
+                                            # silently kept the PREVIOUS round's leftover answer text
+                                            # for a completely different question, which then got
+                                            # saved under the new (wrong) skill label - confirmed in
+                                            # gap_interview_answers with several mismatched entries.
+                                            q_key = f"gapans_{job_key}_{abs(hash(q['question'])) % 10_000_000}"
                                             answer_inputs[q["skill"]] = st.text_area(
-                                                q["question"],
-                                                key=f"gapans_{job_key}_{qi}",
-                                                height=68,
+                                                q["question"], key=q_key, height=68,
                                             )
                                         if st.button("Save answers & regenerate resume", key=f"gapsave_{job_key}"):
                                             answered = {skill: ans for skill, ans in answer_inputs.items() if ans and ans.strip()}
@@ -954,11 +970,14 @@ elif active_tab == "results":
                                                         icon=":material/check_circle:",
                                                     )
                                                     st.rerun()
+                            if doc_key == "resume" and app_record.get("resume_ats_score") is not None:
+                                st.markdown(f"**Resume text (ATS score: {app_record['resume_ats_score']}/100):**")
                             st.code(drafted_text, language=None, wrap_lines=True)
+                            candidate_name = load_profile().get("name")
                             st.download_button(
                                 f"Download {doc_label} (.docx)",
-                                data=text_to_docx_bytes(drafted_text, author=load_profile().get("name")),
-                                file_name=f"{doc_label.replace(' ', '_')}.docx",
+                                data=text_to_docx_bytes(drafted_text, author=candidate_name),
+                                file_name=descriptive_doc_filename(candidate_name, doc_label, job),
                                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                                 key=f"download_{doc_key}_{job.get('source')}_{job.get('job_id')}",
                             )
@@ -1066,6 +1085,7 @@ elif active_tab == "prospector":
         ta_event = st.dataframe(
             ta_df, hide_index=True, width="stretch",
             on_select="rerun", selection_mode="single-row", key="target_accounts_table",
+            column_config=left_aligned_columns(ta_df),
         )
         selected_ta_rows = ta_event.selection.rows if ta_event and ta_event.selection else []
         selected_ta_rows = [i for i in selected_ta_rows if i < len(target_accounts)]
@@ -1098,9 +1118,10 @@ elif active_tab == "prospector":
     c1.metric("Jobs found (total)", coverage["total_jobs"])
     c2.metric("Added in last 7 days", coverage["added_last_7_days"])
     c3.metric("Channels", len(coverage["by_channel"]))
+    coverage_by_channel_df = pd.DataFrame(sorted(coverage["by_channel"].items()), columns=["Channel", "Jobs"])
     st.dataframe(
-        pd.DataFrame(sorted(coverage["by_channel"].items()), columns=["Channel", "Jobs"]),
-        hide_index=True, width="stretch",
+        coverage_by_channel_df,
+        hide_index=True, width="stretch", column_config=left_aligned_columns(coverage_by_channel_df),
     )
     if coverage["untimestamped"]:
         st.markdown(f"{coverage['untimestamped']} job(s) predate 2026-07-30 and have no discovery date, so they're in the total but not the 7-day count.")
@@ -1109,9 +1130,10 @@ elif active_tab == "prospector":
     a1, a2 = st.columns(2)
     a1.metric("Applications tracked (total)", activity["total_applications"])
     a2.metric("Started in last 7 days", activity["created_last_7_days"])
+    activity_by_status_df = pd.DataFrame(sorted(activity["by_status"].items()), columns=["Status", "Count"])
     st.dataframe(
-        pd.DataFrame(sorted(activity["by_status"].items()), columns=["Status", "Count"]),
-        hide_index=True, width="stretch",
+        activity_by_status_df,
+        hide_index=True, width="stretch", column_config=left_aligned_columns(activity_by_status_df),
     )
     if activity["untimestamped"]:
         st.markdown(f"{activity['untimestamped']} application(s) predate 2026-07-30 and have no start date, so they're in the total but not the 7-day count.")
@@ -1147,12 +1169,15 @@ elif active_tab == "prospector":
             return pd.DataFrame(rows)
 
         with st.expander("By channel"):
-            st.dataframe(rates_table(outcome["by_channel"], "Channel"), hide_index=True, width="stretch")
+            by_channel_df = rates_table(outcome["by_channel"], "Channel")
+            st.dataframe(by_channel_df, hide_index=True, width="stretch", column_config=left_aligned_columns(by_channel_df))
         with st.expander("By fit-score band"):
-            st.dataframe(rates_table(outcome["by_score_band"], "Score band"), hide_index=True, width="stretch")
+            by_score_band_df = rates_table(outcome["by_score_band"], "Score band")
+            st.dataframe(by_score_band_df, hide_index=True, width="stretch", column_config=left_aligned_columns(by_score_band_df))
         with st.expander("By target-role priority weight"):
             st.markdown("Weight comes from Settings > target roles - higher weight roles are the ones you prioritized.")
-            st.dataframe(rates_table(outcome["by_role_weight"], "Priority weight"), hide_index=True, width="stretch")
+            by_role_weight_df = rates_table(outcome["by_role_weight"], "Priority weight")
+            st.dataframe(by_role_weight_df, hide_index=True, width="stretch", column_config=left_aligned_columns(by_role_weight_df))
 
     st.subheader("Rejection-pattern diagnosis")
     st.markdown(
@@ -1177,10 +1202,12 @@ elif active_tab == "prospector":
             with st.expander("What it'll be looking at"):
                 if diagnosis_input["rejected"]:
                     st.markdown("**Rejected**")
-                    st.dataframe(pd.DataFrame(diagnosis_input["rejected"]), hide_index=True, width="stretch")
+                    rejected_df = pd.DataFrame(diagnosis_input["rejected"])
+                    st.dataframe(rejected_df, hide_index=True, width="stretch", column_config=left_aligned_columns(rejected_df))
                 if diagnosis_input["not_interested_with_reason"]:
                     st.markdown("**Not interested (with reason)**")
-                    st.dataframe(pd.DataFrame(diagnosis_input["not_interested_with_reason"]), hide_index=True, width="stretch")
+                    not_interested_df = pd.DataFrame(diagnosis_input["not_interested_with_reason"])
+                    st.dataframe(not_interested_df, hide_index=True, width="stretch", column_config=left_aligned_columns(not_interested_df))
 
     st.subheader("Insights (Learn Engine)")
     st.markdown(
@@ -1218,7 +1245,8 @@ elif active_tab == "prospector":
                 ]:
                     if learn_input[key]:
                         st.markdown(f"**{title}**")
-                        st.dataframe(pd.DataFrame(learn_input[key]), hide_index=True, width="stretch")
+                        learn_key_df = pd.DataFrame(learn_input[key])
+                        st.dataframe(learn_key_df, hide_index=True, width="stretch", column_config=left_aligned_columns(learn_key_df))
 
 elif active_tab == "prep":
     render_feedback_widget("prep")
@@ -1384,7 +1412,9 @@ elif active_tab == "linkedin":
 
         if recruiters:
             with st.expander("Recruiter connections"):
-                st.dataframe(pd.DataFrame(recruiters)[["first_name", "last_name", "company", "position"]], hide_index=True, width="stretch")
+                recruiters_df = pd.DataFrame(recruiters)[["first_name", "last_name", "company", "position"]]
+                st.dataframe(recruiters_df, hide_index=True, width="stretch", column_config=left_aligned_columns(recruiters_df))
         if target_matches:
             with st.expander("Connections at a target account"):
-                st.dataframe(pd.DataFrame(target_matches)[["first_name", "last_name", "company", "position", "matched_target_account"]], hide_index=True, width="stretch")
+                target_matches_df = pd.DataFrame(target_matches)[["first_name", "last_name", "company", "position", "matched_target_account"]]
+                st.dataframe(target_matches_df, hide_index=True, width="stretch", column_config=left_aligned_columns(target_matches_df))
