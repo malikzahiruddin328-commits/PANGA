@@ -88,6 +88,23 @@ DOC_SPECS = {
         "what this specific role and organization value, roughly 150-250 "
         "words. Plain text, no markdown."
     ),
+    "apply_answers": (
+        "A structured packet of ready-to-paste answers for the common, "
+        "recurring fields on job-application forms/ATS systems (Workday, "
+        "Greenhouse, iCIMS, etc.) - not a resume or letter. Each item is one "
+        "field: a short label matching how ATS forms usually phrase it "
+        "(e.g. 'Phone Number', 'LinkedIn URL', 'Earliest Start Date', "
+        "'Desired Salary', 'Are you legally authorized to work in the "
+        "United States?', 'How did you hear about this role?'). Cover "
+        "standard contact fields (name, phone, email, address, LinkedIn "
+        "URL) taken exactly from the profile, and common screening "
+        "questions (work authorization, willingness to relocate/travel, "
+        "years of experience in a relevant area, salary expectations, "
+        "notice period, referral source). Never invent a fact the profile "
+        "doesn't contain - if something like salary expectations or notice "
+        "period was never captured, write '[Not yet provided - ask Zahir]' "
+        "as the value instead of guessing."
+    ),
 }
 
 SYSTEM_PROMPT = """You are drafting real job-application documents for a real candidate applying to a real job. Accuracy matters - these documents may be submitted as-is.
@@ -279,6 +296,39 @@ def _resume_schema() -> dict:
     }
 
 
+def _apply_answers_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "apply_answers": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "label": {
+                            "type": "string",
+                            "description": "Short field label, matching how ATS forms usually phrase it.",
+                        },
+                        "value": {
+                            "type": "string",
+                            "description": (
+                                "Exact ready-to-paste answer text, or "
+                                "'[Not yet provided - ask Zahir]' if the profile "
+                                "doesn't contain this fact."
+                            ),
+                        },
+                    },
+                    "required": ["label", "value"],
+                    "additionalProperties": False,
+                },
+                "description": DOC_SPECS["apply_answers"],
+            },
+        },
+        "required": ["apply_answers"],
+        "additionalProperties": False,
+    }
+
+
 def _draft_one(
     client: "anthropic.Anthropic",
     shared_context: list[dict],
@@ -288,7 +338,12 @@ def _draft_one(
     doc_index: int = 1,
     doc_total: int = 1,
 ):
-    schema = _resume_schema() if doc_key == "resume" else _schema([doc_key])
+    if doc_key == "resume":
+        schema = _resume_schema()
+    elif doc_key == "apply_answers":
+        schema = _apply_answers_schema()
+    else:
+        schema = _schema([doc_key])
     # The resume schema carries the text itself plus ats_score/rationale/
     # next_actions/clarifying_questions, and federal-format resumes alone
     # can run 3000+ tokens - give it real headroom rather than truncating
@@ -356,6 +411,8 @@ def _draft_one(
             "ats_next_actions": data.get("ats_next_actions", []),
             "clarifying_questions": data.get("clarifying_questions", []),
         }
+    if doc_key == "apply_answers":
+        return data.get("apply_answers", [])
     return data.get(doc_key, "")
 
 
@@ -367,8 +424,9 @@ def generate_documents(
     on_progress=None,
 ) -> dict:
     """Drafts real, tailored document text for exactly the requested doc_keys
-    (subset of "resume", "cover_letter", "exec_bio", "leadership_summary"),
-    one API call per document type so progress is real, not simulated. The
+    (subset of "resume", "cover_letter", "exec_bio", "leadership_summary",
+    "apply_answers"), one API call per document type so progress is real,
+    not simulated. The
     job+profile context is identical across those calls and marked
     cacheable, so only the first call pays full price for it - subsequent
     ones in the same batch read it back at ~10% cost.
@@ -384,7 +442,9 @@ def generate_documents(
     part of the same drafting pass - clarifying_questions are gaps Claude
     couldn't close honestly without more real facts (never invented; ask,
     don't fabricate - see profile/interview.py's save_answer(), the same
-    mechanism this feeds back into via the Results tab). Raises
+    mechanism this feeds back into via the Results tab). "apply_answers"
+    maps to a list of {"label": ..., "value": ...} dicts (a ready-to-paste
+    packet for common ATS form fields) rather than a single string. Raises
     DraftingNotConfigured if no API key is set, DraftingFailed on
     refusal/truncation/API error."""
     if not doc_keys:

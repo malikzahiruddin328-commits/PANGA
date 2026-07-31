@@ -63,6 +63,7 @@ def upsert_application(
     resume_clarifying_questions: list[dict] | None = None,
     documents_requested: list[str] | None = None,
     skip_reason: str | None = None,
+    apply_answers: list[dict] | None = None,
 ) -> None:
     """Creates or updates the application record for (source, job_id).
     Fields left as None don't overwrite previously saved values -
@@ -84,7 +85,12 @@ def upsert_application(
     profile/interview.py) so the fact helps every future job, not just this
     one. Pass [] explicitly to clear once answered - a fresh generation
     always sets this field, so an empty list here means "nothing left to
-    ask", distinct from None ("don't touch what's stored")."""
+    ask", distinct from None ("don't touch what's stored"). apply_answers is
+    the "Apply Assist" packet (PRD-adjacent, 2026-07-31): a list of
+    {"label": ..., "value": ...} ready-to-paste answers for an ATS form's
+    recurring fields, drafted the same way as the other documents - Zahir
+    still opens the real application and pastes/submits it himself, this
+    only removes the retyping."""
     applications = load_applications()
     for app in applications:
         if app["source"] == source and app["job_id"] == job_id:
@@ -112,6 +118,8 @@ def upsert_application(
             if skip_reason is not None:
                 app["skip_reason"] = skip_reason
                 app["skip_reason_reviewed"] = False
+            if apply_answers is not None:
+                app["apply_answers"] = apply_answers
             _save_all(applications)
             _write_dossier(source, job_id)
             return
@@ -133,6 +141,7 @@ def upsert_application(
         "documents_requested": documents_requested if documents_requested is not None else [],
         "skip_reason": skip_reason,
         "skip_reason_reviewed": False if skip_reason is not None else None,
+        "apply_answers": apply_answers if apply_answers is not None else [],
     })
     _save_all(applications)
     _write_dossier(source, job_id)

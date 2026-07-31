@@ -38,7 +38,7 @@ from ranking.prioritize import weight_for, dedupe_across_sources
 from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion, set_strategy_tag
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
 from tailoring.interview_prep import load_interview_prep, record_round_outcome
-from tailoring.docx_export import text_to_docx_bytes
+from tailoring.docx_export import text_to_docx_bytes, cover_letter_to_docx_bytes
 from tailoring.drafting import generate_documents, score_job, save_gap_answers, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
 from prospector.rejection_diagnosis import gather_diagnosis_input
@@ -814,8 +814,9 @@ elif active_tab == "results":
                     ("cover_letter", "Cover letter"),
                     ("exec_bio", "Executive bio"),
                     ("leadership_summary", "Leadership summary"),
+                    ("apply_answers", "Apply Assist packet"),
                 ]
-                doc_cols = st.columns(4)
+                doc_cols = st.columns(len(doc_types))
                 checked = {}
                 for col, (doc_key, doc_label) in zip(doc_cols, doc_types):
                     with col:
@@ -875,6 +876,7 @@ elif active_tab == "results":
                                 cover_letter_text=drafted.get("cover_letter"),
                                 exec_bio_text=drafted.get("exec_bio"),
                                 leadership_summary_text=drafted.get("leadership_summary"),
+                                apply_answers=drafted.get("apply_answers"),
                             )
                             st.toast("Documents drafted. Review and download them below, then use them for the actual application.", icon=":material/check_circle:")
                             st.rerun()
@@ -884,9 +886,24 @@ elif active_tab == "results":
                     "cover_letter": "cover_letter_text",
                     "exec_bio": "exec_bio_text",
                     "leadership_summary": "leadership_summary_text",
+                    "apply_answers": "apply_answers",
                 }
                 for doc_key, doc_label in doc_types:
                     drafted_text = app_record.get(doc_field_map[doc_key])
+                    if doc_key == "apply_answers":
+                        if drafted_text:
+                            with st.expander(f"{doc_label} (drafted)"):
+                                st.markdown(
+                                    "Open the real application yourself and paste each "
+                                    "answer below into the matching field - nothing here "
+                                    "is submitted automatically."
+                                )
+                                for item in drafted_text:
+                                    label = item.get("label", "")
+                                    value = item.get("value", "")
+                                    st.caption(label)
+                                    st.code(value, language=None, wrap_lines=True)
+                        continue
                     if drafted_text:
                         with st.expander(f"{doc_label} (drafted)"):
                             if doc_key == "resume" and app_record.get("resume_ats_score") is not None:
@@ -974,9 +991,17 @@ elif active_tab == "results":
                                 st.markdown(f"**Resume text (ATS score: {app_record['resume_ats_score']}/100):**")
                             st.code(drafted_text, language=None, wrap_lines=True)
                             candidate_name = load_profile().get("name")
+                            if doc_key == "cover_letter":
+                                docx_bytes = cover_letter_to_docx_bytes(
+                                    drafted_text,
+                                    company_name=job.get("organization"),
+                                    author=candidate_name,
+                                )
+                            else:
+                                docx_bytes = text_to_docx_bytes(drafted_text, author=candidate_name)
                             st.download_button(
                                 f"Download {doc_label} (.docx)",
-                                data=text_to_docx_bytes(drafted_text, author=candidate_name),
+                                data=docx_bytes,
                                 file_name=descriptive_doc_filename(candidate_name, doc_label, job),
                                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                                 key=f"download_{doc_key}_{job.get('source')}_{job.get('job_id')}",

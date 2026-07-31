@@ -22,6 +22,7 @@ Claude to produce, so the heuristics aren't guessing at arbitrary text, they
 
 import io
 import re
+from datetime import date
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -131,6 +132,71 @@ def text_to_docx_bytes(text: str, author: str | None = None) -> bytes:
             continue
 
         doc.add_paragraph(line)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+_UNUSABLE_COMPANY_NAMES = {"", "confidential", "unknown", "n/a", "none"}
+
+
+def cover_letter_to_docx_bytes(
+    body_text: str,
+    company_name: str | None = None,
+    company_address: str | None = None,
+    author: str | None = None,
+) -> bytes:
+    """Cover letters get their own renderer rather than reusing
+    text_to_docx_bytes() above - that one always treats a document's first
+    non-blank line as the candidate's name and renders it at 20pt, which is
+    exactly right for a resume but meant a cover letter's opening line
+    ("Dear Hiring Team,") was rendering as a giant 20pt heading (Zahir's
+    real complaint on the actual downloaded file, 2026-08-01). A cover
+    letter is a standard business letter, not a resume: today's date and a
+    recipient block come first, then plain paragraphs at one consistent
+    size throughout - no line in a cover letter should ever be styled as
+    a "name".
+
+    company_name/company_address come from the job posting, which usually
+    only has a company name (job_store.py's schema has no address field at
+    all) - genuinely unknown values fall back to a bracketed placeholder
+    rather than a guess, since this becomes a real submitted document.
+    """
+    doc = Document()
+    normal = doc.styles["Normal"]
+    normal.font.name = BODY_FONT
+    normal.font.size = BODY_SIZE
+    normal.paragraph_format.space_after = Pt(8)
+
+    if author:
+        doc.core_properties.author = author
+        doc.core_properties.last_modified_by = author
+
+    today = date.today()
+    doc.add_paragraph(f"{today:%B} {today.day}, {today:%Y}")
+
+    clean_company = (company_name or "").strip()
+    company_p = doc.add_paragraph()
+    company_p.add_run(
+        company_name if clean_company.lower() not in _UNUSABLE_COMPANY_NAMES else "[Company Name]"
+    ).bold = True
+
+    clean_address = (company_address or "").strip()
+    address_p = doc.add_paragraph(clean_address if clean_address else "[Company Address]")
+    address_p.paragraph_format.space_after = Pt(20)
+
+    for raw_line in body_text.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        p = doc.add_paragraph()
+        run = p.add_run(line)
+        if author and line == author:
+            # The closing signature line - bold, matching how the name
+            # reads as a distinct element without blowing it up to resume
+            # size the way the old shared renderer's heuristic did.
+            run.bold = True
 
     buf = io.BytesIO()
     doc.save(buf)
