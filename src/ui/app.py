@@ -26,6 +26,10 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
+# Bhangi is a separate, standalone project (shared issue store for the
+# Support tab, reused across projects) - sibling folder to this one, not
+# part of this repo. See ../Bhangi/README.md.
+sys.path.insert(0, str(PROJECT_ROOT.parent / "Bhangi" / "src"))
 
 import pandas as pd
 import streamlit as st
@@ -58,6 +62,9 @@ from feedback.ui_feedback import get_open_feedback, mark_resolved
 from ui.feedback_widget import render_feedback_widget
 from profile.ingest import load_manifest_result, remove_document, ingest_uploaded_document
 from profile.storage import load_profile
+from bhangi.ui import render_support_page
+
+BHANGI_PROJECT = "panga"
 
 CATEGORY_LABELS = {
     "rejection": "Rejection",
@@ -253,6 +260,7 @@ TAB_ICONS = {
     "prospector": ":material/travel_explore:",
     "prep": ":material/school:",
     "linkedin": ":material/badge:",
+    "support": ":material/support_agent:",
     "settings": ":material/settings:",
 }
 TABS = [
@@ -261,6 +269,7 @@ TABS = [
     ("prospector", "Prospector"),
     ("prep", f"Interview prep ({prep_in_progress_count})" if prep_in_progress_count else "Interview prep"),
     ("linkedin", "LinkedIn"),
+    ("support", "Support"),
     ("settings", "Settings"),
 ]
 tab_cols = st.columns(len(TABS))
@@ -1388,3 +1397,14 @@ elif active_tab == "linkedin":
         if target_matches:
             with st.expander("Connections at a target account"):
                 st.dataframe(pd.DataFrame(target_matches)[["first_name", "last_name", "company", "position", "matched_target_account"]], hide_index=True, width="stretch")
+
+elif active_tab == "support":
+    render_feedback_widget("support")
+    render_support_page(
+        BHANGI_PROJECT,
+        intro=(
+            "Ran into something broken? Describe it below and attach a "
+            "screenshot and/or a log file if you have one - this gets queued "
+            "for review, same as everything else Panga tracks."
+        ),
+    )

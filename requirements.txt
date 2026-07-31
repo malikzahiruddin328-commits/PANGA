@@ -10,3 +10,4 @@ keyring
 pypdf
 SpeechRecognition
 anthropic
+pytest
