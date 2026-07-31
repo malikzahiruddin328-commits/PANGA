@@ -181,7 +181,7 @@ def render_outreach_section(key_prefix: str, target_account_name: str | None = N
         oc_title = st.text_input("Contact title (optional)", key=f"{key_prefix}_new_contact_title")
         oc_channel = st.selectbox("Channel", ["email", "linkedin", "phone", "in_person"], key=f"{key_prefix}_new_channel")
         oc_email = st.text_input("Contact email (optional, needed to request a drafted email)", key=f"{key_prefix}_new_email") if oc_channel == "email" else None
-        oc_notes = st.text_input("Notes (optional)", key=f"{key_prefix}_new_notes")
+        oc_notes = st.text_area("Notes (optional)", key=f"{key_prefix}_new_notes")
         if st.button("Log outreach", key=f"{key_prefix}_new_save"):
             if oc_name:
                 add_outreach(
@@ -320,7 +320,7 @@ if active_tab == "settings":
     if doc_category == "resume":
         doc_target_title = st.text_input("Which title does this resume version target? (optional)", key="new_doc_title")
     elif doc_category == "reference":
-        doc_note = st.text_input("What was this tailored for? (optional)", key="new_doc_note")
+        doc_note = st.text_area("What was this tailored for? (optional)", key="new_doc_note")
     new_doc_file = st.file_uploader("Upload a .docx or .pdf", type=["docx", "pdf"], key="new_doc_file")
     if st.button("Save document", type="primary", disabled=not new_doc_file):
         entry = ingest_uploaded_document(
@@ -912,9 +912,10 @@ elif active_tab == "results":
                                         job_key = f"{job.get('source')}_{job.get('job_id')}"
                                         answer_inputs = {}
                                         for qi, q in enumerate(clarifying_questions):
-                                            answer_inputs[q["skill"]] = st.text_input(
+                                            answer_inputs[q["skill"]] = st.text_area(
                                                 q["question"],
                                                 key=f"gapans_{job_key}_{qi}",
+                                                height=68,
                                             )
                                         if st.button("Save answers & regenerate resume", key=f"gapsave_{job_key}"):
                                             answered = {skill: ans for skill, ans in answer_inputs.items() if ans and ans.strip()}
@@ -981,10 +982,10 @@ elif active_tab == "results":
                     if new_status != "-":
                         skip_reason = None
                         if new_status == "not interested":
-                            skip_reason = st.text_input("Why not interested? (optional)", key=f"reason_{job.get('source')}_{job.get('job_id')}")
+                            skip_reason = st.text_area("Why not interested? (optional)", key=f"reason_{job.get('source')}_{job.get('job_id')}")
                         if st.button("Save status", key=f"save_status_{job.get('source')}_{job.get('job_id')}"):
                             upsert_application(job["source"], job["job_id"], status=new_status, skip_reason=skip_reason)
-                            st.success("Status saved.")
+                            st.toast("Status saved.", icon=":material/check_circle:")
                             st.rerun()
                 new_tag = st.text_input(
                     "Strategy tag (optional - what's different about this draft, e.g. \"concise-1-page\")",
@@ -1080,10 +1081,10 @@ elif active_tab == "prospector":
                 index=["watching", "qualified", "contacted", "stale", "disqualified"].index(acc["status"]),
                 key=f"ta_status_{acc['company_name']}",
             )
-            ta_notes = st.text_input("Notes (optional)", value=acc.get("notes") or "", key=f"ta_notes_{acc['company_name']}")
+            ta_notes = st.text_area("Notes (optional)", value=acc.get("notes") or "", key=f"ta_notes_{acc['company_name']}")
             if st.button("Save", key=f"ta_save_{acc['company_name']}"):
                 set_target_account_status(acc["company_name"], new_ta_status, notes=ta_notes or None)
-                st.success("Saved.")
+                st.toast("Saved.", icon=":material/check_circle:")
                 st.rerun()
             st.divider()
             render_outreach_section(f"ta_{acc['company_name']}", target_account_name=acc["company_name"])
@@ -1289,13 +1290,13 @@ elif active_tab == "prep":
                     index=OUTCOME_OPTIONS.index(current_outcome) if current_outcome in OUTCOME_OPTIONS else 0,
                     key=f"outcome_{record['source']}_{record['job_id']}_{round_['round_label']}",
                 )
-                outcome_notes = st.text_input(
+                outcome_notes = st.text_area(
                     "Notes (optional)", value=round_.get("outcome_notes") or "",
                     key=f"outcome_notes_{record['source']}_{record['job_id']}_{round_['round_label']}",
                 )
                 if st.button("Save outcome", key=f"save_outcome_{record['source']}_{record['job_id']}_{round_['round_label']}"):
                     record_round_outcome(record["source"], record["job_id"], round_["round_label"], new_outcome, outcome_notes or None)
-                    st.success("Saved.")
+                    st.toast("Saved.", icon=":material/check_circle:")
                     st.rerun()
 
 elif active_tab == "linkedin":
