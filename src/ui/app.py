@@ -884,7 +884,19 @@ elif active_tab == "results":
                         with st.expander(f"{doc_label} (drafted)"):
                             if doc_key == "resume" and app_record.get("resume_ats_score") is not None:
                                 with st.container(border=True):
-                                    st.metric("ATS compatibility score", f"{app_record['resume_ats_score']}/100")
+                                    current_score = app_record["resume_ats_score"]
+                                    prev_score_key = f"prev_ats_score_{job.get('source')}_{job.get('job_id')}"
+                                    # Set right before a regenerate call below, popped (shown once,
+                                    # not left sitting on every future page view) here on the very
+                                    # next render after that regeneration completes - st.metric's
+                                    # native delta arrow is the "look nice" version of "show the
+                                    # recalculated score" Zahir asked for, not just the bare new number.
+                                    score_delta = None
+                                    if prev_score_key in st.session_state:
+                                        prev_score = st.session_state.pop(prev_score_key)
+                                        if prev_score is not None and prev_score != current_score:
+                                            score_delta = current_score - prev_score
+                                    st.metric("ATS compatibility score", f"{current_score}/100", delta=score_delta)
                                     st.markdown(f"**Why this score:** {app_record.get('resume_ats_rationale') or ''}")
                                     next_actions = app_record.get("resume_ats_next_actions") or []
                                     if next_actions:
@@ -909,6 +921,7 @@ elif active_tab == "results":
                                             if not answered:
                                                 st.toast("Answer at least one question first.", icon=":material/warning:")
                                             else:
+                                                st.session_state[prev_score_key] = current_score
                                                 save_gap_answers(job, answered)
                                                 regen_bar = st.progress(0, text="Regenerating resume with your answers...")
 
