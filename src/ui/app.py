@@ -1407,4 +1407,5 @@ elif active_tab == "support":
             "screenshot and/or a log file if you have one - this gets queued "
             "for review, same as everything else Panga tracks."
         ),
+        project_root=PROJECT_ROOT,
     )
