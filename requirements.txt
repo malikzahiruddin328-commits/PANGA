@@ -9,3 +9,4 @@ cryptography
 keyring
 pypdf
 SpeechRecognition
+anthropic

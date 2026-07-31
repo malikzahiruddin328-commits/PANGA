@@ -57,6 +57,9 @@ def upsert_application(
     cover_letter_text: str | None = None,
     exec_bio_text: str | None = None,
     leadership_summary_text: str | None = None,
+    resume_ats_score: int | None = None,
+    resume_ats_rationale: str | None = None,
+    resume_ats_next_actions: list[str] | None = None,
     documents_requested: list[str] | None = None,
     skip_reason: str | None = None,
 ) -> None:
@@ -68,7 +71,11 @@ def upsert_application(
     skip_reason marks it unreviewed (skip_reason_reviewed=False) - Claude
     evaluates unreviewed reasons for what they imply about future searches
     (per PRD §13's non-applied-job feedback loop) and marks them reviewed
-    via mark_skip_reason_reviewed()."""
+    via mark_skip_reason_reviewed(). resume_ats_score/rationale/next_actions
+    are set together whenever the resume is (re)drafted - how well that
+    exact resume text would score in a real ATS match against this job, and
+    concrete ways to raise it, same "score + why + how to raise it" shape as
+    Prospector Score and LinkedIn's profile-strength score."""
     applications = load_applications()
     for app in applications:
         if app["source"] == source and app["job_id"] == job_id:
@@ -83,6 +90,12 @@ def upsert_application(
                 app["exec_bio_text"] = exec_bio_text
             if leadership_summary_text is not None:
                 app["leadership_summary_text"] = leadership_summary_text
+            if resume_ats_score is not None:
+                app["resume_ats_score"] = resume_ats_score
+            if resume_ats_rationale is not None:
+                app["resume_ats_rationale"] = resume_ats_rationale
+            if resume_ats_next_actions is not None:
+                app["resume_ats_next_actions"] = resume_ats_next_actions
             if documents_requested is not None:
                 app["documents_requested"] = documents_requested
             if skip_reason is not None:
@@ -102,6 +115,9 @@ def upsert_application(
         "cover_letter_text": cover_letter_text,
         "exec_bio_text": exec_bio_text,
         "leadership_summary_text": leadership_summary_text,
+        "resume_ats_score": resume_ats_score,
+        "resume_ats_rationale": resume_ats_rationale,
+        "resume_ats_next_actions": resume_ats_next_actions if resume_ats_next_actions is not None else [],
         "documents_requested": documents_requested if documents_requested is not None else [],
         "skip_reason": skip_reason,
         "skip_reason_reviewed": False if skip_reason is not None else None,

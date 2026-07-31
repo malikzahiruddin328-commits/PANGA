@@ -37,6 +37,8 @@ from ranking.prioritize import weight_for, dedupe_across_sources
 from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion, set_strategy_tag
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
 from tailoring.interview_prep import load_interview_prep, record_round_outcome
+from tailoring.docx_export import text_to_docx_bytes
+from tailoring.drafting import generate_documents, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
 from prospector.rejection_diagnosis import gather_diagnosis_input
 from prospector.target_accounts import load_target_accounts, set_status as set_target_account_status
@@ -55,6 +57,7 @@ from security.crypto_store import has_recovery_code, generate_recovery_code
 from feedback.ui_feedback import get_open_feedback, mark_resolved
 from ui.feedback_widget import render_feedback_widget
 from profile.ingest import load_manifest_result, remove_document, ingest_uploaded_document
+from profile.storage import load_profile
 
 CATEGORY_LABELS = {
     "rejection": "Rejection",
@@ -765,11 +768,60 @@ elif active_tab == "results":
                             value=doc_key in requested,
                             key=f"doc_{doc_key}_{job.get('source')}_{job.get('job_id')}",
                         )
-                if st.button("Request documents", key=f"reqdocs_{job.get('source')}_{job.get('job_id')}"):
+                gen_col, _ = st.columns([1, 3])
+                with gen_col:
+                    generate_clicked = st.button(
+                        "Generate documents",
+                        key=f"gendocs_{job.get('source')}_{job.get('job_id')}",
+                        type="primary",
+                    )
+                if not drafting_is_configured():
+                    st.markdown(
+                        "No Anthropic API key found, so this button will save your "
+                        "selection but can't draft the documents yet. Add "
+                        "`ANTHROPIC_API_KEY` to the `.env` file in the Panga folder "
+                        "(get a key at console.anthropic.com) and restart the app."
+                    )
+                if generate_clicked:
                     selected = [k for k, v in checked.items() if v]
-                    upsert_application(job["source"], job["job_id"], status="under review", documents_requested=selected)
-                    st.toast("Saved. Go to Claude Code and ask to draft the documents for this job - it'll generate exactly what's checked. Once you've actually submitted it, come back and mark it \"applied.\"", icon=":material/check_circle:")
-                    st.rerun()
+                    if not selected:
+                        st.toast("Check at least one document type first.", icon=":material/warning:")
+                    elif not drafting_is_configured():
+                        upsert_application(job["source"], job["job_id"], status="under review", documents_requested=selected)
+                        st.toast("Saved your selection - add an API key to actually draft the documents.", icon=":material/info:")
+                        st.rerun()
+                    else:
+                        doc_labels = dict(doc_types)
+                        progress_bar = st.progress(0, text=f"Drafting 1 of {len(selected)}: {doc_labels[selected[0]]}...")
+
+                        def _update_progress(i, total, doc_key):
+                            progress_bar.progress(
+                                (i - 1) / total,
+                                text=f"Drafting {i} of {total}: {doc_labels[doc_key]}...",
+                            )
+
+                        try:
+                            drafted = generate_documents(job, load_profile(), selected, on_progress=_update_progress)
+                        except (DraftingNotConfigured, DraftingFailed) as exc:
+                            progress_bar.empty()
+                            st.error(str(exc))
+                        else:
+                            progress_bar.progress(1.0, text="Done.")
+                            resume_draft = drafted.get("resume")
+                            resume_is_scored = isinstance(resume_draft, dict)
+                            upsert_application(
+                                job["source"], job["job_id"], status="under review",
+                                documents_requested=selected,
+                                resume_text=resume_draft["text"] if resume_is_scored else resume_draft,
+                                resume_ats_score=resume_draft["ats_score"] if resume_is_scored else None,
+                                resume_ats_rationale=resume_draft["ats_rationale"] if resume_is_scored else None,
+                                resume_ats_next_actions=resume_draft["ats_next_actions"] if resume_is_scored else None,
+                                cover_letter_text=drafted.get("cover_letter"),
+                                exec_bio_text=drafted.get("exec_bio"),
+                                leadership_summary_text=drafted.get("leadership_summary"),
+                            )
+                            st.toast("Documents drafted. Review and download them below, then use them for the actual application.", icon=":material/check_circle:")
+                            st.rerun()
 
                 doc_field_map = {
                     "resume": "resume_text",
@@ -781,7 +833,23 @@ elif active_tab == "results":
                     drafted_text = app_record.get(doc_field_map[doc_key])
                     if drafted_text:
                         with st.expander(f"{doc_label} (drafted)"):
-                            st.code(drafted_text, language=None)
+                            if doc_key == "resume" and app_record.get("resume_ats_score") is not None:
+                                with st.container(border=True):
+                                    st.metric("ATS compatibility score", f"{app_record['resume_ats_score']}/100")
+                                    st.markdown(f"**Why this score:** {app_record.get('resume_ats_rationale') or ''}")
+                                    next_actions = app_record.get("resume_ats_next_actions") or []
+                                    if next_actions:
+                                        st.markdown("**How to raise it:**")
+                                        for action in next_actions:
+                                            st.markdown(f"- {action}")
+                            st.code(drafted_text, language=None, wrap_lines=True)
+                            st.download_button(
+                                f"Download {doc_label} (.docx)",
+                                data=text_to_docx_bytes(drafted_text),
+                                file_name=f"{doc_label.replace(' ', '_')}.docx",
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                key=f"download_{doc_key}_{job.get('source')}_{job.get('job_id')}",
+                            )
 
                 b2, b3 = st.columns(2)
                 with b2:
