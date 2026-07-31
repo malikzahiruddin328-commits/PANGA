@@ -74,8 +74,13 @@ Ground rules:
 - Only use employers, titles, dates, degrees, certifications, and accomplishments that are actually present in the candidate's master profile provided below. Never invent or embellish facts, metrics, employers, or credentials that aren't there.
 - If the job posting calls for a qualification the profile doesn't clearly evidence, do not fabricate it - either omit it or honestly bridge from the closest real, transferable experience in the profile.
 - Tailor every document specifically to this job posting and organization - reference the actual role, organization name, and what the posting emphasizes. Do not write generic, could-apply-to-any-job text.
-- Write in a natural, confident, professional voice - not generic AI phrasing, not stuffed with buzzwords.
-- Return ONLY the documents requested via the structured output schema. No extra commentary."""
+- Return ONLY the documents requested via the structured output schema. No extra commentary.
+
+Writing voice - this must read as a real senior executive's own writing, not AI output:
+- British English prose conventions - phrasing, idiom, and a measured, understated register - but American spellings throughout (e.g. "color" not "colour", "organize" not "organise", "center" not "centre"), since this is for US employers.
+- Vary sentence length and structure line to line; never fall into a uniform rhythm.
+- Do not use these overused AI-writing tells: corporate buzzwords (leverage, spearhead, synergy, robust, cutting-edge, seamless, dynamic, passionate, game-changer); repetitive three-item lists; formulaic openers ("In today's fast-paced environment...", "I am thrilled to apply..."); "not just X, but Y" constructions; excessive em dashes; and stacking multiple adjectives before a noun.
+- Every claim should sound like something this specific person would actually say about his own work - concrete, specific, a little understated rather than oversold."""
 
 
 class DraftingNotConfigured(Exception):
@@ -99,6 +104,78 @@ def _client() -> "anthropic.Anthropic":
             "uses) and restart the app."
         )
     return anthropic.Anthropic()
+
+
+SCORE_SYSTEM_PROMPT = """You are scoring how well one job posting fits this specific candidate, for his personal job-search tool. Read the candidate's master profile below and reason genuinely about fit - never a keyword count.
+
+Consider:
+- Seniority match: this candidate is executive/leadership level (25+ years, CIO/Head of IT background), not an individual-contributor or hands-on technical role.
+- Domain/functional match: IT/technology/data leadership vs. unrelated fields (clinical/medical, legal, HR, finance, military operations, food service, construction, sales, etc.) - a senior-sounding title alone does not mean relevance.
+- Non-US locations count against fit somewhat (relocation/visa impractical) unless the posting is explicitly remote.
+- The candidate has explicitly said he does NOT consider himself qualified for CISO-titled or other specialized security-officer-titled roles (e.g. SISO, "IT Security Officer"), despite broader cybersecurity oversight experience - score these LOW regardless of subject-matter proximity, this is a real disqualifier, not just a preference.
+- Roles requiring current military/National Guard membership (e.g. "Title 32" postings) score 0 regardless of IT relevance - not eligible.
+- Entry-level/intern/student/recent-graduate programs score 0 regardless of subject matter - wrong seniority.
+- Staffing-firm or retained-executive-search-firm postings should be scored on the underlying role itself, same criteria as any direct posting.
+
+Assign a 0-100 fit_score and a one-sentence, specific, plain-language fit_rationale explaining why (not generic filler) via the structured output schema."""
+
+
+def _score_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "fit_score": {"type": "integer", "description": "0-100 fit score for this candidate against this posting."},
+            "fit_rationale": {"type": "string", "description": "One sentence, specific to this role, plain language."},
+        },
+        "required": ["fit_score", "fit_rationale"],
+        "additionalProperties": False,
+    }
+
+
+def score_job(job: dict, profile: dict, model: str | None = None) -> dict:
+    """Live-scores a single job against the master profile via the direct
+    API - for jobs that need an immediate score outside the daily scheduled
+    task or a live Claude Code conversation (namely, jobs added manually via
+    the Results tab intake form, which would otherwise sit invisible - the
+    Results tab hides any job with no fit_score at all). Mirrors the exact
+    rubric panga-daily-job-search's SKILL.md step 5 already uses, so scores
+    stay comparable across the app rather than following a different rubric.
+    Returns {"fit_score": int, "fit_rationale": str}. Raises
+    DraftingNotConfigured/DraftingFailed same as generate_documents()."""
+    client = _client()
+    content = (
+        "JOB POSTING:\n" + json.dumps(job, indent=2, default=str) +
+        "\n\nCANDIDATE'S MASTER PROFILE:\n" + json.dumps(profile, indent=2, default=str)
+    )
+    try:
+        response = client.messages.create(
+            model=model or os.environ.get("ANTHROPIC_MODEL") or DEFAULT_MODEL,
+            max_tokens=2000,
+            thinking={"type": "adaptive"},
+            output_config={"effort": "high", "format": {"type": "json_schema", "schema": _score_schema()}},
+            system=SCORE_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": content}],
+        )
+    except anthropic.APIStatusError as exc:
+        raise DraftingFailed(f"Claude API error ({exc.status_code}): {exc.message}") from exc
+    except anthropic.APIConnectionError as exc:
+        raise DraftingFailed("Couldn't reach the Claude API - check your internet connection.") from exc
+
+    if response.stop_reason == "refusal":
+        raise DraftingFailed("Claude declined to score this job. Try again.")
+    if response.stop_reason == "max_tokens":
+        raise DraftingFailed("The response was cut off before finishing. Try again.")
+
+    text_block = next((b.text for b in response.content if b.type == "text"), None)
+    if not text_block:
+        raise DraftingFailed("Claude returned no score.")
+
+    try:
+        data = json.loads(text_block)
+    except json.JSONDecodeError as exc:
+        raise DraftingFailed("Claude's response wasn't valid - try again.") from exc
+
+    return {"fit_score": data["fit_score"], "fit_rationale": data["fit_rationale"]}
 
 
 def _schema(doc_keys: list[str]) -> dict:
@@ -146,18 +223,58 @@ def _resume_schema() -> dict:
                     "gap can't be closed without real experience they don't have."
                 ),
             },
+            "clarifying_questions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "skill": {
+                            "type": "string",
+                            "description": "Short label for this gap (e.g. 'SK Life Science IT team size/budget'), matching the master profile's gap-tracking convention.",
+                        },
+                        "question": {
+                            "type": "string",
+                            "description": "A direct, specific question whose answer is a genuine, checkable fact (a number, a name, a date) that would close this gap - not vague or stylistic.",
+                        },
+                    },
+                    "required": ["skill", "question"],
+                    "additionalProperties": False,
+                },
+                "description": (
+                    "0-5 specific, directly answerable questions for real facts "
+                    "this resume is currently missing that would raise the score "
+                    "if the candidate actually has them - never invent the answer "
+                    "yourself, ask instead. Only include questions a real number/"
+                    "name/date could answer. Skip anything already answered "
+                    "elsewhere in the profile or that's purely about wording/"
+                    "structure rather than a missing fact."
+                ),
+            },
         },
-        "required": ["text", "ats_score", "ats_rationale", "ats_next_actions"],
+        "required": ["text", "ats_score", "ats_rationale", "ats_next_actions", "clarifying_questions"],
         "additionalProperties": False,
     }
 
 
-def _draft_one(client: "anthropic.Anthropic", shared_context: list[dict], doc_key: str, model: str | None):
+def _draft_one(
+    client: "anthropic.Anthropic",
+    shared_context: list[dict],
+    doc_key: str,
+    model: str | None,
+    on_progress=None,
+    doc_index: int = 1,
+    doc_total: int = 1,
+):
     schema = _resume_schema() if doc_key == "resume" else _schema([doc_key])
+    # The resume schema carries the text itself plus ats_score/rationale/
+    # next_actions/clarifying_questions, and federal-format resumes alone
+    # can run 3000+ tokens - give it real headroom rather than truncating
+    # (hit for real during testing at 6000 with a federal-length resume).
+    max_tokens = 20000 if doc_key == "resume" else 6000
     try:
-        response = client.messages.create(
+        with client.messages.stream(
             model=model or os.environ.get("ANTHROPIC_MODEL") or DEFAULT_MODEL,
-            max_tokens=6000,
+            max_tokens=max_tokens,
             thinking={"type": "adaptive"},
             output_config={"effort": "high", "format": {"type": "json_schema", "schema": schema}},
             system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
@@ -165,7 +282,27 @@ def _draft_one(client: "anthropic.Anthropic", shared_context: list[dict], doc_ke
                 "role": "user",
                 "content": shared_context + [{"type": "text", "text": f"\n\nDraft: {doc_key}"}],
             }],
-        )
+        ) as stream:
+            # One level deeper than "which document is drafting" (Zahir's
+            # ask): surface the thinking->writing transition and a live,
+            # throttled character count from the raw stream, so the progress
+            # bar keeps moving DURING a single document's call, not just
+            # between calls. The streamed text is the raw structured-output
+            # JSON as it's built, not the final prose - a character count is
+            # still an honest, real progress signal, just not a literal
+            # preview of the finished text.
+            char_count = 0
+            last_reported = 0
+            for event in stream:
+                if event.type == "content_block_start" and event.content_block.type == "thinking":
+                    if on_progress:
+                        on_progress(doc_index, doc_total, doc_key, "thinking...")
+                elif event.type == "content_block_delta" and event.delta.type == "text_delta":
+                    char_count += len(event.delta.text)
+                    if on_progress and char_count - last_reported >= 150:
+                        on_progress(doc_index, doc_total, doc_key, f"writing... ({char_count:,} characters so far)")
+                        last_reported = char_count
+            response = stream.get_final_message()
     except anthropic.APIStatusError as exc:
         raise DraftingFailed(f"Claude API error ({exc.status_code}): {exc.message}") from exc
     except anthropic.APIConnectionError as exc:
@@ -194,6 +331,7 @@ def _draft_one(client: "anthropic.Anthropic", shared_context: list[dict], doc_ke
             "ats_score": data.get("ats_score"),
             "ats_rationale": data.get("ats_rationale", ""),
             "ats_next_actions": data.get("ats_next_actions", []),
+            "clarifying_questions": data.get("clarifying_questions", []),
         }
     return data.get(doc_key, "")
 
@@ -211,12 +349,19 @@ def generate_documents(
     job+profile context is identical across those calls and marked
     cacheable, so only the first call pays full price for it - subsequent
     ones in the same batch read it back at ~10% cost.
-    If given, on_progress(i, total, doc_key) is called right before drafting
-    starts on the i-th (1-indexed) of `total` documents.
-    Returns {doc_key: drafted_text}, except "resume" maps to
-    {"text": ..., "ats_score": int, "ats_rationale": str, "ats_next_actions":
-    [...]} instead of a plain string, since the resume is ATS-scored against
-    this posting as part of the same drafting pass. Raises
+    If given, on_progress(i, total, doc_key, substatus=None) is called right
+    before drafting starts on the i-th (1-indexed) of `total` documents
+    (substatus=None), then repeatedly during that document's own generation
+    with a live sub-status ("thinking...", "writing... (N characters so
+    far)") as the response streams in.
+    Returns {doc_key: drafted_text}, except "resume" maps to {"text": ...,
+    "ats_score": int, "ats_rationale": str, "ats_next_actions": [...],
+    "clarifying_questions": [{"skill": ..., "question": ...}]} instead of a
+    plain string, since the resume is ATS-scored against this posting as
+    part of the same drafting pass - clarifying_questions are gaps Claude
+    couldn't close honestly without more real facts (never invented; ask,
+    don't fabricate - see profile/interview.py's save_answer(), the same
+    mechanism this feeds back into via the Results tab). Raises
     DraftingNotConfigured if no API key is set, DraftingFailed on
     refusal/truncation/API error."""
     if not doc_keys:
@@ -233,8 +378,30 @@ def generate_documents(
     }]
 
     results = {}
+    total = len(doc_keys)
     for i, doc_key in enumerate(doc_keys, start=1):
         if on_progress:
-            on_progress(i, len(doc_keys), doc_key)
-        results[doc_key] = _draft_one(client, shared_context, doc_key, model)
+            on_progress(i, total, doc_key)
+        results[doc_key] = _draft_one(client, shared_context, doc_key, model, on_progress, i, total)
     return results
+
+
+def save_gap_answers(job: dict, answers: dict[str, str]) -> None:
+    """Persists confirmed answers to a resume's clarifying_questions into the
+    master profile's gap_interview_answers - the same store/shape
+    profile/interview.py's save_answer() already writes to, so a fact
+    confirmed here (e.g. "SK Life Science IT team size/budget") becomes
+    available to every future job's drafting, not just this one. answers
+    maps each question's "skill" label to the candidate's typed answer;
+    blank/whitespace-only answers are skipped rather than saved as empty
+    facts. Never called with an invented answer - the Results tab UI only
+    calls this with what Zahir actually typed."""
+    from datetime import date
+
+    from profile.interview import save_answer
+
+    role_context = f"{job.get('title', 'Unknown role')} at {job.get('organization', 'Unknown organization')}"
+    today = date.today().isoformat()
+    for skill, answer in answers.items():
+        if answer and answer.strip():
+            save_answer(skill=skill, role_context=role_context, answer=answer.strip(), date_captured=today)

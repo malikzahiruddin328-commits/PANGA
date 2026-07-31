@@ -60,6 +60,7 @@ def upsert_application(
     resume_ats_score: int | None = None,
     resume_ats_rationale: str | None = None,
     resume_ats_next_actions: list[str] | None = None,
+    resume_clarifying_questions: list[dict] | None = None,
     documents_requested: list[str] | None = None,
     skip_reason: str | None = None,
 ) -> None:
@@ -75,7 +76,15 @@ def upsert_application(
     are set together whenever the resume is (re)drafted - how well that
     exact resume text would score in a real ATS match against this job, and
     concrete ways to raise it, same "score + why + how to raise it" shape as
-    Prospector Score and LinkedIn's profile-strength score."""
+    Prospector Score and LinkedIn's profile-strength score.
+    resume_clarifying_questions is the subset of those gaps that hinge on a
+    real fact Claude doesn't have rather than wording/structure - answering
+    them (Results tab UI) feeds tailoring.drafting.save_gap_answers(), which
+    writes into the master profile's own gap_interview_answers (per
+    profile/interview.py) so the fact helps every future job, not just this
+    one. Pass [] explicitly to clear once answered - a fresh generation
+    always sets this field, so an empty list here means "nothing left to
+    ask", distinct from None ("don't touch what's stored")."""
     applications = load_applications()
     for app in applications:
         if app["source"] == source and app["job_id"] == job_id:
@@ -96,6 +105,8 @@ def upsert_application(
                 app["resume_ats_rationale"] = resume_ats_rationale
             if resume_ats_next_actions is not None:
                 app["resume_ats_next_actions"] = resume_ats_next_actions
+            if resume_clarifying_questions is not None:
+                app["resume_clarifying_questions"] = resume_clarifying_questions
             if documents_requested is not None:
                 app["documents_requested"] = documents_requested
             if skip_reason is not None:
@@ -118,6 +129,7 @@ def upsert_application(
         "resume_ats_score": resume_ats_score,
         "resume_ats_rationale": resume_ats_rationale,
         "resume_ats_next_actions": resume_ats_next_actions if resume_ats_next_actions is not None else [],
+        "resume_clarifying_questions": resume_clarifying_questions if resume_clarifying_questions is not None else [],
         "documents_requested": documents_requested if documents_requested is not None else [],
         "skip_reason": skip_reason,
         "skip_reason_reviewed": False if skip_reason is not None else None,

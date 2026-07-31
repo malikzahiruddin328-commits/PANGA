@@ -38,7 +38,7 @@ from tailoring.applications import load_applications, upsert_application, get_ap
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
 from tailoring.interview_prep import load_interview_prep, record_round_outcome
 from tailoring.docx_export import text_to_docx_bytes
-from tailoring.drafting import generate_documents, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed
+from tailoring.drafting import generate_documents, score_job, save_gap_answers, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
 from prospector.rejection_diagnosis import gather_diagnosis_input
 from prospector.target_accounts import load_target_accounts, set_status as set_target_account_status
@@ -608,12 +608,33 @@ elif active_tab == "results":
             "Paste the job description text", key="manual_job_description", height=200,
         )
         if st.button("Save job", type="primary", disabled=not (manual_title and manual_org and manual_url)):
-            from search.job_store import add_manual_job
+            from search.job_store import add_manual_job, update_job_score
             job = add_manual_job(
                 title=manual_title, organization=manual_org, location=manual_location,
                 description=manual_description, posting_url=manual_url, source=manual_source or "linkedin",
             )
-            st.toast(f"Saved \"{job['title']}\" at {job['organization']}.", icon=":material/check_circle:")
+            # A job with no fit_score is hidden by the Results tab regardless
+            # of the slider (see the min_score filter above) - without this,
+            # a manually-added job would sit invisible until the next daily
+            # scoring pass or a live Claude Code conversation scored it.
+            if drafting_is_configured():
+                with st.spinner("Scoring compatibility..."):
+                    try:
+                        scored = score_job(job, load_profile())
+                    except (DraftingNotConfigured, DraftingFailed) as exc:
+                        st.toast(f"Saved, but scoring failed: {exc}", icon=":material/warning:")
+                    else:
+                        update_job_score(job["source"], job["job_id"], scored["fit_score"], scored["fit_rationale"])
+                        st.toast(
+                            f"Saved \"{job['title']}\" at {job['organization']} - scored {scored['fit_score']}/100.",
+                            icon=":material/check_circle:",
+                        )
+            else:
+                st.toast(
+                    f"Saved \"{job['title']}\" at {job['organization']}. No Anthropic API key configured, so it's "
+                    "unscored for now - it'll appear once the daily scoring pass runs, or add an API key to score it immediately.",
+                    icon=":material/info:",
+                )
             st.session_state["manual_job_clear_pending"] = True
             st.rerun()
 
@@ -680,6 +701,18 @@ elif active_tab == "results":
         # identical "Audit Director (IT)" postings.
         return (job.get("title"), job.get("organization"), job.get("location"), job.get("pay_min"), job.get("pay_max"))
 
+    def _select_role_row(event_key, sel_key):
+        # Fires as a real Streamlit on_click callback (runs once, before the
+        # script reruns from the top) - by the time the st.dataframe() call
+        # below executes in that rerun, sel_key already holds the new
+        # selection. sel_key (not event_key) is what persists it: the
+        # ButtonColumn's own click state in st.session_state[event_key]
+        # resets to None right after the click's rerun, same as any other
+        # ButtonColumn per the Streamlit skill's reference docs.
+        click = st.session_state.get(event_key)
+        if click:
+            st.session_state[sel_key] = click["row"]
+
     for channel in channels:
         channel_jobs = [j for j in ranked if j["source"] == channel]
 
@@ -714,26 +747,42 @@ elif active_tab == "results":
                 })
             df = pd.DataFrame(table_rows)
 
-            event = st.dataframe(
+            # Clicking a job's title (Role column, styled as a plain-text
+            # button rather than filled) opens its detail panel below - per
+            # Zahir's explicit ask, replacing Streamlit's native separate
+            # row-selector checkbox column with a click directly on the role
+            # itself. type="tertiary" is the least button-like native style
+            # Streamlit offers for a ButtonColumn (no border/fill) - there is
+            # no way to make a clickable cell render as fully bare text.
+            event_key = f"roleclick_{channel}"
+            sel_key = f"selected_row_{channel}"
+            st.dataframe(
                 df,
                 hide_index=True,
                 width="stretch",
-                on_select="rerun",
-                selection_mode="single-row",
-                column_config={"Posting": st.column_config.LinkColumn(display_text="Open")},
+                column_config={
+                    "Role": st.column_config.ButtonColumn(
+                        "Role", on_click=_select_role_row, args=(event_key, sel_key),
+                        key=event_key, type="tertiary",
+                    ),
+                    "Posting": st.column_config.LinkColumn(display_text="Open"),
+                },
                 key=f"table_{channel}",
             )
 
-            # st.dataframe's on_select state persists across reruns (keyed by
-            # the widget's `key`), but the row-count of `deduped` can shrink
-            # between reruns (e.g. moving the compatibility slider re-filters
+            # sel_key persists across reruns until a different role is
+            # clicked, but the row-count of `deduped` can shrink between
+            # reruns (e.g. moving the compatibility slider re-filters
             # `ranked`/`deduped` this same run) - a previously selected index
             # can point past the end of the new, shorter list. Bounds-check
             # rather than crash; a selection that no longer exists just shows
             # no detail panel, which is correct since that row may no longer
-            # be visible at all.
-            selected_rows = event.selection.rows if event and event.selection else []
-            selected_rows = [i for i in selected_rows if i < len(deduped)]
+            # be visible at all. Same real bug/fix as before (2026-07-29),
+            # now guarding a different selection source.
+            selected_rows = []
+            sel = st.session_state.get(sel_key)
+            if sel is not None and sel < len(deduped):
+                selected_rows = [sel]
             if selected_rows:
                 job = deduped[selected_rows[0]]
                 postings = postings_by_primary[id(job)]
@@ -794,11 +843,10 @@ elif active_tab == "results":
                         doc_labels = dict(doc_types)
                         progress_bar = st.progress(0, text=f"Drafting 1 of {len(selected)}: {doc_labels[selected[0]]}...")
 
-                        def _update_progress(i, total, doc_key):
-                            progress_bar.progress(
-                                (i - 1) / total,
-                                text=f"Drafting {i} of {total}: {doc_labels[doc_key]}...",
-                            )
+                        def _update_progress(i, total, doc_key, substatus=None):
+                            label = f"Drafting {i} of {total}: {doc_labels[doc_key]}"
+                            label += f" — {substatus}" if substatus else "..."
+                            progress_bar.progress((i - 1) / total, text=label)
 
                         try:
                             drafted = generate_documents(job, load_profile(), selected, on_progress=_update_progress)
@@ -816,6 +864,7 @@ elif active_tab == "results":
                                 resume_ats_score=resume_draft["ats_score"] if resume_is_scored else None,
                                 resume_ats_rationale=resume_draft["ats_rationale"] if resume_is_scored else None,
                                 resume_ats_next_actions=resume_draft["ats_next_actions"] if resume_is_scored else None,
+                                resume_clarifying_questions=resume_draft["clarifying_questions"] if resume_is_scored else None,
                                 cover_letter_text=drafted.get("cover_letter"),
                                 exec_bio_text=drafted.get("exec_bio"),
                                 leadership_summary_text=drafted.get("leadership_summary"),
@@ -842,10 +891,59 @@ elif active_tab == "results":
                                         st.markdown("**How to raise it:**")
                                         for action in next_actions:
                                             st.markdown(f"- {action}")
+                                    clarifying_questions = app_record.get("resume_clarifying_questions") or []
+                                    if clarifying_questions:
+                                        st.markdown(
+                                            "**Answer these to raise the score further - only used if you "
+                                            "confirm they're true, nothing is ever invented:**"
+                                        )
+                                        job_key = f"{job.get('source')}_{job.get('job_id')}"
+                                        answer_inputs = {}
+                                        for qi, q in enumerate(clarifying_questions):
+                                            answer_inputs[q["skill"]] = st.text_input(
+                                                q["question"],
+                                                key=f"gapans_{job_key}_{qi}",
+                                            )
+                                        if st.button("Save answers & regenerate resume", key=f"gapsave_{job_key}"):
+                                            answered = {skill: ans for skill, ans in answer_inputs.items() if ans and ans.strip()}
+                                            if not answered:
+                                                st.toast("Answer at least one question first.", icon=":material/warning:")
+                                            else:
+                                                save_gap_answers(job, answered)
+                                                regen_bar = st.progress(0, text="Regenerating resume with your answers...")
+
+                                                def _update_regen_progress(i, total, doc_key2, substatus=None):
+                                                    label = "Regenerating resume"
+                                                    label += f" — {substatus}" if substatus else "..."
+                                                    regen_bar.progress((i - 1) / total, text=label)
+
+                                                try:
+                                                    regen = generate_documents(
+                                                        job, load_profile(), ["resume"], on_progress=_update_regen_progress,
+                                                    )
+                                                except (DraftingNotConfigured, DraftingFailed) as exc:
+                                                    regen_bar.empty()
+                                                    st.error(str(exc))
+                                                else:
+                                                    regen_bar.progress(1.0, text="Done.")
+                                                    new_resume = regen["resume"]
+                                                    upsert_application(
+                                                        job["source"], job["job_id"], status="under review",
+                                                        resume_text=new_resume["text"],
+                                                        resume_ats_score=new_resume["ats_score"],
+                                                        resume_ats_rationale=new_resume["ats_rationale"],
+                                                        resume_ats_next_actions=new_resume["ats_next_actions"],
+                                                        resume_clarifying_questions=new_resume["clarifying_questions"],
+                                                    )
+                                                    st.toast(
+                                                        f"Resume regenerated - new ATS score {new_resume['ats_score']}/100.",
+                                                        icon=":material/check_circle:",
+                                                    )
+                                                    st.rerun()
                             st.code(drafted_text, language=None, wrap_lines=True)
                             st.download_button(
                                 f"Download {doc_label} (.docx)",
-                                data=text_to_docx_bytes(drafted_text),
+                                data=text_to_docx_bytes(drafted_text, author=load_profile().get("name")),
                                 file_name=f"{doc_label.replace(' ', '_')}.docx",
                                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                                 key=f"download_{doc_key}_{job.get('source')}_{job.get('job_id')}",
