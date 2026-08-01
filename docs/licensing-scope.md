@@ -118,6 +118,14 @@ layer that makes that a real product rather than a copy-and-share `.exe`.
   still requires Zahir's own Claude Code session open doesn't make sense.
   Also needs to know the packaging branch's actual installed-app shape
   before finalizing where the license check hooks into app startup.
+  **New (2026-08-01):** the installer's uninstall flow needs a
+  self-service "deactivate this device" endpoint from this branch's
+  license service — expose it as a plain HTTP call the uninstaller can
+  make (best-effort, must not block uninstall if offline) so a legitimate
+  uninstall-and-move doesn't force the customer through the manual
+  lost-device support flow. See native-packaging's
+  `docs/native-packaging-scope.md` "Uninstall behavior" section for the
+  full flow this plugs into.
 - **`feature/update-mechanism`**: a license check needs to survive an
   in-place update (don't force re-activation on every hotfix) — coordinate
   on how the local license/device state is stored so an update doesn't
