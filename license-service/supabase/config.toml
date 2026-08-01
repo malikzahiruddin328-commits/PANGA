@@ -1,0 +1,10 @@
+project_id = "panga-license-service"
+
+# Stripe signs its own webhook payloads — there's no Supabase Auth JWT to
+# check here, so platform-level JWT verification must be off for this one
+# function. Every other function keeps the default (on) and does its own
+# requireCustomer() check on top, since verify_jwt only proves the caller
+# has *some* valid Supabase session, not which endpoints they're allowed
+# to reach.
+[functions.webhooks-stripe]
+verify_jwt = false
