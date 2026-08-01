@@ -20,18 +20,56 @@ expected to get refined against Zahir's real reactions to what shows up,
 same "start crude, let real usage refine it" pattern as the
 compatibility-scoring category-filter lesson (PRD §9).
 """
+from datetime import date
+
 from prospector.company_filters import looks_like_target_company
+
+# Real bug found live 2026-07-31: this originally had NO recency filter at
+# all - a Phase 3 trial that completed in 2003 or 2005 passed through
+# exactly like one from last month, as long as its status was COMPLETED or
+# ACTIVE_NOT_RECRUITING. Zahir spotted four bad entries in one glance
+# (Pacira Pharmaceuticals off a trial completed 2016-01; two academic/
+# cooperative-group sponsors - Gustave Roussy, Radiation Therapy Oncology
+# Group - off trials completed 2005 and 2003; VectivBio AG, acquired by
+# Ironwood Pharmaceuticals in 2023, off a 2024 completion). Checking the
+# real stored data found 8 total watching accounts whose only signal was a
+# trial that completed before 2024. A COMPLETED trial years old tells you
+# nothing about whether the company is STILL approaching commercialization
+# - it may have already been approved, already failed, or the company may
+# no longer exist independently. An ACTIVE_NOT_RECRUITING trial with no
+# completion date yet is inherently current and kept regardless.
+STALE_YEARS = 2
+
+
+def _is_recent_enough(trial: dict) -> bool:
+    if trial.get("status") == "ACTIVE_NOT_RECRUITING":
+        return True
+    completion = trial.get("primary_completion_date")
+    if not completion:
+        return False
+    try:
+        year, month = (int(p) for p in completion.split("-")[:2])
+    except (ValueError, AttributeError):
+        return False
+    cutoff = date.today().replace(day=1)
+    cutoff_year = cutoff.year - STALE_YEARS
+    return (year, month) >= (cutoff_year, cutoff.month)
 
 
 def normalize_trial_signals(trials: list[dict]) -> list[dict]:
     """Takes raw items from the search_trials/search_by_sponsor MCP tool
     response and returns signal-ready dicts (company_name + the kwargs
-    target_accounts.add_signal expects), skipping non-company sponsors and
-    mega-pharma. One signal per trial (ref=nct_id dedupes repeat runs)."""
+    target_accounts.add_signal expects), skipping non-company sponsors,
+    mega-pharma, and trials whose primary completion is more than
+    STALE_YEARS old (still-recruiting/active trials always pass - see
+    _is_recent_enough). One signal per trial (ref=nct_id dedupes repeat
+    runs)."""
     out = []
     for trial in trials:
         sponsor = trial.get("sponsor")
         if not looks_like_target_company(sponsor):
+            continue
+        if not _is_recent_enough(trial):
             continue
         conditions = ", ".join(trial.get("conditions") or []) or "condition not listed"
         detail = (

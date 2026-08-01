@@ -239,6 +239,20 @@ def _resume_schema() -> dict:
         "type": "object",
         "properties": {
             "text": {"type": "string", "description": RESUME_SPEC},
+            "suggested_strategy_tag": {
+                "type": "string",
+                "description": (
+                    "A short (3-6 word) hyphenated label for what's "
+                    "distinctive about THIS specific draft's approach for "
+                    "this posting - e.g. 'concise-2-page-ats-focused', "
+                    "'leadership-narrative-emphasis', 'federal-format-"
+                    "detailed'. This describes a real choice you made in "
+                    "writing this draft, not a fact about the candidate - "
+                    "state it directly, no hedging needed. Prefills the "
+                    "app's own 'strategy tag' field; the candidate can "
+                    "edit or clear it."
+                ),
+            },
             "ats_score": {
                 "type": "integer",
                 "description": (
@@ -276,22 +290,38 @@ def _resume_schema() -> dict:
                             "type": "string",
                             "description": "A direct, specific question whose answer is a genuine, checkable fact (a number, a name, a date) that would close this gap - not vague or stylistic.",
                         },
+                        "suggested_answer": {
+                            "type": "string",
+                            "description": (
+                                "A proposed starting draft for the answer, phrased as "
+                                "the candidate's own words - e.g. a plausible number/"
+                                "scope guess given the role and the rest of the "
+                                "profile ('Roughly 8-10 engineers, ~$2M budget?'). "
+                                "This is a suggestion to edit, never a stated fact - "
+                                "make that uncertainty visible in the phrasing itself "
+                                "(hedge words, a trailing '?') rather than asserting "
+                                "it. Leave as an empty string if you have no "
+                                "reasonable basis to propose anything."
+                            ),
+                        },
                     },
-                    "required": ["skill", "question"],
+                    "required": ["skill", "question", "suggested_answer"],
                     "additionalProperties": False,
                 },
                 "description": (
-                    "0-5 specific, directly answerable questions for real facts "
+                    "3-10 specific, directly answerable questions for real facts "
                     "this resume is currently missing that would raise the score "
                     "if the candidate actually has them - never invent the answer "
-                    "yourself, ask instead. Only include questions a real number/"
+                    "yourself, ask instead; use however many genuine gaps actually "
+                    "exist (sometimes only 3, up to 10 for a role with many gaps), "
+                    "don't pad to hit a count. Only include questions a real number/"
                     "name/date could answer. Skip anything already answered "
                     "elsewhere in the profile or that's purely about wording/"
                     "structure rather than a missing fact."
                 ),
             },
         },
-        "required": ["text", "ats_score", "ats_rationale", "ats_next_actions", "clarifying_questions"],
+        "required": ["text", "suggested_strategy_tag", "ats_score", "ats_rationale", "ats_next_actions", "clarifying_questions"],
         "additionalProperties": False,
     }
 
@@ -406,6 +436,7 @@ def _draft_one(
     if doc_key == "resume":
         return {
             "text": data.get("text", ""),
+            "suggested_strategy_tag": data.get("suggested_strategy_tag", ""),
             "ats_score": data.get("ats_score"),
             "ats_rationale": data.get("ats_rationale", ""),
             "ats_next_actions": data.get("ats_next_actions", []),
@@ -414,6 +445,39 @@ def _draft_one(
     if doc_key == "apply_answers":
         return data.get("apply_answers", [])
     return data.get(doc_key, "")
+
+
+def _lookup_company_address(client: "anthropic.Anthropic", organization: str, location: str | None) -> str | None:
+    """Looks up an organization's real mailing/headquarters address via the
+    Claude API's server-side web search tool, for the cover letter's
+    recipient block - never guessed, only used if a real source turns up.
+    Returns None on no confident match (docx_export.py's existing
+    "[Company Address]" placeholder is the fallback for that case)."""
+    location_hint = f" (job is located in {location})" if location else ""
+    try:
+        response = client.messages.create(
+            model=DEFAULT_MODEL,
+            max_tokens=300,
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
+            system=(
+                "Look up one company's real, current mailing or headquarters "
+                "address for a cover letter's recipient block. Search the web "
+                "and confirm it from the company's own site or another "
+                "reliable source - never guess or infer from the company's "
+                "name/industry alone. Reply with ONLY the address as 1-3 "
+                "short lines (street; city, state zip; country if not US) - "
+                "no company name, no commentary. If you cannot find a "
+                "confident, verifiable address, reply with exactly: NOT_FOUND"
+            ),
+            messages=[{"role": "user", "content": f"Company: {organization}{location_hint}"}],
+        )
+    except (anthropic.APIStatusError, anthropic.APIConnectionError):
+        return None
+
+    text = "".join(b.text for b in response.content if b.type == "text").strip()
+    if not text or text == "NOT_FOUND" or len(text) > 300:
+        return None
+    return text
 
 
 def generate_documents(
@@ -436,8 +500,9 @@ def generate_documents(
     with a live sub-status ("thinking...", "writing... (N characters so
     far)") as the response streams in.
     Returns {doc_key: drafted_text}, except "resume" maps to {"text": ...,
-    "ats_score": int, "ats_rationale": str, "ats_next_actions": [...],
-    "clarifying_questions": [{"skill": ..., "question": ...}]} instead of a
+    "suggested_strategy_tag": str, "ats_score": int, "ats_rationale": str,
+    "ats_next_actions": [...], "clarifying_questions": [{"skill": ...,
+    "question": ..., "suggested_answer": ...}]} instead of a
     plain string, since the resume is ATS-scored against this posting as
     part of the same drafting pass - clarifying_questions are gaps Claude
     couldn't close honestly without more real facts (never invented; ask,
@@ -446,11 +511,29 @@ def generate_documents(
     maps to a list of {"label": ..., "value": ...} dicts (a ready-to-paste
     packet for common ATS form fields) rather than a single string. Raises
     DraftingNotConfigured if no API key is set, DraftingFailed on
-    refusal/truncation/API error."""
+    refusal/truncation/API error.
+
+    When "cover_letter" is requested and this job hasn't been searched for
+    an address before, also looks up the organization's real mailing
+    address via a one-time web search (_lookup_company_address) and caches
+    it onto the job record (search.job_store.update_job_address) plus the
+    passed-in `job` dict in place, so callers building the cover letter's
+    .docx (app.py, dossier.py) can read job["organization_address"]
+    immediately after this call returns. Never falls back to a guessed
+    address - an unconfirmed lookup caches "" (searched, not found) so it
+    isn't re-searched every regenerate, and docx_export.py's own
+    "[Company Address]" placeholder covers that case."""
     if not doc_keys:
         return {}
 
     client = _client()
+    if "cover_letter" in doc_keys and "organization_address" not in job and job.get("organization"):
+        from search.job_store import update_job_address
+
+        address = _lookup_company_address(client, job["organization"], job.get("location")) or ""
+        job["organization_address"] = address
+        update_job_address(job.get("source"), job.get("job_id"), address)
+
     shared_context = [{
         "type": "text",
         "text": (

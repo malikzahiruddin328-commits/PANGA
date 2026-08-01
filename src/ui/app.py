@@ -20,9 +20,8 @@ carries the two cross-cutting things that used to live on a single page
 visible no matter which tab is open.
 """
 
-import re
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -38,19 +37,19 @@ from ranking.prioritize import weight_for, dedupe_across_sources
 from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion, set_strategy_tag, needs_edit_review, record_document_edit_review
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
 from tailoring.interview_prep import load_interview_prep, record_round_outcome
-from tailoring.docx_export import text_to_docx_bytes, cover_letter_to_docx_bytes
 from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
 from tailoring.drafting import generate_documents, score_job, save_gap_answers, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
 from prospector.rejection_diagnosis import gather_diagnosis_input
-from prospector.target_accounts import load_target_accounts, set_status as set_target_account_status
+from prospector.target_accounts import load_target_accounts, set_status as set_target_account_status, set_website, load_website_lookup_cost, save_website_lookup_cost
+from prospector.company_lookup import lookup_company_website
 from prospector.outreach import (
     add_outreach, update_status as update_outreach_status, request_draft,
     get_outreach_for_target_account, get_outreach_for_job, load_outreach,
     set_strategy_tag as set_outreach_strategy_tag,
 )
 from prospector.learn_engine import gather_learn_engine_input
-from prospector.prospector_score import load_prospector_score, gather_prospector_score_input
+from prospector.prospector_score import load_prospector_score, gather_prospector_score_input, compute_prospector_score, save_prospector_score
 from linkedin.storage import load_linkedin_profile, save_snapshot, mark_suggestion_status, get_active_suggestions, SECTIONS as LINKEDIN_SECTIONS
 from linkedin.ingest import extract_text_from_pdf
 from linkedin.connections import parse_connections_csv, looks_like_recruiter, cross_reference_target_accounts
@@ -100,6 +99,8 @@ LINKEDIN_SECTION_LABELS = {
 }
 
 SETTINGS_PATH = PROJECT_ROOT / "config" / "settings.yaml"
+THEMES_DIR = PROJECT_ROOT / ".streamlit" / "themes"
+CONFIG_PATH = PROJECT_ROOT / ".streamlit" / "config.toml"
 
 st.set_page_config(page_title="Panga - Job Search", page_icon=":material/work:", layout="wide")
 
@@ -135,14 +136,20 @@ def format_pay(value) -> str | None:
     return f"{num:,.0f}" if num == int(num) else f"{num:,.2f}"
 
 
-def descriptive_doc_filename(name: str | None, doc_label: str, job: dict) -> str:
-    """'Resume.docx' told you nothing about which application it was for
-    once you had a few downloaded (Zahir's explicit request 2026-07-31) -
-    builds Name_DocType_Title_Organization.docx instead, stripped of
-    characters Windows filenames reject."""
-    parts = [name, doc_label, job.get("title"), job.get("organization")]
-    safe_parts = [re.sub(r'[<>:"/\\|?*]', "", p).strip().replace(" ", "_") for p in parts if p]
-    return "_".join(safe_parts)[:150] + ".docx"
+def format_timestamp(value: str | None) -> str:
+    """Renders a stored ISO timestamp (e.g. "2026-07-30T16:15:55.123456+00:00")
+    as something a non-technical reader can parse at a glance (e.g. "Jul 30,
+    2026 at 4:15 PM") - Zahir's explicit ask 2026-07-31: the raw ISO string
+    ("...30T16:15:55...") reads as noise to anyone who doesn't already know
+    it's a timestamp. Falls back to the raw string on anything that doesn't
+    parse (a malformed/legacy value shouldn't crash the page over cosmetics)."""
+    if not value:
+        return ""
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    return dt.strftime("%b %-d, %Y at %-I:%M %p") if sys.platform != "win32" else dt.strftime("%b %#d, %Y at %#I:%M %p")
 
 
 def left_aligned_columns(df: pd.DataFrame, extra: dict | None = None) -> dict:
@@ -277,6 +284,12 @@ if pending_suggestions or outstanding_drafts:
             st.markdown(f"{len(outstanding_drafts)} draft(s) created and waiting in Gmail for you to review and send - this clears itself once you send them.")
 
 # --- Tab bar ---
+SIGNAL_TYPE_LABELS = {
+    "late_stage_trial": "Late-stage clinical trial",
+    "commercial_hiring": "Commercial-build hiring",
+    "funding_event": "Funding/IPO filing",
+    "regulatory_filing": "Regulatory filing (deprecated signal - see note above)",
+}
 TAB_ICONS = {
     "cta": ":material/notifications_active:",
     "results": ":material/work:",
@@ -491,13 +504,33 @@ if active_tab == "settings":
         for fb in open_feedback:
             fc1, fc2 = st.columns([5, 1])
             with fc1:
-                st.markdown(f"**{fb['section']}** — {fb['created_at']}")
+                st.markdown(f"**{fb['section']}** — {format_timestamp(fb['created_at'])}")
                 st.markdown(fb["note"])
             with fc2:
                 if st.button("Mark reviewed", key=f"fb_resolve_{fb['id']}"):
                     mark_resolved(fb["id"])
                     st.rerun()
             st.divider()
+
+    st.divider()
+    st.header("Appearance")
+    st.markdown(
+        "Pick a color theme. Applies live once you save - no restart needed, "
+        "just pick and the app re-renders in the new colors. The 4 colored "
+        "themes each also carry a light and a dark mode - once one is applied, "
+        "switch between its light/dark from Streamlit's own ≡ menu "
+        "(top right) → Settings."
+    )
+    theme_options = {
+        "Teal": "teal", "Blue": "blue", "Coral": "coral", "Slate purple": "purple",
+        "Light (plain, no accent color)": "light", "Dark (plain, no accent color)": "dark",
+    }
+    theme_choice = st.selectbox("Theme", list(theme_options.keys()), key="theme_choice")
+    if st.button("Apply theme"):
+        theme_file = THEMES_DIR / f"{theme_options[theme_choice]}.toml"
+        CONFIG_PATH.write_text(theme_file.read_text(encoding="utf-8"), encoding="utf-8")
+        st.toast(f"{theme_choice} theme applied.", icon=":material/check_circle:")
+        st.rerun()
 
 elif active_tab == "cta":
     render_feedback_widget("cta")
@@ -763,37 +796,74 @@ elif active_tab == "results":
                 })
             df = pd.DataFrame(table_rows)
 
-            # Reverted 2026-07-31 back to Streamlit's native row-selector
-            # (proven reliable for months) from a ButtonColumn-on-Role
-            # experiment - couldn't verify the click actually fires
-            # end-to-end in this environment (canvas-grid clicks aren't
-            # reliably testable here), and Zahir was actively blocked on a
-            # real application when he reported it not working. Not worth
-            # the risk on unverified code. Columns still left-aligned/
-            # auto-sized per his request, via the shared helper.
-            event = st.dataframe(
+            # Re-tried 2026-07-31 (2nd attempt, same day as the first
+            # revert) - Zahir's explicit ask: no checkbox, activate the row
+            # by clicking the Role cell itself. The first attempt was
+            # reverted because it couldn't be verified end-to-end in this
+            # environment; this retry uses Streamlit 1.60's ButtonColumn
+            # on_click callback, confirmed real via the installed version's
+            # own reference docs and signature (not assumed from memory).
+            # Still couldn't click-test the canvas-rendered grid itself in
+            # this sandbox (same limitation as the first attempt) - verify
+            # live before trusting this.
+            role_click_key = f"roleclick_{channel}"
+            selected_idx_key = f"selected_idx_{channel}"
+
+            scroll_pending_key = f"scroll_pending_{channel}"
+
+            def _activate_row(selected_idx_key=selected_idx_key, role_click_key=role_click_key, scroll_pending_key=scroll_pending_key):
+                click = st.session_state.get(role_click_key)
+                if click:
+                    st.session_state[selected_idx_key] = click["row"]
+                    st.session_state[scroll_pending_key] = True
+
+            st.dataframe(
                 df,
                 hide_index=True,
                 width="stretch",
-                on_select="rerun",
-                selection_mode="single-row",
-                column_config=left_aligned_columns(df, extra={"Posting": st.column_config.LinkColumn("Posting", display_text="Open", alignment="left")}),
+                column_config=left_aligned_columns(df, extra={
+                    "Posting": st.column_config.LinkColumn("Posting", display_text="Open", alignment="left"),
+                    "Role": st.column_config.ButtonColumn(
+                        "Role", type="tertiary", alignment="left",
+                        on_click=_activate_row, key=role_click_key,
+                    ),
+                }),
                 key=f"table_{channel}",
             )
 
-            # st.dataframe's on_select state persists across reruns (keyed by
-            # the widget's `key`), but the row-count of `deduped` can shrink
-            # between reruns (e.g. moving the compatibility slider re-filters
-            # `ranked`/`deduped` this same run) - a previously selected index
-            # can point past the end of the new, shorter list. Bounds-check
-            # rather than crash; a selection that no longer exists just shows
-            # no detail panel, which is correct since that row may no longer
-            # be visible at all.
-            selected_rows = event.selection.rows if event and event.selection else []
-            selected_rows = [i for i in selected_rows if i < len(deduped)]
+            # The row-count of `deduped` can shrink between reruns (e.g.
+            # moving the compatibility slider re-filters `ranked`/`deduped`
+            # this same run) - a previously selected index can point past
+            # the end of the new, shorter list. Bounds-check rather than
+            # crash; a selection that no longer exists just shows no detail
+            # panel, which is correct since that row may no longer be
+            # visible at all.
+            selected_idx = st.session_state.get(selected_idx_key)
+            selected_rows = [selected_idx] if selected_idx is not None and selected_idx < len(deduped) else []
             if selected_rows:
                 job = deduped[selected_rows[0]]
                 postings = postings_by_primary[id(job)]
+
+                # Auto-scrolls to the detail panel right after a fresh Role
+                # click (Zahir's ask 2026-07-31 - Streamlit always renders
+                # the whole page top to bottom, so the panel appears below
+                # the table with no built-in way to jump the viewport to
+                # it). Gated on scroll_pending_key, which _activate_row only
+                # sets on an actual click - not on every rerun caused by
+                # interacting with a widget already inside this panel
+                # (typing a strategy tag, picking a status), which would
+                # otherwise yank the view back up on every keystroke.
+                anchor_id = f"detail-anchor-{channel}"
+                if st.session_state.pop(scroll_pending_key, False):
+                    st.html(
+                        f'<div id="{anchor_id}"></div>'
+                        '<script>'
+                        f'document.getElementById("{anchor_id}")?.scrollIntoView({{behavior: "smooth", block: "start"}});'
+                        '</script>',
+                        unsafe_allow_javascript=True,
+                    )
+                else:
+                    st.html(f'<div id="{anchor_id}"></div>')
 
                 st.markdown(f"{job.get('location') or 'Location not listed'}")
                 if "fit_score" in job:
@@ -874,6 +944,7 @@ elif active_tab == "results":
                                 resume_ats_rationale=resume_draft["ats_rationale"] if resume_is_scored else None,
                                 resume_ats_next_actions=resume_draft["ats_next_actions"] if resume_is_scored else None,
                                 resume_clarifying_questions=resume_draft["clarifying_questions"] if resume_is_scored else None,
+                                suggested_strategy_tag=resume_draft["suggested_strategy_tag"] if resume_is_scored else None,
                                 cover_letter_text=drafted.get("cover_letter"),
                                 exec_bio_text=drafted.get("exec_bio"),
                                 leadership_summary_text=drafted.get("leadership_summary"),
@@ -903,7 +974,7 @@ elif active_tab == "results":
                                 for item in drafted_text:
                                     label = item.get("label", "")
                                     value = item.get("value", "")
-                                    st.caption(label)
+                                    st.markdown(label)
                                     st.code(value, language=None, wrap_lines=True)
                         continue
                     if drafted_text:
@@ -935,6 +1006,12 @@ elif active_tab == "results":
                                             "**Answer these to raise the score further - only used if you "
                                             "confirm they're true, nothing is ever invented:**"
                                         )
+                                        st.markdown(
+                                            "Some boxes are pre-filled with a proposed guess (worded "
+                                            "as a guess, e.g. \"Roughly 8-10 engineers?\") - edit it "
+                                            "to whatever's actually true, or clear it if it's wrong. "
+                                            "Nothing pre-filled is saved as-is."
+                                        )
                                         job_key = f"{job.get('source')}_{job.get('job_id')}"
                                         answer_inputs = {}
                                         for q in clarifying_questions:
@@ -948,9 +1025,15 @@ elif active_tab == "results":
                                             # for a completely different question, which then got
                                             # saved under the new (wrong) skill label - confirmed in
                                             # gap_interview_answers with several mismatched entries.
-                                            q_key = f"gapans_{job_key}_{abs(hash(q['question'])) % 10_000_000}"
+                                            # Also folded in the suggested_answer text (2026-07-31,
+                                            # same bug class caught on the strategy-tag box): the SAME
+                                            # question can recur across rounds with a DIFFERENT
+                                            # suggested answer, and a key on question text alone would
+                                            # silently keep showing the earlier round's stale suggestion.
+                                            q_key = f"gapans_{job_key}_{abs(hash(q['question'] + '|' + (q.get('suggested_answer') or ''))) % 10_000_000}"
                                             answer_inputs[q["skill"]] = st.text_area(
-                                                q["question"], key=q_key, height=68,
+                                                q["question"], value=q.get("suggested_answer") or "",
+                                                key=q_key, height=68,
                                             )
                                         if st.button("Save answers & regenerate resume", key=f"gapsave_{job_key}"):
                                             answered = {skill: ans for skill, ans in answer_inputs.items() if ans and ans.strip()}
@@ -983,6 +1066,7 @@ elif active_tab == "results":
                                                         resume_ats_rationale=new_resume["ats_rationale"],
                                                         resume_ats_next_actions=new_resume["ats_next_actions"],
                                                         resume_clarifying_questions=new_resume["clarifying_questions"],
+                                                        suggested_strategy_tag=new_resume["suggested_strategy_tag"],
                                                     )
                                                     sync_workspace_documents(
                                                         job["source"], job["job_id"], ["resume"],
@@ -996,22 +1080,18 @@ elif active_tab == "results":
                             if doc_key == "resume" and app_record.get("resume_ats_score") is not None:
                                 st.markdown(f"**Resume text (ATS score: {app_record['resume_ats_score']}/100):**")
                             st.code(drafted_text, language=None, wrap_lines=True)
-                            candidate_name = load_profile().get("name")
-                            if doc_key == "cover_letter":
-                                docx_bytes = cover_letter_to_docx_bytes(
-                                    drafted_text,
-                                    company_name=job.get("organization"),
-                                    author=candidate_name,
-                                )
-                            else:
-                                docx_bytes = text_to_docx_bytes(drafted_text, author=candidate_name)
-                            st.download_button(
-                                f"Download {doc_label} (.docx)",
-                                data=docx_bytes,
-                                file_name=descriptive_doc_filename(candidate_name, doc_label, job),
-                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                key=f"download_{doc_key}_{job.get('source')}_{job.get('job_id')}",
-                            )
+                            # No download button here on purpose (removed
+                            # 2026-07-31, real bug Zahir hit): sync_workspace_
+                            # documents() already wrote this exact .docx into
+                            # the per-application folder below the moment it
+                            # was drafted. A browser download button would
+                            # save a SECOND copy to Chrome's Downloads folder
+                            # - if Zahir edited that copy instead of the
+                            # workspace one, check_for_edits() would silently
+                            # see "no changes" on the file it actually
+                            # tracks, since it never looks at Downloads. One
+                            # editable copy, in the folder shown below, is
+                            # the only correct place to make changes.
 
                 has_any_document = any(
                     app_record.get(f) for f in ("resume_text", "cover_letter_text", "exec_bio_text", "leadership_summary_text")
@@ -1021,17 +1101,26 @@ elif active_tab == "results":
                     workspace_folder = dossier_dir(job.get("source"), job.get("job_id"), job.get("organization"), job.get("title"))
                     st.markdown("**Your application folder (edit the Word files directly here):**")
                     st.code(str(workspace_folder), language=None)
-                    st.caption(
-                        "Open this folder in File Explorer and edit resume.docx/cover_letter.docx/etc. "
-                        "directly in Word if you want to change anything, then click \"Check my edited "
-                        "documents\" below - you'll need to do this before marking the job \"applied\"."
+                    st.markdown(
+                        "Open this folder in File Explorer and edit the .docx files directly in Word "
+                        "if you want to change anything (each file is named "
+                        "Name_DocType_Role_Company.docx, same convention as before), then click "
+                        "\"Check my edited documents\" below - you'll need to do this before marking "
+                        "the job \"applied\"."
                     )
                     if st.button("Check my edited documents", key=f"checkedits_{job_key}"):
                         st.session_state[f"editreport_{job_key}"] = check_for_edits(job["source"], job["job_id"])
 
+                    # edit_report/what_changed are computed here (if a check
+                    # has been run) but RENDERED further below, folded into
+                    # the single combined save row - kept apart from that
+                    # rendering so the diff display above stays exactly
+                    # where Zahir expects it, right under the "Check my
+                    # edited documents" button.
                     report_key = f"editreport_{job_key}"
-                    if report_key in st.session_state:
-                        edit_report = st.session_state[report_key]
+                    edit_report = st.session_state.get(report_key)
+                    what_changed = ""
+                    if edit_report:
                         any_changed = any(r.get("changed") for r in edit_report.values())
                         missing_files = [k for k, r in edit_report.items() if r.get("no_workspace_file")]
                         if any_changed:
@@ -1046,59 +1135,95 @@ elif active_tab == "results":
                             st.markdown(
                                 f"No editable file found yet for: {', '.join(missing_files)} "
                                 "(drafted before this folder feature existed, or not regenerated since) - "
-                                "click \"Generate documents\" above to create it, or note in your reason below "
-                                "that you're using the downloaded copy instead."
+                                "click \"Generate documents\" above to create it, or note in the reason "
+                                "box below that you're using the downloaded copy instead."
                             )
+                        changed_docs = [k for k, r in edit_report.items() if r.get("changed")]
+                        if changed_docs:
+                            parts = []
+                            for doc_key2 in changed_docs:
+                                diff_lines = edit_report[doc_key2]["diff"]
+                                added = sum(1 for line in diff_lines if line.startswith("+") and not line.startswith("+++"))
+                                removed = sum(1 for line in diff_lines if line.startswith("-") and not line.startswith("---"))
+                                parts.append(f"{doc_key2}: {added} line(s) added, {removed} removed")
+                            what_changed = "; ".join(parts) + "."
+                else:
+                    edit_report, what_changed = None, ""
 
-                        review_reason = st.text_area(
-                            "What did you change, and why? (required - even \"no changes made\" counts)",
-                            key=f"editreason_{job_key}",
-                        )
-                        if st.button("Save review", key=f"savereview_{job_key}"):
-                            if not review_reason.strip():
-                                st.toast("Type a reason first, even a short one.", icon=":material/warning:")
-                            else:
-                                record_document_edit_review(job["source"], job["job_id"], edit_report, review_reason.strip())
-                                st.toast("Saved - you can now mark this job \"applied\".", icon=":material/check_circle:")
-                                st.rerun()
+                if status in ("applied", "interview scheduled"):
+                    if st.button("Prep for interview", key=f"prep_results_{job.get('source')}_{job.get('job_id')}"):
+                        go_to_prep({
+                            "kind": "job",
+                            "source": job["source"],
+                            "job_id": job["job_id"],
+                            "job_label": job_label(job),
+                        })
 
-                b2, b3 = st.columns(2)
-                with b2:
-                    if status in ("applied", "interview scheduled"):
-                        if st.button("Prep for interview", key=f"prep_results_{job.get('source')}_{job.get('job_id')}"):
-                            go_to_prep({
-                                "kind": "job",
-                                "source": job["source"],
-                                "job_id": job["job_id"],
-                                "job_label": job_label(job),
-                            })
-                with b3:
+                # Why-reason, Strategy tag, and Mark status side by side,
+                # one shared "Save status" button underneath (Zahir's
+                # explicit ask 2026-07-31) - these three used to be three
+                # separate decisions with three separate buttons (Save
+                # review/Save tag/Save status); they're really all made at
+                # the same moment, so now one action saves all three.
+                reason_col, tag_col, status_col = st.columns(3)
+                report_hash = abs(hash(str(edit_report))) % 10_000_000 if edit_report else 0
+                with reason_col:
+                    # "Why" only ever gets a placeholder, never a prefilled
+                    # guess (see history above the removed block) - the
+                    # whole point is Zahir's own reasoning, not the app's.
+                    why_reason = st.text_area(
+                        "Why did you make these changes? (required before marking applied)",
+                        placeholder="e.g. Simplified the bullet formatting so it parses cleanly in the ATS.",
+                        key=f"editreason_{job_key}_{report_hash}", height=68,
+                    )
+                    if what_changed:
+                        st.markdown(f"What changed: {what_changed}")
+                with tag_col:
+                    # Prefilled from the resume draft's own proposed tag
+                    # (Zahir's ask 2026-07-31) whenever he hasn't saved a
+                    # real one yet. Keyed on a hash of the suggestion text
+                    # itself, not just job_key - a real bug caught live:
+                    # a stable key meant Streamlit kept showing the box's
+                    # ORIGINAL (blank, pre-suggestion) session state
+                    # forever, silently ignoring every new `value=` from a
+                    # later regenerate. Same fix already applied to the
+                    # gap-answer and why-reason boxes above.
+                    tag_default = app_record.get("strategy_tag") or app_record.get("strategy_tag_suggestion") or ""
+                    tag_version = abs(hash(tag_default)) % 10_000_000
+                    new_tag = st.text_input(
+                        "Strategy tag (optional - what's different about this draft, e.g. \"concise-1-page\")",
+                        value=tag_default, key=f"tag_{job.get('source')}_{job.get('job_id')}_{tag_version}",
+                    )
+                with status_col:
                     new_status = st.selectbox(
                         "Mark status",
                         ["-", "applied", "interview scheduled", "offer", "rejected", "not interested", "save for later"],
                         key=f"status_{job.get('source')}_{job.get('job_id')}",
                     )
-                    if new_status != "-":
-                        skip_reason = None
-                        if new_status == "not interested":
-                            skip_reason = st.text_area("Why not interested? (optional)", key=f"reason_{job.get('source')}_{job.get('job_id')}")
-                        if st.button("Save status", key=f"save_status_{job.get('source')}_{job.get('job_id')}"):
-                            if new_status == "applied" and needs_edit_review(app_record):
-                                st.error(
-                                    "Check your edited documents and save a change-review note first "
-                                    "(see \"Check my edited documents\" above) before marking this applied."
-                                )
-                            else:
-                                upsert_application(job["source"], job["job_id"], status=new_status, skip_reason=skip_reason)
-                                st.toast("Status saved.", icon=":material/check_circle:")
-                                st.rerun()
-                new_tag = st.text_input(
-                    "Strategy tag (optional - what's different about this draft, e.g. \"concise-1-page\")",
-                    value=app_record.get("strategy_tag") or "", key=f"tag_{job.get('source')}_{job.get('job_id')}",
-                )
-                if new_tag != (app_record.get("strategy_tag") or "") and st.button("Save tag", key=f"savetag_{job.get('source')}_{job.get('job_id')}"):
-                    set_strategy_tag(job["source"], job["job_id"], new_tag)
-                    st.rerun()
+                    skip_reason = None
+                    if new_status == "not interested":
+                        skip_reason = st.text_area(
+                            "Why not interested? (optional)",
+                            key=f"reason_{job.get('source')}_{job.get('job_id')}", height=68,
+                        )
+
+                if st.button("Save status", key=f"save_status_{job.get('source')}_{job.get('job_id')}"):
+                    if new_status == "-":
+                        st.toast("Pick a status first.", icon=":material/warning:")
+                    elif new_status == "applied" and needs_edit_review(app_record) and not why_reason.strip():
+                        st.error(
+                            "Check your edited documents (button above) and explain why in the "
+                            "reason box before marking this applied."
+                        )
+                    else:
+                        if why_reason.strip():
+                            full_reason = f"{what_changed} Why: {why_reason.strip()}" if what_changed else why_reason.strip()
+                            record_document_edit_review(job["source"], job["job_id"], edit_report or {}, full_reason)
+                        if new_tag != (app_record.get("strategy_tag") or ""):
+                            set_strategy_tag(job["source"], job["job_id"], new_tag)
+                        upsert_application(job["source"], job["job_id"], status=new_status, skip_reason=skip_reason)
+                        st.toast("Saved.", icon=":material/check_circle:")
+                        st.rerun()
                 st.divider()
                 render_outreach_section(f"job_{job.get('source')}_{job.get('job_id')}", job_source=job.get("source"), job_id=job.get("job_id"))
 
@@ -1128,7 +1253,7 @@ elif active_tab == "prospector":
     prospector_score = load_prospector_score()
     with st.container(border=True):
         if prospector_score["score"] is None:
-            st.info("Not yet computed - click \"Prepare Prospector Score data\" below, then ask Claude Code to compute it.")
+            st.info("Not yet computed - click \"Compute Prospector Score\" below.")
         else:
             st.metric("Prospector Score", f"{prospector_score['score']}/100")
             st.markdown("**Why this score:**")
@@ -1137,49 +1262,147 @@ elif active_tab == "prospector":
                 st.markdown("**How to raise it:**")
                 for action in prospector_score["next_actions"]:
                     st.markdown(f"- {action}")
-            st.markdown(f"Based on {prospector_score['data_points']} real outcome data point(s) as of {prospector_score['computed_at']} - recompute anytime, it re-reads your actual data fresh so real progress is reflected automatically.")
-    if st.button("Prepare Prospector Score data"):
-        st.session_state["prospector_score_input"] = gather_prospector_score_input(
+            st.markdown(f"Based on {prospector_score['data_points']} real outcome data point(s) as of {format_timestamp(prospector_score['computed_at'])} - recompute anytime, it re-reads your actual data fresh so real progress is reflected automatically.")
+    # Computes for real on click (Zahir's explicit ask 2026-07-31: the old
+    # two-step "Prepare data" -> "go ask Claude Code" flow was the exact
+    # same friction point already fixed once for document drafting - see
+    # tailoring/drafting.py's module docstring). Same deliberate, narrow
+    # direct-API exception, applied here for the same reason.
+    if st.button("Compute Prospector Score", type="primary"):
+        score_input = gather_prospector_score_input(
             applications, jobs, target_accounts, outreach_records, prep_records, target_roles,
         )
-    prospector_score_input = st.session_state.get("prospector_score_input")
-    if prospector_score_input:
-        st.success("Data's ready. Go to Claude Code and ask it to compute the Prospector Score.")
-        st.markdown(f"{prospector_score_input['data_points']} outcome data point(s) currently available to reason over.")
+        try:
+            with st.spinner("Reasoning over your real data..."):
+                result = compute_prospector_score(score_input)
+        except (DraftingNotConfigured, DraftingFailed) as exc:
+            st.error(str(exc))
+        else:
+            save_prospector_score(
+                result["score"], result["rationale"], result["next_actions"],
+                score_input["data_points"], datetime.now(timezone.utc).isoformat(),
+            )
+            st.toast(f"Prospector Score: {result['score']}/100.", icon=":material/check_circle:")
+            st.rerun()
 
     st.subheader("Target accounts")
     st.markdown(
-        "Sourced from ClinicalTrials.gov Phase 3 activity, recent openFDA drug approvals, "
-        "commercial-hiring job postings already in Results, and SEC S-1/IPO filings mentioning "
-        "Phase 3 activity (PRD §16a, all 4 signals). Filtered to exclude obvious non-companies "
-        "(universities, hospitals, government), known mega-pharma majors, and known-acquired "
-        "companies - but not every remaining entry is a great fit (a research consortium, an "
-        "unusual NDA holder, or an unrelated industry whose job title happened to match can still "
-        "slip through), so treat \"watching\" as a starting point to review, not a verified lead. "
-        "Mark anything wrong as \"disqualified\" below."
+        "Companies worth watching before they've posted a role - currently pharma-only "
+        "(other industries need their own good-signal criteria worked out with Zahir first, "
+        "not assumed). Sourced from ClinicalTrials.gov Phase 3 trial activity, commercial-build "
+        "hiring postings already in Results, and SEC S-1/IPO filings mentioning Phase 3 activity - "
+        "all APPROACHING-commercialization signals on purpose (2026-07-31: an 'already approved' "
+        "signal was removed after real review showed it was surfacing companies years past their "
+        "actual hiring window, not before it - see regulatory_filings.py). Late Phase 3/PDUFA-date/"
+        "just-submitted-NDA detection isn't built yet - openFDA has no reliable data for that; it "
+        "would need a different source (e.g. SEC filings mentioning \"PDUFA\"), not yet built. "
+        "Filtered to exclude obvious non-companies (universities, hospitals, government), known "
+        "mega-pharma majors, and known-acquired companies - but not every remaining entry is a "
+        "great fit (a research consortium, an unusual NDA holder, or an unrelated industry whose "
+        "job title happened to match can still slip through), so treat \"watching\" as a starting "
+        "point to review, not a verified lead. \"Signals\" below counts DISTINCT signal types "
+        "found for that company (2+ distinct types auto-promotes it to \"qualified\"; 1 stays "
+        "\"watching\") - click a company to see exactly what each one is. Mark anything wrong as "
+        "\"disqualified\"."
     )
     if not target_accounts:
         st.info("No target accounts yet.")
     else:
+        # Disqualified/stale accounts previously stayed visible forever once
+        # marked - Zahir's real complaint 2026-07-31: he'd already
+        # disqualified UroGen (bad signal, see note above) but it was still
+        # sitting in the list looking untouched, since "disqualified" only
+        # changed the Status column text, nothing hid it. Same "hidden by
+        # default, nothing deleted" pattern as the Results tab's "not
+        # interested" jobs toggle.
+        DONE_STATUSES = ("disqualified", "stale")
+        hidden_count = sum(1 for a in target_accounts if a["status"] in DONE_STATUSES)
+        show_done = st.checkbox(
+            f"Show {hidden_count} disqualified/stale account(s) (hidden by default, nothing is deleted)"
+        ) if hidden_count else False
+        visible_accounts = target_accounts if show_done else [a for a in target_accounts if a["status"] not in DONE_STATUSES]
+
+        # Website URLs aren't in any signal source - they need a real web
+        # lookup (Zahir's explicit ask 2026-07-31), same one-time-search-
+        # then-cache pattern as the cover letter's company-address lookup.
+        # A real API call per company, so this is an explicit button (cost
+        # visible, under his control) rather than something that fires
+        # silently on every page load.
+        missing_website = [a for a in visible_accounts if "website" not in a]
+        if missing_website:
+            # Button label shows the real $ from the LAST run (Zahir's
+            # explicit ask 2026-07-31, "($X for the last run)" instead of a
+            # generic cost warning) - computed from actual API usage via
+            # api_cost.estimate_response_cost, not an estimate.
+            last_run = load_website_lookup_cost()
+            cost_label = f"(${last_run['cost']:.2f} for the last run)" if last_run["count"] else "(real API cost)"
+            if st.button(f"Look up website for {len(missing_website)} account(s) {cost_label}"):
+                with st.spinner(f"Looking up {len(missing_website)} website(s)..."):
+                    run_cost = 0.0
+                    for acc in missing_website:
+                        found, cost = lookup_company_website(acc["company_name"])
+                        set_website(acc["company_name"], found or "")
+                        run_cost += cost
+                    save_website_lookup_cost(run_cost, len(missing_website))
+                st.rerun()
+
         ta_rows = [{
             "Company": a["company_name"],
+            "Website": a.get("website") or "",
             "Status": a["status"],
-            "Signals": len(a["signals"]),
+            # A bare count ("2") wasn't readable at a glance (Zahir's
+            # explicit ask 2026-07-31) - a short comma-joined list of what
+            # those signals actually are is self-explanatory without a
+            # click, same spirit as the human labels used in the detail
+            # panel below.
+            "Signals": ", ".join(SIGNAL_TYPE_LABELS.get(s["signal_type"], s["signal_type"]) for s in a["signals"]) or "-",
             "Industry": a.get("industry") or "-",
-        } for a in target_accounts]
+        } for a in visible_accounts]
         ta_df = pd.DataFrame(ta_rows)
-        ta_event = st.dataframe(
-            ta_df, hide_index=True, width="stretch",
-            on_select="rerun", selection_mode="single-row", key="target_accounts_table",
-            column_config=left_aligned_columns(ta_df),
+        # Same click-to-activate pattern as the Results tab's Role column
+        # (Zahir's explicit ask 2026-07-31, "i want the same behaviour like
+        # the job page") - no checkbox row-selector, click the Company cell
+        # itself. See the Results tab's matching block for the mechanism
+        # notes (ButtonColumn on_click + a scroll-into-view anchor).
+        ta_click_key = "ta_company_click"
+        ta_selected_key = "ta_selected_idx"
+        ta_scroll_key = "ta_scroll_pending"
+
+        def _activate_ta_row():
+            click = st.session_state.get(ta_click_key)
+            if click:
+                st.session_state[ta_selected_key] = click["row"]
+                st.session_state[ta_scroll_key] = True
+
+        st.dataframe(
+            ta_df, hide_index=True, width="stretch", key="target_accounts_table",
+            column_config=left_aligned_columns(ta_df, extra={
+                "Company": st.column_config.ButtonColumn(
+                    "Company", type="tertiary", alignment="left",
+                    on_click=_activate_ta_row, key=ta_click_key,
+                ),
+                "Website": st.column_config.LinkColumn("Website", display_text="Visit", alignment="left"),
+            }),
         )
-        selected_ta_rows = ta_event.selection.rows if ta_event and ta_event.selection else []
-        selected_ta_rows = [i for i in selected_ta_rows if i < len(target_accounts)]
+        selected_ta_idx = st.session_state.get(ta_selected_key)
+        selected_ta_rows = [selected_ta_idx] if selected_ta_idx is not None and selected_ta_idx < len(visible_accounts) else []
         if selected_ta_rows:
-            acc = target_accounts[selected_ta_rows[0]]
+            acc = visible_accounts[selected_ta_rows[0]]
+            ta_anchor_id = "detail-anchor-target-accounts"
+            if st.session_state.pop(ta_scroll_key, False):
+                st.html(
+                    f'<div id="{ta_anchor_id}"></div>'
+                    '<script>'
+                    f'document.getElementById("{ta_anchor_id}")?.scrollIntoView({{behavior: "smooth", block: "start"}});'
+                    '</script>',
+                    unsafe_allow_javascript=True,
+                )
+            else:
+                st.html(f'<div id="{ta_anchor_id}"></div>')
             st.markdown(f"**{acc['company_name']}**")
             for sig in acc["signals"]:
-                st.markdown(f"[{sig['signal_type']}, {sig['source']}] {sig['detail']} (observed {sig['date_observed'][:10]})")
+                sig_label = SIGNAL_TYPE_LABELS.get(sig["signal_type"], sig["signal_type"])
+                st.markdown(f"[{sig_label}, {sig['source']}] {sig['detail']} (observed {sig['date_observed'][:10]})")
             if acc.get("notes"):
                 st.markdown(f"Notes: {acc['notes']}")
             new_ta_status = st.selectbox(
@@ -1207,7 +1430,7 @@ elif active_tab == "prospector":
     coverage_by_channel_df = pd.DataFrame(sorted(coverage["by_channel"].items()), columns=["Channel", "Jobs"])
     st.dataframe(
         coverage_by_channel_df,
-        hide_index=True, width="stretch", column_config=left_aligned_columns(coverage_by_channel_df),
+        hide_index=True, width="content", column_config=left_aligned_columns(coverage_by_channel_df),
     )
     if coverage["untimestamped"]:
         st.markdown(f"{coverage['untimestamped']} job(s) predate 2026-07-30 and have no discovery date, so they're in the total but not the 7-day count.")
@@ -1219,7 +1442,7 @@ elif active_tab == "prospector":
     activity_by_status_df = pd.DataFrame(sorted(activity["by_status"].items()), columns=["Status", "Count"])
     st.dataframe(
         activity_by_status_df,
-        hide_index=True, width="stretch", column_config=left_aligned_columns(activity_by_status_df),
+        hide_index=True, width="content", column_config=left_aligned_columns(activity_by_status_df),
     )
     if activity["untimestamped"]:
         st.markdown(f"{activity['untimestamped']} application(s) predate 2026-07-30 and have no start date, so they're in the total but not the 7-day count.")
@@ -1256,14 +1479,14 @@ elif active_tab == "prospector":
 
         with st.expander("By channel"):
             by_channel_df = rates_table(outcome["by_channel"], "Channel")
-            st.dataframe(by_channel_df, hide_index=True, width="stretch", column_config=left_aligned_columns(by_channel_df))
+            st.dataframe(by_channel_df, hide_index=True, width="content", column_config=left_aligned_columns(by_channel_df))
         with st.expander("By fit-score band"):
             by_score_band_df = rates_table(outcome["by_score_band"], "Score band")
-            st.dataframe(by_score_band_df, hide_index=True, width="stretch", column_config=left_aligned_columns(by_score_band_df))
+            st.dataframe(by_score_band_df, hide_index=True, width="content", column_config=left_aligned_columns(by_score_band_df))
         with st.expander("By target-role priority weight"):
             st.markdown("Weight comes from Settings > target roles - higher weight roles are the ones you prioritized.")
             by_role_weight_df = rates_table(outcome["by_role_weight"], "Priority weight")
-            st.dataframe(by_role_weight_df, hide_index=True, width="stretch", column_config=left_aligned_columns(by_role_weight_df))
+            st.dataframe(by_role_weight_df, hide_index=True, width="content", column_config=left_aligned_columns(by_role_weight_df))
 
     st.subheader("Rejection-pattern diagnosis")
     st.markdown(
@@ -1294,6 +1517,10 @@ elif active_tab == "prospector":
                     st.markdown("**Not interested (with reason)**")
                     not_interested_df = pd.DataFrame(diagnosis_input["not_interested_with_reason"])
                     st.dataframe(not_interested_df, hide_index=True, width="stretch", column_config=left_aligned_columns(not_interested_df))
+                    # (rejected_df/not_interested_df kept at width="stretch",
+                    # not "content" - unlike the summary tables above, these
+                    # hold free-text rejection reasons/skip notes that need
+                    # room to read, not a tight fit.)
 
     st.subheader("Insights (Learn Engine)")
     st.markdown(
@@ -1332,7 +1559,7 @@ elif active_tab == "prospector":
                     if learn_input[key]:
                         st.markdown(f"**{title}**")
                         learn_key_df = pd.DataFrame(learn_input[key])
-                        st.dataframe(learn_key_df, hide_index=True, width="stretch", column_config=left_aligned_columns(learn_key_df))
+                        st.dataframe(learn_key_df, hide_index=True, width="content", column_config=left_aligned_columns(learn_key_df))
 
 elif active_tab == "prep":
     render_feedback_widget("prep")

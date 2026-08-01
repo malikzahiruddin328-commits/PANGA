@@ -16,6 +16,16 @@ NON_COMPANY_KEYWORDS = (
     "institute", "department of veterans affairs", "national institutes of health",
     " nih", "clinic", "foundation", ", m.d.", "school of medicine",
     "cancer center", "health network", "medical associates",
+    # Added 2026-07-31 after Zahir spotted two real clinical-trial-sponsor
+    # examples that slipped through: "Gustave Roussy, Cancer Campus, Grand
+    # Paris" (a major French cancer research hospital) and "Radiation
+    # Therapy Oncology Group" (a former US clinical-trials cooperative
+    # group, now part of NRG Oncology) - neither is a company, but neither
+    # matched any existing keyword. "cooperative group"/"oncology group"
+    # catch the broader pattern of trial-sponsoring research consortiums;
+    # "cancer campus" and the specific name catch this exact one directly.
+    "cancer campus", "gustave roussy", "cooperative group", "oncology group",
+    "research consortium",
 )
 
 # Universally-recognized multinational pharma majors - decades into being
@@ -49,6 +59,9 @@ KNOWN_ACQUIRED_KEYWORDS = (
     "shire", "alexion", "medimmune", "pharmacyclics", "cubist pharmaceuticals",
     "ariad pharmaceuticals", "actelion", "loxo oncology", "array biopharma",
     "bioverativ", "spark therapeutics", "tesaro", "c. r. bard", "c.r. bard",
+    # Added 2026-07-31, Zahir spotted it directly: VectivBio AG, acquired by
+    # Ironwood Pharmaceuticals in 2023 - no longer an independent company.
+    "vectivbio",
 )
 
 

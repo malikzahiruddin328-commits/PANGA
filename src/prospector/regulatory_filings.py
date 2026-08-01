@@ -60,10 +60,46 @@ def fetch_recent_nda_bla_approvals(limit: int = 1000) -> list[dict]:
 
 
 def normalize_regulatory_signals(applications: list[dict], years_back: int = 3) -> list[dict]:
-    """Filters to sponsors whose most recent ORIG/AP submission falls
-    within years_back, excludes non-companies/mega-pharma/known-acquired
-    via company_filters, and returns signal-ready dicts (company_name +
-    the kwargs target_accounts.add_signal expects)."""
+    """DEPRECATED as a target-account signal source (2026-07-31, Zahir's
+    explicit call - see below) - kept only so callers referencing it fail
+    loudly instead of silently, and as a record of why. Do not wire this
+    into target_accounts.add_signal() again without addressing the note
+    below first.
+
+    Real problem found live: this originally treated ANY approval within
+    years_back (3 years) as a positive prospecting signal. Zahir's
+    feedback, verbatim: a company he actually recognized (UroGen) showed
+    up as "watching" off an approval that (from his own knowledge) was
+    years old and long past being a live opportunity - "this is not a
+    prime company to focus." Checking the real stored data confirmed the
+    underlying bug even for entries that WERE inside the 3-year window:
+    30 of 78 real target accounts (as of 2026-07-31) had ONLY this one
+    signal, spanning approvals from 1 month to 2.5 years old - a company
+    that has ALREADY been approved has already passed the moment it needs
+    to build out corporate/IT functions in anticipation of commercial
+    launch, whether that approval was last month or three years ago. The
+    fix isn't a shorter window - it's that "already approved" is
+    structurally the wrong direction of signal for this product's purpose.
+
+    What Zahir actually wants instead: companies in late Phase 3, with a
+    PDUFA date set, or that just submitted an NDA/BLA - i.e. APPROACHING
+    approval, not past it. openFDA's drugsfda.json (this module's only
+    data source) can't support that: it only records actions that have
+    ALREADY happened (an "AP"/approved submission_status with the date
+    approval occurred) - there's no PDUFA date field and no reliable way
+    to distinguish "NDA submitted, still under review" from "hasn't been
+    submitted yet," since a pending submission generally doesn't appear in
+    this dataset at all until FDA acts on it. Getting real PDUFA-date/
+    pending-NDA signals needs a different source - likely SEC 8-K/10-Q
+    filings mentioning "PDUFA," "NDA submission," or "BLA submission"
+    (same EDGAR full-text-search approach funding_filings.py already uses
+    for Phase 3 mentions in S-1 filings) - not yet built; needs Zahir's
+    go-ahead before spending real effort on it, since EDGAR full-text
+    coverage/reliability for this specific use case is unverified.
+
+    clinical_trials.py's "late_stage_trial" signal (Phase 3, ongoing) is
+    the one existing signal type still correctly aligned with "approaching,
+    not past" - unaffected by this deprecation."""
     cutoff = (datetime.now(timezone.utc) - timedelta(days=365 * years_back)).strftime("%Y%m%d")
 
     out = []

@@ -6,6 +6,12 @@
       "runtimeExecutable": "venv/Scripts/streamlit.exe",
       "runtimeArgs": ["run", "src/ui/app.py", "--server.headless", "true"],
       "port": 8501
+    },
+    {
+      "name": "panga-ui-verify",
+      "runtimeExecutable": "venv/Scripts/streamlit.exe",
+      "runtimeArgs": ["run", "src/ui/app.py", "--server.headless", "true", "--server.port", "8504"],
+      "port": 8504
     }
   ]
 }

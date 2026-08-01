@@ -36,6 +36,7 @@ from pathlib import Path
 
 from docx import Document
 
+from profile.storage import load_profile
 from search.job_store import load_jobs
 from tailoring.applications import get_application
 from tailoring.interview_prep import get_interview_prep
@@ -51,12 +52,10 @@ DOC_LABELS = {
     "leadership_summary_text": "Leadership summary",
 }
 
-# Which workspace filename backs each drafted-text field - shared by
-# sync_workspace_documents() (writing) and check_for_edits() (reading back
-# to diff). apply_answers is deliberately excluded: it's a list of
-# {label, value} fields, not editable prose, so it isn't part of the
-# edit-review loop below.
-_WORKSPACE_FILENAMES = {
+# The generic names workspace files used before 2026-07-31 - kept only so
+# _migrate_legacy_filename() can find and rename a folder's existing files
+# the first time it's touched after the naming convention below changed.
+_LEGACY_WORKSPACE_FILENAMES = {
     "resume_text": "resume.docx",
     "cover_letter_text": "cover_letter.docx",
     "exec_bio_text": "exec_bio.docx",
@@ -83,6 +82,37 @@ def dossier_dir(source: str, job_id: str, organization: str | None = None, title
 
 def dossier_path(source: str, job_id: str, organization: str | None = None, title: str | None = None) -> Path:
     return dossier_dir(source, job_id, organization, title) / "dossier.md"
+
+
+def _sanitize_filename_part(value: str) -> str:
+    return re.sub(r'[<>:"/\\|?*]', "", value).strip().replace(" ", "_")
+
+
+def _workspace_filename(field: str, candidate_name: str | None, job: dict) -> str:
+    """Descriptive filename for a workspace document - Zahir's explicit ask
+    2026-07-31: files inside the per-application folder should follow the
+    same {Name}_{DocType}_{Title}_{Organization}.docx convention the old
+    per-document download button used, so a file is self-explanatory even
+    pulled out of its folder (e.g. attached to an email)."""
+    doc_label = DOC_LABELS.get(field, field)
+    parts = [candidate_name, doc_label, job.get("title"), job.get("organization")]
+    safe_parts = [_sanitize_filename_part(p) for p in parts if p]
+    return "_".join(safe_parts)[:150] + ".docx"
+
+
+def _migrate_legacy_filename(folder: Path, field: str, new_filename: str) -> None:
+    """One-time rename for a workspace folder created before descriptive
+    filenames existed: if the old generic name (resume.docx, etc.) is still
+    on disk and the new descriptive name isn't, renames it in place so
+    Zahir's real edits carry over under the new convention rather than
+    being silently orphaned under the old name."""
+    legacy_name = _LEGACY_WORKSPACE_FILENAMES.get(field)
+    if not legacy_name:
+        return
+    legacy_path = folder / legacy_name
+    new_path = folder / new_filename
+    if legacy_path.exists() and not new_path.exists():
+        legacy_path.rename(new_path)
 
 
 def _format_pay(job: dict) -> str | None:
@@ -225,9 +255,9 @@ def sync_workspace_documents(
     written - his edits are preserved on disk, never silently overwritten,
     even though the app can no longer treat that specific text as "the
     current working copy" once a fresh regenerate has happened.
-    apply_answers is skipped here (see _WORKSPACE_FILENAMES) - it isn't
-    rendered as an editable docx, the Results tab shows it as copy-paste
-    fields directly.
+    apply_answers is skipped here (see DOC_KEY_TO_FIELD) - it isn't rendered
+    as an editable docx, the Results tab shows it as copy-paste fields
+    directly.
     """
     doc_keys_with_files = [k for k in doc_keys if k in DOC_KEY_TO_FIELD]
     if not doc_keys_with_files:
@@ -239,15 +269,14 @@ def sync_workspace_documents(
 
     for doc_key in doc_keys_with_files:
         field = f"{doc_key}_text"
-        filename = _WORKSPACE_FILENAMES.get(field)
-        if not filename:
-            continue
         new_text = drafted.get(doc_key)
         if doc_key == "resume" and isinstance(new_text, dict):
             new_text = new_text.get("text")
         if not new_text:
             continue
 
+        filename = _workspace_filename(field, candidate_name, job)
+        _migrate_legacy_filename(folder, field, filename)
         file_path = folder / filename
         if file_path.exists():
             previous_stored_text = application.get(field)
@@ -261,7 +290,12 @@ def sync_workspace_documents(
                 file_path.rename(folder / backup_name)
 
         if doc_key == "cover_letter":
-            doc_bytes = cover_letter_to_docx_bytes(new_text, company_name=job.get("organization"), author=candidate_name)
+            doc_bytes = cover_letter_to_docx_bytes(
+                new_text,
+                company_name=job.get("organization"),
+                company_address=job.get("organization_address"),
+                author=candidate_name,
+            )
         else:
             doc_bytes = text_to_docx_bytes(new_text, author=candidate_name)
         file_path.write_bytes(doc_bytes)
@@ -286,13 +320,15 @@ def check_for_edits(source: str, job_id: str) -> dict:
     if job is None:
         return {}
     folder = dossier_dir(source, job_id, job.get("organization"), job.get("title"))
+    candidate_name = load_profile().get("name")
 
     results = {}
     for doc_key, field in DOC_KEY_TO_FIELD.items():
         stored_text = application.get(field)
-        filename = _WORKSPACE_FILENAMES.get(field)
-        if not stored_text or not filename:
+        if not stored_text:
             continue
+        filename = _workspace_filename(field, candidate_name, job)
+        _migrate_legacy_filename(folder, field, filename)
         file_path = folder / filename
         if not file_path.exists():
             # A document drafted before this workspace feature existed (or

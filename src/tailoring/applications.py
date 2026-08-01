@@ -61,6 +61,7 @@ def upsert_application(
     resume_ats_rationale: str | None = None,
     resume_ats_next_actions: list[str] | None = None,
     resume_clarifying_questions: list[dict] | None = None,
+    suggested_strategy_tag: str | None = None,
     documents_requested: list[str] | None = None,
     skip_reason: str | None = None,
     apply_answers: list[dict] | None = None,
@@ -90,7 +91,13 @@ def upsert_application(
     {"label": ..., "value": ...} ready-to-paste answers for an ATS form's
     recurring fields, drafted the same way as the other documents - Zahir
     still opens the real application and pastes/submits it himself, this
-    only removes the retyping."""
+    only removes the retyping. suggested_strategy_tag (2026-07-31) is a
+    short label Claude proposes describing what's distinctive about this
+    specific resume draft (e.g. "concise-2-page-ats-focused") - stored
+    separately from the real strategy_tag field (set_strategy_tag()) so a
+    fresh regenerate's suggestion never silently overwrites a tag Zahir
+    already saved himself; the Results tab prefills the strategy-tag input
+    with this only when strategy_tag is still empty."""
     applications = load_applications()
     for app in applications:
         if app["source"] == source and app["job_id"] == job_id:
@@ -115,6 +122,8 @@ def upsert_application(
                 app["resume_ats_next_actions"] = resume_ats_next_actions
             if resume_clarifying_questions is not None:
                 app["resume_clarifying_questions"] = resume_clarifying_questions
+            if suggested_strategy_tag is not None:
+                app["strategy_tag_suggestion"] = suggested_strategy_tag
             if documents_requested is not None:
                 app["documents_requested"] = documents_requested
             if skip_reason is not None:
@@ -146,6 +155,7 @@ def upsert_application(
         "resume_ats_rationale": resume_ats_rationale,
         "resume_ats_next_actions": resume_ats_next_actions if resume_ats_next_actions is not None else [],
         "resume_clarifying_questions": resume_clarifying_questions if resume_clarifying_questions is not None else [],
+        "strategy_tag_suggestion": suggested_strategy_tag,
         "documents_requested": documents_requested if documents_requested is not None else [],
         "skip_reason": skip_reason,
         "skip_reason_reviewed": False if skip_reason is not None else None,
