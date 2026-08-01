@@ -20,16 +20,42 @@ carries the two cross-cutting things that used to live on a single page
 visible no matter which tab is open.
 """
 
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
-# Bhangi is a separate, standalone project (shared issue store for the
-# Support tab, reused across projects) - sibling folder to this one, not
-# part of this repo. See ../Bhangi/README.md.
-sys.path.insert(0, str(PROJECT_ROOT.parent / "Bhangi" / "src"))
+
+
+def _find_bhangi_src(project_root: Path) -> Path | None:
+    """Locate the sibling Bhangi checkout's src/ directory.
+
+    Bhangi is a separate, standalone project (shared issue store for the
+    Support tab, reused across projects), normally a sibling folder to the
+    main Panga checkout - see ../Bhangi/README.md. But every git worktree
+    branch lives under Panga/.claude/worktrees/<branch>/, where
+    project_root.parent has no Bhangi folder. Walk up the ancestor chain
+    (which passes through the real Panga checkout for any worktree) looking
+    for an ancestor whose sibling is Bhangi. BHANGI_PATH env var overrides
+    this search entirely.
+    """
+    override = os.environ.get("BHANGI_PATH")
+    if override:
+        candidate = Path(override) / "src"
+        if candidate.is_dir():
+            return candidate
+    for ancestor in (project_root, *project_root.parents):
+        candidate = ancestor.parent / "Bhangi" / "src"
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+_bhangi_src = _find_bhangi_src(PROJECT_ROOT)
+if _bhangi_src is not None:
+    sys.path.insert(0, str(_bhangi_src))
 
 import pandas as pd
 import streamlit as st
