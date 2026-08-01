@@ -20,16 +20,42 @@ carries the two cross-cutting things that used to live on a single page
 visible no matter which tab is open.
 """
 
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
-# Bhangi is a separate, standalone project (shared issue store for the
-# Support tab, reused across projects) - sibling folder to this one, not
-# part of this repo. See ../Bhangi/README.md.
-sys.path.insert(0, str(PROJECT_ROOT.parent / "Bhangi" / "src"))
+
+
+def _find_bhangi_src(project_root: Path) -> Path | None:
+    """Locate the sibling Bhangi checkout's src/ directory.
+
+    Bhangi is a separate, standalone project (shared issue store for the
+    Support tab, reused across projects), normally a sibling folder to the
+    main Panga checkout - see ../Bhangi/README.md. But every git worktree
+    branch lives under Panga/.claude/worktrees/<branch>/, where
+    project_root.parent has no Bhangi folder. Walk up the ancestor chain
+    (which passes through the real Panga checkout for any worktree) looking
+    for an ancestor whose sibling is Bhangi. BHANGI_PATH env var overrides
+    this search entirely.
+    """
+    override = os.environ.get("BHANGI_PATH")
+    if override:
+        candidate = Path(override) / "src"
+        if candidate.is_dir():
+            return candidate
+    for ancestor in (project_root, *project_root.parents):
+        candidate = ancestor.parent / "Bhangi" / "src"
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+_bhangi_src = _find_bhangi_src(PROJECT_ROOT)
+if _bhangi_src is not None:
+    sys.path.insert(0, str(_bhangi_src))
 
 import pandas as pd
 import streamlit as st
@@ -42,7 +68,7 @@ from tailoring.applications import load_applications, upsert_application, get_ap
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
 from tailoring.interview_prep import load_interview_prep, record_round_outcome, build_prep_context, generate_prep, start_round, save_round
 from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
-from tailoring.drafting import generate_documents, score_job, save_gap_answers, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed
+from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
 from prospector.rejection_diagnosis import gather_diagnosis_input, diagnose
 from prospector.target_accounts import load_target_accounts, set_status as set_target_account_status, set_website, load_website_lookup_cost, save_website_lookup_cost
@@ -63,9 +89,11 @@ from security.crypto_store import has_recovery_code, generate_recovery_code
 import gmail_client
 from feedback.ui_feedback import get_open_feedback, mark_resolved
 from ui.feedback_widget import render_feedback_widget
-from profile.ingest import load_manifest_result, remove_document, ingest_uploaded_document
-from profile.storage import load_profile
+from profile.ingest import load_manifest_result, remove_document, ingest_uploaded_document, resume_text as ingested_resume_text
+from profile.storage import load_profile, update_profile_field
 from bhangi.ui import render_support_page
+from ui.license_gate import render_indicator_and_get_block, render_block_screen
+from licensing.client import release_device, create_portal_session, LicenseNetworkError, LicenseServiceError
 
 BHANGI_PROJECT = "panga"
 
@@ -255,7 +283,15 @@ def go_to_prep(target: dict) -> None:
     st.rerun()
 
 
-st.title("Panga - Job Search")
+title_col, license_col = st.columns([5, 1])
+with title_col:
+    st.title("Panga - Job Search")
+with license_col:
+    license_block = render_indicator_and_get_block()
+
+if license_block is not None:
+    render_block_screen(license_block)
+    st.stop()
 
 jobs = load_jobs()
 all_cta = get_active_cta_emails()
@@ -379,8 +415,107 @@ if active_tab == "settings":
             new_doc_file, new_doc_file.name, doc_category,
             target_title=doc_target_title or None, note=doc_note or None,
         )
-        st.toast(f"Saved {entry['source_file']} ({entry['word_count']} words).", icon=":material/check_circle:")
+        toast_msg = f"Saved {entry['source_file']} ({entry['word_count']} words)."
+        if doc_category == "resume":
+            # Nudge straight to the next real step (Zahir's ask: a saved
+            # resume should point at what to do with it, not just confirm
+            # the save) - target roles/industries sits right below now,
+            # not several unrelated sections down the page.
+            toast_msg += " Add your target industries below to generate your target roles."
+        st.toast(toast_msg, icon=":material/check_circle:")
         st.rerun()
+
+    st.divider()
+    st.header("Target roles and industries")
+    st.markdown("These control sort order on the Results tab - higher weight surfaces first. Not a search filter; every source is still searched the same way.")
+
+    settings = load_settings()
+    profile_for_settings = load_profile()
+
+    st.subheader("Your target industries/verticals")
+    st.markdown(
+        "What kind of employer or industry are you aiming for? Free text, "
+        "one per line - trades vary too widely for a fixed dropdown, and "
+        "even within one trade the target companies can differ a lot by "
+        "sub-vertical (e.g. a chemical engineer targeting nuclear plants "
+        "needs different targets than one targeting plastics plants)."
+    )
+    industries_text = st.text_area(
+        "One per line",
+        value="\n".join(settings.get("industries", [])),
+        key="industries_text",
+    )
+
+    st.subheader("Your seniority / experience level")
+    st.markdown(
+        "A short self-description used when generating your target roles "
+        "below and when scoring job fit - e.g. \"22 years, Director-to-VP "
+        "level\" or \"4 years post-residency, attending physician level\"."
+    )
+    seniority_text = st.text_input(
+        "Seniority / years of experience",
+        value=profile_for_settings.get("seniority", ""),
+        key="seniority_text",
+    )
+
+    has_resume = any(e["category"] == "resume" for e in manifest_entries)
+    gen_disabled = not has_resume or not industries_text.strip() or not drafting_is_configured()
+    if st.button("Generate my target roles from my resume", icon=":material/auto_awesome:", disabled=gen_disabled):
+        industries_list = [line.strip() for line in industries_text.splitlines() if line.strip()]
+        with st.spinner("Reading your resume and reasoning about target roles..."):
+            try:
+                proposal = generate_target_roles(ingested_resume_text(), industries_list, seniority_text.strip())
+            except (DraftingNotConfigured, DraftingFailed) as exc:
+                st.error(str(exc))
+            else:
+                new_counter = st.session_state.get("target_roles_gen_counter", 0) + 1
+                st.session_state["target_roles_gen_counter"] = new_counter
+                st.session_state[f"target_roles_seed_{new_counter}"] = proposal["target_roles"]
+                st.toast(
+                    f"Proposed {len(proposal['target_roles'])} target role(s) below for "
+                    f"\"{proposal['ladder_role']}\" in {proposal['ladder_industry']} - "
+                    "review, edit, then Save settings.",
+                    icon=":material/auto_awesome:",
+                )
+                st.rerun()
+    if not has_resume:
+        st.caption("Upload a resume above first.")
+    elif not industries_text.strip():
+        st.caption("Add at least one target industry/vertical above first.")
+
+    st.subheader("Target roles")
+    gen_counter = st.session_state.get("target_roles_gen_counter", 0)
+    seed_key = f"target_roles_seed_{gen_counter}"
+    if seed_key not in st.session_state:
+        st.session_state[seed_key] = settings.get("target_roles", [])
+    roles_df = st.data_editor(
+        st.session_state[seed_key],
+        num_rows="dynamic",
+        column_config={
+            "name": st.column_config.TextColumn("Role name", required=True),
+            "priority_weight": st.column_config.NumberColumn("Priority weight", required=True, min_value=0, max_value=10),
+        },
+        key=f"roles_editor_{gen_counter}",
+    )
+
+    st.subheader("USAJOBS job series")
+    st.markdown("See \"Occupations and job series\" on usajobs.gov for codes. This runs alongside keyword search (not instead of it) - government classification is inconsistent, so restricting to one series alone would miss real matches filed under a different code. The compatibility score, not this filter, is what actually screens for relevance.")
+    job_series_text = st.text_area(
+        "One code per line, e.g. 2210 for Information Technology Management",
+        value="\n".join(settings.get("usajobs_job_series", [])),
+    )
+
+    if st.button("Save settings"):
+        settings["target_roles"] = roles_df
+        settings["industries"] = [line.strip() for line in industries_text.splitlines() if line.strip()]
+        settings["usajobs_job_series"] = [line.strip() for line in job_series_text.splitlines() if line.strip()]
+        try:
+            save_settings(settings)
+            update_profile_field("seniority", seniority_text.strip())
+        except Exception as exc:
+            st.error(f"Failed to save settings: {exc}")
+        else:
+            st.success("Saved.")
 
     st.divider()
     st.subheader("LinkedIn profile")
@@ -529,43 +664,6 @@ if active_tab == "settings":
                     st.success(f"Connected - found {len(labels)} Gmail label(s). The Gmail scan/fulfillment scripts are ready to use.")
 
     st.divider()
-    st.header("Target roles and industries")
-    st.markdown("These control sort order on the Results tab - higher weight surfaces first. Not a search filter; every source is still searched the same way.")
-
-    settings = load_settings()
-
-    st.subheader("Target roles")
-    roles_df = st.data_editor(
-        settings.get("target_roles", []),
-        num_rows="dynamic",
-        column_config={
-            "name": st.column_config.TextColumn("Role name", required=True),
-            "priority_weight": st.column_config.NumberColumn("Priority weight", required=True, min_value=0, max_value=10),
-        },
-        key="roles_editor",
-    )
-
-    st.subheader("Industries")
-    industries_text = st.text_area(
-        "One per line",
-        value="\n".join(settings.get("industries", [])),
-    )
-
-    st.subheader("USAJOBS job series")
-    st.markdown("See \"Occupations and job series\" on usajobs.gov for codes. This runs alongside keyword search (not instead of it) - government classification is inconsistent, so restricting to one series alone would miss real matches filed under a different code. The compatibility score, not this filter, is what actually screens for relevance.")
-    job_series_text = st.text_area(
-        "One code per line, e.g. 2210 for Information Technology Management",
-        value="\n".join(settings.get("usajobs_job_series", [])),
-    )
-
-    if st.button("Save settings"):
-        settings["target_roles"] = roles_df
-        settings["industries"] = [line.strip() for line in industries_text.splitlines() if line.strip()]
-        settings["usajobs_job_series"] = [line.strip() for line in job_series_text.splitlines() if line.strip()]
-        save_settings(settings)
-        st.success("Saved.")
-
-    st.divider()
     st.header("Data recovery")
     st.markdown(
         "Your resume, job history, and applications are encrypted on this "
@@ -596,6 +694,36 @@ if active_tab == "settings":
         if st.button("I've saved this somewhere safe"):
             del st.session_state["new_recovery_code"]
             st.rerun()
+
+    st.divider()
+    st.header("License & billing")
+    st.markdown(
+        "This license is bound to this computer. Deactivating releases it "
+        "immediately so a new device can activate — use this when you're "
+        "moving to a new computer, not if this one is lost or stolen (that "
+        "needs a manual support review instead)."
+    )
+    if st.button("Deactivate this device", key="license_deactivate_device"):
+        try:
+            release_device()
+            st.session_state.pop("license_check_result", None)
+            st.success("Device deactivated. A new device can now activate this license.")
+        except LicenseNetworkError:
+            st.error("Couldn't reach the license service — check your internet connection and try again.")
+        except LicenseServiceError as e:
+            if e.status_code == 429:
+                st.error("A device was already transferred within the last 30 days — contact support for an exception.")
+            else:
+                st.error(f"Couldn't deactivate this device: {e}")
+
+    if st.button("Manage subscription", key="license_manage_billing"):
+        try:
+            portal = create_portal_session(return_url="http://localhost:8501")
+            st.link_button("Open billing portal", portal["portal_url"])
+        except LicenseNetworkError:
+            st.error("Couldn't reach the billing service — check your internet connection and try again.")
+        except LicenseServiceError as e:
+            st.error(f"Couldn't open the billing portal: {e}")
 
     st.divider()
     st.header("UI feedback")
@@ -1133,7 +1261,7 @@ elif active_tab == "results":
                                             "Nothing pre-filled is saved as-is."
                                         )
                                         job_key = f"{job.get('source')}_{job.get('job_id')}"
-                                        answer_inputs = {}
+                                        answer_entries = []
                                         for q in clarifying_questions:
                                             # Keyed by the question's own content, not its position
                                             # (qi) - a real bug found 2026-07-31: each regeneration
@@ -1151,12 +1279,25 @@ elif active_tab == "results":
                                             # suggested answer, and a key on question text alone would
                                             # silently keep showing the earlier round's stale suggestion.
                                             q_key = f"gapans_{job_key}_{abs(hash(q['question'] + '|' + (q.get('suggested_answer') or ''))) % 10_000_000}"
-                                            answer_inputs[q["skill"]] = st.text_area(
+                                            is_disqualifier = q.get("type") == "disqualifier_check"
+                                            if is_disqualifier:
+                                                st.caption(
+                                                    ":material/flag: This answer applies to every "
+                                                    "future job match, not just this one - not a "
+                                                    "guess, so the box starts empty."
+                                                )
+                                            answer_value = st.text_area(
                                                 q["question"], value=q.get("suggested_answer") or "",
                                                 key=q_key, height=68,
+                                                placeholder="Type your answer..." if is_disqualifier else None,
                                             )
+                                            answer_entries.append({
+                                                "skill": q["skill"],
+                                                "type": q.get("type", "skill_gap"),
+                                                "answer": answer_value,
+                                            })
                                         if st.button("Save answers & regenerate resume", key=f"gapsave_{job_key}"):
-                                            answered = {skill: ans for skill, ans in answer_inputs.items() if ans and ans.strip()}
+                                            answered = [e for e in answer_entries if e["answer"] and e["answer"].strip()]
                                             if not answered:
                                                 st.toast("Answer at least one question first.", icon=":material/warning:")
                                             else:

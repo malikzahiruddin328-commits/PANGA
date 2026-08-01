@@ -49,3 +49,13 @@ when explicitly asked.
   This isn't a fixed checklist to run mechanically - it's the standard to
   hold every UI change to, the same way the checks above apply to every
   code change.
+
+## Merging a finished worktree branch into master
+
+Panga usually has several sessions working in parallel worktrees. When a
+branch is ready to integrate, follow the **release manager** convention in
+`docs/release-manager.md` rather than improvising: check master's current
+tip (it moves while you work), resolve conflicts inside the feature
+branch's own worktree, run the full suite, then fast-forward master -
+never merge conflict-resolution work directly in the shared master
+checkout, and never touch another session's unrelated uncommitted files.
