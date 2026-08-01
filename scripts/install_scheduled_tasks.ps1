@@ -51,8 +51,12 @@ $scanTriggers = @(
 Register-PangaTask -Name "Panga-GmailCtaScan" -ScriptRelativePath "scripts\gmail_cta_scan.py" -Triggers $scanTriggers
 
 # panga-cta-fulfillment -> every 10 minutes, indefinitely (cron
-# "*/10 * * * *" from the original SKILL.md)
-$fulfillmentTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 10) -RepetitionDuration ([TimeSpan]::MaxValue)
+# "*/10 * * * *" from the original SKILL.md). Task Scheduler rejects
+# [TimeSpan]::MaxValue as a repetition duration ("value ... out of range") -
+# there's no real "forever" value for RepetitionDuration, so this uses 10
+# years as a practical stand-in; re-run this script (safe, uses -Force) to
+# extend it before that expires.
+$fulfillmentTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 10) -RepetitionDuration (New-TimeSpan -Days 3650)
 Register-PangaTask -Name "Panga-CtaFulfillment" -ScriptRelativePath "scripts\cta_fulfillment.py" -Triggers @($fulfillmentTrigger)
 
 Write-Host ""
