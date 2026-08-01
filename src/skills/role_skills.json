@@ -5,17 +5,114 @@
   },
   "Lifesciences/Pharma": {
     "Head of IT / CIO": [
-      { "skill": "21 CFR Part 11 / GxP computer system validation (CSV)", "why_it_matters": "Core regulatory requirement for any validated system in a pharma environment." },
-      { "skill": "Electronic signature validated state (e.g. DocuSign under Part 11)", "why_it_matters": "PRD's own example — common gap between 'used e-signature' and 'maintained validated state through releases'." },
-      { "skill": "SSO / identity provider specifics (Okta, MS Authenticator, Azure AD)", "why_it_matters": "Generic 'IAM' on a resume hides which specific tooling and migrations were actually owned." },
-      { "skill": "SOX ITGC (IT general controls) and audit readiness", "why_it_matters": "Required for public-company or public-company-readiness environments." },
-      { "skill": "Veeva CRM / Veeva R&D Suite ownership", "why_it_matters": "Industry-standard commercial/R&D platform in pharma; depth of ownership vs. peripheral exposure matters." },
-      { "skill": "Drug serialization / track-and-trace compliance", "why_it_matters": "DSCSA-driven requirement for commercial pharma product launches." },
-      { "skill": "GxP change control and system lifecycle management", "why_it_matters": "Distinguishes 'implemented' from 'implemented and maintained under ongoing change control'." },
-      { "skill": "Master Data Management (MDM) governance model", "why_it_matters": "Resume shows heavy MDM delivery experience — worth confirming ownership of the governance model vs. just implementation." },
-      { "skill": "Cloud/SaaS vendor governance and cost optimization", "why_it_matters": "Resume claims 30% opex reduction — worth probing the specific levers used." },
-      { "skill": "AI-enabled analytics adoption in a regulated environment", "why_it_matters": "Newer area; regulated-industry AI adoption has specific validation/compliance nuances worth capturing in detail." },
-      { "skill": "M&A / Day-1 technology integration", "why_it_matters": "Resume mentions two SK Life Science integration initiatives — worth capturing what specifically was owned (systems, data, cybersecurity, vendor contracts)." }
+      {
+        "skill": "21 CFR Part 11 / GxP computer system validation (CSV)",
+        "why_it_matters": "Core regulatory requirement for any validated system in a pharma environment."
+      },
+      {
+        "skill": "Electronic signature validated state (e.g. DocuSign under Part 11)",
+        "why_it_matters": "PRD's own example — common gap between 'used e-signature' and 'maintained validated state through releases'."
+      },
+      {
+        "skill": "SSO / identity provider specifics (Okta, MS Authenticator, Azure AD)",
+        "why_it_matters": "Generic 'IAM' on a resume hides which specific tooling and migrations were actually owned."
+      },
+      {
+        "skill": "SOX ITGC (IT general controls) and audit readiness",
+        "why_it_matters": "Required for public-company or public-company-readiness environments."
+      },
+      {
+        "skill": "Veeva CRM / Veeva R&D Suite ownership",
+        "why_it_matters": "Industry-standard commercial/R&D platform in pharma; depth of ownership vs. peripheral exposure matters."
+      },
+      {
+        "skill": "Drug serialization / track-and-trace compliance",
+        "why_it_matters": "DSCSA-driven requirement for commercial pharma product launches."
+      },
+      {
+        "skill": "GxP change control and system lifecycle management",
+        "why_it_matters": "Distinguishes 'implemented' from 'implemented and maintained under ongoing change control'."
+      },
+      {
+        "skill": "Master Data Management (MDM) governance model",
+        "why_it_matters": "Resume shows heavy MDM delivery experience — worth confirming ownership of the governance model vs. just implementation."
+      },
+      {
+        "skill": "Cloud/SaaS vendor governance and cost optimization",
+        "why_it_matters": "Resume claims 30% opex reduction — worth probing the specific levers used."
+      },
+      {
+        "skill": "AI-enabled analytics adoption in a regulated environment",
+        "why_it_matters": "Newer area; regulated-industry AI adoption has specific validation/compliance nuances worth capturing in detail."
+      },
+      {
+        "skill": "M&A / Day-1 technology integration",
+        "why_it_matters": "Resume mentions two SK Life Science integration initiatives — worth capturing what specifically was owned (systems, data, cybersecurity, vendor contracts)."
+      }
+    ]
+  },
+  "Financial Services / Banking": {
+    "Chief Information Officer (CIO)": [
+      {
+        "skill": "Regulatory examination readiness for banking supervisors (OCC, FDIC, FRB, FFIEC IT Examination Handbook)",
+        "why_it_matters": "Bank and credit union CIOs are directly accountable for evidencing IT control adequacy to examiners, and this is the single most common screening question for the role."
+      },
+      {
+        "skill": "SOX ITGC ownership plus financial-services control frameworks (COBIT, NIST CSF, ISO 27001)",
+        "why_it_matters": "A financial services CIO must own access, change, and operations controls that survive both external audit and internal audit/audit committee scrutiny."
+      },
+      {
+        "skill": "GLBA Safeguards Rule, FFIEC CAT, and customer data privacy obligations (CCPA/GDPR where applicable)",
+        "why_it_matters": "Protecting non-public personal information is a statutory duty for banks, and CIOs are asked how they operationalized it."
+      },
+      {
+        "skill": "Third-party / vendor risk management under interagency guidance (SOC 2 review, critical-vendor concentration risk, exit planning)",
+        "why_it_matters": "Regulators treat outsourced fintech and SaaS providers as an extension of the bank, so vendor governance rigor is evaluated separately from cost savings."
+      },
+      {
+        "skill": "Core banking platform knowledge (e.g., FIS, Fiserv, Jack Henry, Temenos) and core conversion or modernization experience",
+        "why_it_matters": "Core system ownership or conversion leadership is the defining technical credential that distinguishes a banking CIO from a general enterprise CIO."
+      },
+      {
+        "skill": "Payments and channel infrastructure fluency (ACH/Nacha rules, wires, card networks, real-time payments, digital/online banking platforms)",
+        "why_it_matters": "Payments availability and fraud exposure sit at the center of a bank CIO's operational risk portfolio."
+      },
+      {
+        "skill": "BSA/AML, fraud, and financial crime technology stack oversight (transaction monitoring, sanctions screening, case management)",
+        "why_it_matters": "Compliance technology failures create enforcement risk, and the CIO is expected to partner with the BSA officer on platform selection and data quality."
+      },
+      {
+        "skill": "Business continuity, disaster recovery, and cyber resilience testing with documented RTO/RPO and tabletop exercises",
+        "why_it_matters": "Examiners and boards require tested recovery capability for critical banking services, not just documented plans."
+      },
+      {
+        "skill": "Cybersecurity program leadership: identity and access management, privileged access, endpoint/email security, SOC/MSSP oversight, incident response",
+        "why_it_matters": "Financial institutions are prime attack targets and boards expect the CIO to articulate the threat posture and 36-hour incident notification obligations."
+      },
+      {
+        "skill": "Enterprise data governance, MDM, and analytics for regulatory and risk reporting (customer master, product master, data lineage, BCBS 239-style principles)",
+        "why_it_matters": "Accurate, lineage-traceable data is the foundation of credit, liquidity, and regulatory reporting that the CIO is expected to enable."
+      },
+      {
+        "skill": "Cloud and SaaS strategy in a regulated environment (AWS/Azure landing zones, data residency, cloud concentration risk, contractual audit rights)",
+        "why_it_matters": "Banks require cloud adoption to pass regulator and internal audit scrutiny, so the CIO must show governed migration, not just modernization."
+      },
+      {
+        "skill": "IT budget, capital planning, and P&L discipline with demonstrable run-rate reduction and unit-cost transparency",
+        "why_it_matters": "Efficiency ratio pressure makes measurable IT cost management a top hiring criterion for financial services CIOs."
+      },
+      {
+        "skill": "Board and audit committee reporting, plus CFO/CRO/Chief Compliance Officer partnership",
+        "why_it_matters": "CIOs at banks present risk, cyber, and roadmap updates directly to board committees and must translate technology risk into business language."
+      },
+      {
+        "skill": "M&A technology diligence, Day-1 readiness, and post-close systems/data integration",
+        "why_it_matters": "Bank consolidation is constant, and CIOs are frequently hired specifically for their ability to integrate acquired institutions' cores, data, and controls."
+      },
+      {
+        "skill": "3-year technology roadmap development with AI/automation strategy and model-risk-aware governance",
+        "why_it_matters": "Boards now expect a CIO to present a funded multi-year roadmap that includes AI use cases with clear risk, data, and vendor guardrails."
+      }
     ]
   }
 }

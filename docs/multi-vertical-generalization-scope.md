@@ -34,6 +34,28 @@ untouched per its own "incremental, not speculative" design. What's left
 on this branch: nothing identified yet beyond point 4's eventual
 demand-driven builds, which aren't this branch's job to start early.
 
+**Real end-to-end smoke test, 2026-08-01** (isolated to this worktree's own
+`data/` - never touched Zahir's real production Panga data): ingested his
+actual resume (`GAND/Zahir Resume.docx`), then ran `generate_target_roles()`
+against a genuinely new, non-pharma vertical ("Financial Services /
+Banking") - it correctly proposed a banking-specific title ladder (OCC/
+FDIC/FFIEC exam readiness, GLBA, core banking platforms, BSA/AML) with zero
+pharma leakage, and wrote it into `role_skills.json` as a real second
+entry (kept, not synthetic - see the file itself). Then seeded a real
+CISO-titled test posting and ran resume drafting against it: Claude
+correctly proposed a `disqualifier_check` clarifying question (empty
+suggested answer, as designed) instead of guessing; answering it "yes,
+exclude" routed to `gap_interview_answers` with `is_disqualifier: true` via
+`save_gap_answers()`. Confirmed the generalization actually holds by
+scoring two brand-new postings (different org, different vertical -
+healthcare - never seen before) with `score_job()`: a CISO-titled one
+scored 3/100 citing the disqualifier by name, a comparable CIO one scored
+88/100 - proving the exclusion applies to future postings generically, not
+just the one job it was captured on. Synthetic test job/application
+records and the fabricated test disqualifier answer were removed after;
+the real resume ingestion and the real generated Financial Services/
+Banking ladder were kept.
+
 ## What's currently hardcoded (the problem)
 
 - **CISO/security-officer-title disqualification** — Zahir's personal
