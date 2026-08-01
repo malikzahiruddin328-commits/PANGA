@@ -40,11 +40,11 @@ from search.job_store import load_jobs
 from ranking.prioritize import weight_for, dedupe_across_sources
 from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion, set_strategy_tag, needs_edit_review, record_document_edit_review
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
-from tailoring.interview_prep import load_interview_prep, record_round_outcome
+from tailoring.interview_prep import load_interview_prep, record_round_outcome, build_prep_context, generate_prep, start_round, save_round
 from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
 from tailoring.drafting import generate_documents, score_job, save_gap_answers, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
-from prospector.rejection_diagnosis import gather_diagnosis_input
+from prospector.rejection_diagnosis import gather_diagnosis_input, diagnose
 from prospector.target_accounts import load_target_accounts, set_status as set_target_account_status, set_website, load_website_lookup_cost, save_website_lookup_cost
 from prospector.company_lookup import lookup_company_website
 from prospector.outreach import (
@@ -52,13 +52,15 @@ from prospector.outreach import (
     get_outreach_for_target_account, get_outreach_for_job, load_outreach,
     set_strategy_tag as set_outreach_strategy_tag,
 )
-from prospector.learn_engine import gather_learn_engine_input
+from prospector.learn_engine import gather_learn_engine_input, analyze as analyze_learn_engine
 from prospector.prospector_score import load_prospector_score, gather_prospector_score_input, compute_prospector_score, save_prospector_score
-from linkedin.storage import load_linkedin_profile, save_snapshot, mark_suggestion_status, get_active_suggestions, SECTIONS as LINKEDIN_SECTIONS
+from linkedin.storage import load_linkedin_profile, save_snapshot, save_analysis, mark_suggestion_status, get_active_suggestions, SECTIONS as LINKEDIN_SECTIONS
+from linkedin.enhance import build_enhancement_context, analyze_profile
 from linkedin.ingest import extract_text_from_pdf
 from linkedin.connections import parse_connections_csv, looks_like_recruiter, cross_reference_target_accounts
 from linkedin.connections_store import load_connections_snapshot, save_connections
 from security.crypto_store import has_recovery_code, generate_recovery_code
+import gmail_client
 from feedback.ui_feedback import get_open_feedback, mark_resolved
 from ui.feedback_widget import render_feedback_widget
 from profile.ingest import load_manifest_result, remove_document, ingest_uploaded_document
@@ -404,7 +406,7 @@ if active_tab == "settings":
             parts.append(f"--- {f.name} ---\n{text}")
             source_files.append(f.name)
         save_snapshot("\n\n".join(parts), source_files, saved_at=datetime.now().isoformat(timespec="seconds"))
-        st.toast("Saved. Go to the LinkedIn tab, or ask Claude Code to analyze/enhance your profile.", icon=":material/check_circle:")
+        st.toast("Saved. Go to the LinkedIn tab and click \"Analyze profile\" to get suggestions.", icon=":material/check_circle:")
         st.rerun()
     if linkedin_data.get("last_saved"):
         st.markdown(f"Last saved: {linkedin_data['last_saved']} (from {', '.join(linkedin_data.get('source_files', []))})")
@@ -428,6 +430,103 @@ if active_tab == "settings":
         st.rerun()
     if connections_snapshot.get("last_saved"):
         st.markdown(f"Last saved: {connections_snapshot['last_saved']} ({len(connections_snapshot['connections'])} connections from {connections_snapshot.get('source_file')})")
+
+    st.divider()
+    st.header("Gmail connection")
+    st.markdown(
+        "Panga reads and labels your inbox, and drafts replies, using "
+        "Gmail's own official API - not a browser extension or shared "
+        "login. Google requires every app to register its own credentials, "
+        "so this needs a one-time setup of your own Google Cloud project "
+        "and OAuth client. Takes a few minutes, once - the steps below open "
+        "the exact right page each time."
+    )
+
+    if gmail_client.is_configured():
+        st.success("Gmail credentials found - see \"Test connection\" below to confirm it actually works.")
+    else:
+        st.info("Not set up yet - follow the steps below in order.")
+
+    with st.container(border=True):
+        st.markdown("**Step 1 - Create a Google Cloud project**")
+        st.markdown("Name it anything (e.g. \"Panga\"). Skip this if you already have a project you'd rather use.")
+        st.link_button("Open: Create a new project", "https://console.cloud.google.com/projectcreate")
+
+    with st.container(border=True):
+        st.markdown("**Step 2 - Enable the Gmail API**")
+        st.markdown("Make sure your new project is selected (top of the page), then click \"Enable\".")
+        st.link_button("Open: Enable Gmail API", "https://console.cloud.google.com/apis/library/gmail.googleapis.com")
+
+    with st.container(border=True):
+        st.markdown("**Step 3 - Configure the OAuth consent screen**")
+        st.markdown(
+            "Choose **External**. Fill in an app name (e.g. \"Panga\") and "
+            "your own email as the support and developer contact. On the "
+            "\"Test users\" screen, add your own Gmail address - this is "
+            "what lets you actually sign in during testing, before any "
+            "formal Google review. The first time you connect, you'll see "
+            "a \"Google hasn't verified this app\" warning - that's "
+            "expected for a personal, unreviewed OAuth client; click "
+            "**Continue** (not \"Back to safety\")."
+        )
+        st.link_button("Open: OAuth consent screen", "https://console.cloud.google.com/apis/credentials/consent")
+
+    with st.container(border=True):
+        st.markdown("**Step 4 - Create an OAuth client**")
+        st.markdown(
+            "Click \"Create Credentials\" > \"OAuth client ID\". Choose "
+            "**Desktop app** as the application type (not \"Web "
+            "application\" - Desktop is what lets this run without a "
+            "public redirect URL). Name it anything, then click the "
+            "download icon next to the new client to save its JSON file."
+        )
+        st.link_button("Open: Create OAuth client", "https://console.cloud.google.com/apis/credentials")
+
+    with st.container(border=True):
+        st.markdown("**Step 5 - Add the downloaded file**")
+        downloads_hits = gmail_client.find_downloaded_credentials()
+        if downloads_hits:
+            hit_labels = [f"{p.name} (modified {datetime.fromtimestamp(p.stat().st_mtime):%Y-%m-%d %H:%M})" for p in downloads_hits]
+            chosen_idx = st.selectbox(
+                "Found matching file(s) in your Downloads folder:",
+                range(len(downloads_hits)), format_func=lambda i: hit_labels[i],
+                key="gmail_cred_downloads_pick",
+            )
+            if st.button("Use this file", type="primary", key="gmail_cred_use_downloaded"):
+                gmail_client.install_credentials_from_path(downloads_hits[chosen_idx])
+                st.toast("Gmail credentials saved.", icon=":material/check_circle:")
+                st.rerun()
+            st.markdown("Or upload the file manually below instead.")
+        else:
+            st.markdown("No matching file spotted yet in your Downloads folder - download it from Step 4 above, then check back here (or upload it manually below).")
+
+        uploaded_gmail_cred = st.file_uploader("Or upload the client-secret JSON manually", type=["json"], key="gmail_cred_upload")
+        if st.button("Save uploaded file", type="primary", disabled=not uploaded_gmail_cred, key="gmail_cred_save_uploaded"):
+            try:
+                gmail_client.install_credentials_from_bytes(uploaded_gmail_cred.getvalue())
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                st.toast("Gmail credentials saved.", icon=":material/check_circle:")
+                st.rerun()
+
+    with st.container(border=True):
+        st.markdown("**Step 6 - Test the connection**")
+        st.markdown(
+            "The first real connection opens a browser window for you to "
+            "approve access - one time only, cached after that. Approve it "
+            "there, then come back here."
+        )
+        if st.button("Test Gmail connection", type="primary", disabled=not gmail_client.is_configured()):
+            with st.spinner("Connecting to Gmail - a browser window may open, approve access there..."):
+                try:
+                    labels = gmail_client.list_labels()
+                except gmail_client.GmailNotConfigured as exc:
+                    st.error(str(exc))
+                except Exception as exc:
+                    st.error(f"Couldn't connect: {exc}")
+                else:
+                    st.success(f"Connected - found {len(labels)} Gmail label(s). The Gmail scan/fulfillment scripts are ready to use.")
 
     st.divider()
     st.header("Target roles and industries")
@@ -1532,75 +1631,74 @@ elif active_tab == "prospector":
     st.subheader("Rejection-pattern diagnosis")
     st.markdown(
         "Looks for clustering in why applications aren't landing - by score band, channel, "
-        "role type, or the reasons you've given for marking something not interested. This "
-        "needs Claude's live reasoning, not a canned report, so this button only gathers the "
-        "data - come back to Claude Code and ask it to run the diagnosis."
+        "role type, or the reasons you've given for marking something not interested."
     )
-    if st.button("Prepare diagnosis data"):
+    diagnosis_result = st.session_state.get("diagnosis_result")
+    if diagnosis_result:
+        with st.container(border=True):
+            st.markdown(diagnosis_result["narrative"])
+            if diagnosis_result["recommendations"]:
+                st.markdown("**Worth trying:**")
+                for rec in diagnosis_result["recommendations"]:
+                    st.markdown(f"- {rec}")
+    if st.button("Run rejection-pattern diagnosis", type="primary"):
         diagnosis_input = gather_diagnosis_input(applications, jobs)
-        st.session_state["diagnosis_input"] = diagnosis_input
-
-    diagnosis_input = st.session_state.get("diagnosis_input")
-    if diagnosis_input:
-        d1, d2 = st.columns(2)
-        d1.metric("Rejected applications", diagnosis_input["rejected_count"])
-        d2.metric("'Not interested' with a reason given", diagnosis_input["not_interested_with_reason_count"])
         if diagnosis_input["rejected_count"] == 0 and diagnosis_input["not_interested_with_reason_count"] == 0:
             st.info("Nothing to diagnose yet - no rejections tracked and no not-interested reasons given so far.")
         else:
-            st.success("Data's ready. Go to Claude Code and ask it to run the rejection-pattern diagnosis - it'll read this and give you a plain-language write-up with suggestions.")
-            with st.expander("What it'll be looking at"):
-                if diagnosis_input["rejected"]:
-                    st.markdown("**Rejected**")
-                    rejected_df = pd.DataFrame(diagnosis_input["rejected"])
-                    st.dataframe(rejected_df, hide_index=True, width="stretch", column_config=left_aligned_columns(rejected_df))
-                if diagnosis_input["not_interested_with_reason"]:
-                    st.markdown("**Not interested (with reason)**")
-                    not_interested_df = pd.DataFrame(diagnosis_input["not_interested_with_reason"])
-                    st.dataframe(not_interested_df, hide_index=True, width="stretch", column_config=left_aligned_columns(not_interested_df))
-                    # (rejected_df/not_interested_df kept at width="stretch",
-                    # not "content" - unlike the summary tables above, these
-                    # hold free-text rejection reasons/skip notes that need
-                    # room to read, not a tight fit.)
+            diag_bar = st.progress(0, text="Looking for patterns in your rejections...")
+
+            def _update_diag_progress(substatus):
+                diag_bar.progress(0.5, text=f"Looking for patterns in your rejections - {substatus}")
+
+            try:
+                result = diagnose(diagnosis_input, on_progress=_update_diag_progress)
+            except (DraftingNotConfigured, DraftingFailed) as exc:
+                diag_bar.empty()
+                st.error(str(exc))
+            else:
+                diag_bar.progress(1.0, text="Done.")
+                st.session_state["diagnosis_result"] = result
+                st.rerun()
 
     st.subheader("Insights (Learn Engine)")
     st.markdown(
         "Cross-cutting feedback loop over every prediction Panga makes - scoring, target-account "
-        "qualification, outreach channel, strategy tags, interview outcomes (PRD §17). Same as "
-        "rejection-pattern diagnosis above: this button only gathers the data across all of these "
-        "tables - come back to Claude Code and ask it to run the analysis. Recommend-only, always - "
-        "it never changes a score threshold or any setting on its own."
+        "qualification, outreach channel, strategy tags, interview outcomes (PRD §17). "
+        "Recommend-only, always - it never changes a score threshold or any setting on its own."
     )
-    if st.button("Prepare Learn Engine data"):
-        st.session_state["learn_engine_input"] = gather_learn_engine_input(
-            applications, jobs, target_accounts, outreach_records, prep_records,
-        )
-
-    learn_input = st.session_state.get("learn_engine_input")
-    if learn_input:
-        l1, l2, l3, l4 = st.columns(4)
-        l1.metric("Scored applications", len(learn_input["scoring_vs_outcome"]))
-        l2.metric("Target accounts", len(learn_input["target_account_vs_outcome"]))
-        l3.metric("Outreach records", len(learn_input["outreach_vs_outcome"]))
-        l4.metric("Interview outcomes", len(learn_input["interview_outcomes"]))
+    learn_result = st.session_state.get("learn_engine_result")
+    if learn_result:
+        with st.container(border=True):
+            st.markdown(learn_result["narrative"])
+            if learn_result["recommendations"]:
+                st.markdown("**Worth considering:**")
+                for rec in learn_result["recommendations"]:
+                    st.markdown(f"- {rec}")
+            for gap in learn_result.get("known_gaps", []):
+                st.markdown(f"**Known gap:** {gap}")
+    if st.button("Run Learn Engine analysis", type="primary"):
+        learn_input = gather_learn_engine_input(applications, jobs, target_accounts, outreach_records, prep_records)
         total_inputs = sum(len(learn_input[k]) for k in ("scoring_vs_outcome", "target_account_vs_outcome", "outreach_vs_outcome", "interview_outcomes"))
         if total_inputs == 0:
             st.info("Nothing to analyze yet - come back once there's more history across scoring, target accounts, outreach, or interviews.")
         else:
-            st.success("Data's ready. Go to Claude Code and ask it to run the Learn Engine analysis.")
-            for gap in learn_input["known_gaps"]:
-                st.markdown(f"**Known gap:** {gap}")
-            with st.expander("What it'll be looking at"):
-                for key, title in [
-                    ("scoring_vs_outcome", "Scoring vs. application outcome"),
-                    ("target_account_vs_outcome", "Target accounts vs. real postings"),
-                    ("outreach_vs_outcome", "Outreach vs. response"),
-                    ("interview_outcomes", "Interview outcomes"),
-                ]:
-                    if learn_input[key]:
-                        st.markdown(f"**{title}**")
-                        learn_key_df = pd.DataFrame(learn_input[key])
-                        st.dataframe(learn_key_df, hide_index=True, width="content", column_config=left_aligned_columns(learn_key_df))
+            learn_bar = st.progress(0, text="Reasoning over your real data...")
+
+            def _update_learn_progress(substatus):
+                learn_bar.progress(0.5, text=f"Reasoning over your real data - {substatus}")
+
+            try:
+                result = analyze_learn_engine(learn_input, on_progress=_update_learn_progress)
+            except (DraftingNotConfigured, DraftingFailed) as exc:
+                learn_bar.empty()
+                st.error(str(exc))
+            else:
+                learn_bar.progress(1.0, text="Done.")
+                for gap in learn_input["known_gaps"]:
+                    result.setdefault("known_gaps", []).append(gap)
+                st.session_state["learn_engine_result"] = result
+                st.rerun()
 
 elif active_tab == "prep":
     render_feedback_widget("prep")
@@ -1611,14 +1709,65 @@ elif active_tab == "prep":
     if prep_target:
         with st.container(border=True):
             if prep_target["kind"] == "job":
+                target_job = next((j for j in jobs if j["source"] == prep_target["source"] and j["job_id"] == prep_target["job_id"]), None)
                 st.markdown(f"**Ready to prep: {prep_target['job_label']}**")
-                st.markdown("Go to Claude Code and ask to prep for this interview - it'll research the interviewer(s)/company and draft persona-aware questions and talking points from your master profile.")
             else:
                 st.markdown(f"**Ready to prep: \"{prep_target['subject']}\"** from {prep_target['sender']}")
-                st.markdown("Go to Claude Code and ask to prep for this interview. It'll read the full email thread first to find interviewer/panel names, match it to the right application, then research from there.")
-            if st.button("Clear", key="clear_prep_target"):
-                st.session_state["prep_target"] = None
-                st.rerun()
+                st.markdown(f"[Open in Gmail]({prep_target['gmail_link']})")
+                job_options = {job_label(j): j for j in jobs}
+                chosen_label = st.selectbox(
+                    "Which application is this interview for?", ["-- select --"] + list(job_options.keys()),
+                    key="prep_email_job_select",
+                )
+                target_job = job_options.get(chosen_label)
+
+            round_label = st.text_input("Round (e.g. \"Phone screen\", \"Final round\")", value="Round 1", key="prep_round_label")
+            interviewer_text = st.text_area(
+                "Interviewer(s), one per line - \"Name\" or \"Name - Title\" (optional, leave blank if unknown)",
+                key="prep_interviewer_text",
+            )
+            interviewers = []
+            for line in interviewer_text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                if " - " in line:
+                    name, title = line.split(" - ", 1)
+                    interviewers.append({"name": name.strip(), "title": title.strip(), "found_via": "manual"})
+                else:
+                    interviewers.append({"name": line, "title": None, "found_via": "manual"})
+
+            gen_col, clear_col = st.columns([1, 1])
+            with gen_col:
+                if st.button("Generate prep", type="primary", key="generate_prep_btn", disabled=(target_job is None)):
+                    start_round(target_job["source"], target_job["job_id"], round_label, interviewers=interviewers or None)
+                    prep_bar = st.progress(0, text="Researching the company and interviewer(s)...")
+
+                    def _update_prep_progress(substatus):
+                        prep_bar.progress(0.6, text=f"Drafting prep content - {substatus}")
+
+                    try:
+                        result = generate_prep(target_job, load_profile(), interviewers, on_progress=_update_prep_progress)
+                    except (DraftingNotConfigured, DraftingFailed) as exc:
+                        prep_bar.empty()
+                        st.error(str(exc))
+                    else:
+                        prep_bar.progress(1.0, text="Done.")
+                        save_round(
+                            target_job["source"], target_job["job_id"], round_label,
+                            interviewers=result["interviewers"] or interviewers,
+                            company_snapshot=result["company_snapshot"],
+                            likely_questions=result["likely_questions"],
+                            questions_to_ask=result["questions_to_ask"],
+                            status="ready",
+                        )
+                        st.session_state["prep_target"] = None
+                        st.toast("Interview prep ready.", icon=":material/check_circle:")
+                        st.rerun()
+            with clear_col:
+                if st.button("Clear", key="clear_prep_target"):
+                    st.session_state["prep_target"] = None
+                    st.rerun()
 
     if not prep_records:
         st.markdown("No interview prep started yet. Use \"Prep for this interview\" on Results or Call to Action once you're past the applied stage.")
@@ -1689,11 +1838,11 @@ elif active_tab == "linkedin":
         "Uploads for your LinkedIn profile and connections live in Settings "
         "now, alongside your resume and other source documents - one shared "
         "place to manage everything Panga reads from. This tab shows the "
-        "analysis and suggestions once you've uploaded there and asked "
-        "Claude Code to review your profile - that's where the comparison "
-        "against your master profile and target-role skills happens, and "
-        "where suggested rewrites get drafted. Suggestions below are yours "
-        "to copy and paste into LinkedIn's own edit screens."
+        "analysis and suggestions once you've uploaded there and run the "
+        "analysis below - it compares your export against your master "
+        "profile and target-role skills, and drafts suggested rewrites. "
+        "Suggestions below are yours to copy and paste into LinkedIn's own "
+        "edit screens."
     )
     if st.button("Go to Settings to upload/update", icon=":material/upload_file:"):
         st.session_state["active_tab"] = "settings"
@@ -1703,6 +1852,27 @@ elif active_tab == "linkedin":
 
     if linkedin_data.get("last_saved"):
         st.markdown(f"Last saved: {linkedin_data['last_saved']} (from {', '.join(linkedin_data.get('source_files', []))})")
+
+        if st.button("Analyze profile", type="primary", disabled=not linkedin_data.get("raw_text")):
+            enhance_bar = st.progress(0, text="Analyzing your LinkedIn profile...")
+
+            def _update_enhance_progress(substatus):
+                enhance_bar.progress(0.5, text=f"Analyzing your LinkedIn profile - {substatus}")
+
+            try:
+                context = build_enhancement_context()
+                result = analyze_profile(context, on_progress=_update_enhance_progress)
+            except (DraftingNotConfigured, DraftingFailed) as exc:
+                enhance_bar.empty()
+                st.error(str(exc))
+            else:
+                enhance_bar.progress(1.0, text="Done.")
+                save_analysis(
+                    result["suggestions"], result["profile_strength_score"], result["profile_strength_rationale"],
+                    datetime.now(timezone.utc).isoformat(),
+                )
+                st.toast(f"Profile strength: {result['profile_strength_score']}/100.", icon=":material/check_circle:")
+                st.rerun()
 
     st.divider()
 
@@ -1740,7 +1910,7 @@ elif active_tab == "linkedin":
                         st.rerun()
                 st.divider()
     else:
-        st.markdown("Not yet analyzed - upload your profile PDF(s) in Settings, then ask Claude to analyze it.")
+        st.markdown("Not yet analyzed - upload your profile PDF(s) in Settings, then click \"Analyze profile\" above.")
 
     st.divider()
     st.subheader("Connections (for Prospector outreach)")

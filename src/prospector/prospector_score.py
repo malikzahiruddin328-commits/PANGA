@@ -29,12 +29,10 @@ re-reads these stores live every time, not a cached snapshot.
 import json
 from pathlib import Path
 
-import anthropic
-
+from llm_client import DEFAULT_MODEL, LLMCallFailed as DraftingFailed, call_structured, get_client as _client
 from prospector.learn_engine import gather_learn_engine_input
 from prospector.kpis import activity_summary, coverage_summary, outcome_summary
 from security.crypto_store import read_json, write_json
-from tailoring.drafting import DEFAULT_MODEL, DraftingFailed, _client
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCORE_PATH = PROJECT_ROOT / "data" / "prospector" / "prospector_score.json"
@@ -144,47 +142,22 @@ def compute_prospector_score(input_data: dict, on_progress=None) -> dict:
     generation (Zahir's explicit ask 2026-07-31: no spinner anywhere should
     be opaque when the underlying call can report real progress instead)."""
     client = _client()
-    try:
-        with client.messages.stream(
-            model=DEFAULT_MODEL,
-            max_tokens=2000,
-            output_config={"effort": "medium", "format": {"type": "json_schema", "schema": _SCORE_SCHEMA}},
-            system=(
-                "You compute a self-learning Prospector Score for a job search's "
-                "proactive-outreach system by reasoning over the real data "
-                "provided - never a fixed formula. Score honestly; a thin score "
-                "grounded in few real outcomes is correct, not something to "
-                "inflate for encouragement."
-            ),
-            messages=[{"role": "user", "content": json.dumps(input_data, indent=2, default=str)}],
-        ) as stream:
-            char_count = 0
-            last_reported = 0
-            for event in stream:
-                if event.type == "content_block_start" and event.content_block.type == "thinking":
-                    if on_progress:
-                        on_progress("thinking...")
-                elif event.type == "content_block_delta" and event.delta.type == "text_delta":
-                    char_count += len(event.delta.text)
-                    if on_progress and char_count - last_reported >= 150:
-                        on_progress(f"writing... ({char_count:,} characters so far)")
-                        last_reported = char_count
-            response = stream.get_final_message()
-    except anthropic.APIStatusError as exc:
-        raise DraftingFailed(f"Claude API error ({exc.status_code}): {exc.message}") from exc
-    except anthropic.APIConnectionError as exc:
-        raise DraftingFailed("Couldn't reach the Claude API - check your internet connection.") from exc
-
-    if response.stop_reason == "refusal":
-        raise DraftingFailed("Claude declined to compute a score. Try again.")
-    if response.stop_reason == "max_tokens":
-        raise DraftingFailed("The response was cut off before finishing. Try again.")
-
-    text_block = next((b.text for b in response.content if b.type == "text"), None)
-    if not text_block:
-        raise DraftingFailed("Claude returned no result.")
-    try:
-        data = json.loads(text_block)
-    except json.JSONDecodeError as exc:
-        raise DraftingFailed("Claude's response wasn't valid - try again.") from exc
+    data = call_structured(
+        client,
+        system=(
+            "You compute a self-learning Prospector Score for a job search's "
+            "proactive-outreach system by reasoning over the real data "
+            "provided - never a fixed formula. Score honestly; a thin score "
+            "grounded in few real outcomes is correct, not something to "
+            "inflate for encouragement."
+        ),
+        user_content=json.dumps(input_data, indent=2, default=str),
+        schema=_SCORE_SCHEMA,
+        max_tokens=2000,
+        model=DEFAULT_MODEL,
+        effort="medium",
+        thinking=False,
+        on_progress=on_progress,
+        refusal_message="Claude declined to compute a score. Try again.",
+    )
     return {"score": data["score"], "rationale": data["rationale"], "next_actions": data["next_actions"]}

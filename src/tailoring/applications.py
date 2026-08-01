@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from security.crypto_store import read_json, write_json
+from security.file_lock import locked
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 APPLICATIONS_PATH = PROJECT_ROOT / "data" / "applications" / "applications.json"
@@ -98,71 +99,72 @@ def upsert_application(
     fresh regenerate's suggestion never silently overwrites a tag Zahir
     already saved himself; the Results tab prefills the strategy-tag input
     with this only when strategy_tag is still empty."""
-    applications = load_applications()
-    for app in applications:
-        if app["source"] == source and app["job_id"] == job_id:
-            if app.get("status") != status:
-                app["status_updated_at"] = datetime.now(timezone.utc).isoformat()
-            app["status"] = status
-            if any(t is not None for t in (resume_text, cover_letter_text, exec_bio_text, leadership_summary_text)):
-                app["documents_drafted_at"] = datetime.now(timezone.utc).isoformat()
-            if resume_text is not None:
-                app["resume_text"] = resume_text
-            if cover_letter_text is not None:
-                app["cover_letter_text"] = cover_letter_text
-            if exec_bio_text is not None:
-                app["exec_bio_text"] = exec_bio_text
-            if leadership_summary_text is not None:
-                app["leadership_summary_text"] = leadership_summary_text
-            if resume_ats_score is not None:
-                app["resume_ats_score"] = resume_ats_score
-            if resume_ats_rationale is not None:
-                app["resume_ats_rationale"] = resume_ats_rationale
-            if resume_ats_next_actions is not None:
-                app["resume_ats_next_actions"] = resume_ats_next_actions
-            if resume_clarifying_questions is not None:
-                app["resume_clarifying_questions"] = resume_clarifying_questions
-            if suggested_strategy_tag is not None:
-                app["strategy_tag_suggestion"] = suggested_strategy_tag
-            if documents_requested is not None:
-                app["documents_requested"] = documents_requested
-            if skip_reason is not None:
-                app["skip_reason"] = skip_reason
-                app["skip_reason_reviewed"] = False
-            if apply_answers is not None:
-                app["apply_answers"] = apply_answers
-            _save_all(applications)
-            _write_dossier(source, job_id)
-            return
+    with locked("applications"):
+        applications = load_applications()
+        for app in applications:
+            if app["source"] == source and app["job_id"] == job_id:
+                if app.get("status") != status:
+                    app["status_updated_at"] = datetime.now(timezone.utc).isoformat()
+                app["status"] = status
+                if any(t is not None for t in (resume_text, cover_letter_text, exec_bio_text, leadership_summary_text)):
+                    app["documents_drafted_at"] = datetime.now(timezone.utc).isoformat()
+                if resume_text is not None:
+                    app["resume_text"] = resume_text
+                if cover_letter_text is not None:
+                    app["cover_letter_text"] = cover_letter_text
+                if exec_bio_text is not None:
+                    app["exec_bio_text"] = exec_bio_text
+                if leadership_summary_text is not None:
+                    app["leadership_summary_text"] = leadership_summary_text
+                if resume_ats_score is not None:
+                    app["resume_ats_score"] = resume_ats_score
+                if resume_ats_rationale is not None:
+                    app["resume_ats_rationale"] = resume_ats_rationale
+                if resume_ats_next_actions is not None:
+                    app["resume_ats_next_actions"] = resume_ats_next_actions
+                if resume_clarifying_questions is not None:
+                    app["resume_clarifying_questions"] = resume_clarifying_questions
+                if suggested_strategy_tag is not None:
+                    app["strategy_tag_suggestion"] = suggested_strategy_tag
+                if documents_requested is not None:
+                    app["documents_requested"] = documents_requested
+                if skip_reason is not None:
+                    app["skip_reason"] = skip_reason
+                    app["skip_reason_reviewed"] = False
+                if apply_answers is not None:
+                    app["apply_answers"] = apply_answers
+                _save_all(applications)
+                _write_dossier(source, job_id)
+                return
 
-    applications.append({
-        "source": source,
-        "job_id": job_id,
-        "status": status,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "status_updated_at": datetime.now(timezone.utc).isoformat(),
-        "documents_drafted_at": (
-            datetime.now(timezone.utc).isoformat()
-            if any(t is not None for t in (resume_text, cover_letter_text, exec_bio_text, leadership_summary_text))
-            else None
-        ),
-        "document_edit_review": None,
-        "resume_text": resume_text,
-        "cover_letter_text": cover_letter_text,
-        "exec_bio_text": exec_bio_text,
-        "leadership_summary_text": leadership_summary_text,
-        "resume_ats_score": resume_ats_score,
-        "resume_ats_rationale": resume_ats_rationale,
-        "resume_ats_next_actions": resume_ats_next_actions if resume_ats_next_actions is not None else [],
-        "resume_clarifying_questions": resume_clarifying_questions if resume_clarifying_questions is not None else [],
-        "strategy_tag_suggestion": suggested_strategy_tag,
-        "documents_requested": documents_requested if documents_requested is not None else [],
-        "skip_reason": skip_reason,
-        "skip_reason_reviewed": False if skip_reason is not None else None,
-        "apply_answers": apply_answers if apply_answers is not None else [],
-    })
-    _save_all(applications)
-    _write_dossier(source, job_id)
+        applications.append({
+            "source": source,
+            "job_id": job_id,
+            "status": status,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "status_updated_at": datetime.now(timezone.utc).isoformat(),
+            "documents_drafted_at": (
+                datetime.now(timezone.utc).isoformat()
+                if any(t is not None for t in (resume_text, cover_letter_text, exec_bio_text, leadership_summary_text))
+                else None
+            ),
+            "document_edit_review": None,
+            "resume_text": resume_text,
+            "cover_letter_text": cover_letter_text,
+            "exec_bio_text": exec_bio_text,
+            "leadership_summary_text": leadership_summary_text,
+            "resume_ats_score": resume_ats_score,
+            "resume_ats_rationale": resume_ats_rationale,
+            "resume_ats_next_actions": resume_ats_next_actions if resume_ats_next_actions is not None else [],
+            "resume_clarifying_questions": resume_clarifying_questions if resume_clarifying_questions is not None else [],
+            "strategy_tag_suggestion": suggested_strategy_tag,
+            "documents_requested": documents_requested if documents_requested is not None else [],
+            "skip_reason": skip_reason,
+            "skip_reason_reviewed": False if skip_reason is not None else None,
+            "apply_answers": apply_answers if apply_answers is not None else [],
+        })
+        _save_all(applications)
+        _write_dossier(source, job_id)
 
 
 def record_document_edit_review(source: str, job_id: str, documents: dict, reason: str) -> None:
@@ -182,17 +184,18 @@ def record_document_edit_review(source: str, job_id: str, documents: dict, reaso
     ordering (not just presence) is what needs_edit_review() below checks,
     so regenerating a document invalidates a stale review instead of
     silently keeping stale reasoning attached to newly re-drafted text."""
-    applications = load_applications()
-    for app in applications:
-        if app["source"] == source and app["job_id"] == job_id:
-            app["document_edit_review"] = {
-                "checked_at": datetime.now(timezone.utc).isoformat(),
-                "documents": documents,
-                "reason": reason,
-            }
-            _save_all(applications)
-            _write_dossier(source, job_id)
-            return
+    with locked("applications"):
+        applications = load_applications()
+        for app in applications:
+            if app["source"] == source and app["job_id"] == job_id:
+                app["document_edit_review"] = {
+                    "checked_at": datetime.now(timezone.utc).isoformat(),
+                    "documents": documents,
+                    "reason": reason,
+                }
+                _save_all(applications)
+                _write_dossier(source, job_id)
+                return
 
 
 def needs_edit_review(app_record: dict) -> bool:
@@ -223,22 +226,24 @@ def set_strategy_tag(source: str, job_id: str, strategy_tag: str) -> None:
     focus") - set at drafting time so the Learn Engine can later correlate
     tags with outcomes. No fixed taxonomy - Claude suggests one based on
     what's actually different about this draft, Zahir confirms/edits."""
-    applications = load_applications()
-    for app in applications:
-        if app["source"] == source and app["job_id"] == job_id:
-            app["strategy_tag"] = strategy_tag
-            _save_all(applications)
-            _write_dossier(source, job_id)
-            return
+    with locked("applications"):
+        applications = load_applications()
+        for app in applications:
+            if app["source"] == source and app["job_id"] == job_id:
+                app["strategy_tag"] = strategy_tag
+                _save_all(applications)
+                _write_dossier(source, job_id)
+                return
 
 
 def mark_skip_reason_reviewed(source: str, job_id: str) -> None:
-    applications = load_applications()
-    for app in applications:
-        if app["source"] == source and app["job_id"] == job_id:
-            app["skip_reason_reviewed"] = True
-            _save_all(applications)
-            return
+    with locked("applications"):
+        applications = load_applications()
+        for app in applications:
+            if app["source"] == source and app["job_id"] == job_id:
+                app["skip_reason_reviewed"] = True
+                _save_all(applications)
+                return
 
 
 def get_unreviewed_skip_reasons() -> list[dict]:
@@ -251,13 +256,14 @@ def suggest_status(source: str, job_id: str, suggested_status: str, reason: str)
     does NOT change the real status. The user confirms or rejects it
     (confirm_status_suggestion), since matching an email to the right job
     record is a best guess, not a certainty (e.g. duplicate-titled postings)."""
-    applications = load_applications()
-    for app in applications:
-        if app["source"] == source and app["job_id"] == job_id:
-            app["suggested_status"] = suggested_status
-            app["suggested_status_reason"] = reason
-            _save_all(applications)
-            return
+    with locked("applications"):
+        applications = load_applications()
+        for app in applications:
+            if app["source"] == source and app["job_id"] == job_id:
+                app["suggested_status"] = suggested_status
+                app["suggested_status_reason"] = reason
+                _save_all(applications)
+                return
 
 
 def get_pending_status_suggestions() -> list[dict]:
@@ -267,15 +273,16 @@ def get_pending_status_suggestions() -> list[dict]:
 def confirm_status_suggestion(source: str, job_id: str, accept: bool) -> None:
     """accept=True applies the suggested_status as the real status; either
     way, clears the suggestion so it isn't asked about again."""
-    applications = load_applications()
-    for app in applications:
-        if app["source"] == source and app["job_id"] == job_id:
-            if accept and app.get("suggested_status"):
-                if app.get("status") != app["suggested_status"]:
-                    app["status_updated_at"] = datetime.now(timezone.utc).isoformat()
-                app["status"] = app["suggested_status"]
-            app["suggested_status"] = None
-            app["suggested_status_reason"] = None
-            _save_all(applications)
-            _write_dossier(source, job_id)
-            return
+    with locked("applications"):
+        applications = load_applications()
+        for app in applications:
+            if app["source"] == source and app["job_id"] == job_id:
+                if accept and app.get("suggested_status"):
+                    if app.get("status") != app["suggested_status"]:
+                        app["status_updated_at"] = datetime.now(timezone.utc).isoformat()
+                    app["status"] = app["suggested_status"]
+                app["suggested_status"] = None
+                app["suggested_status_reason"] = None
+                _save_all(applications)
+                _write_dossier(source, job_id)
+                return

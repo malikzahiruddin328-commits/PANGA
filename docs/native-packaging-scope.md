@@ -89,9 +89,21 @@ customer if done naively:**
   not-yet-designed backlog item (PRD §13), deliberately deferred until this
   branch and its direct-API prerequisite are further along, since license/
   billing design depends on how end-user API calls actually get made.
-- **Code signing** — not needed yet (Zahir is still the only real user);
-  revisit once this is genuinely distributed to others, since an unsigned
-  installer will trip Windows SmartScreen.
+- **Code signing** — not needed yet (Zahir is still the only real user).
+  Updated 2026-08-01 per MS Store research from the General session: if
+  distribution ever goes through the Microsoft Store, or a direct-download
+  link surfaced *via* the Store, code signing becomes a **hard
+  requirement**, not deferred polish — a real certificate purchase (cost
+  line item), not something to route around silently. Revisit as a real
+  budget item once Store distribution is actually scoped, not just SmartScreen
+  friction on an unsigned installer.
+- **Microsoft Store Generative-AI content policy (11.16)** — flagged
+  2026-08-01, not urgent yet: Store listing requirements include (1)
+  disclosing that Panga uses Claude/Anthropic AI, and (2) giving users a
+  way to report bad AI output that's actually acted on. Panga's existing
+  point-and-talk feedback widget (`ui/feedback_widget.py`, on every tab) is
+  a plausible reuse for (2) — worth reusing rather than building a separate
+  reporting mechanism, when Store distribution is actually scoped.
 
 ## A note on shared files
 

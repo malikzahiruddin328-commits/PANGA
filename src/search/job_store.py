@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from security.crypto_store import read_json, write_json
+from security.file_lock import locked
 
 LINKEDIN_JOB_ID_RE = re.compile(r"/jobs/view/(\d+)")
 
@@ -30,21 +31,22 @@ def save_jobs(new_jobs: list[dict]) -> int:
     report "jobs found this week"). Jobs saved before this date have no
     date_added and are counted in totals but not in any date-based slice -
     there's no real discovery date to recover for them."""
-    existing = load_jobs()
-    seen = {(j.get("source"), j.get("job_id")) for j in existing}
+    with locked("jobs"):
+        existing = load_jobs()
+        seen = {(j.get("source"), j.get("job_id")) for j in existing}
 
-    added = 0
-    for job in new_jobs:
-        key = (job.get("source"), job.get("job_id"))
-        if key in seen:
-            continue
-        job.setdefault("date_added", datetime.now(timezone.utc).isoformat())
-        existing.append(job)
-        seen.add(key)
-        added += 1
+        added = 0
+        for job in new_jobs:
+            key = (job.get("source"), job.get("job_id"))
+            if key in seen:
+                continue
+            job.setdefault("date_added", datetime.now(timezone.utc).isoformat())
+            existing.append(job)
+            seen.add(key)
+            added += 1
 
-    write_json(JOBS_PATH, existing)
-    return added
+        write_json(JOBS_PATH, existing)
+        return added
 
 
 def add_manual_job(
@@ -91,12 +93,13 @@ def update_job_address(source: str, job_id: str, address: str) -> None:
     block) on the job record so it isn't re-searched on every regenerate.
     "" is a valid cached value meaning "searched, genuinely not found" -
     distinct from the key being absent, which means "never searched yet"."""
-    jobs = load_jobs()
-    for job in jobs:
-        if job.get("source") == source and job.get("job_id") == job_id:
-            job["organization_address"] = address
-            break
-    write_json(JOBS_PATH, jobs)
+    with locked("jobs"):
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("source") == source and job.get("job_id") == job_id:
+                job["organization_address"] = address
+                break
+        write_json(JOBS_PATH, jobs)
 
 
 def update_job_score(source: str, job_id: str, fit_score: int, fit_rationale: str) -> None:
@@ -105,10 +108,11 @@ def update_job_score(source: str, job_id: str, fit_score: int, fit_rationale: st
     + master profile, not a keyword heuristic - this function only persists
     the result, matching the mechanical/reasoning split used elsewhere
     (interview.py, tailor.py)."""
-    jobs = load_jobs()
-    for job in jobs:
-        if job.get("source") == source and job.get("job_id") == job_id:
-            job["fit_score"] = fit_score
-            job["fit_rationale"] = fit_rationale
-            break
-    write_json(JOBS_PATH, jobs)
+    with locked("jobs"):
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("source") == source and job.get("job_id") == job_id:
+                job["fit_score"] = fit_score
+                job["fit_rationale"] = fit_rationale
+                break
+        write_json(JOBS_PATH, jobs)

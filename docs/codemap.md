@@ -46,23 +46,37 @@ flowchart TD
 - `applications.py` - the `applications` table (JSON, encrypted). `upsert_application`, status suggestions, edit-review gate (`needs_edit_review`/`record_document_edit_review`).
 - `dossier.py` - per-application workspace folder under `data/applications/dossiers/{org-title-slug}-{hash}/` - plain (unencrypted) `.docx` files named `Name_DocType_Role_Company.docx` plus `dossier.md`. `sync_workspace_documents()` writes them on (re)generate with edit-preserving backups; `check_for_edits()` diffs Zahir's hand-edited copy back against the stored draft text.
 - `docx_export.py` - plain text -> styled `.docx` bytes (resume style vs. cover-letter style are different renderers).
-- `interview_prep.py` - interview rounds/interviewer research store.
+- `interview_prep.py` - interview rounds/interviewer research store, PLUS `generate_prep()` (native-packaging branch) - direct-API web-research + structuring, replacing the old live-Claude-Code research/drafting step.
 - `cta_emails.py` - Gmail call-to-action store (offers/interview requests/rejections/etc., populated by the external `panga-gmail-cta-scan` scheduled task, not by this app).
 - `tailor.py` - older/lower-level JD+profile drafting helper (mostly superseded by `drafting.py`'s one-click flow - check before extending, it may be legacy).
 
 **prospector/** - proactive search (target accounts, outreach, self-scoring)
 - `target_accounts.py`, `outreach.py`, `kpis.py`, `learn_engine.py`, `rejection_diagnosis.py` - the KPI/self-learning layer.
 - `prospector_score.py` - Coverage/Activity/Outcome summary gathering PLUS `compute_prospector_score()`, a direct-Anthropic-API call (same deliberate exception as `tailoring/drafting.py`) that computes the actual score - no more "prepare data, go ask Claude Code" two-step.
+- `rejection_diagnosis.py` (native-packaging branch) - `gather_diagnosis_input()` (mechanical) PLUS `diagnose()`, direct-API - same "no more ask Claude Code" conversion.
+- `learn_engine.py` (native-packaging branch) - `gather_learn_engine_input()` (mechanical) PLUS `analyze()`, direct-API, same conversion.
 - `clinical_trials.py`, `commercial_hiring.py`, `funding_filings.py`, `company_filters.py` - signal sources that feed target_accounts; `clinical_trials.py` filters out trials with a stale (2+ year) primary completion.
 - `regulatory_filings.py` - DEPRECATED as a target-account signal source (2026-07-31) - "already approved" pointed the wrong direction for prospecting; read its module docstring before reusing.
 - `company_lookup.py` - one-time web-search lookup of a target account's real company website (`lookup_company_website()`), cached via `target_accounts.set_website()`.
 
 **src/api_cost.py** - `estimate_response_cost(response, model)`, real dollar cost of one direct-API call from its actual `usage` + web-search count. Reusable across every direct-API call site (drafting.py, company_lookup.py, prospector_score.py); use it instead of re-deriving token math per module.
 
+**src/llm_client.py** (native-packaging branch) - shared direct-Anthropic-API plumbing (client setup, streamed structured-output calls, web-search calls, error handling) factored out of drafting.py/prospector_score.py/company_lookup.py, which now just call into it; `DEFAULT_MODEL`/exceptions re-exported from `tailoring.drafting` under their old names so no other import path changed.
+
+**src/gmail_client.py** (native-packaging branch) - official Gmail API + OAuth (native-packaging Phase 1), replacing the Claude Code Gmail MCP connector: `search_threads`/`get_thread`/`list_labels`/`create_label`/`ensure_label`/`label_thread`/`unlabel_thread`/`create_draft`/`list_drafts`. One-time OAuth client setup needed - see its `get_credentials()` docstring. PLUS `find_downloaded_credentials()`/`install_credentials_from_path()`/`install_credentials_from_bytes()` - support functions for the Settings-tab setup wizard (`ui/app.py`'s "Gmail connection" section) that deep-links each Google Cloud Console step and auto-detects the downloaded client-secret JSON in Downloads.
+
+**src/notifications.py** (native-packaging branch) - `send_notification()`, a Windows balloon-tip notification (System.Windows.Forms via PowerShell) replacing Claude Code's PushNotification tool for the standalone scheduled scripts.
+
+**src/security/file_lock.py** (native-packaging branch) - `locked(name)`, a cross-process advisory lock for a JSON store's whole read-modify-write critical section. Added because this branch's standalone scheduled scripts are the first *unattended* writers to jobs.json/applications.json/cta_emails.json running alongside the Streamlit app - wrapped around job_store.py's and applications.py's and cta_emails.py's write functions.
+
+**scripts/** (native-packaging branch) - standalone replacements for the 3 Claude Code scheduled tasks, run via native Windows Task Scheduler instead (see `docs/native-packaging-task-scheduler.md`): `run_search.py` (daily job search + direct-API fit scoring), `gmail_cta_scan.py` (Gmail classification via gmail_client.py + tailoring/cta_reasoning.py), `cta_fulfillment.py` (archive/draft fulfillment + reconciliation). `install_scheduled_tasks.ps1`/`uninstall_scheduled_tasks.ps1` register/remove the Windows Task Scheduler entries.
+
+**src/tailoring/cta_reasoning.py** (native-packaging branch) - direct-API replacement for the CTA scan/fulfillment tasks' live-session reasoning: `classify_thread()`, `match_application_confirmation()`, `draft_cta_reply()`. Used by `scripts/gmail_cta_scan.py` and `scripts/cta_fulfillment.py`.
+
 **linkedin/** - the one channel with no public search API
 - `ingest.py`/`connections.py` - mechanical PDF/CSV parsing of user-provided exports.
 - `storage.py`/`connections_store.py` - encrypted stores for the above.
-- `enhance.py` - profile-strength scoring/suggestions (same "score + why + how to raise it" shape as everything else).
+- `enhance.py` - `build_enhancement_context()` (mechanical) PLUS `analyze_profile()` (native-packaging branch, direct-API) - profile-strength scoring/suggestions (same "score + why + how to raise it" shape as everything else), no more live-Claude-Code step.
 
 **security/**
 - `crypto_store.py` - AES-256-GCM read_json/write_json used by every store above EXCEPT `dossier.py`'s workspace files (Zahir's explicit call - needs to be directly Word-editable).

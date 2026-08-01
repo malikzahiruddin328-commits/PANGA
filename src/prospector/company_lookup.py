@@ -9,10 +9,7 @@ and only search once per company, not on every page render.
 
 import re
 
-import anthropic
-
-from api_cost import estimate_response_cost
-from tailoring.drafting import DEFAULT_MODEL, _client
+from llm_client import DEFAULT_MODEL, call_with_web_search, get_client as _client
 
 # Real bug found live 2026-07-31: despite the system prompt saying "ONLY
 # the URL, no commentary", the model sometimes prepends a short lead-in
@@ -35,35 +32,29 @@ def lookup_company_website(company_name: str) -> tuple[str | None, float]:
     (input/output tokens + searches actually run), not an estimate - 0.0 if
     the call itself failed before any usage was billed."""
     client = _client()
-    try:
-        response = client.messages.create(
-            model=DEFAULT_MODEL,
-            max_tokens=200,
-            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
-            system=(
-                "Look up one company's real, official website homepage URL. "
-                "Search the web and confirm it - never guess from the "
-                "company name alone. Start with a plain query like "
-                "'<company name> official website' or '<company name> "
-                "homepage' - for a company that recently filed for an IPO "
-                "or was just spun out, general search results are often "
-                "dominated by SEC/finance/news aggregator pages (Bloomberg, "
-                "stockanalysis.com, EDGAR, TradingView); don't stop at "
-                "those, keep searching for the company's own site "
-                "specifically before giving up. Reply with ONLY the URL "
-                "(e.g. https://www.example.com), nothing else - no "
-                "commentary. If you cannot find a confident, verifiable "
-                "official website after genuinely trying, reply with "
-                "exactly: NOT_FOUND"
-            ),
-            messages=[{"role": "user", "content": f"Company: {company_name}"}],
-        )
-    except (anthropic.APIStatusError, anthropic.APIConnectionError):
-        return None, 0.0
-
-    cost = estimate_response_cost(response, DEFAULT_MODEL)
-
-    text = "".join(b.text for b in response.content if b.type == "text").strip()
+    text, cost = call_with_web_search(
+        client,
+        system=(
+            "Look up one company's real, official website homepage URL. "
+            "Search the web and confirm it - never guess from the "
+            "company name alone. Start with a plain query like "
+            "'<company name> official website' or '<company name> "
+            "homepage' - for a company that recently filed for an IPO "
+            "or was just spun out, general search results are often "
+            "dominated by SEC/finance/news aggregator pages (Bloomberg, "
+            "stockanalysis.com, EDGAR, TradingView); don't stop at "
+            "those, keep searching for the company's own site "
+            "specifically before giving up. Reply with ONLY the URL "
+            "(e.g. https://www.example.com), nothing else - no "
+            "commentary. If you cannot find a confident, verifiable "
+            "official website after genuinely trying, reply with "
+            "exactly: NOT_FOUND"
+        ),
+        user_content=f"Company: {company_name}",
+        max_tokens=200,
+        max_uses=5,
+        model=DEFAULT_MODEL,
+    )
     match = _URL_RE.search(text)
     if not match:
         return None, cost

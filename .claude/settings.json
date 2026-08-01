@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__Claude_Browser__get_page_text",
+      "mcp__cd809711-b201-46ed-aa0d-91dbce97a6c7__list_labels",
+      "mcp__Claude_Browser__read_page",
+      "mcp__Claude_Browser__preview_logs",
+      "mcp__Claude_Browser__find",
+      "mcp__Claude_Browser__read_console_messages",
+      "mcp__cd809711-b201-46ed-aa0d-91dbce97a6c7__search_threads",
+      "mcp__ccd_session_mgmt__list_events",
+      "mcp__ccd_session_mgmt__list_sessions",
+      "mcp__mcp-registry__search_mcp_registry",
+      "mcp__cd809711-b201-46ed-aa0d-91dbce97a6c7__get_thread"
+    ]
+  }
+}

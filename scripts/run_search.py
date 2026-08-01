@@ -1,1 +1,212 @@
-# Entry point for scheduled + on-demand search runs.
+"""Entry point for scheduled + on-demand search runs (native-packaging
+branch, 2026-07-31). Standalone replacement for the panga-daily-job-search
+Claude scheduled task's SKILL.md - runs mechanical source searches plus
+direct-API fit scoring with no live Claude Code session required, so it can
+be invoked from Windows Task Scheduler in a standalone build.
+
+Ported step-for-step from
+C:\\Users\\User\\.claude\\scheduled-tasks\\panga-daily-job-search\\SKILL.md,
+with one deliberate scope cut: STEP 2 (ZipRecruiter/Dice/Indeed via MCP
+connector tools) is dropped entirely - see docs/native-packaging-scope.md's
+Phase 1 spike. Neither ZipRecruiter nor Dice expose anything reachable
+outside that connector (ZipRecruiter's only API is a "Publisher Partner"
+program built for job-aggregator sites, not a personal search tool; Dice's
+old unofficial public endpoint no longer resolves), and Indeed's own
+connector tool has no non-MCP equivalent either. These three sources are
+simply unavailable in a standalone build; USAJOBS + company-site ATS APIs +
+industry-board scraping (steps 1, 3, 4) are unaffected, since none of those
+ever depended on MCP.
+"""
+
+import sys
+from pathlib import Path
+
+# Real job titles/organization names contain arbitrary Unicode - a Windows
+# console's default codepage can't encode most of it, so an unguarded
+# print() would crash the whole run on one (same issue found live in
+# gmail_cta_scan.py - see its identical comment).
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+SRC = Path(__file__).resolve().parents[1] / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+import yaml  # noqa: E402
+
+from notifications import send_notification  # noqa: E402
+from profile.storage import load_profile  # noqa: E402
+from search import company_sites, industry_boards, job_store, usajobs  # noqa: E402
+from tailoring.applications import get_unreviewed_skip_reasons  # noqa: E402
+from tailoring.drafting import DraftingFailed, DraftingNotConfigured, score_job  # noqa: E402
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SETTINGS_PATH = PROJECT_ROOT / "config" / "settings.yaml"
+
+# STEP 3's known-companies list, ported verbatim from the SKILL.md (kept
+# here rather than in settings.yaml since it's this script's own concern,
+# not something the Streamlit app or any other consumer reads).
+_WORKDAY_COMPANIES = [
+    dict(company_name="Eisai", tenant="eisai", site="eisai", wd_number=5, limit=15),
+    dict(
+        company_name="IQVIA", tenant="iqvia", site="IQVIA", wd_number=1, limit=15,
+        # Zahir asked 2026-07-30 that IQVIA be US-only (large global CRO,
+        # most listings are outside the US) - this facet ID is IQVIA's
+        # Workday "Location_Country = United States of America" value,
+        # confirmed live 2026-07-30. If this starts erroring/returning 0
+        # results, rediscover it per company_sites.search_workday_jobs()'s
+        # own docstring.
+        applied_facets={"Location_Country": ["bc33aa3152ec42d4995f4791a106ed09"]},
+    ),
+]
+_SMARTRECRUITERS_COMPANIES = [
+    dict(company_name="AbbVie", company_id="abbvie", limit=15),
+]
+
+
+def _load_settings() -> dict:
+    with open(SETTINGS_PATH, encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def _log(message: str) -> None:
+    print(message, flush=True)
+
+
+def search_usajobs(target_roles: list[dict], job_series: list[str]) -> int:
+    added = 0
+    for role in target_roles:
+        try:
+            jobs = usajobs.search_jobs(keyword=role["name"], results_per_page=50)
+            added += job_store.save_jobs(jobs)
+        except Exception as exc:  # noqa: BLE001 - one role's failure shouldn't stop the rest
+            _log(f"  [usajobs] keyword search failed for {role['name']!r}: {exc}")
+    for code in job_series:
+        try:
+            jobs = usajobs.search_jobs(job_category_code=code, results_per_page=100)
+            added += job_store.save_jobs(jobs)
+        except Exception as exc:  # noqa: BLE001
+            _log(f"  [usajobs] job-series search failed for {code!r}: {exc}")
+    return added
+
+
+def search_company_sites(target_roles: list[dict]) -> int:
+    added = 0
+    for role in target_roles:
+        for company in _WORKDAY_COMPANIES:
+            try:
+                jobs = company_sites.search_workday_jobs(
+                    company["company_name"], company["tenant"], company["site"], company["wd_number"],
+                    keyword=role["name"], limit=company["limit"],
+                    applied_facets=company.get("applied_facets"),
+                )
+                added += job_store.save_jobs(jobs)
+            except Exception as exc:  # noqa: BLE001 - one company's failure shouldn't stop the rest
+                _log(f"  [company_sites] Workday search failed for {company['company_name']} / {role['name']!r}: {exc}")
+        for company in _SMARTRECRUITERS_COMPANIES:
+            try:
+                jobs = company_sites.search_smartrecruiters_jobs(
+                    company["company_name"], company["company_id"], keyword=role["name"], limit=company["limit"],
+                )
+                added += job_store.save_jobs(jobs)
+            except Exception as exc:  # noqa: BLE001
+                _log(f"  [company_sites] SmartRecruiters search failed for {company['company_name']} / {role['name']!r}: {exc}")
+    return added
+
+
+_INDUSTRY_BOARD_FETCHERS = [
+    ("Planet Pharma", industry_boards.fetch_planet_pharma_jobs),
+    ("BioSpace", industry_boards.fetch_biospace_jobs),
+    ("Beacon Hill", industry_boards.fetch_beacon_hill_jobs),
+    ("Atrium", industry_boards.fetch_atrium_jobs),
+    ("GForce", industry_boards.fetch_gforce_jobs),
+]
+
+
+def search_industry_boards() -> int:
+    added = 0
+    for name, fetch in _INDUSTRY_BOARD_FETCHERS:
+        try:
+            jobs = fetch(limit=25)
+            added += job_store.save_jobs(jobs)
+        except Exception as exc:  # noqa: BLE001 - one site's failure shouldn't stop the rest
+            _log(f"  [industry_boards] {name} fetch failed: {exc}")
+    return added
+
+
+def score_unscored_jobs(profile: dict) -> list[dict]:
+    """Scores every job missing a fit_score via the direct API (mirrors the
+    exact rubric tailoring.drafting.score_job already uses for manually-added
+    jobs, per docs/native-packaging-scope.md Phase 1). Returns the list of
+    newly-scored job records that scored 60+, for the notification step."""
+    jobs = job_store.load_jobs()
+    unscored = [j for j in jobs if "fit_score" not in j]
+    if not unscored:
+        return []
+
+    _log(f"Scoring {len(unscored)} new job(s)...")
+    strong_matches = []
+    for job in unscored:
+        try:
+            result = score_job(job, profile)
+        except (DraftingNotConfigured, DraftingFailed) as exc:
+            _log(f"  [score] failed for {job.get('title')!r} at {job.get('organization')!r}: {exc}")
+            continue
+        job_store.update_job_score(job.get("source"), job.get("job_id"), result["fit_score"], result["fit_rationale"])
+        if result["fit_score"] >= 60:
+            strong_matches.append({**job, **result})
+    return strong_matches
+
+
+def notify(strong_matches: list[dict], unreviewed_skip_count: int) -> None:
+    parts = []
+    if strong_matches:
+        listed = ", ".join(f"{j['title']} at {j['organization']} ({j['fit_score']})" for j in strong_matches[:3])
+        remainder = len(strong_matches) - 3
+        if remainder > 0:
+            listed += f", +{remainder} more"
+        parts.append(f"{len(strong_matches)} strong new match{'es' if len(strong_matches) != 1 else ''}: {listed}")
+    if unreviewed_skip_count:
+        parts.append(
+            f"{unreviewed_skip_count} rejection reason{'s' if unreviewed_skip_count != 1 else ''} ready for your review"
+        )
+    if not parts:
+        return
+    message = ". Also: ".join(parts) if len(parts) > 1 else parts[0]
+    send_notification("Panga - Daily job search", message[:200])
+
+
+def run() -> None:
+    settings = _load_settings()
+    target_roles = settings.get("target_roles", [])
+    job_series = settings.get("usajobs_job_series", [])
+
+    _log("STEP 1 - USAJOBS")
+    added = search_usajobs(target_roles, job_series)
+    _log(f"  added {added} new job(s)")
+
+    _log("STEP 2 - ZipRecruiter/Dice/Indeed: skipped (not available outside the Claude Code MCP "
+         "connector - see docs/native-packaging-scope.md Phase 1 spike)")
+
+    _log("STEP 3 - Company career sites")
+    added = search_company_sites(target_roles)
+    _log(f"  added {added} new job(s)")
+
+    _log("STEP 4 - Industry job boards")
+    added = search_industry_boards()
+    _log(f"  added {added} new job(s)")
+
+    _log("STEP 5 - Scoring")
+    profile = load_profile()
+    strong_matches = score_unscored_jobs(profile)
+
+    _log("STEP 6 - Unreviewed 'not interested' reasons")
+    unreviewed = get_unreviewed_skip_reasons()
+    _log(f"  {len(unreviewed)} unreviewed")
+
+    _log("STEP 7 - Notify")
+    notify(strong_matches, len(unreviewed))
+    _log("Done.")
+
+
+if __name__ == "__main__":
+    run()

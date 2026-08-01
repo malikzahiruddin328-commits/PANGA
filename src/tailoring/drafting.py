@@ -13,16 +13,18 @@ console.anthropic.com - this module never creates or manages the key itself.
 """
 
 import json
-import os
-from pathlib import Path
 
 import anthropic
-from dotenv import load_dotenv
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-load_dotenv(PROJECT_ROOT / ".env")
-
-DEFAULT_MODEL = "claude-opus-5"
+from llm_client import (
+    DEFAULT_MODEL,
+    LLMCallFailed as DraftingFailed,
+    LLMNotConfigured as DraftingNotConfigured,
+    call_structured,
+    call_with_web_search,
+    get_client as _client,
+    is_configured,
+)
 
 RESUME_SPEC = (
     "Tailored resume text for this specific job, written to be ATS-perfect - "
@@ -123,29 +125,6 @@ Writing voice - this must read as a real senior executive's own writing, not AI 
 - Every claim should sound like something this specific person would actually say about his own work - concrete, specific, a little understated rather than oversold."""
 
 
-class DraftingNotConfigured(Exception):
-    pass
-
-
-class DraftingFailed(Exception):
-    pass
-
-
-def is_configured() -> bool:
-    return bool(os.environ.get("ANTHROPIC_API_KEY"))
-
-
-def _client() -> "anthropic.Anthropic":
-    if not is_configured():
-        raise DraftingNotConfigured(
-            "ANTHROPIC_API_KEY must be set in .env for one-click document "
-            "drafting. Get a key at console.anthropic.com, then add it to "
-            "the .env file in the Panga folder (copy the same line USAJOBS_API_KEY "
-            "uses) and restart the app."
-        )
-    return anthropic.Anthropic()
-
-
 SCORE_SYSTEM_PROMPT = """You are scoring how well one job posting fits this specific candidate, for his personal job-search tool. Read the candidate's master profile below and reason genuinely about fit - never a keyword count.
 
 Consider:
@@ -193,46 +172,17 @@ def score_job(job: dict, profile: dict, model: str | None = None, on_progress=No
         "JOB POSTING:\n" + json.dumps(job, indent=2, default=str) +
         "\n\nCANDIDATE'S MASTER PROFILE:\n" + json.dumps(profile, indent=2, default=str)
     )
-    try:
-        with client.messages.stream(
-            model=model or os.environ.get("ANTHROPIC_MODEL") or DEFAULT_MODEL,
-            max_tokens=2000,
-            thinking={"type": "adaptive"},
-            output_config={"effort": "high", "format": {"type": "json_schema", "schema": _score_schema()}},
-            system=SCORE_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": content}],
-        ) as stream:
-            char_count = 0
-            last_reported = 0
-            for event in stream:
-                if event.type == "content_block_start" and event.content_block.type == "thinking":
-                    if on_progress:
-                        on_progress("thinking...")
-                elif event.type == "content_block_delta" and event.delta.type == "text_delta":
-                    char_count += len(event.delta.text)
-                    if on_progress and char_count - last_reported >= 150:
-                        on_progress(f"writing... ({char_count:,} characters so far)")
-                        last_reported = char_count
-            response = stream.get_final_message()
-    except anthropic.APIStatusError as exc:
-        raise DraftingFailed(f"Claude API error ({exc.status_code}): {exc.message}") from exc
-    except anthropic.APIConnectionError as exc:
-        raise DraftingFailed("Couldn't reach the Claude API - check your internet connection.") from exc
-
-    if response.stop_reason == "refusal":
-        raise DraftingFailed("Claude declined to score this job. Try again.")
-    if response.stop_reason == "max_tokens":
-        raise DraftingFailed("The response was cut off before finishing. Try again.")
-
-    text_block = next((b.text for b in response.content if b.type == "text"), None)
-    if not text_block:
-        raise DraftingFailed("Claude returned no score.")
-
-    try:
-        data = json.loads(text_block)
-    except json.JSONDecodeError as exc:
-        raise DraftingFailed("Claude's response wasn't valid - try again.") from exc
-
+    data = call_structured(
+        client,
+        system=SCORE_SYSTEM_PROMPT,
+        user_content=content,
+        schema=_score_schema(),
+        max_tokens=2000,
+        model=model,
+        effort="high",
+        on_progress=on_progress,
+        refusal_message="Claude declined to score this job. Try again.",
+    )
     return {"fit_score": data["fit_score"], "fit_rationale": data["fit_rationale"]}
 
 
@@ -397,59 +347,25 @@ def _draft_one(
     # can run 3000+ tokens - give it real headroom rather than truncating
     # (hit for real during testing at 6000 with a federal-length resume).
     max_tokens = 20000 if doc_key == "resume" else 6000
-    try:
-        with client.messages.stream(
-            model=model or os.environ.get("ANTHROPIC_MODEL") or DEFAULT_MODEL,
-            max_tokens=max_tokens,
-            thinking={"type": "adaptive"},
-            output_config={"effort": "high", "format": {"type": "json_schema", "schema": schema}},
-            system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
-            messages=[{
-                "role": "user",
-                "content": shared_context + [{"type": "text", "text": f"\n\nDraft: {doc_key}"}],
-            }],
-        ) as stream:
-            # One level deeper than "which document is drafting" (Zahir's
-            # ask): surface the thinking->writing transition and a live,
-            # throttled character count from the raw stream, so the progress
-            # bar keeps moving DURING a single document's call, not just
-            # between calls. The streamed text is the raw structured-output
-            # JSON as it's built, not the final prose - a character count is
-            # still an honest, real progress signal, just not a literal
-            # preview of the finished text.
-            char_count = 0
-            last_reported = 0
-            for event in stream:
-                if event.type == "content_block_start" and event.content_block.type == "thinking":
-                    if on_progress:
-                        on_progress(doc_index, doc_total, doc_key, "thinking...")
-                elif event.type == "content_block_delta" and event.delta.type == "text_delta":
-                    char_count += len(event.delta.text)
-                    if on_progress and char_count - last_reported >= 150:
-                        on_progress(doc_index, doc_total, doc_key, f"writing... ({char_count:,} characters so far)")
-                        last_reported = char_count
-            response = stream.get_final_message()
-    except anthropic.APIStatusError as exc:
-        raise DraftingFailed(f"Claude API error ({exc.status_code}): {exc.message}") from exc
-    except anthropic.APIConnectionError as exc:
-        raise DraftingFailed("Couldn't reach the Claude API - check your internet connection.") from exc
 
-    if response.stop_reason == "refusal":
-        raise DraftingFailed(
+    def _progress(substatus):
+        if on_progress:
+            on_progress(doc_index, doc_total, doc_key, substatus)
+
+    data = call_structured(
+        client,
+        system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
+        user_content=shared_context + [{"type": "text", "text": f"\n\nDraft: {doc_key}"}],
+        schema=schema,
+        max_tokens=max_tokens,
+        model=model,
+        effort="high",
+        on_progress=_progress if on_progress else None,
+        refusal_message=(
             "Claude declined to draft this document. This is unusual for resume "
             "content - try again, or check the job posting text for anything unusual."
-        )
-    if response.stop_reason == "max_tokens":
-        raise DraftingFailed("The response was cut off before finishing. Try again.")
-
-    text_block = next((b.text for b in response.content if b.type == "text"), None)
-    if not text_block:
-        raise DraftingFailed("Claude returned no draftable text.")
-
-    try:
-        data = json.loads(text_block)
-    except json.JSONDecodeError as exc:
-        raise DraftingFailed("Claude's response wasn't valid - try again.") from exc
+        ),
+    )
 
     if doc_key == "resume":
         return {
@@ -472,27 +388,22 @@ def _lookup_company_address(client: "anthropic.Anthropic", organization: str, lo
     Returns None on no confident match (docx_export.py's existing
     "[Company Address]" placeholder is the fallback for that case)."""
     location_hint = f" (job is located in {location})" if location else ""
-    try:
-        response = client.messages.create(
-            model=DEFAULT_MODEL,
-            max_tokens=300,
-            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
-            system=(
-                "Look up one company's real, current mailing or headquarters "
-                "address for a cover letter's recipient block. Search the web "
-                "and confirm it from the company's own site or another "
-                "reliable source - never guess or infer from the company's "
-                "name/industry alone. Reply with ONLY the address as 1-3 "
-                "short lines (street; city, state zip; country if not US) - "
-                "no company name, no commentary. If you cannot find a "
-                "confident, verifiable address, reply with exactly: NOT_FOUND"
-            ),
-            messages=[{"role": "user", "content": f"Company: {organization}{location_hint}"}],
-        )
-    except (anthropic.APIStatusError, anthropic.APIConnectionError):
-        return None
-
-    text = "".join(b.text for b in response.content if b.type == "text").strip()
+    text, _cost = call_with_web_search(
+        client,
+        system=(
+            "Look up one company's real, current mailing or headquarters "
+            "address for a cover letter's recipient block. Search the web "
+            "and confirm it from the company's own site or another "
+            "reliable source - never guess or infer from the company's "
+            "name/industry alone. Reply with ONLY the address as 1-3 "
+            "short lines (street; city, state zip; country if not US) - "
+            "no company name, no commentary. If you cannot find a "
+            "confident, verifiable address, reply with exactly: NOT_FOUND"
+        ),
+        user_content=f"Company: {organization}{location_hint}",
+        max_tokens=300,
+        max_uses=3,
+    )
     if not text or text == "NOT_FOUND" or len(text) > 300:
         return None
     return text

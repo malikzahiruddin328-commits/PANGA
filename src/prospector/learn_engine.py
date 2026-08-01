@@ -4,12 +4,12 @@ diagnosis, KPI-adjacent outcome rates, strategy-tag correlation) into one
 mechanism spanning every part of Panga that makes a prediction/decision,
 not just Prospector's own tables.
 
-Same "Python gathers, Claude reasons" split as rejection_diagnosis.py and
-every other live-reasoning feature in Panga - this module never decides
-whether a pattern is real, it just assembles the raw material. The
-Prospector tab's "Run analysis" button can't do the reasoning itself
-(Streamlit has no path to a live Claude conversation); it prepares this
-data and tells Zahir to ask Claude Code to read it.
+gather_learn_engine_input() never decides whether a pattern is real, it
+just assembles the raw material; analyze() (native-packaging branch,
+2026-07-31) reasons over it via a direct Anthropic API call, same
+conversion as rejection_diagnosis.py's diagnose() - the old "prepare data,
+go ask Claude Code" button was the exact friction point already fixed for
+document drafting and Prospector Score.
 
 Known, disclosed gap: LinkedIn recruiter-contact-rate (how often a
 recruiter reaches out after a profile edit) has no capture mechanism
@@ -18,7 +18,10 @@ today, so that Learn Engine input from the original design (PRD §17) is
 simply absent below, not silently faked. Would need a small new manual-log
 feature to close - flagged, not built here (see PRD §17 build note).
 """
+import json
 import re
+
+from llm_client import call_structured, get_client
 
 
 def _normalize_company(name: str) -> str:
@@ -97,3 +100,41 @@ def gather_learn_engine_input(
             "not silently faked.",
         ],
     }
+
+
+_ANALYZE_SYSTEM_PROMPT = """You are a self-learning feedback loop over every prediction a job-search tool makes for its candidate - fit scoring, target-account qualification, outreach channel choice, strategy tags, interview prep approach. Reason over the real correlation data given (scoring vs. outcome, target-account vs. real postings, outreach vs. response, interview outcomes) and surface genuine cross-cutting patterns - never invent one that isn't in the data. With few real outcomes tracked so far, a thin, low-confidence result that says so honestly is correct, not something to inflate. This is recommend-only: never propose changing a score threshold or setting as if you'd actually done it - only suggest it as something the candidate could consider."""
+
+_ANALYZE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "narrative": {
+            "type": "string",
+            "description": "2-5 sentences: what cross-cutting pattern(s), if any, are visible across scoring/target-accounts/outreach/interviews, and how confident that reading is given how much real data exists.",
+        },
+        "recommendations": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "0-5 concrete, specific things to consider adjusting (e.g. a scoring weight, an outreach channel, a strategy tag) - empty list if no real pattern is visible yet. Recommend-only phrasing, never stated as already done.",
+        },
+    },
+    "required": ["narrative", "recommendations"],
+    "additionalProperties": False,
+}
+
+
+def analyze(learn_input: dict, on_progress=None) -> dict:
+    """Computes the Learn Engine's cross-cutting analysis directly via the
+    Claude API. Returns {"narrative": str, "recommendations": [str]}.
+    Raises LLMNotConfigured/LLMCallFailed (via llm_client)."""
+    client = get_client()
+    return call_structured(
+        client,
+        system=_ANALYZE_SYSTEM_PROMPT,
+        user_content=json.dumps(learn_input, indent=2, default=str),
+        schema=_ANALYZE_SCHEMA,
+        max_tokens=1500,
+        effort="medium",
+        thinking=False,
+        on_progress=on_progress,
+        refusal_message="Claude declined to run the analysis. Try again.",
+    )
