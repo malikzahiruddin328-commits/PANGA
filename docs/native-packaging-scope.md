@@ -75,6 +75,18 @@ customer if done naively:**
   lost-device support flow. If offline at uninstall time, fail gracefully
   and tell them to deactivate manually later or contact support — don't
   block the uninstall on a network call.
+  - **Ordering, confirmed with the Licensing session 2026-08-01**: call
+    device-release BEFORE deleting `data/security/` or removing the OS
+    keyring entry, not after — cleanup last, network-dependent step
+    first. Licensing's `client.py` already transparently refreshes an
+    expired access token as long as the cached refresh token/credential
+    file is still present and hasn't itself been revoked, so this doesn't
+    need a fresh/live login at uninstall time, just the credential file to
+    still exist when the call is made. Stays best-effort either way
+    (~3s timeout, swallow all failures, never block uninstall) — offline
+    or a revoked refresh token just means the release silently doesn't
+    happen and the customer falls back to the manual lost-device flow,
+    same as today.
 - No language change — Python's native-packaging tooling (PyInstaller/
   Nuitka) is mature enough; a C#/Java/Electron rewrite would cost all the
   existing scoring/search/encryption logic for no real gain.
