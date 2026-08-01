@@ -7,10 +7,24 @@ lookup, so callers should cache the result (target_accounts.set_website())
 and only search once per company, not on every page render.
 """
 
+import re
+
 import anthropic
 
 from api_cost import estimate_response_cost
 from tailoring.drafting import DEFAULT_MODEL, _client
+
+# Real bug found live 2026-07-31: despite the system prompt saying "ONLY
+# the URL, no commentary", the model sometimes prepends a short lead-in
+# sentence anyway (e.g. "I'll search for this company's official website.
+# https://brainstorm-cell.com") - the old exact-match validation (reject
+# if the text contains any space) threw away the real URL along with the
+# unwanted preamble. Only 2 of 36 real lookups survived that check in one
+# batch. Extracting the URL by pattern instead of requiring the whole
+# response to BE the URL fixes this without loosening what counts as a
+# genuine find - still never invents a URL, just tolerates a stray
+# sentence around a real one.
+_URL_RE = re.compile(r"https?://[^\s\"')]+")
 
 
 def lookup_company_website(company_name: str) -> tuple[str | None, float]:
@@ -42,6 +56,7 @@ def lookup_company_website(company_name: str) -> tuple[str | None, float]:
     cost = estimate_response_cost(response, DEFAULT_MODEL)
 
     text = "".join(b.text for b in response.content if b.type == "text").strip()
-    if not text or text == "NOT_FOUND" or len(text) > 300 or " " in text:
+    match = _URL_RE.search(text)
+    if not match:
         return None, cost
-    return text, cost
+    return match.group(0).rstrip(".,;:)"), cost
