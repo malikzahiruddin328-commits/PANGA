@@ -617,28 +617,30 @@ elif active_tab == "results":
     col1, col2 = st.columns([1, 3])
     with col1:
         if st.button("Run now (USAJOBS)", type="primary"):
-            with st.spinner("Searching USAJOBS.gov..."):
-                try:
-                    from search.job_store import save_jobs
-                    total_new = 0
-                    # Keyword search per target role, not restricted to any one
-                    # job category - USAJOBS classification is inconsistent
-                    # relative to actual job content (e.g. "Audit Director (IT)"
-                    # and "Head of Innovation" are filed as Auditing/Program
-                    # Management, not IT Management), so a hard category filter
-                    # would silently exclude good matches. The compatibility
-                    # score, not the search itself, is what filters for quality.
-                    for role in settings.get("target_roles", []):
-                        results = search_jobs(keyword=role["name"], results_per_page=50)
+            # Real "i of N" progress instead of an opaque spinner (Zahir's
+            # explicit ask 2026-07-31, same request applied to every
+            # spinner in the app) - each target role/job-series code is a
+            # real, separate search call, so the step count is genuine,
+            # not simulated.
+            try:
+                from search.job_store import save_jobs
+                target_roles = settings.get("target_roles", [])
+                job_series = settings.get("usajobs_job_series", [])
+                steps = [("role", r["name"]) for r in target_roles] + [("series", c) for c in job_series]
+                total_new = 0
+                if steps:
+                    search_bar = st.progress(0, text=f"Searching 1 of {len(steps)}: {steps[0][1]}...")
+                    for i, (kind, value) in enumerate(steps, start=1):
+                        search_bar.progress((i - 1) / len(steps), text=f"Searching {i} of {len(steps)}: {value}...")
+                        if kind == "role":
+                            results = search_jobs(keyword=value, results_per_page=50)
+                        else:
+                            results = search_jobs(job_category_code=value, results_per_page=100)
                         total_new += save_jobs(results)
-                    # Job series search as a supplementary net, for roles a
-                    # role-name keyword wouldn't catch (e.g. "IT Specialist (AI)").
-                    for code in settings.get("usajobs_job_series", []):
-                        results = search_jobs(job_category_code=code, results_per_page=100)
-                        total_new += save_jobs(results)
-                    st.success(f"Found {total_new} new job(s).")
-                except USAJobsNotConfigured as e:
-                    st.error(str(e))
+                    search_bar.progress(1.0, text="Done.")
+                st.success(f"Found {total_new} new job(s).")
+            except USAJobsNotConfigured as e:
+                st.error(str(e))
     with col2:
         st.markdown("This button only covers USAJOBS.gov directly. ZipRecruiter, Dice, and Indeed are searched automatically once a day by the scheduled task instead (they're MCP connector tools, not reachable from this button).")
 
@@ -679,17 +681,27 @@ elif active_tab == "results":
             # a manually-added job would sit invisible until the next daily
             # scoring pass or a live Claude Code conversation scored it.
             if drafting_is_configured():
-                with st.spinner("Scoring compatibility..."):
-                    try:
-                        scored = score_job(job, load_profile())
-                    except (DraftingNotConfigured, DraftingFailed) as exc:
-                        st.toast(f"Saved, but scoring failed: {exc}", icon=":material/warning:")
-                    else:
-                        update_job_score(job["source"], job["job_id"], scored["fit_score"], scored["fit_rationale"])
-                        st.toast(
-                            f"Saved \"{job['title']}\" at {job['organization']} - scored {scored['fit_score']}/100.",
-                            icon=":material/check_circle:",
-                        )
+                # Real streaming progress instead of a spinner (Zahir's
+                # explicit ask 2026-07-31, "same needs to be here and all
+                # other spinner places") - same thinking/writing
+                # character-count mechanism as document drafting.
+                score_bar = st.progress(0, text="Scoring compatibility...")
+
+                def _update_score_progress(substatus):
+                    score_bar.progress(0.5, text=f"Scoring compatibility - {substatus}")
+
+                try:
+                    scored = score_job(job, load_profile(), on_progress=_update_score_progress)
+                except (DraftingNotConfigured, DraftingFailed) as exc:
+                    score_bar.empty()
+                    st.toast(f"Saved, but scoring failed: {exc}", icon=":material/warning:")
+                else:
+                    score_bar.progress(1.0, text="Done.")
+                    update_job_score(job["source"], job["job_id"], scored["fit_score"], scored["fit_rationale"])
+                    st.toast(
+                        f"Saved \"{job['title']}\" at {job['organization']} - scored {scored['fit_score']}/100.",
+                        icon=":material/check_circle:",
+                    )
             else:
                 st.toast(
                     f"Saved \"{job['title']}\" at {job['organization']}. No Anthropic API key configured, so it's "
@@ -1272,12 +1284,21 @@ elif active_tab == "prospector":
         score_input = gather_prospector_score_input(
             applications, jobs, target_accounts, outreach_records, prep_records, target_roles,
         )
+        # Real streaming progress instead of a spinner (Zahir's explicit
+        # ask 2026-07-31) - same thinking/writing character-count
+        # mechanism as document drafting.
+        score_compute_bar = st.progress(0, text="Reasoning over your real data...")
+
+        def _update_score_compute_progress(substatus):
+            score_compute_bar.progress(0.5, text=f"Reasoning over your real data - {substatus}")
+
         try:
-            with st.spinner("Reasoning over your real data..."):
-                result = compute_prospector_score(score_input)
+            result = compute_prospector_score(score_input, on_progress=_update_score_compute_progress)
         except (DraftingNotConfigured, DraftingFailed) as exc:
+            score_compute_bar.empty()
             st.error(str(exc))
         else:
+            score_compute_bar.progress(1.0, text="Done.")
             save_prospector_score(
                 result["score"], result["rationale"], result["next_actions"],
                 score_input["data_points"], datetime.now(timezone.utc).isoformat(),
@@ -1329,21 +1350,32 @@ elif active_tab == "prospector":
         # visible, under his control) rather than something that fires
         # silently on every page load.
         missing_website = [a for a in visible_accounts if "website" not in a]
+        # Real bug found live 2026-07-31: the last-run cost line lived
+        # INSIDE `if missing_website:` alongside the button - once a batch
+        # resolved every remaining account, missing_website went empty, the
+        # whole block (button AND cost line) stopped rendering, and the
+        # cost Zahir had just spent seemed to vanish. Show the last-run
+        # summary unconditionally (whenever a run has ever happened); only
+        # the button itself is conditional on there being work left to do.
+        last_run = load_website_lookup_cost()
+        if last_run["count"]:
+            st.markdown(f"Last website lookup: ${last_run['cost']:.2f} for {last_run['count']} account(s) as of {format_timestamp(last_run['at'])}.")
         if missing_website:
-            # Button label shows the real $ from the LAST run (Zahir's
-            # explicit ask 2026-07-31, "($X for the last run)" instead of a
-            # generic cost warning) - computed from actual API usage via
-            # api_cost.estimate_response_cost, not an estimate.
-            last_run = load_website_lookup_cost()
             cost_label = f"(${last_run['cost']:.2f} for the last run)" if last_run["count"] else "(real API cost)"
             if st.button(f"Look up website for {len(missing_website)} account(s) {cost_label}"):
-                with st.spinner(f"Looking up {len(missing_website)} website(s)..."):
-                    run_cost = 0.0
-                    for acc in missing_website:
-                        found, cost = lookup_company_website(acc["company_name"])
-                        set_website(acc["company_name"], found or "")
-                        run_cost += cost
-                    save_website_lookup_cost(run_cost, len(missing_website))
+                # Real "i of N" progress instead of a spinner (Zahir's
+                # explicit ask 2026-07-31) - one company per real search
+                # call, so this is a genuine count, not a simulated one.
+                total = len(missing_website)
+                lookup_bar = st.progress(0, text=f"Looking up website 1 of {total}: {missing_website[0]['company_name']}...")
+                run_cost = 0.0
+                for i, acc in enumerate(missing_website, start=1):
+                    lookup_bar.progress((i - 1) / total, text=f"Looking up website {i} of {total}: {acc['company_name']}...")
+                    found, cost = lookup_company_website(acc["company_name"])
+                    set_website(acc["company_name"], found or "")
+                    run_cost += cost
+                lookup_bar.progress(1.0, text="Done.")
+                save_website_lookup_cost(run_cost, total)
                 st.rerun()
 
         ta_rows = [{

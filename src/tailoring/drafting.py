@@ -172,7 +172,7 @@ def _score_schema() -> dict:
     }
 
 
-def score_job(job: dict, profile: dict, model: str | None = None) -> dict:
+def score_job(job: dict, profile: dict, model: str | None = None, on_progress=None) -> dict:
     """Live-scores a single job against the master profile via the direct
     API - for jobs that need an immediate score outside the daily scheduled
     task or a live Claude Code conversation (namely, jobs added manually via
@@ -181,21 +181,39 @@ def score_job(job: dict, profile: dict, model: str | None = None) -> dict:
     rubric panga-daily-job-search's SKILL.md step 5 already uses, so scores
     stay comparable across the app rather than following a different rubric.
     Returns {"fit_score": int, "fit_rationale": str}. Raises
-    DraftingNotConfigured/DraftingFailed same as generate_documents()."""
+    DraftingNotConfigured/DraftingFailed same as generate_documents().
+
+    If given, on_progress(substatus: str) is called with a live "thinking..."
+    / "writing... (N characters so far)" status as the response streams in -
+    same real-progress mechanism as _draft_one()'s document generation
+    (Zahir's explicit ask 2026-07-31: no spinner anywhere should be opaque
+    when the underlying call can report real progress instead)."""
     client = _client()
     content = (
         "JOB POSTING:\n" + json.dumps(job, indent=2, default=str) +
         "\n\nCANDIDATE'S MASTER PROFILE:\n" + json.dumps(profile, indent=2, default=str)
     )
     try:
-        response = client.messages.create(
+        with client.messages.stream(
             model=model or os.environ.get("ANTHROPIC_MODEL") or DEFAULT_MODEL,
             max_tokens=2000,
             thinking={"type": "adaptive"},
             output_config={"effort": "high", "format": {"type": "json_schema", "schema": _score_schema()}},
             system=SCORE_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": content}],
-        )
+        ) as stream:
+            char_count = 0
+            last_reported = 0
+            for event in stream:
+                if event.type == "content_block_start" and event.content_block.type == "thinking":
+                    if on_progress:
+                        on_progress("thinking...")
+                elif event.type == "content_block_delta" and event.delta.type == "text_delta":
+                    char_count += len(event.delta.text)
+                    if on_progress and char_count - last_reported >= 150:
+                        on_progress(f"writing... ({char_count:,} characters so far)")
+                        last_reported = char_count
+            response = stream.get_final_message()
     except anthropic.APIStatusError as exc:
         raise DraftingFailed(f"Claude API error ({exc.status_code}): {exc.message}") from exc
     except anthropic.APIConnectionError as exc:

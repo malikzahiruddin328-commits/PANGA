@@ -125,7 +125,7 @@ _SCORE_SCHEMA = {
 }
 
 
-def compute_prospector_score(input_data: dict) -> dict:
+def compute_prospector_score(input_data: dict, on_progress=None) -> dict:
     """Computes the Prospector Score directly via the Claude API (Zahir's
     explicit ask 2026-07-31: clicking the button produced "Data's ready. Go
     to Claude Code and ask it to compute it" instead of an actual result -
@@ -136,10 +136,16 @@ def compute_prospector_score(input_data: dict) -> dict:
     so a synchronous in-app result needs a direct API call. Returns
     {"score": int, "rationale": str, "next_actions": [...]}; raises
     DraftingNotConfigured (via _client()) if no API key is set,
-    DraftingFailed on refusal/API error."""
+    DraftingFailed on refusal/API error.
+
+    If given, on_progress(substatus: str) is called with a live "thinking..."
+    / "writing... (N characters so far)" status as the response streams in -
+    same real-progress mechanism as tailoring/drafting.py's document
+    generation (Zahir's explicit ask 2026-07-31: no spinner anywhere should
+    be opaque when the underlying call can report real progress instead)."""
     client = _client()
     try:
-        response = client.messages.create(
+        with client.messages.stream(
             model=DEFAULT_MODEL,
             max_tokens=2000,
             output_config={"effort": "medium", "format": {"type": "json_schema", "schema": _SCORE_SCHEMA}},
@@ -151,7 +157,19 @@ def compute_prospector_score(input_data: dict) -> dict:
                 "inflate for encouragement."
             ),
             messages=[{"role": "user", "content": json.dumps(input_data, indent=2, default=str)}],
-        )
+        ) as stream:
+            char_count = 0
+            last_reported = 0
+            for event in stream:
+                if event.type == "content_block_start" and event.content_block.type == "thinking":
+                    if on_progress:
+                        on_progress("thinking...")
+                elif event.type == "content_block_delta" and event.delta.type == "text_delta":
+                    char_count += len(event.delta.text)
+                    if on_progress and char_count - last_reported >= 150:
+                        on_progress(f"writing... ({char_count:,} characters so far)")
+                        last_reported = char_count
+            response = stream.get_final_message()
     except anthropic.APIStatusError as exc:
         raise DraftingFailed(f"Claude API error ({exc.status_code}): {exc.message}") from exc
     except anthropic.APIConnectionError as exc:

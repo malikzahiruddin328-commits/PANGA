@@ -39,14 +39,22 @@ def lookup_company_website(company_name: str) -> tuple[str | None, float]:
         response = client.messages.create(
             model=DEFAULT_MODEL,
             max_tokens=200,
-            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
             system=(
                 "Look up one company's real, official website homepage URL. "
                 "Search the web and confirm it - never guess from the "
-                "company name alone. Reply with ONLY the URL "
+                "company name alone. Start with a plain query like "
+                "'<company name> official website' or '<company name> "
+                "homepage' - for a company that recently filed for an IPO "
+                "or was just spun out, general search results are often "
+                "dominated by SEC/finance/news aggregator pages (Bloomberg, "
+                "stockanalysis.com, EDGAR, TradingView); don't stop at "
+                "those, keep searching for the company's own site "
+                "specifically before giving up. Reply with ONLY the URL "
                 "(e.g. https://www.example.com), nothing else - no "
                 "commentary. If you cannot find a confident, verifiable "
-                "official website, reply with exactly: NOT_FOUND"
+                "official website after genuinely trying, reply with "
+                "exactly: NOT_FOUND"
             ),
             messages=[{"role": "user", "content": f"Company: {company_name}"}],
         )
