@@ -13,7 +13,7 @@ from pypdf import PdfReader
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from security.crypto_store import read_json, write_text, write_json  # noqa: E402
+from security.crypto_store import read_json, read_text, write_text, write_json  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MANIFEST_PATH = PROJECT_ROOT / "config" / "document_manifest.yaml"
@@ -70,6 +70,18 @@ def _extract_pdf_text(file) -> str:
 
 def load_manifest_result() -> list[dict]:
     return read_json(MANIFEST_RESULT_PATH, default=[])
+
+
+def resume_text() -> str:
+    """Concatenated raw text of every ingested document tagged
+    category=="resume" - shared by profile.interview's gap detection and
+    tailoring.drafting.generate_target_roles(), so both reason over the
+    same source text instead of each re-reading manifest_result.json."""
+    chunks = []
+    for entry in load_manifest_result():
+        if entry["category"] == "resume":
+            chunks.append(read_text(PROJECT_ROOT / entry["extracted_to"]))
+    return "\n".join(chunks)
 
 
 def remove_document(source_file: str) -> None:

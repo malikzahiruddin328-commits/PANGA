@@ -14,19 +14,14 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from skills.lookup import skills_for  # noqa: E402
 from profile.storage import MASTER_PROFILE_PATH, load_profile, save_profile  # noqa: E402
-from security.crypto_store import read_json, read_text  # noqa: E402
+from profile.ingest import resume_text as _shared_resume_text  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RAW_DIR = PROJECT_ROOT / "data" / "profile" / "raw"
 
 
 def _resume_text() -> str:
-    manifest_result = read_json(RAW_DIR / "manifest_result.json", default=[])
-    chunks = []
-    for entry in manifest_result:
-        if entry["category"] == "resume":
-            chunks.append(read_text(PROJECT_ROOT / entry["extracted_to"]))
-    return "\n".join(chunks).lower()
+    return _shared_resume_text().lower()
 
 
 def _already_answered(skill: str) -> bool:
@@ -48,13 +43,21 @@ def detect_gaps(industry: str, role: str) -> list[dict]:
     return gaps
 
 
-def save_answer(skill: str, role_context: str, answer: str, date_captured: str) -> None:
+def save_answer(
+    skill: str, role_context: str, answer: str, date_captured: str, is_disqualifier: bool = False,
+) -> None:
+    """is_disqualifier marks this as a real, candidate-confirmed exclusion
+    (a role type they've said they don't want/aren't qualified for despite
+    otherwise-matching experience) rather than an ordinary skill-gap
+    confirmation - drafting.SCORE_SYSTEM_PROMPT reads this flag and scores
+    matching postings low regardless of subject-matter proximity."""
     profile = load_profile()
     profile.setdefault("gap_interview_answers", []).append({
         "skill": skill,
         "role_context": role_context,
         "answer": answer,
         "date_captured": date_captured,
+        "is_disqualifier": is_disqualifier,
     })
     save_profile(profile)
 

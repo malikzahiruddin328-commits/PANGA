@@ -146,18 +146,128 @@ def _client() -> "anthropic.Anthropic":
     return anthropic.Anthropic()
 
 
-SCORE_SYSTEM_PROMPT = """You are scoring how well one job posting fits this specific candidate, for his personal job-search tool. Read the candidate's master profile below and reason genuinely about fit - never a keyword count.
+SCORE_SYSTEM_PROMPT = """You are scoring how well one job posting fits this specific candidate, for their personal job-search tool. Read the candidate's master profile below and reason genuinely about fit - never a keyword count.
 
 Consider:
-- Seniority match: this candidate is executive/leadership level (25+ years, CIO/Head of IT background), not an individual-contributor or hands-on technical role.
-- Domain/functional match: IT/technology/data leadership vs. unrelated fields (clinical/medical, legal, HR, finance, military operations, food service, construction, sales, etc.) - a senior-sounding title alone does not mean relevance.
+- Seniority match: check the profile's self-reported seniority/experience level (a "seniority" field, if present) against what this posting expects - read what's actually in the profile, don't assume any particular level by default.
+- Domain/functional match: does the posting's field genuinely align with the candidate's actual background per the profile, vs. an unrelated field - a senior-sounding title alone does not mean relevance.
 - Non-US locations count against fit somewhat (relocation/visa impractical) unless the posting is explicitly remote.
-- The candidate has explicitly said he does NOT consider himself qualified for CISO-titled or other specialized security-officer-titled roles (e.g. SISO, "IT Security Officer"), despite broader cybersecurity oversight experience - score these LOW regardless of subject-matter proximity, this is a real disqualifier, not just a preference.
-- Roles requiring current military/National Guard membership (e.g. "Title 32" postings) score 0 regardless of IT relevance - not eligible.
+- The profile's "gap_interview_answers" list may include entries with "is_disqualifier": true - real, candidate-confirmed exclusions (a role type they've explicitly said they don't consider themselves qualified for, or don't want, despite otherwise-matching experience - e.g. a candidate who rules out CISO-titled roles despite broader cybersecurity oversight experience). Score a posting matching any such entry LOW regardless of subject-matter proximity. Entries without that flag are just supporting facts, not exclusions - don't treat them as disqualifiers.
+- Roles requiring current military/National Guard membership (e.g. "Title 32" postings) score 0 regardless of relevance - not eligible.
 - Entry-level/intern/student/recent-graduate programs score 0 regardless of subject matter - wrong seniority.
 - Staffing-firm or retained-executive-search-firm postings should be scored on the underlying role itself, same criteria as any direct posting.
 
 Assign a 0-100 fit_score and a one-sentence, specific, plain-language fit_rationale explaining why (not generic filler) via the structured output schema."""
+
+
+TARGET_ROLES_SYSTEM_PROMPT = """You are proposing a starter set of target job titles, plus the standard title-ladder/expectations checklist for one primary role/vertical, for a real job candidate - based on their actual resume text and their own stated target industries/verticals and seniority. This seeds an editable settings table the candidate reviews and adjusts themselves, never applied automatically - keep titles realistic to how they're actually posted for this trade and seniority level (not generic or padded), and never invent employers, credentials, or experience the resume doesn't support."""
+
+
+def _target_roles_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "target_roles": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "A job title this candidate should search/track, matching how it's commonly posted (not overly specific or invented).",
+                        },
+                        "priority_weight": {
+                            "type": "integer",
+                            "description": "0-10: how strongly to prioritize this title. 10 for the closest direct match to their current level and background, lower for adjacent/equivalent/stretch titles they may not have listed themselves.",
+                        },
+                    },
+                    "required": ["name", "priority_weight"],
+                    "additionalProperties": False,
+                },
+                "description": "5-12 target job titles for this candidate's chosen verticals, seniority, and resume background - include direct matches to their most recent title plus genuinely adjacent/equivalent titles they may not have thought to list themselves (the same spirit as a human recruiter suggesting related titles).",
+            },
+            "ladder_industry": {
+                "type": "string",
+                "description": "The single primary industry/vertical this title ladder is generated for - pick the best-fit one of the candidate's stated verticals if they listed several.",
+            },
+            "ladder_role": {
+                "type": "string",
+                "description": "The single primary role/title (usually the top-weighted target_roles entry) this title ladder describes.",
+            },
+            "title_ladder": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "skill": {
+                            "type": "string",
+                            "description": "A specific skill, credential, tool, or domain-specific knowledge area expected for this role in this vertical - matching the style of an experienced recruiter's checklist, not generic soft skills.",
+                        },
+                        "why_it_matters": {
+                            "type": "string",
+                            "description": "One sentence: why this specific item matters for this role/vertical.",
+                        },
+                    },
+                    "required": ["skill", "why_it_matters"],
+                    "additionalProperties": False,
+                },
+                "description": "8-15 specific, checkable skills/credentials/knowledge areas a strong candidate for ladder_role in ladder_industry would be expected to have - the standard title-ladder/expectations checklist for this trade, used later to spot real gaps in this candidate's resume. Never generic filler like 'communication skills'.",
+            },
+        },
+        "required": ["target_roles", "ladder_industry", "ladder_role", "title_ladder"],
+        "additionalProperties": False,
+    }
+
+
+def generate_target_roles(resume_text: str, industries: list[str], seniority: str, model: str | None = None) -> dict:
+    """One reasoning call proposing a starter target_roles/weights list plus
+    a title-ladder skills checklist for the candidate's primary vertical/
+    role, from their resume text + stated target industries/verticals +
+    self-reported seniority. Prefills the Settings tab's target-roles editor
+    (the candidate reviews/edits before it's ever saved) and extends
+    skills/lookup.py's role_skills.json with the generated ladder, so future
+    gap-detection has real data for this vertical instead of only the
+    original hand-built Lifesciences/Pharma entry. Returns
+    {"target_roles": [...], "ladder_industry": str, "ladder_role": str,
+    "title_ladder": [...]}. Raises DraftingNotConfigured/DraftingFailed same
+    as the other drafting calls."""
+    client = _client()
+    content = (
+        "CANDIDATE'S RESUME TEXT:\n" + resume_text +
+        "\n\nCANDIDATE'S STATED TARGET INDUSTRIES/VERTICALS:\n" + "\n".join(industries) +
+        "\n\nCANDIDATE'S SELF-REPORTED SENIORITY/EXPERIENCE:\n" + (seniority or "(not provided)")
+    )
+    try:
+        response = client.messages.create(
+            model=model or os.environ.get("ANTHROPIC_MODEL") or DEFAULT_MODEL,
+            max_tokens=4000,
+            thinking={"type": "adaptive"},
+            output_config={"effort": "high", "format": {"type": "json_schema", "schema": _target_roles_schema()}},
+            system=TARGET_ROLES_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": content}],
+        )
+    except anthropic.APIStatusError as exc:
+        raise DraftingFailed(f"Claude API error ({exc.status_code}): {exc.message}") from exc
+    except anthropic.APIConnectionError as exc:
+        raise DraftingFailed("Couldn't reach the Claude API - check your internet connection.") from exc
+
+    if response.stop_reason == "refusal":
+        raise DraftingFailed("Claude declined to propose target roles. Try again.")
+    if response.stop_reason == "max_tokens":
+        raise DraftingFailed("The response was cut off before finishing. Try again.")
+
+    text_block = next((b.text for b in response.content if b.type == "text"), None)
+    if not text_block:
+        raise DraftingFailed("Claude returned no proposal.")
+    try:
+        data = json.loads(text_block)
+    except json.JSONDecodeError as exc:
+        raise DraftingFailed("Claude's response wasn't valid - try again.") from exc
+
+    from skills.lookup import save_role_skills
+    save_role_skills(data["ladder_industry"], data["ladder_role"], data["title_ladder"])
+
+    return data
 
 
 def _score_schema() -> dict:
@@ -300,42 +410,75 @@ def _resume_schema() -> dict:
                 "items": {
                     "type": "object",
                     "properties": {
+                        "type": {
+                            "type": "string",
+                            "enum": ["skill_gap", "disqualifier_check"],
+                            "description": (
+                                "\"skill_gap\" (the normal case) for a missing real "
+                                "fact/number/name/date that would raise the ATS "
+                                "score if confirmed. \"disqualifier_check\" only "
+                                "when this posting's title/domain sits right at the "
+                                "edge of what the profile's real experience covers, "
+                                "in a way the candidate might want to hard-exclude "
+                                "going forward (not just skip this one job) - the "
+                                "same kind of thing as a candidate ruling out "
+                                "CISO-titled roles despite broader cybersecurity "
+                                "experience. Before proposing one, check whether the "
+                                "profile's gap_interview_answers already has an "
+                                "is_disqualifier entry covering this same role type "
+                                "- if so, don't ask again, the scoring already "
+                                "applies it."
+                            ),
+                        },
                         "skill": {
                             "type": "string",
-                            "description": "Short label for this gap (e.g. 'SK Life Science IT team size/budget'), matching the master profile's gap-tracking convention.",
+                            "description": "Short label for this gap or disqualifier topic (e.g. 'SK Life Science IT team size/budget', or 'CISO-titled roles'), matching the master profile's gap-tracking convention.",
                         },
                         "question": {
                             "type": "string",
-                            "description": "A direct, specific question whose answer is a genuine, checkable fact (a number, a name, a date) that would close this gap - not vague or stylistic.",
+                            "description": (
+                                "For skill_gap: a direct, specific question whose "
+                                "answer is a genuine, checkable fact (a number, a "
+                                "name, a date) that would close this gap - not "
+                                "vague or stylistic. For disqualifier_check: a "
+                                "direct yes/no-style question asking whether this "
+                                "role type is one the candidate wants excluded from "
+                                "future matches, or whether their experience "
+                                "actually covers it after all."
+                            ),
                         },
                         "suggested_answer": {
                             "type": "string",
                             "description": (
-                                "A proposed starting draft for the answer, phrased as "
-                                "the candidate's own words - e.g. a plausible number/"
-                                "scope guess given the role and the rest of the "
-                                "profile ('Roughly 8-10 engineers, ~$2M budget?'). "
-                                "This is a suggestion to edit, never a stated fact - "
-                                "make that uncertainty visible in the phrasing itself "
-                                "(hedge words, a trailing '?') rather than asserting "
-                                "it. Leave as an empty string if you have no "
-                                "reasonable basis to propose anything."
+                                "For skill_gap: a proposed starting draft for the "
+                                "answer, phrased as the candidate's own words - e.g. "
+                                "a plausible number/scope guess given the role and "
+                                "the rest of the profile ('Roughly 8-10 engineers, "
+                                "~$2M budget?'). A suggestion to edit, never a "
+                                "stated fact - make that uncertainty visible in the "
+                                "phrasing itself (hedge words, a trailing '?') "
+                                "rather than asserting it. Leave as an empty string "
+                                "if you have no reasonable basis to propose "
+                                "anything. For disqualifier_check: always an empty "
+                                "string - this is a genuine judgment call only the "
+                                "candidate can make, never a guess."
                             ),
                         },
                     },
-                    "required": ["skill", "question", "suggested_answer"],
+                    "required": ["type", "skill", "question", "suggested_answer"],
                     "additionalProperties": False,
                 },
                 "description": (
-                    "3-10 specific, directly answerable questions for real facts "
-                    "this resume is currently missing that would raise the score "
-                    "if the candidate actually has them - never invent the answer "
-                    "yourself, ask instead; use however many genuine gaps actually "
-                    "exist (sometimes only 3, up to 10 for a role with many gaps), "
-                    "don't pad to hit a count. Only include questions a real number/"
-                    "name/date could answer. Skip anything already answered "
-                    "elsewhere in the profile or that's purely about wording/"
-                    "structure rather than a missing fact."
+                    "3-10 specific, directly answerable questions - either real "
+                    "facts this resume is currently missing that would raise the "
+                    "score if the candidate actually has them (skill_gap), or a "
+                    "borderline-fit role type worth confirming as a standing "
+                    "exclusion or not (disqualifier_check, rare - only when "
+                    "genuinely borderline). Never invent an answer yourself, ask "
+                    "instead; use however many genuine items actually exist "
+                    "(sometimes only 3, up to 10), don't pad to hit a count. Skip "
+                    "anything already answered elsewhere in the profile or that's "
+                    "purely about wording/structure rather than a missing fact."
                 ),
             },
         },
@@ -570,22 +713,31 @@ def generate_documents(
     return results
 
 
-def save_gap_answers(job: dict, answers: dict[str, str]) -> None:
+def save_gap_answers(job: dict, answered_questions: list[dict]) -> None:
     """Persists confirmed answers to a resume's clarifying_questions into the
     master profile's gap_interview_answers - the same store/shape
     profile/interview.py's save_answer() already writes to, so a fact
     confirmed here (e.g. "SK Life Science IT team size/budget") becomes
-    available to every future job's drafting, not just this one. answers
-    maps each question's "skill" label to the candidate's typed answer;
-    blank/whitespace-only answers are skipped rather than saved as empty
-    facts. Never called with an invented answer - the Results tab UI only
-    calls this with what Zahir actually typed."""
+    available to every future job's drafting, not just this one.
+    answered_questions is the subset of clarifying_questions the candidate
+    actually typed a real answer for (blank ones already filtered out by the
+    caller), each a {"skill":, "type":, "answer":} dict - "type" ==
+    "disqualifier_check" is saved with is_disqualifier=True so
+    SCORE_SYSTEM_PROMPT applies it to every future job, not just this one;
+    anything else (including missing/old-shape entries) saves as an ordinary
+    skill-gap fact. Never called with an invented answer - the Results tab
+    UI only calls this with what the candidate actually typed."""
     from datetime import date
 
     from profile.interview import save_answer
 
     role_context = f"{job.get('title', 'Unknown role')} at {job.get('organization', 'Unknown organization')}"
     today = date.today().isoformat()
-    for skill, answer in answers.items():
-        if answer and answer.strip():
-            save_answer(skill=skill, role_context=role_context, answer=answer.strip(), date_captured=today)
+    for q in answered_questions:
+        answer = (q.get("answer") or "").strip()
+        if not answer:
+            continue
+        save_answer(
+            skill=q["skill"], role_context=role_context, answer=answer, date_captured=today,
+            is_disqualifier=(q.get("type") == "disqualifier_check"),
+        )

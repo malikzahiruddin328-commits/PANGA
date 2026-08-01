@@ -42,7 +42,7 @@ from tailoring.applications import load_applications, upsert_application, get_ap
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
 from tailoring.interview_prep import load_interview_prep, record_round_outcome
 from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
-from tailoring.drafting import generate_documents, score_job, save_gap_answers, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed
+from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
 from prospector.rejection_diagnosis import gather_diagnosis_input
 from prospector.target_accounts import load_target_accounts, set_status as set_target_account_status, set_website, load_website_lookup_cost, save_website_lookup_cost
@@ -61,8 +61,8 @@ from linkedin.connections_store import load_connections_snapshot, save_connectio
 from security.crypto_store import has_recovery_code, generate_recovery_code
 from feedback.ui_feedback import get_open_feedback, mark_resolved
 from ui.feedback_widget import render_feedback_widget
-from profile.ingest import load_manifest_result, remove_document, ingest_uploaded_document
-from profile.storage import load_profile
+from profile.ingest import load_manifest_result, remove_document, ingest_uploaded_document, resume_text as ingested_resume_text
+from profile.storage import load_profile, save_profile
 from bhangi.ui import render_support_page
 
 BHANGI_PROJECT = "panga"
@@ -434,22 +434,72 @@ if active_tab == "settings":
     st.markdown("These control sort order on the Results tab - higher weight surfaces first. Not a search filter; every source is still searched the same way.")
 
     settings = load_settings()
+    profile_for_settings = load_profile()
+
+    st.subheader("Your target industries/verticals")
+    st.markdown(
+        "What kind of employer or industry are you aiming for? Free text, "
+        "one per line - trades vary too widely for a fixed dropdown, and "
+        "even within one trade the target companies can differ a lot by "
+        "sub-vertical (e.g. a chemical engineer targeting nuclear plants "
+        "needs different targets than one targeting plastics plants)."
+    )
+    industries_text = st.text_area(
+        "One per line",
+        value="\n".join(settings.get("industries", [])),
+        key="industries_text",
+    )
+
+    st.subheader("Your seniority / experience level")
+    st.markdown(
+        "A short self-description used when generating your target roles "
+        "below and when scoring job fit - e.g. \"22 years, Director-to-VP "
+        "level\" or \"4 years post-residency, attending physician level\"."
+    )
+    seniority_text = st.text_input(
+        "Seniority / years of experience",
+        value=profile_for_settings.get("seniority", ""),
+        key="seniority_text",
+    )
+
+    has_resume = any(e["category"] == "resume" for e in manifest_entries)
+    gen_disabled = not has_resume or not industries_text.strip() or not drafting_is_configured()
+    if st.button("Generate my target roles from my resume", icon=":material/auto_awesome:", disabled=gen_disabled):
+        industries_list = [line.strip() for line in industries_text.splitlines() if line.strip()]
+        with st.spinner("Reading your resume and reasoning about target roles..."):
+            try:
+                proposal = generate_target_roles(ingested_resume_text(), industries_list, seniority_text.strip())
+            except (DraftingNotConfigured, DraftingFailed) as exc:
+                st.error(str(exc))
+            else:
+                new_counter = st.session_state.get("target_roles_gen_counter", 0) + 1
+                st.session_state["target_roles_gen_counter"] = new_counter
+                st.session_state[f"target_roles_seed_{new_counter}"] = proposal["target_roles"]
+                st.toast(
+                    f"Proposed {len(proposal['target_roles'])} target role(s) below for "
+                    f"\"{proposal['ladder_role']}\" in {proposal['ladder_industry']} - "
+                    "review, edit, then Save settings.",
+                    icon=":material/auto_awesome:",
+                )
+                st.rerun()
+    if not has_resume:
+        st.caption("Upload a resume above first.")
+    elif not industries_text.strip():
+        st.caption("Add at least one target industry/vertical above first.")
 
     st.subheader("Target roles")
+    gen_counter = st.session_state.get("target_roles_gen_counter", 0)
+    seed_key = f"target_roles_seed_{gen_counter}"
+    if seed_key not in st.session_state:
+        st.session_state[seed_key] = settings.get("target_roles", [])
     roles_df = st.data_editor(
-        settings.get("target_roles", []),
+        st.session_state[seed_key],
         num_rows="dynamic",
         column_config={
             "name": st.column_config.TextColumn("Role name", required=True),
             "priority_weight": st.column_config.NumberColumn("Priority weight", required=True, min_value=0, max_value=10),
         },
-        key="roles_editor",
-    )
-
-    st.subheader("Industries")
-    industries_text = st.text_area(
-        "One per line",
-        value="\n".join(settings.get("industries", [])),
+        key=f"roles_editor_{gen_counter}",
     )
 
     st.subheader("USAJOBS job series")
@@ -464,6 +514,8 @@ if active_tab == "settings":
         settings["industries"] = [line.strip() for line in industries_text.splitlines() if line.strip()]
         settings["usajobs_job_series"] = [line.strip() for line in job_series_text.splitlines() if line.strip()]
         save_settings(settings)
+        profile_for_settings["seniority"] = seniority_text.strip()
+        save_profile(profile_for_settings)
         st.success("Saved.")
 
     st.divider()
@@ -1034,7 +1086,7 @@ elif active_tab == "results":
                                             "Nothing pre-filled is saved as-is."
                                         )
                                         job_key = f"{job.get('source')}_{job.get('job_id')}"
-                                        answer_inputs = {}
+                                        answer_entries = []
                                         for q in clarifying_questions:
                                             # Keyed by the question's own content, not its position
                                             # (qi) - a real bug found 2026-07-31: each regeneration
@@ -1052,12 +1104,25 @@ elif active_tab == "results":
                                             # suggested answer, and a key on question text alone would
                                             # silently keep showing the earlier round's stale suggestion.
                                             q_key = f"gapans_{job_key}_{abs(hash(q['question'] + '|' + (q.get('suggested_answer') or ''))) % 10_000_000}"
-                                            answer_inputs[q["skill"]] = st.text_area(
+                                            is_disqualifier = q.get("type") == "disqualifier_check"
+                                            if is_disqualifier:
+                                                st.caption(
+                                                    ":material/flag: This answer applies to every "
+                                                    "future job match, not just this one - not a "
+                                                    "guess, so the box starts empty."
+                                                )
+                                            answer_value = st.text_area(
                                                 q["question"], value=q.get("suggested_answer") or "",
                                                 key=q_key, height=68,
+                                                placeholder="Type your answer..." if is_disqualifier else None,
                                             )
+                                            answer_entries.append({
+                                                "skill": q["skill"],
+                                                "type": q.get("type", "skill_gap"),
+                                                "answer": answer_value,
+                                            })
                                         if st.button("Save answers & regenerate resume", key=f"gapsave_{job_key}"):
-                                            answered = {skill: ans for skill, ans in answer_inputs.items() if ans and ans.strip()}
+                                            answered = [e for e in answer_entries if e["answer"] and e["answer"].strip()]
                                             if not answered:
                                                 st.toast("Answer at least one question first.", icon=":material/warning:")
                                             else:

@@ -9,7 +9,7 @@ MASTER_PROFILE_PATH = PROJECT_ROOT / "data" / "profile" / "structured" / "master
 
 
 def load_profile() -> dict:
-    return read_json(MASTER_PROFILE_PATH)
+    return read_json(MASTER_PROFILE_PATH, default={})
 
 
 def save_profile(profile: dict) -> None:
