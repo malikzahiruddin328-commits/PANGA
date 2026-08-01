@@ -62,7 +62,7 @@ from security.crypto_store import has_recovery_code, generate_recovery_code
 from feedback.ui_feedback import get_open_feedback, mark_resolved
 from ui.feedback_widget import render_feedback_widget
 from profile.ingest import load_manifest_result, remove_document, ingest_uploaded_document, resume_text as ingested_resume_text
-from profile.storage import load_profile, save_profile
+from profile.storage import load_profile, update_profile_field
 from bhangi.ui import render_support_page
 
 BHANGI_PROJECT = "panga"
@@ -471,10 +471,13 @@ if active_tab == "settings":
         settings["target_roles"] = roles_df
         settings["industries"] = [line.strip() for line in industries_text.splitlines() if line.strip()]
         settings["usajobs_job_series"] = [line.strip() for line in job_series_text.splitlines() if line.strip()]
-        save_settings(settings)
-        profile_for_settings["seniority"] = seniority_text.strip()
-        save_profile(profile_for_settings)
-        st.success("Saved.")
+        try:
+            save_settings(settings)
+            update_profile_field("seniority", seniority_text.strip())
+        except Exception as exc:
+            st.error(f"Failed to save settings: {exc}")
+        else:
+            st.success("Saved.")
 
     st.divider()
     st.subheader("LinkedIn profile")

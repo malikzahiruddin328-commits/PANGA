@@ -165,6 +165,28 @@ future upfront-gap-check feature if one gets built.
 - Marketing/pricing/positioning decisions about which verticals to target
   first — business calls for Zahir, not a design output of this branch.
 
+## Fast-follow items (from 2026-08-01 code-review/security-review sweep)
+
+Not blocking merge — logged here so they don't get lost:
+
+- **No unit tests yet** for `generate_target_roles`, `save_role_skills`,
+  the reshaped `save_answer`/`save_gap_answers` signatures, or the shared
+  `resume_text()` helper. At minimum, add a test for `save_role_skills`'s
+  case/whitespace-insensitive setdefault-merge behavior (does a near-dupe
+  key like `"Financial services/Banking"` update the existing
+  `"Financial Services / Banking"` entry rather than creating a second
+  one?) and for `save_gap_answers`'s `is_disqualifier` routing.
+- **`load_profile()`'s `default={}` fallback** wasn't exhaustively verified
+  at every call site. Spot-checked `dossier.py:323` (fine — handles an
+  empty dict). `tailor.py`, `interview_prep.py`, and `enhance.py` weren't
+  checked for whether they assume a populated dict rather than `{}`.
+- **`src/skills/role_skills.json` is still plaintext under `src/`**, not
+  `data/`, so it doesn't get `security.crypto_store`'s encryption-at-rest
+  even though it now holds resume-derived content and (as of this branch)
+  has a runtime writer for the first time. Pre-existing pattern, not a new
+  regression from this branch — worth a future decision on whether it
+  should move under `data/`.
+
 ## A note on shared files
 
 `src/ui/app.py`, `config/settings.yaml`, `src/profile/interview.py`, and

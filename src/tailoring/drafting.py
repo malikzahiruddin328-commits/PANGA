@@ -264,8 +264,13 @@ def generate_target_roles(resume_text: str, industries: list[str], seniority: st
     except json.JSONDecodeError as exc:
         raise DraftingFailed("Claude's response wasn't valid - try again.") from exc
 
+    ladder_industry = data.get("ladder_industry")
+    ladder_role = data.get("ladder_role")
+    if not ladder_industry or not ladder_role:
+        raise DraftingFailed("Claude's response was missing the expected ladder industry/role - try again.")
+
     from skills.lookup import save_role_skills
-    save_role_skills(data["ladder_industry"], data["ladder_role"], data["title_ladder"])
+    save_role_skills(ladder_industry, ladder_role, data.get("title_ladder", []))
 
     return data
 
