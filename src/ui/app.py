@@ -20,32 +20,42 @@ carries the two cross-cutting things that used to live on a single page
 visible no matter which tab is open.
 """
 
-import subprocess
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
-# Bhangi is a separate, standalone project (shared issue store for the
-# Support tab, reused across projects) - sibling folder to the main Panga
-# checkout, not part of this repo. See ../Bhangi/README.md.
-#
-# PROJECT_ROOT.parent is only "Myra/" when running from the main checkout -
-# inside a `.claude/worktrees/<branch>` worktree it resolves to
-# `Panga/.claude/worktrees/`, which has no Bhangi sibling. `git rev-parse
-# --git-common-dir` always points at the main checkout's shared .git dir
-# regardless of which worktree is running, so its parent is the real repo
-# root in both cases.
-try:
-    _git_common_dir = subprocess.run(
-        ["git", "rev-parse", "--git-common-dir"],
-        cwd=PROJECT_ROOT, capture_output=True, text=True, check=True, timeout=5,
-    ).stdout.strip()
-    _panga_repo_root = Path(_git_common_dir).resolve().parent
-except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
-    _panga_repo_root = PROJECT_ROOT  # not a git checkout (e.g. a packaged build) - fall back to the old assumption
-sys.path.insert(0, str(_panga_repo_root.parent / "Bhangi" / "src"))
+
+
+def _find_bhangi_src(project_root: Path) -> Path | None:
+    """Locate the sibling Bhangi checkout's src/ directory.
+
+    Bhangi is a separate, standalone project (shared issue store for the
+    Support tab, reused across projects), normally a sibling folder to the
+    main Panga checkout - see ../Bhangi/README.md. But every git worktree
+    branch lives under Panga/.claude/worktrees/<branch>/, where
+    project_root.parent has no Bhangi folder. Walk up the ancestor chain
+    (which passes through the real Panga checkout for any worktree) looking
+    for an ancestor whose sibling is Bhangi. BHANGI_PATH env var overrides
+    this search entirely.
+    """
+    override = os.environ.get("BHANGI_PATH")
+    if override:
+        candidate = Path(override) / "src"
+        if candidate.is_dir():
+            return candidate
+    for ancestor in (project_root, *project_root.parents):
+        candidate = ancestor.parent / "Bhangi" / "src"
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+_bhangi_src = _find_bhangi_src(PROJECT_ROOT)
+if _bhangi_src is not None:
+    sys.path.insert(0, str(_bhangi_src))
 
 import pandas as pd
 import streamlit as st
