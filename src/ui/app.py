@@ -20,6 +20,7 @@ carries the two cross-cutting things that used to live on a single page
 visible no matter which tab is open.
 """
 
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,9 +28,24 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 # Bhangi is a separate, standalone project (shared issue store for the
-# Support tab, reused across projects) - sibling folder to this one, not
-# part of this repo. See ../Bhangi/README.md.
-sys.path.insert(0, str(PROJECT_ROOT.parent / "Bhangi" / "src"))
+# Support tab, reused across projects) - sibling folder to the main Panga
+# checkout, not part of this repo. See ../Bhangi/README.md.
+#
+# PROJECT_ROOT.parent is only "Myra/" when running from the main checkout -
+# inside a `.claude/worktrees/<branch>` worktree it resolves to
+# `Panga/.claude/worktrees/`, which has no Bhangi sibling. `git rev-parse
+# --git-common-dir` always points at the main checkout's shared .git dir
+# regardless of which worktree is running, so its parent is the real repo
+# root in both cases.
+try:
+    _git_common_dir = subprocess.run(
+        ["git", "rev-parse", "--git-common-dir"],
+        cwd=PROJECT_ROOT, capture_output=True, text=True, check=True, timeout=5,
+    ).stdout.strip()
+    _panga_repo_root = Path(_git_common_dir).resolve().parent
+except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+    _panga_repo_root = PROJECT_ROOT  # not a git checkout (e.g. a packaged build) - fall back to the old assumption
+sys.path.insert(0, str(_panga_repo_root.parent / "Bhangi" / "src"))
 
 import pandas as pd
 import streamlit as st
@@ -64,6 +80,8 @@ from ui.feedback_widget import render_feedback_widget
 from profile.ingest import load_manifest_result, remove_document, ingest_uploaded_document
 from profile.storage import load_profile
 from bhangi.ui import render_support_page
+from ui.license_gate import render_indicator_and_get_block, render_block_screen
+from licensing.client import release_device, create_portal_session, LicenseNetworkError, LicenseServiceError
 
 BHANGI_PROJECT = "panga"
 
@@ -253,7 +271,15 @@ def go_to_prep(target: dict) -> None:
     st.rerun()
 
 
-st.title("Panga - Job Search")
+title_col, license_col = st.columns([5, 1])
+with title_col:
+    st.title("Panga - Job Search")
+with license_col:
+    license_block = render_indicator_and_get_block()
+
+if license_block is not None:
+    render_block_screen(license_block)
+    st.stop()
 
 jobs = load_jobs()
 all_cta = get_active_cta_emails()
@@ -497,6 +523,36 @@ if active_tab == "settings":
         if st.button("I've saved this somewhere safe"):
             del st.session_state["new_recovery_code"]
             st.rerun()
+
+    st.divider()
+    st.header("License & billing")
+    st.markdown(
+        "This license is bound to this computer. Deactivating releases it "
+        "immediately so a new device can activate — use this when you're "
+        "moving to a new computer, not if this one is lost or stolen (that "
+        "needs a manual support review instead)."
+    )
+    if st.button("Deactivate this device", key="license_deactivate_device"):
+        try:
+            release_device()
+            st.session_state.pop("license_check_result", None)
+            st.success("Device deactivated. A new device can now activate this license.")
+        except LicenseNetworkError:
+            st.error("Couldn't reach the license service — check your internet connection and try again.")
+        except LicenseServiceError as e:
+            if e.status_code == 429:
+                st.error("A device was already transferred within the last 30 days — contact support for an exception.")
+            else:
+                st.error(f"Couldn't deactivate this device: {e}")
+
+    if st.button("Manage subscription", key="license_manage_billing"):
+        try:
+            portal = create_portal_session(return_url="http://localhost:8501")
+            st.link_button("Open billing portal", portal["portal_url"])
+        except LicenseNetworkError:
+            st.error("Couldn't reach the billing service — check your internet connection and try again.")
+        except LicenseServiceError as e:
+            st.error(f"Couldn't open the billing portal: {e}")
 
     st.divider()
     st.header("UI feedback")
