@@ -19,3 +19,33 @@
 
 Apply these checks whenever writing or reviewing code in this repo, not just
 when explicitly asked.
+
+- **Apply HCI principles to every UI change, proactively, not reactively.**
+  2026-07-31: a string of small UI fixes this session (checkbox row-select
+  → click-to-activate, no auto-scroll to a freshly opened detail panel,
+  stale prefilled text in widgets after a regenerate, three related actions
+  needing three separate buttons, a full-width field wasting vertical
+  space) were each individually reported by Zahir one at a time. He pointed
+  out that catching these up front as a standing practice would have made
+  most of that back-and-forth unnecessary. Before shipping a UI change,
+  check it against basics like:
+  - Does an action need scrolling to see its result? If Streamlit re-renders
+    the page top-to-bottom and the outcome lands off-screen, consider an
+    anchor + `st.html(..., unsafe_allow_javascript=True)` scroll-into-view
+    (not iframed, so this works - see the Results-tab Role-click handler).
+  - Does a widget keep showing stale content after the data behind it
+    changes? Streamlit ignores a new `value=` once a `key` already has
+    session-state - fold whatever changed into the key (see the
+    strategy-tag and clarifying-question boxes for the pattern), or the
+    box silently lies about current state.
+  - Are related decisions forced into separate clicks/buttons when they're
+    really one decision made at one moment? Consolidate.
+  - Does a suggested/prefilled value risk being mistaken for a fact or for
+    the user's own answer? Keep genuine guesses hedged and editable (never
+    asserted); keep things that need the user's real reasoning (not a
+    guess at all) as an empty box with a placeholder, not a prefill.
+  - Is space used proportionally to importance - is a field taking a full
+    row when it could sit beside a related one at the same height?
+  This isn't a fixed checklist to run mechanically - it's the standard to
+  hold every UI change to, the same way the checks above apply to every
+  code change.

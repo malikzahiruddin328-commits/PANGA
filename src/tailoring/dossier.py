@@ -1,32 +1,46 @@
-"""Per-application "dossier" (Zahir's request 2026-07-30): one traceable
-file per job actually engaged with (applied, rejected, under review, etc.),
+"""Per-application workspace (Zahir's request 2026-07-30, extended
+2026-07-31 into a real folder per application): one traceable folder per
+job actually engaged with (applied, rejected, under review, etc.),
 consolidating the posting itself, application status/timeline, drafted
 documents, and interview prep into a single place - instead of having to
 cross-reference jobs.json/applications.json/interview_prep.json by hand for
-context on one job. Markdown, not JSON: most of the content (drafted cover
-letters, interview notes) is prose meant to be read, not machine-parsed -
-nothing else in Panga reads this file back in, it's purely a readable
-output.
+context on one job.
 
-Regenerated (overwritten wholesale, not appended/merged) from the
-source-of-truth stores every time any of them changes for a given job - see
-the write_dossier() call sites in applications.py/interview_prep.py. This
-module only reads from those stores; it never writes back to them.
+Two kinds of content live in this folder, written by two different
+functions:
+- dossier.md (write_dossier(), below) - a readable summary, regenerated
+  wholesale from the source-of-truth stores every time any of them changes
+  for a given job (see call sites in applications.py/interview_prep.py).
+  Read-only output - nothing reads it back in, and nothing Zahir is meant
+  to hand-edit.
+- The actual editable documents - resume.docx, cover_letter.docx, etc.
+  (sync_workspace_documents(), below) - written ONLY at the moment a
+  document is freshly (re)generated, never as a side effect of an unrelated
+  dossier refresh (status change, strategy tag, skip reason...), because
+  Zahir is expected to open and edit these directly in Word. Rewriting them
+  on every unrelated save would silently clobber his in-progress edits.
 
-Encrypted at rest via security.crypto_store, same as every other file under
-data/ (PRD §7) - no carve-out for this one, even though that means it isn't
-directly double-clickable outside Panga. Flagged to Zahir as a tradeoff
-worth revisiting if he wants a plain-text export option later.
+Plain files on disk, not encrypted (Zahir's explicit call 2026-07-31 - this
+folder needs to be directly double-clickable/editable in Word, which
+encryption at rest would prevent). Lives under data/ like every other Panga
+store, so it persists across code updates/reinstalls the same way
+jobs.json/applications.json do - the only way to lose it is deleting the
+data/ folder itself, same as everything else here.
 """
 
+import difflib
 import hashlib
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
+from docx import Document
+
+from profile.storage import load_profile
 from search.job_store import load_jobs
 from tailoring.applications import get_application
 from tailoring.interview_prep import get_interview_prep
-from security.crypto_store import write_text
+from tailoring.docx_export import text_to_docx_bytes, cover_letter_to_docx_bytes
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DOSSIER_DIR = PROJECT_ROOT / "data" / "applications" / "dossiers"
@@ -38,6 +52,23 @@ DOC_LABELS = {
     "leadership_summary_text": "Leadership summary",
 }
 
+# The generic names workspace files used before 2026-07-31 - kept only so
+# _migrate_legacy_filename() can find and rename a folder's existing files
+# the first time it's touched after the naming convention below changed.
+_LEGACY_WORKSPACE_FILENAMES = {
+    "resume_text": "resume.docx",
+    "cover_letter_text": "cover_letter.docx",
+    "exec_bio_text": "exec_bio.docx",
+    "leadership_summary_text": "leadership_summary.docx",
+}
+
+DOC_KEY_TO_FIELD = {
+    "resume": "resume_text",
+    "cover_letter": "cover_letter_text",
+    "exec_bio": "exec_bio_text",
+    "leadership_summary": "leadership_summary_text",
+}
+
 
 def _slug(source: str, job_id: str, organization: str | None, title: str | None) -> str:
     base = re.sub(r"[^a-z0-9]+", "-", f"{organization or ''}-{title or ''}".lower()).strip("-")[:60]
@@ -45,8 +76,43 @@ def _slug(source: str, job_id: str, organization: str | None, title: str | None)
     return f"{base or 'job'}-{short_hash}"
 
 
+def dossier_dir(source: str, job_id: str, organization: str | None = None, title: str | None = None) -> Path:
+    return DOSSIER_DIR / _slug(source, job_id, organization, title)
+
+
 def dossier_path(source: str, job_id: str, organization: str | None = None, title: str | None = None) -> Path:
-    return DOSSIER_DIR / f"{_slug(source, job_id, organization, title)}.md"
+    return dossier_dir(source, job_id, organization, title) / "dossier.md"
+
+
+def _sanitize_filename_part(value: str) -> str:
+    return re.sub(r'[<>:"/\\|?*]', "", value).strip().replace(" ", "_")
+
+
+def _workspace_filename(field: str, candidate_name: str | None, job: dict) -> str:
+    """Descriptive filename for a workspace document - Zahir's explicit ask
+    2026-07-31: files inside the per-application folder should follow the
+    same {Name}_{DocType}_{Title}_{Organization}.docx convention the old
+    per-document download button used, so a file is self-explanatory even
+    pulled out of its folder (e.g. attached to an email)."""
+    doc_label = DOC_LABELS.get(field, field)
+    parts = [candidate_name, doc_label, job.get("title"), job.get("organization")]
+    safe_parts = [_sanitize_filename_part(p) for p in parts if p]
+    return "_".join(safe_parts)[:150] + ".docx"
+
+
+def _migrate_legacy_filename(folder: Path, field: str, new_filename: str) -> None:
+    """One-time rename for a workspace folder created before descriptive
+    filenames existed: if the old generic name (resume.docx, etc.) is still
+    on disk and the new descriptive name isn't, renames it in place so
+    Zahir's real edits carry over under the new convention rather than
+    being silently orphaned under the old name."""
+    legacy_name = _LEGACY_WORKSPACE_FILENAMES.get(field)
+    if not legacy_name:
+        return
+    legacy_path = folder / legacy_name
+    new_path = folder / new_filename
+    if legacy_path.exists() and not new_path.exists():
+        legacy_path.rename(new_path)
 
 
 def _format_pay(job: dict) -> str | None:
@@ -145,5 +211,143 @@ def write_dossier(source: str, job_id: str) -> Path | None:
                 lines.append("")
 
     path = dossier_path(source, job_id, job.get("organization"), job.get("title"))
-    write_text(path, "\n".join(lines))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
     return path
+
+
+def _extract_docx_text(path: Path) -> str:
+    # Deliberately not reused from profile/ingest.py's extract_text() -
+    # same reasoning as linkedin/ingest.py's separate _extract_pdf_text():
+    # the logic is small and the packages serve different concerns, so a
+    # cross-package dependency isn't worth it for ~10 lines.
+    doc = Document(str(path))
+    parts = [p.text for p in doc.paragraphs if p.text.strip()]
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                if cell.text.strip():
+                    parts.append(cell.text)
+    return "\n".join(parts)
+
+
+def sync_workspace_documents(
+    source: str,
+    job_id: str,
+    doc_keys: list[str],
+    drafted: dict,
+    profile: dict,
+    job: dict,
+) -> None:
+    """Writes the real, editable .docx files for exactly the doc_keys just
+    (re)generated by tailoring.drafting.generate_documents() - called ONLY
+    right after that succeeds (see ui/app.py), never from write_dossier()'s
+    generic refresh path. This is deliberate: Zahir is meant to open these
+    files directly in Word and edit them, so anything that rewrote them on
+    an unrelated save (a status change, a strategy tag) would silently
+    destroy his in-progress edits.
+
+    If a workspace file already exists AND its current on-disk text differs
+    from what's already stored in applications.json for that field (i.e.
+    Zahir appears to have edited his working copy since the last draft),
+    the existing file is renamed to a timestamped backup
+    (resume.edited-2026-07-31T121500.docx) before the fresh draft is
+    written - his edits are preserved on disk, never silently overwritten,
+    even though the app can no longer treat that specific text as "the
+    current working copy" once a fresh regenerate has happened.
+    apply_answers is skipped here (see DOC_KEY_TO_FIELD) - it isn't rendered
+    as an editable docx, the Results tab shows it as copy-paste fields
+    directly.
+    """
+    doc_keys_with_files = [k for k in doc_keys if k in DOC_KEY_TO_FIELD]
+    if not doc_keys_with_files:
+        return
+    application = get_application(source, job_id) or {}
+    folder = dossier_dir(source, job_id, job.get("organization"), job.get("title"))
+    folder.mkdir(parents=True, exist_ok=True)
+    candidate_name = profile.get("name")
+
+    for doc_key in doc_keys_with_files:
+        field = f"{doc_key}_text"
+        new_text = drafted.get(doc_key)
+        if doc_key == "resume" and isinstance(new_text, dict):
+            new_text = new_text.get("text")
+        if not new_text:
+            continue
+
+        filename = _workspace_filename(field, candidate_name, job)
+        _migrate_legacy_filename(folder, field, filename)
+        file_path = folder / filename
+        if file_path.exists():
+            previous_stored_text = application.get(field)
+            try:
+                current_on_disk_text = _extract_docx_text(file_path)
+            except Exception:
+                current_on_disk_text = None
+            if current_on_disk_text is not None and current_on_disk_text.strip() != (previous_stored_text or "").strip():
+                stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%S")
+                backup_name = f"{file_path.stem}.edited-{stamp}{file_path.suffix}"
+                file_path.rename(folder / backup_name)
+
+        if doc_key == "cover_letter":
+            doc_bytes = cover_letter_to_docx_bytes(
+                new_text,
+                company_name=job.get("organization"),
+                company_address=job.get("organization_address"),
+                author=candidate_name,
+            )
+        else:
+            doc_bytes = text_to_docx_bytes(new_text, author=candidate_name)
+        file_path.write_bytes(doc_bytes)
+
+
+def check_for_edits(source: str, job_id: str) -> dict:
+    """Reads back each workspace document that exists on disk and diffs it
+    against the text currently stored in applications.json for that field -
+    this is how Panga detects that Zahir edited his working copy, without
+    needing him to paste anything back manually. Returns
+    {doc_key: {"changed": bool, "diff": [...]}} for every doc_key with
+    stored text, one entry per drafted document regardless of whether a
+    workspace file exists yet. A document drafted before this workspace
+    feature existed (or not regenerated since) has stored text but no
+    on-disk file yet - that case returns {"changed": False, "diff": [],
+    "no_workspace_file": True} rather than being silently omitted, so the
+    Results tab can tell "nothing changed" apart from "there's nothing to
+    compare against yet, regenerate this document to create it." diff is a
+    compact unified-diff line list (empty if unchanged or no file)."""
+    application = get_application(source, job_id) or {}
+    job = next((j for j in load_jobs() if j.get("source") == source and j.get("job_id") == job_id), None)
+    if job is None:
+        return {}
+    folder = dossier_dir(source, job_id, job.get("organization"), job.get("title"))
+    candidate_name = load_profile().get("name")
+
+    results = {}
+    for doc_key, field in DOC_KEY_TO_FIELD.items():
+        stored_text = application.get(field)
+        if not stored_text:
+            continue
+        filename = _workspace_filename(field, candidate_name, job)
+        _migrate_legacy_filename(folder, field, filename)
+        file_path = folder / filename
+        if not file_path.exists():
+            # A document drafted before this workspace feature existed (or
+            # never re-generated since) has stored text but no editable
+            # file yet - distinct from "checked, no changes found", which
+            # is what an empty diff on an EXISTING file means below.
+            results[doc_key] = {"changed": False, "diff": [], "no_workspace_file": True}
+            continue
+        try:
+            current_text = _extract_docx_text(file_path)
+        except Exception as exc:
+            results[doc_key] = {"changed": False, "diff": [], "error": f"Couldn't read {filename}: {exc}"}
+            continue
+        if current_text.strip() == stored_text.strip():
+            results[doc_key] = {"changed": False, "diff": []}
+        else:
+            diff = list(difflib.unified_diff(
+                stored_text.splitlines(), current_text.splitlines(),
+                fromfile="original draft", tofile="your edited version", lineterm="",
+            ))
+            results[doc_key] = {"changed": True, "diff": diff}
+    return results

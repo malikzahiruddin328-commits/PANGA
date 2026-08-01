@@ -44,9 +44,31 @@ RESUME_SPEC = (
     "chronological work history with month/year date ranges, hours worked "
     "per week, and specific, quantifiable accomplishments for each role - "
     "federal resumes are longer and more detailed than private-sector ones, "
-    "there is no one-page limit. Otherwise write a concise, "
-    "achievement-focused resume. Use plain '- ' dashes for bullet points, "
-    "blank lines between sections."
+    "there is no one-page limit. Otherwise (private-sector, retained-search, "
+    "or direct-company postings), the WHOLE document must fit on roughly 2 "
+    "pages - target a total of about 900-1100 words of body text (excluding "
+    "headers/contact/dates), and treat these as hard caps, not suggestions: "
+    "- Give full bullet-point detail to ONLY the 3 most recent roles: 5-6 "
+    "bullets for the most recent, 4-5 for the 2nd most recent, 3-4 for the "
+    "3rd most recent. "
+    "- If two or more of those 3 recent roles are consecutive promotions at "
+    "the SAME employer, list that employer's name/location ONCE, then list "
+    "each title as its own sub-entry underneath with its own date range and "
+    "bullets - do not repeat the full employer/location block per title. "
+    "- Condense every role beyond the 3 most recent into a single "
+    "'EARLIER CAREER' section: one line per role (title, employer, years, "
+    "one short sentence of summary - no bullets at all), regardless of how "
+    "many years ago it was. "
+    "- Keep the Core Skills / Technical Skills section to a tight, "
+    "scannable list of terms - not full sentences. "
+    "Include a 'TARGET ROLE ALIGNMENT' section directly after the "
+    "professional summary - at most 5 bullets, each mapping a specific "
+    "requirement or theme from THIS job posting to the strongest genuine "
+    "matching experience in the profile, in the posting's own language "
+    "where accurate. Use plain '- ' dashes for bullet points, one blank "
+    "line between sections. If applying these caps would still run "
+    "noticeably over 2 pages, trim bullet wording and cut the least "
+    "job-relevant bullets first - length wins over completeness here."
 )
 
 DOC_SPECS = {
@@ -66,12 +88,30 @@ DOC_SPECS = {
         "what this specific role and organization value, roughly 150-250 "
         "words. Plain text, no markdown."
     ),
+    "apply_answers": (
+        "A structured packet of ready-to-paste answers for the common, "
+        "recurring fields on job-application forms/ATS systems (Workday, "
+        "Greenhouse, iCIMS, etc.) - not a resume or letter. Each item is one "
+        "field: a short label matching how ATS forms usually phrase it "
+        "(e.g. 'Phone Number', 'LinkedIn URL', 'Earliest Start Date', "
+        "'Desired Salary', 'Are you legally authorized to work in the "
+        "United States?', 'How did you hear about this role?'). Cover "
+        "standard contact fields (name, phone, email, address, LinkedIn "
+        "URL) taken exactly from the profile, and common screening "
+        "questions (work authorization, willingness to relocate/travel, "
+        "years of experience in a relevant area, salary expectations, "
+        "notice period, referral source). Never invent a fact the profile "
+        "doesn't contain - if something like salary expectations or notice "
+        "period was never captured, write '[Not yet provided - ask Zahir]' "
+        "as the value instead of guessing."
+    ),
 }
 
 SYSTEM_PROMPT = """You are drafting real job-application documents for a real candidate applying to a real job. Accuracy matters - these documents may be submitted as-is.
 
 Ground rules:
 - Only use employers, titles, dates, degrees, certifications, and accomplishments that are actually present in the candidate's master profile provided below. Never invent or embellish facts, metrics, employers, or credentials that aren't there.
+- Reproduce every date and date range EXACTLY as given in the profile - same month and year, character for character. Never round, smooth, or shift a date to make a timeline look tidier or a transition look gapless - if the profile says a role started in March, write March, even if the prior role's stated end date is February of the same year.
 - If the job posting calls for a qualification the profile doesn't clearly evidence, do not fabricate it - either omit it or honestly bridge from the closest real, transferable experience in the profile.
 - Tailor every document specifically to this job posting and organization - reference the actual role, organization name, and what the posting emphasizes. Do not write generic, could-apply-to-any-job text.
 - Return ONLY the documents requested via the structured output schema. No extra commentary.
@@ -132,7 +172,7 @@ def _score_schema() -> dict:
     }
 
 
-def score_job(job: dict, profile: dict, model: str | None = None) -> dict:
+def score_job(job: dict, profile: dict, model: str | None = None, on_progress=None) -> dict:
     """Live-scores a single job against the master profile via the direct
     API - for jobs that need an immediate score outside the daily scheduled
     task or a live Claude Code conversation (namely, jobs added manually via
@@ -141,21 +181,39 @@ def score_job(job: dict, profile: dict, model: str | None = None) -> dict:
     rubric panga-daily-job-search's SKILL.md step 5 already uses, so scores
     stay comparable across the app rather than following a different rubric.
     Returns {"fit_score": int, "fit_rationale": str}. Raises
-    DraftingNotConfigured/DraftingFailed same as generate_documents()."""
+    DraftingNotConfigured/DraftingFailed same as generate_documents().
+
+    If given, on_progress(substatus: str) is called with a live "thinking..."
+    / "writing... (N characters so far)" status as the response streams in -
+    same real-progress mechanism as _draft_one()'s document generation
+    (Zahir's explicit ask 2026-07-31: no spinner anywhere should be opaque
+    when the underlying call can report real progress instead)."""
     client = _client()
     content = (
         "JOB POSTING:\n" + json.dumps(job, indent=2, default=str) +
         "\n\nCANDIDATE'S MASTER PROFILE:\n" + json.dumps(profile, indent=2, default=str)
     )
     try:
-        response = client.messages.create(
+        with client.messages.stream(
             model=model or os.environ.get("ANTHROPIC_MODEL") or DEFAULT_MODEL,
             max_tokens=2000,
             thinking={"type": "adaptive"},
             output_config={"effort": "high", "format": {"type": "json_schema", "schema": _score_schema()}},
             system=SCORE_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": content}],
-        )
+        ) as stream:
+            char_count = 0
+            last_reported = 0
+            for event in stream:
+                if event.type == "content_block_start" and event.content_block.type == "thinking":
+                    if on_progress:
+                        on_progress("thinking...")
+                elif event.type == "content_block_delta" and event.delta.type == "text_delta":
+                    char_count += len(event.delta.text)
+                    if on_progress and char_count - last_reported >= 150:
+                        on_progress(f"writing... ({char_count:,} characters so far)")
+                        last_reported = char_count
+            response = stream.get_final_message()
     except anthropic.APIStatusError as exc:
         raise DraftingFailed(f"Claude API error ({exc.status_code}): {exc.message}") from exc
     except anthropic.APIConnectionError as exc:
@@ -199,6 +257,20 @@ def _resume_schema() -> dict:
         "type": "object",
         "properties": {
             "text": {"type": "string", "description": RESUME_SPEC},
+            "suggested_strategy_tag": {
+                "type": "string",
+                "description": (
+                    "A short (3-6 word) hyphenated label for what's "
+                    "distinctive about THIS specific draft's approach for "
+                    "this posting - e.g. 'concise-2-page-ats-focused', "
+                    "'leadership-narrative-emphasis', 'federal-format-"
+                    "detailed'. This describes a real choice you made in "
+                    "writing this draft, not a fact about the candidate - "
+                    "state it directly, no hedging needed. Prefills the "
+                    "app's own 'strategy tag' field; the candidate can "
+                    "edit or clear it."
+                ),
+            },
             "ats_score": {
                 "type": "integer",
                 "description": (
@@ -236,22 +308,71 @@ def _resume_schema() -> dict:
                             "type": "string",
                             "description": "A direct, specific question whose answer is a genuine, checkable fact (a number, a name, a date) that would close this gap - not vague or stylistic.",
                         },
+                        "suggested_answer": {
+                            "type": "string",
+                            "description": (
+                                "A proposed starting draft for the answer, phrased as "
+                                "the candidate's own words - e.g. a plausible number/"
+                                "scope guess given the role and the rest of the "
+                                "profile ('Roughly 8-10 engineers, ~$2M budget?'). "
+                                "This is a suggestion to edit, never a stated fact - "
+                                "make that uncertainty visible in the phrasing itself "
+                                "(hedge words, a trailing '?') rather than asserting "
+                                "it. Leave as an empty string if you have no "
+                                "reasonable basis to propose anything."
+                            ),
+                        },
                     },
-                    "required": ["skill", "question"],
+                    "required": ["skill", "question", "suggested_answer"],
                     "additionalProperties": False,
                 },
                 "description": (
-                    "0-5 specific, directly answerable questions for real facts "
+                    "3-10 specific, directly answerable questions for real facts "
                     "this resume is currently missing that would raise the score "
                     "if the candidate actually has them - never invent the answer "
-                    "yourself, ask instead. Only include questions a real number/"
+                    "yourself, ask instead; use however many genuine gaps actually "
+                    "exist (sometimes only 3, up to 10 for a role with many gaps), "
+                    "don't pad to hit a count. Only include questions a real number/"
                     "name/date could answer. Skip anything already answered "
                     "elsewhere in the profile or that's purely about wording/"
                     "structure rather than a missing fact."
                 ),
             },
         },
-        "required": ["text", "ats_score", "ats_rationale", "ats_next_actions", "clarifying_questions"],
+        "required": ["text", "suggested_strategy_tag", "ats_score", "ats_rationale", "ats_next_actions", "clarifying_questions"],
+        "additionalProperties": False,
+    }
+
+
+def _apply_answers_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "apply_answers": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "label": {
+                            "type": "string",
+                            "description": "Short field label, matching how ATS forms usually phrase it.",
+                        },
+                        "value": {
+                            "type": "string",
+                            "description": (
+                                "Exact ready-to-paste answer text, or "
+                                "'[Not yet provided - ask Zahir]' if the profile "
+                                "doesn't contain this fact."
+                            ),
+                        },
+                    },
+                    "required": ["label", "value"],
+                    "additionalProperties": False,
+                },
+                "description": DOC_SPECS["apply_answers"],
+            },
+        },
+        "required": ["apply_answers"],
         "additionalProperties": False,
     }
 
@@ -265,7 +386,12 @@ def _draft_one(
     doc_index: int = 1,
     doc_total: int = 1,
 ):
-    schema = _resume_schema() if doc_key == "resume" else _schema([doc_key])
+    if doc_key == "resume":
+        schema = _resume_schema()
+    elif doc_key == "apply_answers":
+        schema = _apply_answers_schema()
+    else:
+        schema = _schema([doc_key])
     # The resume schema carries the text itself plus ats_score/rationale/
     # next_actions/clarifying_questions, and federal-format resumes alone
     # can run 3000+ tokens - give it real headroom rather than truncating
@@ -328,12 +454,48 @@ def _draft_one(
     if doc_key == "resume":
         return {
             "text": data.get("text", ""),
+            "suggested_strategy_tag": data.get("suggested_strategy_tag", ""),
             "ats_score": data.get("ats_score"),
             "ats_rationale": data.get("ats_rationale", ""),
             "ats_next_actions": data.get("ats_next_actions", []),
             "clarifying_questions": data.get("clarifying_questions", []),
         }
+    if doc_key == "apply_answers":
+        return data.get("apply_answers", [])
     return data.get(doc_key, "")
+
+
+def _lookup_company_address(client: "anthropic.Anthropic", organization: str, location: str | None) -> str | None:
+    """Looks up an organization's real mailing/headquarters address via the
+    Claude API's server-side web search tool, for the cover letter's
+    recipient block - never guessed, only used if a real source turns up.
+    Returns None on no confident match (docx_export.py's existing
+    "[Company Address]" placeholder is the fallback for that case)."""
+    location_hint = f" (job is located in {location})" if location else ""
+    try:
+        response = client.messages.create(
+            model=DEFAULT_MODEL,
+            max_tokens=300,
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
+            system=(
+                "Look up one company's real, current mailing or headquarters "
+                "address for a cover letter's recipient block. Search the web "
+                "and confirm it from the company's own site or another "
+                "reliable source - never guess or infer from the company's "
+                "name/industry alone. Reply with ONLY the address as 1-3 "
+                "short lines (street; city, state zip; country if not US) - "
+                "no company name, no commentary. If you cannot find a "
+                "confident, verifiable address, reply with exactly: NOT_FOUND"
+            ),
+            messages=[{"role": "user", "content": f"Company: {organization}{location_hint}"}],
+        )
+    except (anthropic.APIStatusError, anthropic.APIConnectionError):
+        return None
+
+    text = "".join(b.text for b in response.content if b.type == "text").strip()
+    if not text or text == "NOT_FOUND" or len(text) > 300:
+        return None
+    return text
 
 
 def generate_documents(
@@ -344,8 +506,9 @@ def generate_documents(
     on_progress=None,
 ) -> dict:
     """Drafts real, tailored document text for exactly the requested doc_keys
-    (subset of "resume", "cover_letter", "exec_bio", "leadership_summary"),
-    one API call per document type so progress is real, not simulated. The
+    (subset of "resume", "cover_letter", "exec_bio", "leadership_summary",
+    "apply_answers"), one API call per document type so progress is real,
+    not simulated. The
     job+profile context is identical across those calls and marked
     cacheable, so only the first call pays full price for it - subsequent
     ones in the same batch read it back at ~10% cost.
@@ -355,19 +518,40 @@ def generate_documents(
     with a live sub-status ("thinking...", "writing... (N characters so
     far)") as the response streams in.
     Returns {doc_key: drafted_text}, except "resume" maps to {"text": ...,
-    "ats_score": int, "ats_rationale": str, "ats_next_actions": [...],
-    "clarifying_questions": [{"skill": ..., "question": ...}]} instead of a
+    "suggested_strategy_tag": str, "ats_score": int, "ats_rationale": str,
+    "ats_next_actions": [...], "clarifying_questions": [{"skill": ...,
+    "question": ..., "suggested_answer": ...}]} instead of a
     plain string, since the resume is ATS-scored against this posting as
     part of the same drafting pass - clarifying_questions are gaps Claude
     couldn't close honestly without more real facts (never invented; ask,
     don't fabricate - see profile/interview.py's save_answer(), the same
-    mechanism this feeds back into via the Results tab). Raises
+    mechanism this feeds back into via the Results tab). "apply_answers"
+    maps to a list of {"label": ..., "value": ...} dicts (a ready-to-paste
+    packet for common ATS form fields) rather than a single string. Raises
     DraftingNotConfigured if no API key is set, DraftingFailed on
-    refusal/truncation/API error."""
+    refusal/truncation/API error.
+
+    When "cover_letter" is requested and this job hasn't been searched for
+    an address before, also looks up the organization's real mailing
+    address via a one-time web search (_lookup_company_address) and caches
+    it onto the job record (search.job_store.update_job_address) plus the
+    passed-in `job` dict in place, so callers building the cover letter's
+    .docx (app.py, dossier.py) can read job["organization_address"]
+    immediately after this call returns. Never falls back to a guessed
+    address - an unconfirmed lookup caches "" (searched, not found) so it
+    isn't re-searched every regenerate, and docx_export.py's own
+    "[Company Address]" placeholder covers that case."""
     if not doc_keys:
         return {}
 
     client = _client()
+    if "cover_letter" in doc_keys and "organization_address" not in job and job.get("organization"):
+        from search.job_store import update_job_address
+
+        address = _lookup_company_address(client, job["organization"], job.get("location")) or ""
+        job["organization_address"] = address
+        update_job_address(job.get("source"), job.get("job_id"), address)
+
     shared_context = [{
         "type": "text",
         "text": (

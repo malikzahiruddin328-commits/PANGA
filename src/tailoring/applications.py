@@ -61,8 +61,10 @@ def upsert_application(
     resume_ats_rationale: str | None = None,
     resume_ats_next_actions: list[str] | None = None,
     resume_clarifying_questions: list[dict] | None = None,
+    suggested_strategy_tag: str | None = None,
     documents_requested: list[str] | None = None,
     skip_reason: str | None = None,
+    apply_answers: list[dict] | None = None,
 ) -> None:
     """Creates or updates the application record for (source, job_id).
     Fields left as None don't overwrite previously saved values -
@@ -84,13 +86,26 @@ def upsert_application(
     profile/interview.py) so the fact helps every future job, not just this
     one. Pass [] explicitly to clear once answered - a fresh generation
     always sets this field, so an empty list here means "nothing left to
-    ask", distinct from None ("don't touch what's stored")."""
+    ask", distinct from None ("don't touch what's stored"). apply_answers is
+    the "Apply Assist" packet (PRD-adjacent, 2026-07-31): a list of
+    {"label": ..., "value": ...} ready-to-paste answers for an ATS form's
+    recurring fields, drafted the same way as the other documents - Zahir
+    still opens the real application and pastes/submits it himself, this
+    only removes the retyping. suggested_strategy_tag (2026-07-31) is a
+    short label Claude proposes describing what's distinctive about this
+    specific resume draft (e.g. "concise-2-page-ats-focused") - stored
+    separately from the real strategy_tag field (set_strategy_tag()) so a
+    fresh regenerate's suggestion never silently overwrites a tag Zahir
+    already saved himself; the Results tab prefills the strategy-tag input
+    with this only when strategy_tag is still empty."""
     applications = load_applications()
     for app in applications:
         if app["source"] == source and app["job_id"] == job_id:
             if app.get("status") != status:
                 app["status_updated_at"] = datetime.now(timezone.utc).isoformat()
             app["status"] = status
+            if any(t is not None for t in (resume_text, cover_letter_text, exec_bio_text, leadership_summary_text)):
+                app["documents_drafted_at"] = datetime.now(timezone.utc).isoformat()
             if resume_text is not None:
                 app["resume_text"] = resume_text
             if cover_letter_text is not None:
@@ -107,11 +122,15 @@ def upsert_application(
                 app["resume_ats_next_actions"] = resume_ats_next_actions
             if resume_clarifying_questions is not None:
                 app["resume_clarifying_questions"] = resume_clarifying_questions
+            if suggested_strategy_tag is not None:
+                app["strategy_tag_suggestion"] = suggested_strategy_tag
             if documents_requested is not None:
                 app["documents_requested"] = documents_requested
             if skip_reason is not None:
                 app["skip_reason"] = skip_reason
                 app["skip_reason_reviewed"] = False
+            if apply_answers is not None:
+                app["apply_answers"] = apply_answers
             _save_all(applications)
             _write_dossier(source, job_id)
             return
@@ -122,6 +141,12 @@ def upsert_application(
         "status": status,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status_updated_at": datetime.now(timezone.utc).isoformat(),
+        "documents_drafted_at": (
+            datetime.now(timezone.utc).isoformat()
+            if any(t is not None for t in (resume_text, cover_letter_text, exec_bio_text, leadership_summary_text))
+            else None
+        ),
+        "document_edit_review": None,
         "resume_text": resume_text,
         "cover_letter_text": cover_letter_text,
         "exec_bio_text": exec_bio_text,
@@ -130,12 +155,66 @@ def upsert_application(
         "resume_ats_rationale": resume_ats_rationale,
         "resume_ats_next_actions": resume_ats_next_actions if resume_ats_next_actions is not None else [],
         "resume_clarifying_questions": resume_clarifying_questions if resume_clarifying_questions is not None else [],
+        "strategy_tag_suggestion": suggested_strategy_tag,
         "documents_requested": documents_requested if documents_requested is not None else [],
         "skip_reason": skip_reason,
         "skip_reason_reviewed": False if skip_reason is not None else None,
+        "apply_answers": apply_answers if apply_answers is not None else [],
     })
     _save_all(applications)
     _write_dossier(source, job_id)
+
+
+def record_document_edit_review(source: str, job_id: str, documents: dict, reason: str) -> None:
+    """"Apply Assist edit review" (Zahir's request 2026-07-31): once he's
+    opened a drafted document's real .docx file (dossier.sync_workspace_
+    documents()) and possibly edited it, dossier.check_for_edits() diffs the
+    on-disk file against what's stored here and this function saves that
+    result plus his own required note on WHY he changed anything - so a
+    future Learn Engine pass can eventually reason about what edits Zahir
+    tends to make and why, not just whether he applied. `documents` is
+    whatever dossier.check_for_edits() returned (doc_key -> {"changed",
+    "diff"}); `reason` is required non-empty text - the Results tab only
+    calls this once Zahir has actually typed something, matching the same
+    "never save an invented/blank fact" convention as skip reasons and gap
+    answers elsewhere in this module. checked_at is a fresh timestamp,
+    always after documents_drafted_at at the moment this is called - that
+    ordering (not just presence) is what needs_edit_review() below checks,
+    so regenerating a document invalidates a stale review instead of
+    silently keeping stale reasoning attached to newly re-drafted text."""
+    applications = load_applications()
+    for app in applications:
+        if app["source"] == source and app["job_id"] == job_id:
+            app["document_edit_review"] = {
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+                "documents": documents,
+                "reason": reason,
+            }
+            _save_all(applications)
+            _write_dossier(source, job_id)
+            return
+
+
+def needs_edit_review(app_record: dict) -> bool:
+    """True if this application has at least one drafted prose document
+    (resume/cover letter/exec bio/leadership summary) and no completed edit
+    review since the last time any of them was (re)drafted - i.e. Zahir
+    hasn't yet confirmed whether he changed anything and why. Pure/no store
+    I/O, so the Results tab can call it on an already-loaded record without
+    an extra read. Used to gate marking a job "applied" (Zahir's explicit
+    request: a hard block, not just a nag)."""
+    has_any_document = any(
+        app_record.get(field) for field in ("resume_text", "cover_letter_text", "exec_bio_text", "leadership_summary_text")
+    )
+    if not has_any_document:
+        return False
+    drafted_at = app_record.get("documents_drafted_at")
+    review = app_record.get("document_edit_review")
+    if not review or not (review.get("reason") or "").strip():
+        return True
+    if drafted_at and review.get("checked_at", "") < drafted_at:
+        return True
+    return False
 
 
 def set_strategy_tag(source: str, job_id: str, strategy_tag: str) -> None:

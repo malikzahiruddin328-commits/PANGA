@@ -17,6 +17,7 @@ from security.crypto_store import read_json, write_json
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 TARGET_ACCOUNTS_PATH = PROJECT_ROOT / "data" / "target_accounts" / "target_accounts.json"
+WEBSITE_LOOKUP_COST_PATH = PROJECT_ROOT / "data" / "target_accounts" / "website_lookup_cost.json"
 
 MANUAL_STATUSES = ("contacted", "stale", "disqualified")
 
@@ -97,5 +98,35 @@ def set_status(company_name: str, status: str, notes: str | None = None) -> None
             acc["status"] = status
             if notes is not None:
                 acc["notes"] = notes
+            _save_all(accounts)
+            return
+
+
+def load_website_lookup_cost() -> dict:
+    """Real spend from the last "Look up website" batch run (Zahir's
+    explicit ask 2026-07-31 - the button should show the actual $ from the
+    last run, not a generic cost warning). {"cost": float, "count": int,
+    "at": iso timestamp} - default to zeroed-out values before any run."""
+    return read_json(WEBSITE_LOOKUP_COST_PATH, default={"cost": 0.0, "count": 0, "at": None})
+
+
+def save_website_lookup_cost(cost: float, count: int) -> None:
+    write_json(WEBSITE_LOOKUP_COST_PATH, {
+        "cost": cost,
+        "count": count,
+        "at": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+def set_website(company_name: str, website: str) -> None:
+    """Caches a looked-up company website URL on the account record - ""
+    is a valid cached value meaning "searched, genuinely not found",
+    distinct from the "website" key being absent entirely (never searched
+    yet). See prospector.company_lookup.lookup_company_website() for the
+    actual search."""
+    accounts = load_target_accounts()
+    for acc in accounts:
+        if acc["company_name"].lower() == company_name.lower():
+            acc["website"] = website
             _save_all(accounts)
             return

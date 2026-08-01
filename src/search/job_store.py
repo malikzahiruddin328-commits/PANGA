@@ -85,6 +85,20 @@ def add_manual_job(
     return job
 
 
+def update_job_address(source: str, job_id: str, address: str) -> None:
+    """Caches a company's real mailing address (found via a one-time web
+    search in tailoring/drafting.py, for the cover letter's recipient
+    block) on the job record so it isn't re-searched on every regenerate.
+    "" is a valid cached value meaning "searched, genuinely not found" -
+    distinct from the key being absent, which means "never searched yet"."""
+    jobs = load_jobs()
+    for job in jobs:
+        if job.get("source") == source and job.get("job_id") == job_id:
+            job["organization_address"] = address
+            break
+    write_json(JOBS_PATH, jobs)
+
+
 def update_job_score(source: str, job_id: str, fit_score: int, fit_rationale: str) -> None:
     """fit_score is 0-100: how well this job matches the master profile,
     per PRD §3 "Fit + Tailoring". Computed by Claude reasoning over the job
