@@ -377,57 +377,15 @@ if active_tab == "settings":
             new_doc_file, new_doc_file.name, doc_category,
             target_title=doc_target_title or None, note=doc_note or None,
         )
-        st.toast(f"Saved {entry['source_file']} ({entry['word_count']} words).", icon=":material/check_circle:")
+        toast_msg = f"Saved {entry['source_file']} ({entry['word_count']} words)."
+        if doc_category == "resume":
+            # Nudge straight to the next real step (Zahir's ask: a saved
+            # resume should point at what to do with it, not just confirm
+            # the save) - target roles/industries sits right below now,
+            # not several unrelated sections down the page.
+            toast_msg += " Add your target industries below to generate your target roles."
+        st.toast(toast_msg, icon=":material/check_circle:")
         st.rerun()
-
-    st.divider()
-    st.subheader("LinkedIn profile")
-    st.markdown(
-        "Upload a PDF export of your current LinkedIn profile - either "
-        "LinkedIn's own \"Save to PDF\" (from your profile page: click "
-        "\"More\" under your name, then \"Save to PDF\"), or a browser "
-        "print-to-PDF of the profile page. Both are things you export "
-        "yourself from your own logged-in session - Panga never logs into "
-        "LinkedIn, scrapes it, or posts anything there itself. Analysis and "
-        "suggestions show up on the LinkedIn tab."
-    )
-    linkedin_data = load_linkedin_profile()
-    uploaded_linkedin_files = st.file_uploader(
-        "LinkedIn profile PDF(s)", type=["pdf"], accept_multiple_files=True, key="settings_linkedin_pdf",
-        help="You can upload one file or several (e.g. the LinkedIn export and a printed profile page) - text from all of them is combined.",
-    )
-    if st.button("Save LinkedIn profile", type="primary", disabled=not uploaded_linkedin_files):
-        parts = []
-        source_files = []
-        for f in uploaded_linkedin_files:
-            text = extract_text_from_pdf(f)
-            parts.append(f"--- {f.name} ---\n{text}")
-            source_files.append(f.name)
-        save_snapshot("\n\n".join(parts), source_files, saved_at=datetime.now().isoformat(timespec="seconds"))
-        st.toast("Saved. Go to the LinkedIn tab, or ask Claude Code to analyze/enhance your profile.", icon=":material/check_circle:")
-        st.rerun()
-    if linkedin_data.get("last_saved"):
-        st.markdown(f"Last saved: {linkedin_data['last_saved']} (from {', '.join(linkedin_data.get('source_files', []))})")
-
-    st.divider()
-    st.subheader("LinkedIn connections")
-    st.markdown(
-        "Upload your LinkedIn connections export (Settings > Data Privacy > "
-        "\"Get a copy of your data\" > check Connections only, then download "
-        "the resulting CSV) to help find who to reach out to on the "
-        "Prospector tab: connections whose title looks like a recruiter, and "
-        "connections who work at a company already in your target accounts "
-        "list."
-    )
-    connections_snapshot = load_connections_snapshot()
-    uploaded_connections_csv = st.file_uploader("LinkedIn connections CSV", type=["csv"], key="settings_connections_csv")
-    if st.button("Save connections", type="primary", disabled=not uploaded_connections_csv):
-        parsed = parse_connections_csv(uploaded_connections_csv)
-        save_connections(parsed, uploaded_connections_csv.name, saved_at=datetime.now().isoformat(timespec="seconds"))
-        st.toast(f"Saved {len(parsed)} connection(s).", icon=":material/check_circle:")
-        st.rerun()
-    if connections_snapshot.get("last_saved"):
-        st.markdown(f"Last saved: {connections_snapshot['last_saved']} ({len(connections_snapshot['connections'])} connections from {connections_snapshot.get('source_file')})")
 
     st.divider()
     st.header("Target roles and industries")
@@ -517,6 +475,55 @@ if active_tab == "settings":
         profile_for_settings["seniority"] = seniority_text.strip()
         save_profile(profile_for_settings)
         st.success("Saved.")
+
+    st.divider()
+    st.subheader("LinkedIn profile")
+    st.markdown(
+        "Upload a PDF export of your current LinkedIn profile - either "
+        "LinkedIn's own \"Save to PDF\" (from your profile page: click "
+        "\"More\" under your name, then \"Save to PDF\"), or a browser "
+        "print-to-PDF of the profile page. Both are things you export "
+        "yourself from your own logged-in session - Panga never logs into "
+        "LinkedIn, scrapes it, or posts anything there itself. Analysis and "
+        "suggestions show up on the LinkedIn tab."
+    )
+    linkedin_data = load_linkedin_profile()
+    uploaded_linkedin_files = st.file_uploader(
+        "LinkedIn profile PDF(s)", type=["pdf"], accept_multiple_files=True, key="settings_linkedin_pdf",
+        help="You can upload one file or several (e.g. the LinkedIn export and a printed profile page) - text from all of them is combined.",
+    )
+    if st.button("Save LinkedIn profile", type="primary", disabled=not uploaded_linkedin_files):
+        parts = []
+        source_files = []
+        for f in uploaded_linkedin_files:
+            text = extract_text_from_pdf(f)
+            parts.append(f"--- {f.name} ---\n{text}")
+            source_files.append(f.name)
+        save_snapshot("\n\n".join(parts), source_files, saved_at=datetime.now().isoformat(timespec="seconds"))
+        st.toast("Saved. Go to the LinkedIn tab, or ask Claude Code to analyze/enhance your profile.", icon=":material/check_circle:")
+        st.rerun()
+    if linkedin_data.get("last_saved"):
+        st.markdown(f"Last saved: {linkedin_data['last_saved']} (from {', '.join(linkedin_data.get('source_files', []))})")
+
+    st.divider()
+    st.subheader("LinkedIn connections")
+    st.markdown(
+        "Upload your LinkedIn connections export (Settings > Data Privacy > "
+        "\"Get a copy of your data\" > check Connections only, then download "
+        "the resulting CSV) to help find who to reach out to on the "
+        "Prospector tab: connections whose title looks like a recruiter, and "
+        "connections who work at a company already in your target accounts "
+        "list."
+    )
+    connections_snapshot = load_connections_snapshot()
+    uploaded_connections_csv = st.file_uploader("LinkedIn connections CSV", type=["csv"], key="settings_connections_csv")
+    if st.button("Save connections", type="primary", disabled=not uploaded_connections_csv):
+        parsed = parse_connections_csv(uploaded_connections_csv)
+        save_connections(parsed, uploaded_connections_csv.name, saved_at=datetime.now().isoformat(timespec="seconds"))
+        st.toast(f"Saved {len(parsed)} connection(s).", icon=":material/check_circle:")
+        st.rerun()
+    if connections_snapshot.get("last_saved"):
+        st.markdown(f"Last saved: {connections_snapshot['last_saved']} ({len(connections_snapshot['connections'])} connections from {connections_snapshot.get('source_file')})")
 
     st.divider()
     st.header("Data recovery")

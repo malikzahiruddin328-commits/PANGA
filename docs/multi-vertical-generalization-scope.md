@@ -23,6 +23,17 @@ none of that infrastructure produces something sellable. Worth sequencing
 this branch's core pieces early relative to the others, not as an
 afterthought once they're done.
 
+## Progress (updated 2026-08-01)
+
+Design points 1, 2, 3, and 5 below are done — vertical/seniority intake,
+resume-driven title-ladder + target-role generation, and user-editable
+disqualifiers are all built, tested (70 existing tests pass, no
+regressions), and manually verified in the browser including the
+fresh-install/new-user path. Point 4 (Prospector) is intentionally still
+untouched per its own "incremental, not speculative" design. What's left
+on this branch: nothing identified yet beyond point 4's eventual
+demand-driven builds, which aren't this branch's job to start early.
+
 ## What's currently hardcoded (the problem)
 
 - **CISO/security-officer-title disqualification** — Zahir's personal
@@ -40,31 +51,56 @@ afterthought once they're done.
 ## Design (converged 2026-07-31)
 
 ### 1. Vertical/industry intake, after resume + support-doc ingestion
-New intake step: ask the user's desired industries/verticals directly —
-**not** a hardcoded dropdown. Trades vary too widely to enumerate up front,
-and even within one trade the target companies differ hugely by
-sub-vertical (a chemical engineer targeting nuclear plants needs different
-target-account signals than one targeting plastics/injection-molding
-plants). Free-text or tag-style input, not a fixed picklist.
+**Status: done (2026-08-01).** New intake step: ask the user's desired
+industries/verticals directly — **not** a hardcoded dropdown. Trades vary
+too widely to enumerate up front, and even within one trade the target
+companies differ hugely by sub-vertical (a chemical engineer targeting
+nuclear plants needs different target-account signals than one targeting
+plastics/injection-molding plants). Free-text or tag-style input, not a
+fixed picklist.
+
+Implementation: the Settings tab's previously-decorative "Industries" box
+(free text, one per line) is now the real intake field, plus a new
+self-reported seniority field alongside it. The whole "Target roles and
+industries" section was reordered to sit directly after the Documents
+section (before LinkedIn profile/connections, which aren't part of the
+intake) so it actually reads as "the next step after resume ingestion"
+rather than a settings box several unrelated sections down the page.
+Saving a resume now nudges the user toward it via the save toast.
 
 ### 2. Title-ladder generation, resume-driven + live-reasoning
-Job titles prefilled from the resume, then cross-checked against a live
-Claude reasoning pass: "what's the standard title ladder for this
-trade/vertical" — a physician's ladder looks nothing like a nurse
-practitioner's, which looks nothing like a chemical engineer's. This
-extends the **existing** `src/skills/` role/skill lookup mechanism (build
-step 2 in the original PRD) to be vertical-aware, rather than building a
-new system from scratch — that mechanism is already live-reasoning-based,
-not a static table, which is the right foundation for this.
+**Status: done (2026-08-01).** Job titles prefilled from the resume, then
+cross-checked against a live Claude reasoning pass: "what's the standard
+title ladder for this trade/vertical" — a physician's ladder looks nothing
+like a nurse practitioner's, which looks nothing like a chemical
+engineer's. This extends the **existing** `src/skills/` role/skill lookup
+mechanism (build step 2 in the original PRD) to be vertical-aware, rather
+than building a new system from scratch — that mechanism is already
+live-reasoning-based, not a static table, which is the right foundation
+for this.
+
+Implementation: `tailoring.drafting.generate_target_roles()` (one reasoning
+call) writes the generated ladder into `src/skills/role_skills.json` via a
+new `skills.lookup.save_role_skills()`, giving that "grows over time" file
+its first real caller beyond the original hand-built Lifesciences/Pharma
+entry.
 
 ### 3. Per-user `target_roles`/weights, reasoning-generated
-Generated via a reasoning pass over: resume content + self-reported
-seniority + years of real-world experience + the chosen verticals from
-step 1 — proposing adjacent/equivalent roles the user might not have
-listed themselves (the same spirit as Zahir's own `config/settings.yaml`
-starter weights, but generated per-user instead of hand-typed). Loads into
-the **existing** Settings `st.data_editor` target-roles table so the user
-reviews/edits a proposed starter set rather than typing weights in blind.
+**Status: done (2026-08-01).** Generated via a reasoning pass over: resume
+content + self-reported seniority + years of real-world experience + the
+chosen verticals from step 1 — proposing adjacent/equivalent roles the
+user might not have listed themselves (the same spirit as Zahir's own
+`config/settings.yaml` starter weights, but generated per-user instead of
+hand-typed). Loads into the **existing** Settings `st.data_editor`
+target-roles table so the user reviews/edits a proposed starter set rather
+than typing weights in blind.
+
+Implementation: same `generate_target_roles()` call as point 2 returns both
+the ladder and the proposed `target_roles`/weights list; the Settings
+tab's "Generate my target roles from my resume" button prefills the
+existing editor (folding a generation counter into the widget key so a
+fresh generation actually replaces stale values, not Streamlit's usual
+key-persistence trap).
 
 ### 4. Prospector stays life-sciences-specific for now — build incrementally
 **Do not** try to pre-build signal sources for every trade speculatively.
@@ -77,11 +113,26 @@ empty/wrong data). Matches the standing architecture principle already in
 the PRD: "should not be over-engineered for scale it doesn't need yet."
 
 ### 5. Disqualifiers become user-editable
-The CISO-rule pattern (a real, non-obvious personal disqualifier despite
-otherwise-matching experience) generalizes to: gather this kind of
-disqualifier during the **existing** gap-probing interview
-(`src/profile/interview.py`), store it per-user, and apply it in scoring
-instructions — not hardcoded in Python for one person.
+**Status: done (2026-08-01).** The CISO-rule pattern (a real, non-obvious
+personal disqualifier despite otherwise-matching experience) generalizes
+to: gather this kind of disqualifier during the **existing** gap-probing
+interview (`src/profile/interview.py`), store it per-user, and apply it in
+scoring instructions — not hardcoded in Python for one person.
+
+Implementation note: the live "gap-probing interview" turned out to be the
+resume-drafting flow's `clarifying_questions` (Results tab, per-job) —
+`src/profile/interview.py`'s own `detect_gaps()` function was already
+dead code (no UI ever called it) before this change, so that's the
+mechanism this extends, not that one. Confirmed with Zahir 2026-08-01
+(chose the reactive option: disqualifiers surface organically when Claude
+notices a borderline posting during drafting, not a static upfront
+question, since a new user usually can't name their own disqualifiers in
+the abstract before seeing a real borderline case). `save_answer()` gained
+an `is_disqualifier` flag on `gap_interview_answers` entries;
+`SCORE_SYSTEM_PROMPT` reads it generically instead of hardcoding the CISO
+text. `detect_gaps()`/`role_skills.json` remain wired up (now with real
+data via point 2 above) but still have no caller — still available for a
+future upfront-gap-check feature if one gets built.
 
 ## Explicitly out of scope for this branch
 
