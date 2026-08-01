@@ -193,3 +193,21 @@ Items this BRD depends on or surfaces:
 - Microsoft Store submission prerequisites: code-signing certificate,
   Company developer account, demo/test license for reviewers, Live
   Generative AI disclosure + reporting mechanism (new, this document)
+
+## 11. Real-Cost Table (researched 2026-08-01, verify before committing spend)
+
+Every line item across this BRD and the PRD backlog with an actual dollar
+cost, in one place. "$0" items are prioritized first per Zahir's explicit
+instruction (2026-08-01) — nothing with a real cost gets scheduled
+alongside the free work by default.
+
+| Line item | Real cost | Frequency | Notes |
+|---|---|---|---|
+| Stripe card processing | 2.9% + $0.30/charge | Per transaction | Scales with revenue only, $0 upfront |
+| Stripe Billing (subscriptions) | +0.5% of subscription volume | Per transaction | Same — no upfront cost |
+| Supabase (licensing branch's backend) | $0 (free tier) → $25/mo (Pro) | Monthly, only once free-tier limits are exceeded | Free tier covers 500MB DB / 50,000 MAU / 5GB egress — almost certainly enough at launch scale |
+| Code-signing certificate | ~$211-226/yr (Sectigo, cheapest legitimate option) up to $399-560/yr (DigiCert standard/EV) | **Annual, recurring** — a 2026 CA/Browser-Forum rule caps validity at ~1 year, no more multi-year one-time buys | Only needed for Store distribution or a Store-linked direct-download URL; avoided entirely by pure direct-download distribution |
+| Microsoft Partner Center developer account | **$0** — corrected 2026-08-01; Microsoft removed the former $99 Company-account fee as of May 2026 | One-time | Both Individual and Company accounts are free to register now |
+| Google CASA security assessment (Gmail OAuth scaling, Option 3 only) | $500-$4,500/yr depending on assessment tier | **Annual, recurring** | Google charges nothing directly — the fee goes to an independent third-party assessor. Deliberately deferred until real customer volume justifies it |
+
+**Not yet priced** (out of scope until asked): a marketing/sales website's own domain and hosting costs, any paid marketing spend, legal review of the ToS/EULA if Zahir wants a lawyer's pass instead of a self-drafted version.
