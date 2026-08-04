@@ -25,6 +25,7 @@ from llm_client import (
     get_client as _client,
     is_configured,
 )
+from tailoring.ats_score import score_resume_ats
 
 RESUME_SPEC = (
     "Tailored resume text for this specific job, written to be ATS-perfect - "
@@ -296,12 +297,16 @@ def _schema(doc_keys: list[str]) -> dict:
 
 def _resume_schema() -> dict:
     # The resume gets a richer schema than the other doc types: alongside
-    # the text itself, Claude self-assesses how well that exact text would
-    # score in a real ATS keyword/structure match against this posting -
-    # same "score + why + how to raise it" shape as Prospector Score and
-    # LinkedIn's profile-strength score elsewhere in this app, computed in
-    # the same pass so the assessment is grounded in the text actually
-    # produced, not a separate guess.
+    # the text itself, it carries clarifying_questions for real facts that
+    # would close a gap. ats_score/ats_rationale/ats_next_actions are
+    # deliberately NOT part of this schema - they used to be a free-text
+    # Claude self-assessment made in the same call that wrote the resume,
+    # which is an independent, memoryless AI guess every time (no memory of
+    # the previous score or what changed), and produced a score that never
+    # moved no matter what was edited. tailoring.ats_score.score_resume_ats()
+    # computes those three fields deterministically after this call returns,
+    # from real keyword-overlap arithmetic against the drafted text - see
+    # generate_documents() below.
     return {
         "type": "object",
         "properties": {
@@ -318,30 +323,6 @@ def _resume_schema() -> dict:
                     "state it directly, no hedging needed. Prefills the "
                     "app's own 'strategy tag' field; the candidate can "
                     "edit or clear it."
-                ),
-            },
-            "ats_score": {
-                "type": "integer",
-                "description": (
-                    "0-100 estimate of how well THIS resume text would score when "
-                    "parsed by a typical Applicant Tracking System and matched "
-                    "against this specific job posting - keyword/skill overlap "
-                    "with the posting's stated requirements, standard parseable "
-                    "structure, title alignment. Be honest, not generous."
-                ),
-            },
-            "ats_rationale": {
-                "type": "string",
-                "description": "1-3 sentences: what matched well, what's weak or missing.",
-            },
-            "ats_next_actions": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": (
-                    "2-5 concrete, specific actions that would raise the score - "
-                    "e.g. a specific keyword/skill from the posting to add IF the "
-                    "candidate's real profile supports it, or honestly note that a "
-                    "gap can't be closed without real experience they don't have."
                 ),
             },
             "clarifying_questions": {
@@ -421,7 +402,7 @@ def _resume_schema() -> dict:
                 ),
             },
         },
-        "required": ["text", "suggested_strategy_tag", "ats_score", "ats_rationale", "ats_next_actions", "clarifying_questions"],
+        "required": ["text", "suggested_strategy_tag", "clarifying_questions"],
         "additionalProperties": False,
     }
 
@@ -467,6 +448,7 @@ def _draft_one(
     on_progress=None,
     doc_index: int = 1,
     doc_total: int = 1,
+    job: dict | None = None,
 ):
     if doc_key == "resume":
         schema = _resume_schema()
@@ -474,10 +456,10 @@ def _draft_one(
         schema = _apply_answers_schema()
     else:
         schema = _schema([doc_key])
-    # The resume schema carries the text itself plus ats_score/rationale/
-    # next_actions/clarifying_questions, and federal-format resumes alone
-    # can run 3000+ tokens - give it real headroom rather than truncating
-    # (hit for real during testing at 6000 with a federal-length resume).
+    # The resume schema carries the text itself plus suggested_strategy_tag/
+    # clarifying_questions, and federal-format resumes alone can run 3000+
+    # tokens - give it real headroom rather than truncating (hit for real
+    # during testing at 6000 with a federal-length resume).
     max_tokens = 20000 if doc_key == "resume" else 6000
 
     def _progress(substatus):
@@ -500,12 +482,19 @@ def _draft_one(
     )
 
     if doc_key == "resume":
+        resume_text = data.get("text", "")
+        posting_text = "\n".join(filter(None, [
+            (job or {}).get("title"),
+            (job or {}).get("qualification_summary"),
+            (job or {}).get("description"),
+        ]))
+        ats = score_resume_ats(posting_text, resume_text)
         return {
-            "text": data.get("text", ""),
+            "text": resume_text,
             "suggested_strategy_tag": data.get("suggested_strategy_tag", ""),
-            "ats_score": data.get("ats_score"),
-            "ats_rationale": data.get("ats_rationale", ""),
-            "ats_next_actions": data.get("ats_next_actions", []),
+            "ats_score": ats["ats_score"],
+            "ats_rationale": ats["ats_rationale"],
+            "ats_next_actions": ats["ats_next_actions"],
             "clarifying_questions": data.get("clarifying_questions", []),
         }
     if doc_key == "apply_answers":
@@ -564,11 +553,18 @@ def generate_documents(
     "suggested_strategy_tag": str, "ats_score": int, "ats_rationale": str,
     "ats_next_actions": [...], "clarifying_questions": [{"skill": ...,
     "question": ..., "suggested_answer": ...}]} instead of a
-    plain string, since the resume is ATS-scored against this posting as
-    part of the same drafting pass - clarifying_questions are gaps Claude
-    couldn't close honestly without more real facts (never invented; ask,
-    don't fabricate - see profile/interview.py's save_answer(), the same
-    mechanism this feeds back into via the Results tab). "apply_answers"
+    plain string. ats_score/ats_rationale/ats_next_actions are computed
+    deterministically by tailoring.ats_score.score_resume_ats() from real
+    keyword-overlap arithmetic between the posting's own text (title +
+    qualification_summary/description, whichever this job record has - see
+    search/job_store.py) and the resume text Claude just wrote, right after
+    this call returns - not asked of the same API call that drafted the
+    text, which used to be an independent AI guess every time with no real
+    comparison happening and a score that never moved no matter what
+    changed. clarifying_questions are gaps Claude couldn't close honestly
+    without more real facts (never invented; ask, don't fabricate - see
+    profile/interview.py's save_answer(), the same mechanism this feeds
+    back into via the Results tab). "apply_answers"
     maps to a list of {"label": ..., "value": ...} dicts (a ready-to-paste
     packet for common ATS form fields) rather than a single string. Raises
     DraftingNotConfigured if no API key is set, DraftingFailed on
@@ -609,7 +605,7 @@ def generate_documents(
     for i, doc_key in enumerate(doc_keys, start=1):
         if on_progress:
             on_progress(i, total, doc_key)
-        results[doc_key] = _draft_one(client, shared_context, doc_key, model, on_progress, i, total)
+        results[doc_key] = _draft_one(client, shared_context, doc_key, model, on_progress, i, total, job)
     return results
 
 
