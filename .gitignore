@@ -23,3 +23,6 @@ Thumbs.db
 
 # Worktree metadata for parallel feature-branch sessions - not real content
 .claude/worktrees/
+
+# Supabase CLI local build/link cache - machine-specific, not real content
+license-service/supabase/.temp/
