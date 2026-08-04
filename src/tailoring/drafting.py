@@ -25,6 +25,7 @@ from llm_client import (
     get_client as _client,
     is_configured,
 )
+from tailoring.ats_score import score_resume_against_keywords, score_resume_ats
 
 RESUME_SPEC = (
     "Tailored resume text for this specific job, written to be ATS-perfect - "
@@ -238,6 +239,86 @@ def generate_target_roles(resume_text: str, industries: list[str], seniority: st
     return data
 
 
+ATS_KEYWORDS_SYSTEM_PROMPT = """You are extracting the literal keywords/skills/tools/certifications a job posting itself asks for, for a deterministic ATS keyword-match scorer downstream - you are NOT scoring or judging fit, just pulling out real terms that are actually present in the posting's text.
+
+Rules:
+- Only extract terms that genuinely appear in the posting (as words/phrases or unmistakable synonyms of them, e.g. "Excel" for "Microsoft Excel") - never invent a skill the posting doesn't mention.
+- required_keywords: terms from a "required"/"minimum qualifications"/"must-have" section, or stated as mandatory even without an explicit section header.
+- preferred_keywords: terms from a "preferred"/"desired"/"nice-to-have"/"bonus" section, or that read as a plus rather than mandatory.
+- If the posting doesn't clearly separate required vs preferred, use your best judgment on which items read as mandatory vs a plus - don't force a 50/50 split.
+- Keep each term short (1-4 words) and in the posting's own wording - e.g. "SQL", "AWS", "Project Management", "Agile", "PMP certification" - not full sentences or restated requirements.
+- If the posting text is boilerplate/empty/has no real requirements in it at all, return empty lists for both - do not pad with generic guesses."""
+
+
+def _ats_keywords_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "required_keywords": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Short (1-4 word) required/must-have terms taken directly from the posting's own wording. Empty list if none are genuinely stated.",
+            },
+            "preferred_keywords": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Short (1-4 word) preferred/nice-to-have terms taken directly from the posting's own wording. Empty list if none are genuinely stated.",
+            },
+        },
+        "required": ["required_keywords", "preferred_keywords"],
+        "additionalProperties": False,
+    }
+
+
+def _extract_ats_keywords(client: "anthropic.Anthropic", job: dict, model: str | None = None) -> tuple[list[str], list[str]]:
+    """One real-NLP-judgment AI call that pulls the literal required/
+    preferred keyword list out of this job's own posting text (title +
+    qualification_summary/description, whichever this job record has - see
+    search/job_store.py). This is the piece regex heuristics can't do well
+    (real language understanding of what's mandatory vs a nice-to-have in
+    messy scraped prose) - everything downstream (the actual score) stays
+    deterministic counting against this list, done by
+    ats_score.score_resume_against_keywords(), not another AI guess.
+
+    Cached on the job record (search.job_store.update_job_ats_keywords) so
+    the same posting always scores against the same keyword list rather
+    than re-extracting (and potentially drifting) on every regenerate -
+    same caching shape as _lookup_company_address's organization_address.
+    Returns ([], []) without caching on any drafting failure, so a
+    transient API error doesn't permanently freeze a job at "no keywords
+    found" - the caller falls back to the local heuristic for that one
+    draft and the next regenerate gets another real attempt."""
+    posting_text = "\n".join(filter(None, [
+        job.get("title"), job.get("qualification_summary"), job.get("description"),
+    ]))
+    if not posting_text.strip():
+        return [], []
+    try:
+        data = call_structured(
+            client,
+            system=ATS_KEYWORDS_SYSTEM_PROMPT,
+            user_content=f"JOB POSTING:\n{posting_text}",
+            schema=_ats_keywords_schema(),
+            max_tokens=1500,
+            model=model,
+            effort="medium",
+            refusal_message="Claude declined to extract ATS keywords.",
+        )
+    except (DraftingNotConfigured, DraftingFailed):
+        return [], []
+
+    required = data.get("required_keywords") or []
+    preferred = data.get("preferred_keywords") or []
+
+    from search.job_store import update_job_ats_keywords
+
+    job["ats_required_keywords"] = required
+    job["ats_preferred_keywords"] = preferred
+    if job.get("source") and job.get("job_id"):
+        update_job_ats_keywords(job["source"], job["job_id"], required, preferred)
+    return required, preferred
+
+
 def _score_schema() -> dict:
     return {
         "type": "object",
@@ -296,12 +377,16 @@ def _schema(doc_keys: list[str]) -> dict:
 
 def _resume_schema() -> dict:
     # The resume gets a richer schema than the other doc types: alongside
-    # the text itself, Claude self-assesses how well that exact text would
-    # score in a real ATS keyword/structure match against this posting -
-    # same "score + why + how to raise it" shape as Prospector Score and
-    # LinkedIn's profile-strength score elsewhere in this app, computed in
-    # the same pass so the assessment is grounded in the text actually
-    # produced, not a separate guess.
+    # the text itself, it carries clarifying_questions for real facts that
+    # would close a gap. ats_score/ats_rationale/ats_next_actions are
+    # deliberately NOT part of this schema - they used to be a free-text
+    # Claude self-assessment made in the same call that wrote the resume,
+    # which is an independent, memoryless AI guess every time (no memory of
+    # the previous score or what changed), and produced a score that never
+    # moved no matter what was edited. tailoring.ats_score.score_resume_ats()
+    # computes those three fields deterministically after this call returns,
+    # from real keyword-overlap arithmetic against the drafted text - see
+    # generate_documents() below.
     return {
         "type": "object",
         "properties": {
@@ -318,30 +403,6 @@ def _resume_schema() -> dict:
                     "state it directly, no hedging needed. Prefills the "
                     "app's own 'strategy tag' field; the candidate can "
                     "edit or clear it."
-                ),
-            },
-            "ats_score": {
-                "type": "integer",
-                "description": (
-                    "0-100 estimate of how well THIS resume text would score when "
-                    "parsed by a typical Applicant Tracking System and matched "
-                    "against this specific job posting - keyword/skill overlap "
-                    "with the posting's stated requirements, standard parseable "
-                    "structure, title alignment. Be honest, not generous."
-                ),
-            },
-            "ats_rationale": {
-                "type": "string",
-                "description": "1-3 sentences: what matched well, what's weak or missing.",
-            },
-            "ats_next_actions": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": (
-                    "2-5 concrete, specific actions that would raise the score - "
-                    "e.g. a specific keyword/skill from the posting to add IF the "
-                    "candidate's real profile supports it, or honestly note that a "
-                    "gap can't be closed without real experience they don't have."
                 ),
             },
             "clarifying_questions": {
@@ -421,7 +482,7 @@ def _resume_schema() -> dict:
                 ),
             },
         },
-        "required": ["text", "suggested_strategy_tag", "ats_score", "ats_rationale", "ats_next_actions", "clarifying_questions"],
+        "required": ["text", "suggested_strategy_tag", "clarifying_questions"],
         "additionalProperties": False,
     }
 
@@ -467,6 +528,7 @@ def _draft_one(
     on_progress=None,
     doc_index: int = 1,
     doc_total: int = 1,
+    job: dict | None = None,
 ):
     if doc_key == "resume":
         schema = _resume_schema()
@@ -474,10 +536,10 @@ def _draft_one(
         schema = _apply_answers_schema()
     else:
         schema = _schema([doc_key])
-    # The resume schema carries the text itself plus ats_score/rationale/
-    # next_actions/clarifying_questions, and federal-format resumes alone
-    # can run 3000+ tokens - give it real headroom rather than truncating
-    # (hit for real during testing at 6000 with a federal-length resume).
+    # The resume schema carries the text itself plus suggested_strategy_tag/
+    # clarifying_questions, and federal-format resumes alone can run 3000+
+    # tokens - give it real headroom rather than truncating (hit for real
+    # during testing at 6000 with a federal-length resume).
     max_tokens = 20000 if doc_key == "resume" else 6000
 
     def _progress(substatus):
@@ -500,12 +562,30 @@ def _draft_one(
     )
 
     if doc_key == "resume":
+        resume_text = data.get("text", "")
+        job = job or {}
+        required_kw = job.get("ats_required_keywords")
+        preferred_kw = job.get("ats_preferred_keywords")
+        if required_kw is not None and preferred_kw is not None:
+            # AI-extracted keyword list already cached on the job record
+            # (generate_documents() ensures this before calling _draft_one) -
+            # the real-NLP-judgment path, see _extract_ats_keywords().
+            ats = score_resume_against_keywords(required_kw, preferred_kw, resume_text)
+        else:
+            # Extraction was never attempted/failed for this job (e.g. no
+            # posting text, or a transient API error) - fall back to the
+            # dependency-free regex heuristic rather than leaving the
+            # resume unscored.
+            posting_text = "\n".join(filter(None, [
+                job.get("title"), job.get("qualification_summary"), job.get("description"),
+            ]))
+            ats = score_resume_ats(posting_text, resume_text)
         return {
-            "text": data.get("text", ""),
+            "text": resume_text,
             "suggested_strategy_tag": data.get("suggested_strategy_tag", ""),
-            "ats_score": data.get("ats_score"),
-            "ats_rationale": data.get("ats_rationale", ""),
-            "ats_next_actions": data.get("ats_next_actions", []),
+            "ats_score": ats["ats_score"],
+            "ats_rationale": ats["ats_rationale"],
+            "ats_next_actions": ats["ats_next_actions"],
             "clarifying_questions": data.get("clarifying_questions", []),
         }
     if doc_key == "apply_answers":
@@ -564,11 +644,18 @@ def generate_documents(
     "suggested_strategy_tag": str, "ats_score": int, "ats_rationale": str,
     "ats_next_actions": [...], "clarifying_questions": [{"skill": ...,
     "question": ..., "suggested_answer": ...}]} instead of a
-    plain string, since the resume is ATS-scored against this posting as
-    part of the same drafting pass - clarifying_questions are gaps Claude
-    couldn't close honestly without more real facts (never invented; ask,
-    don't fabricate - see profile/interview.py's save_answer(), the same
-    mechanism this feeds back into via the Results tab). "apply_answers"
+    plain string. ats_score/ats_rationale/ats_next_actions are computed
+    deterministically by tailoring.ats_score.score_resume_ats() from real
+    keyword-overlap arithmetic between the posting's own text (title +
+    qualification_summary/description, whichever this job record has - see
+    search/job_store.py) and the resume text Claude just wrote, right after
+    this call returns - not asked of the same API call that drafted the
+    text, which used to be an independent AI guess every time with no real
+    comparison happening and a score that never moved no matter what
+    changed. clarifying_questions are gaps Claude couldn't close honestly
+    without more real facts (never invented; ask, don't fabricate - see
+    profile/interview.py's save_answer(), the same mechanism this feeds
+    back into via the Results tab). "apply_answers"
     maps to a list of {"label": ..., "value": ...} dicts (a ready-to-paste
     packet for common ATS form fields) rather than a single string. Raises
     DraftingNotConfigured if no API key is set, DraftingFailed on
@@ -595,6 +682,9 @@ def generate_documents(
         job["organization_address"] = address
         update_job_address(job.get("source"), job.get("job_id"), address)
 
+    if "resume" in doc_keys and job.get("ats_required_keywords") is None:
+        _extract_ats_keywords(client, job, model)
+
     shared_context = [{
         "type": "text",
         "text": (
@@ -609,7 +699,7 @@ def generate_documents(
     for i, doc_key in enumerate(doc_keys, start=1):
         if on_progress:
             on_progress(i, total, doc_key)
-        results[doc_key] = _draft_one(client, shared_context, doc_key, model, on_progress, i, total)
+        results[doc_key] = _draft_one(client, shared_context, doc_key, model, on_progress, i, total, job)
     return results
 
 

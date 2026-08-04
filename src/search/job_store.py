@@ -102,6 +102,27 @@ def update_job_address(source: str, job_id: str, address: str) -> None:
         write_json(JOBS_PATH, jobs)
 
 
+def update_job_ats_keywords(source: str, job_id: str, required_keywords: list[str], preferred_keywords: list[str]) -> None:
+    """Caches the AI-extracted required/preferred ATS keyword list for this
+    job (tailoring/drafting.py's _extract_ats_keywords - one real-NLP-
+    judgment call over the posting's own text) so the same posting always
+    scores against the same keyword list rather than re-extracting (and
+    potentially drifting) on every resume regenerate. Same
+    cache-on-the-job-record shape as update_job_address(); an empty list is
+    a valid cached value meaning "extracted, genuinely no such keywords" -
+    tailoring/drafting.py only calls this on a successful extraction, never
+    on a failed/unconfigured API call, so a transient failure doesn't
+    permanently freeze a job at "no keywords found"."""
+    with locked("jobs"):
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("source") == source and job.get("job_id") == job_id:
+                job["ats_required_keywords"] = required_keywords
+                job["ats_preferred_keywords"] = preferred_keywords
+                break
+        write_json(JOBS_PATH, jobs)
+
+
 def update_job_score(source: str, job_id: str, fit_score: int, fit_rationale: str) -> None:
     """fit_score is 0-100: how well this job matches the master profile,
     per PRD §3 "Fit + Tailoring". Computed by Claude reasoning over the job
