@@ -10,6 +10,14 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
+# Native-packaging (Phase 2) build output - regenerate with PyInstaller/Inno
+# Setup, never commit the output itself (see docs/native-packaging-phase2-build.md)
+build_venv/
+build_dist/
+build_work/
+installer_output/
+*.spec.bak
+
 # OS
 Thumbs.db
 .DS_Store

@@ -91,12 +91,75 @@ customer if done naively:**
   Nuitka) is mature enough; a C#/Java/Electron rewrite would cost all the
   existing scoring/search/encryption logic for no real gain.
 
+## Phase 2 status (2026-08-03)
+
+Started. All packaging code lives under `packaging/` - deliberately
+additive, no changes to `src/`, `scripts/`, or `requirements.txt`. See
+`docs/native-packaging-phase2-build.md` for the build sequence and what's
+been verified vs. not.
+
+- `packaging/panga_launcher.py` - the one PyInstaller entry point, four
+  modes by argv (GUI, `--serve`, `--task`, `--uninstall-helper`). See its
+  own module docstring for why GUI mode runs the Streamlit server as a
+  child process rather than a background thread (a real constraint hit
+  while building this, not a style choice - `bootstrap.run()` registers a
+  SIGTERM handler that only works on an actual main thread).
+- `packaging/panga.spec` - PyInstaller spec, **`--onedir`, not
+  `--onefile`** - this is the artifact-shape answer
+  feature/update-mechanism needs (see "Explicitly out of scope" below):
+  a stable directory (`Panga.exe` + `_internal\`), not a single file that
+  re-extracts to a fresh temp path on every launch.
+- `packaging/panga.iss` - Inno Setup script. Per-user install
+  (`{localappdata}\Programs\Panga`, no admin/UAC), fixed AppId GUID
+  `29D8F805-F3A8-455D-AC29-482DDED84C50` (keep this exact value in every
+  future release - Inno uses it, not AppName, to recognize upgrades).
+  Start Menu + optional Desktop shortcut; Add/Remove Programs uninstall
+  entry comes from Inno automatically, no extra config needed.
+- **Artifact layout** - the reason zero `src/`/`scripts/` changes were
+  needed: PyInstaller's default `--onedir` layout puts collected pure-Python
+  modules under `_internal\` at the same relative nesting depth their
+  source files had under `src\` (`_internal\tailoring\dossier.py` vs.
+  `src\tailoring\dossier.py` - same depth, `_internal\` structurally
+  standing in for `src\`). Every module's own
+  `PROJECT_ROOT = Path(__file__).resolve().parents[N]` therefore still
+  resolves to the exe's own directory when frozen, same as it resolves to
+  the repo root in dev mode - confirmed by building a real bundle from
+  this repo's actual `security/crypto_store.py`, `gmail_client.py`, and
+  `tailoring/dossier.py` and printing where each landed. `config/` and
+  `.streamlit/` are **not** part of the PyInstaller bundle itself (its own
+  `datas` mechanism would nest them under `_internal\`, one level too
+  deep) - the installer copies them in as real top-level `{app}\config`,
+  `{app}\.streamlit` instead.
+- Uninstaller: `panga_launcher.py --uninstall-helper`, run by
+  `panga.iss`'s `[Code]` section at Inno's `usUninstall` step (before file
+  removal) - implements the data-retention prompt / backup offer / license
+  device-release ordering fixed above, using tkinter for the dialogs (same
+  toolkit `scripts/recover_access.py` already uses for its own standalone
+  dialog, not a new dependency).
+- Task Scheduler: `packaging/install_scheduled_tasks_packaged.ps1` is a
+  separate file from Phase 1's `scripts/install_scheduled_tasks.ps1`, not
+  an edit to it - the original targets `venv\Scripts\python.exe`, which a
+  packaged install doesn't have; the packaged one targets
+  `Panga.exe --task <name>` instead. `scripts/uninstall_scheduled_tasks.ps1`
+  is shipped and used unmodified (purely name-based, no python-path
+  assumption, works against either setup).
+
 ## Explicitly out of scope for this branch
 
 - **Update/hotfix delivery** — separate branch/session
   (`feature/update-mechanism`, see `docs/update-mechanism-scope.md`).
   Coordinate before merge: the updater needs to know the exact artifact
   shape this branch produces (single-file vs. directory PyInstaller build).
+  **Answer, as of the "Phase 2 status" section above**: directory build
+  (`--onedir`) - `Panga.exe` + `_internal\` under a stable per-user install
+  directory (`{localappdata}\Programs\Panga` by default), not a
+  self-extracting single file. Also needs the fixed Inno Setup AppId GUID
+  (`29D8F805-F3A8-455D-AC29-482DDED84C50`) if the updater ever drives Inno
+  Setup's own upgrade path rather than replacing files itself, and should
+  know `data\security\license_state.json` (the licensing branch's cached
+  refresh token) needs to survive an in-place update undisturbed - flagged
+  independently in `licensing/local_state.py`'s own docstring as "not yet
+  confirmed with the update-mechanism branch".
 - **Licensing / per-user API key handling for a sold product** — separate,
   not-yet-designed backlog item (PRD §13), deliberately deferred until this
   branch and its direct-API prerequisite are further along, since license/
