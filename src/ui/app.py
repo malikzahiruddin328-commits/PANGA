@@ -1260,6 +1260,19 @@ elif active_tab == "results":
     if not show_not_interested:
         ranked = [j for j in ranked if application_status(j) not in NOT_INTERESTED]
 
+    # Separate from "not interested" (Zahir's own preference) - this is the
+    # posting itself having closed on the source site (LinkedIn showing "No
+    # longer accepting applications"), which he's now hit twice (2026-08-04)
+    # scrolling stale results. Same hide-but-never-delete pattern as above -
+    # a distinct status/count rather than folding into NOT_INTERESTED so the
+    # two different reasons ("I don't want it" vs. "it's gone") stay visible
+    # as different information, not conflated into one bucket.
+    CLOSED = ("closed by employer",)
+    closed_count = sum(1 for j in ranked if application_status(j) in CLOSED)
+    show_closed = st.checkbox(f"Show {closed_count} job(s) marked 'closed by employer' (hidden by default, nothing is deleted)")
+    if not show_closed:
+        ranked = [j for j in ranked if application_status(j) not in CLOSED]
+
     # Cross-source dedup (2026-07-30): if a company has a direct-site channel
     # (Eisai/AbbVie/IQVIA via company_sites.py) and the same real opening also
     # shows up on a job board (Indeed/ZipRecruiter/Dice/USAJOBS/industry
@@ -1313,7 +1326,7 @@ elif active_tab == "results":
         if cross_source_merged:
             dup_notes.append(f"{cross_source_merged} job-board posting(s) matched to this direct listing")
         dup_note = f", {'; '.join(dup_notes)}" if dup_notes else ""
-        with st.expander(f"{channel} ({len(deduped)}{dup_note})", expanded=True):
+        with st.expander(f"{channel} ({len(deduped)}{dup_note})", expanded=False):
             table_rows = []
             for job in deduped:
                 pay_min, pay_max = format_pay(job.get("pay_min")), format_pay(job.get("pay_max"))
@@ -1761,8 +1774,9 @@ elif active_tab == "results":
                 with status_col:
                     new_status = st.selectbox(
                         "Mark status",
-                        ["-", "applied", "interview scheduled", "offer", "rejected", "not interested", "save for later"],
+                        ["-", "applied", "interview scheduled", "offer", "rejected", "not interested", "save for later", "closed by employer"],
                         key=f"status_{job.get('source')}_{job.get('job_id')}",
+                        help="\"closed by employer\" is for a posting that's stopped accepting applications on the source site (e.g. LinkedIn showing \"No longer accepting applications\") - separate from \"not interested\", which is your own choice.",
                     )
                     skip_reason = None
                     if new_status == "not interested":
