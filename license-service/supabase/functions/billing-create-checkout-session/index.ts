@@ -8,7 +8,7 @@ import { serviceClient } from "../_shared/supabase-client.ts";
 import { requireCustomer, AuthError } from "../_shared/auth.ts";
 import { json, errorResponse, corsHeaders } from "../_shared/responses.ts";
 
-const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY")!, { apiVersion: "2024-06-20" });
+const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY")!, { apiVersion: "2025-03-31.basil" });
 const PRICE_ID = Deno.env.get("STRIPE_PRICE_ID")!;
 
 Deno.serve(async (req) => {
