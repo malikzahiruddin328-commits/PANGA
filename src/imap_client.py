@@ -67,6 +67,28 @@ def is_configured(email: str) -> bool:
     return _account_path(email).exists()
 
 
+def list_configured_accounts() -> list[str]:
+    """Every email address with saved IMAP credentials, for the
+    account-setup wizard's "already connected" display - IMAP is
+    multi-account by construction (see module docstring), unlike Gmail/
+    Microsoft's single-account modules, so the wizard needs this to show
+    more than one at a time."""
+    if not IMAP_DIR.is_dir():
+        return []
+    accounts = []
+    for path in sorted(IMAP_DIR.glob("*.json")):
+        creds = read_json(path, default=None)
+        if creds and "email" in creds:
+            accounts.append(creds["email"])
+    return accounts
+
+
+def remove_account(email: str) -> None:
+    """Deletes this account's saved credentials - the wizard's
+    "disconnect" action. No-op if nothing was saved for this email."""
+    _account_path(email).unlink(missing_ok=True)
+
+
 def save_credentials(email: str, app_password: str, host: str, port: int = 993) -> None:
     """Stores this account's IMAP login, encrypted at rest. Called by the
     wizard after email_providers.detect_imap_settings() has resolved (or

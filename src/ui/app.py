@@ -87,6 +87,10 @@ from linkedin.connections import parse_connections_csv, looks_like_recruiter, cr
 from linkedin.connections_store import load_connections_snapshot, save_connections
 from security.crypto_store import has_recovery_code, generate_recovery_code
 import gmail_client
+import imap_client
+import microsoft_client
+import google_calendar_client
+from email_providers import detect_imap_settings
 from feedback.ui_feedback import get_open_feedback, mark_resolved
 from ui.feedback_widget import render_feedback_widget
 from profile.ingest import load_manifest_result, remove_document, ingest_uploaded_document, resume_text as ingested_resume_text
@@ -670,6 +674,144 @@ if active_tab == "settings":
                     st.error(f"Couldn't connect: {exc}")
                 else:
                     st.success(f"Connected - found {len(labels)} Gmail label(s). The Gmail scan/fulfillment scripts are ready to use.")
+
+    st.divider()
+    st.header("Other email accounts")
+    st.markdown(
+        "Not using Gmail? Connect Outlook, Hotmail, Yahoo, or any other "
+        "personal email provider below - same idea as Gmail above (Panga "
+        "reads/labels/drafts using each provider's own official access, "
+        "never sends anything without you)."
+    )
+
+    other_provider = st.selectbox("Provider", ["Outlook", "Hotmail", "Yahoo", "Other"], key="other_email_provider")
+
+    if other_provider in ("Outlook", "Hotmail"):
+        st.markdown(
+            f"{other_provider} and Outlook are the same Microsoft account "
+            "system under the hood, so this one setup covers both."
+        )
+        if microsoft_client.is_configured():
+            st.success("Microsoft app registration found - see \"Test connection\" below.")
+        else:
+            st.info("Not set up yet - follow the steps below in order.")
+
+        with st.container(border=True):
+            st.markdown("**Step 1 - Register an app in Azure**")
+            st.markdown(
+                "Choose **\"Personal Microsoft accounts only\"** for supported "
+                "account types. Under \"Redirect URI\", add a platform of "
+                "type **\"Mobile and desktop applications\"** with URI "
+                "`http://localhost`."
+            )
+            st.link_button("Open: Azure App registrations", "https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade")
+
+        with st.container(border=True):
+            st.markdown("**Step 2 - Save the Application (client) ID**")
+            ms_client_id = st.text_input("Application (client) ID", key="ms_client_id_input")
+            if st.button("Save", type="primary", disabled=not ms_client_id, key="ms_client_id_save"):
+                microsoft_client.save_client_id(ms_client_id)
+                st.toast("Microsoft app registration saved.", icon=":material/check_circle:")
+                st.rerun()
+
+        with st.container(border=True):
+            st.markdown("**Step 3 - Test the connection**")
+            st.markdown("Opens a browser window to sign in and approve access - one time only, cached after that.")
+            if st.button("Test Microsoft connection", type="primary", disabled=not microsoft_client.is_configured(), key="ms_test_connection"):
+                with st.spinner("Connecting - a browser window may open, approve access there..."):
+                    try:
+                        labels = microsoft_client.list_labels()
+                    except microsoft_client.MicrosoftNotConfigured as exc:
+                        st.error(str(exc))
+                    except Exception as exc:
+                        st.error(f"Couldn't connect: {exc}")
+                    else:
+                        st.success(f"Connected - found {len(labels)} categor{'y' if len(labels) == 1 else 'ies'} defined. Ready to use.")
+
+    else:  # Yahoo / Other - generic IMAP, multi-account
+        connected = imap_client.list_configured_accounts()
+        if connected:
+            st.success(f"Already connected: {', '.join(connected)}")
+            for acct in connected:
+                if st.button(f"Disconnect {acct}", key=f"imap_disconnect_{acct}"):
+                    imap_client.remove_account(acct)
+                    st.rerun()
+
+        st.markdown("**Connect another account**" if connected else "**Connect an account**")
+        imap_email = st.text_input(
+            "Email address",
+            key="imap_new_email",
+            placeholder="you@yahoo.com" if other_provider == "Yahoo" else "you@yourprovider.com",
+        )
+
+        if imap_email and st.button("Look up mail server settings", key="imap_detect_btn"):
+            with st.spinner("Looking up your provider's mail server..."):
+                st.session_state["imap_detected_for"] = imap_email
+                st.session_state["imap_detected_settings"] = detect_imap_settings(imap_email)
+
+        detect_attempted_for_current = st.session_state.get("imap_detected_for") == imap_email
+        detected = st.session_state.get("imap_detected_settings") if detect_attempted_for_current else None
+
+        if imap_email and detect_attempted_for_current and detected is None:
+            st.error("That doesn't look like a valid email address.")
+        elif detected is not None:
+            if detected.source == "guess":
+                st.warning(
+                    "Couldn't confirm these automatically - double-check them "
+                    "with your email provider if the connection test below fails."
+                )
+            # Keyed by email so switching to a different address shows that
+            # address's own detected values instead of a stale locked-in
+            # value from whatever was typed first (see CLAUDE.md's widget-
+            # key-staleness note).
+            host = st.text_input("IMAP server", value=detected.host, key=f"imap_host_{imap_email}")
+            port = st.number_input("Port", value=detected.port, key=f"imap_port_{imap_email}")
+            app_password = st.text_input(
+                "App password",
+                type="password",
+                key=f"imap_password_{imap_email}",
+                help="Most providers require a generated \"app password\" here, not your regular login "
+                     "password, once 2-factor authentication is on - check your provider's account "
+                     "security settings for \"App passwords\".",
+            )
+            if st.button("Save & test connection", type="primary", disabled=not app_password, key="imap_save_test"):
+                with st.spinner("Connecting..."):
+                    imap_client.save_credentials(imap_email, app_password, host, int(port))
+                    try:
+                        imap_client.search_messages(imap_email, criteria="ALL", max_results=1)
+                    except (imap_client.ImapConnectionError, imap_client.ImapNotConfigured) as exc:
+                        st.error(f"Saved, but the connection test failed: {exc}")
+                    else:
+                        st.success(f"Connected - {imap_email} is ready to use.")
+                        st.rerun()
+
+    st.divider()
+    st.header("Calendar")
+    st.markdown(
+        "Connect Google Calendar so interview-request replies can offer a "
+        "few real, believable open times instead of just asking the "
+        "recruiter to propose their own. Read-only, free/busy times only - "
+        "Panga never reads what's actually on your calendar, and never "
+        "creates or changes events."
+    )
+    if google_calendar_client.is_configured():
+        st.success("Google Calendar access found - see \"Test connection\" below.")
+        if google_calendar_client.using_gmail_credentials():
+            st.caption("Using the same Google sign-in already set up for Gmail above.")
+    else:
+        st.info("Not set up yet - set up Gmail above first (Calendar can reuse that same sign-in), or add a separate Google Cloud OAuth client for Calendar only.")
+
+    if st.button("Test Google Calendar connection", type="primary", disabled=not google_calendar_client.is_configured(), key="calendar_test_connection"):
+        with st.spinner("Connecting to Google Calendar - a browser window may open, approve access there..."):
+            try:
+                from datetime import datetime as _dt, timedelta as _td
+                busy = google_calendar_client.get_busy_intervals(_dt.now(), _dt.now() + _td(days=1))
+            except google_calendar_client.GoogleCalendarNotConfigured as exc:
+                st.error(str(exc))
+            except Exception as exc:
+                st.error(f"Couldn't connect: {exc}")
+            else:
+                st.success(f"Connected - found {len(busy)} busy block(s) in the next 24 hours. Ready to use.")
 
     st.divider()
     st.header("Data recovery")

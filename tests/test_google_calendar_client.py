@@ -113,3 +113,22 @@ def test_curate_believable_slots_one_slot_per_day():
     assert len(windows) == 2  # sanity: both windows exist
     picked = curate_believable_slots(windows, count=5)
     assert len(picked) == 1
+
+
+def test_using_gmail_credentials_true_when_only_gmail_present(tmp_path, monkeypatch):
+    import google_calendar_client as gcc
+
+    monkeypatch.setattr(gcc, "CREDENTIALS_PATH", tmp_path / "calendar_creds.json")
+    monkeypatch.setattr(gcc, "GMAIL_CREDENTIALS_PATH", tmp_path / "gmail_creds.json")
+    (tmp_path / "gmail_creds.json").write_text("{}")
+    assert gcc.using_gmail_credentials() is True
+
+
+def test_using_gmail_credentials_false_when_own_creds_present(tmp_path, monkeypatch):
+    import google_calendar_client as gcc
+
+    monkeypatch.setattr(gcc, "CREDENTIALS_PATH", tmp_path / "calendar_creds.json")
+    monkeypatch.setattr(gcc, "GMAIL_CREDENTIALS_PATH", tmp_path / "gmail_creds.json")
+    (tmp_path / "calendar_creds.json").write_text("{}")
+    (tmp_path / "gmail_creds.json").write_text("{}")
+    assert gcc.using_gmail_credentials() is False

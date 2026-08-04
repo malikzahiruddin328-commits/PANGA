@@ -156,3 +156,19 @@ def test_create_draft_threads_reply(fake_connect):
 
 def test_list_folders_parses_quoted_names(fake_connect):
     assert imap_client.list_folders("me@example.com") == ["INBOX", "Drafts"]
+
+
+def test_list_and_remove_configured_accounts(tmp_path, monkeypatch):
+    monkeypatch.setattr(imap_client, "IMAP_DIR", tmp_path)
+    assert imap_client.list_configured_accounts() == []
+
+    imap_client.save_credentials("a@yahoo.com", "app-pw-1", "imap.mail.yahoo.com")
+    imap_client.save_credentials("b@btinternet.com", "app-pw-2", "mail.btinternet.com")
+    assert sorted(imap_client.list_configured_accounts()) == ["a@yahoo.com", "b@btinternet.com"]
+    assert imap_client.is_configured("a@yahoo.com")
+
+    imap_client.remove_account("a@yahoo.com")
+    assert imap_client.list_configured_accounts() == ["b@btinternet.com"]
+    assert not imap_client.is_configured("a@yahoo.com")
+
+    imap_client.remove_account("never-saved@example.com")  # no-op, must not raise

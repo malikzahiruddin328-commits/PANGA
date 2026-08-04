@@ -61,6 +61,13 @@ def is_configured() -> bool:
     return _credentials_source_path() is not None
 
 
+def using_gmail_credentials() -> bool:
+    """True if this module is riding on Gmail's existing OAuth client
+    rather than a separate one of its own - the Settings UI uses this to
+    tell the user their Gmail sign-in already covers Calendar too."""
+    return not CREDENTIALS_PATH.exists() and GMAIL_CREDENTIALS_PATH.exists()
+
+
 def _load_cached_credentials() -> Optional[Credentials]:
     token_json = read_text(TOKEN_PATH, default=None)
     if token_json is None:
