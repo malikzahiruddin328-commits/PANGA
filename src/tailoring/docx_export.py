@@ -101,6 +101,7 @@ def text_to_docx_bytes(text: str, author: str | None = None, body_size_pt: float
             run.bold = True
             run.font.size = name_size
             run.font.color.rgb = NAME_ACCENT_COLOR
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             seen_name = True
             in_contact_block = True
             continue
