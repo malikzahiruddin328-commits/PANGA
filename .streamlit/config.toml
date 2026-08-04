@@ -1,3 +1,16 @@
+# baseFontSize is registered by Streamlit (config.py's _create_theme_options)
+# with categories=["theme"] only, unlike baseRadius/showWidgetBorder/
+# linkUnderline below (which also carry CustomThemeCategories.SIDEBAR, the
+# thing that makes an option settable per light/dark mode). That means
+# theme.light.baseFontSize/theme.dark.baseFontSize were never valid config
+# keys - found live 2026-08-04 via a friend tester's console log ("not a
+# valid config option... it may have been removed"), non-fatal (Streamlit
+# just warns and ignores it) but alarming red text for a non-technical
+# tester to see on first launch. Both modes used the same value (15) anyway,
+# so this is a behavior-preserving move, not a real config change.
+[theme]
+baseFontSize = 15
+
 [theme.light]
 primaryColor = "#993C1D"
 backgroundColor = "#ffffff"
@@ -10,7 +23,6 @@ redColor = "#cf222e"
 yellowColor = "#bf8700"
 font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
 headingFont = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@600;700&display=swap"
-baseFontSize = 15
 baseRadius = "8px"
 showWidgetBorder = true
 linkUnderline = false
@@ -27,7 +39,6 @@ redColor = "#f85149"
 yellowColor = "#d29922"
 font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
 headingFont = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@600;700&display=swap"
-baseFontSize = 15
 baseRadius = "8px"
 showWidgetBorder = true
 linkUnderline = false
