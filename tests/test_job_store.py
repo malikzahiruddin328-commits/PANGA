@@ -58,3 +58,21 @@ def test_update_job_address_caches_empty_string_as_a_real_value(isolated_data):
     # entirely ("never searched"). Both must be preserved distinctly.
     assert "organization_address" in job
     assert job["organization_address"] == ""
+
+
+def test_update_job_ats_keywords_sets_both_lists_on_matching_job(isolated_data):
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}])
+    job_store.update_job_ats_keywords("Dice", "1", ["python", "sql"], ["aws"])
+    job = job_store.load_jobs()[0]
+    assert job["ats_required_keywords"] == ["python", "sql"]
+    assert job["ats_preferred_keywords"] == ["aws"]
+
+
+def test_update_job_ats_keywords_caches_empty_lists_as_a_real_value(isolated_data):
+    # Empty lists mean "extracted, genuinely no such keywords" - distinct
+    # from the keys being absent entirely ("never extracted").
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}])
+    job_store.update_job_ats_keywords("Dice", "1", [], [])
+    job = job_store.load_jobs()[0]
+    assert job["ats_required_keywords"] == []
+    assert job["ats_preferred_keywords"] == []

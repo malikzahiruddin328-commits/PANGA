@@ -5,18 +5,25 @@ call that WROTE the resume to also self-grade it via a free-text
 "ats_score" field): that was an independent, memoryless AI guess every
 single call, with no actual comparison happening, which is why the number
 never moved no matter what Zahir changed. This module does real text
-comparison instead - it extracts required/preferred keywords from the job
-posting's own text (whatever mix of `title`, `qualification_summary`, and
-`description` a given job record has - see search/job_store.py, only some
-job sources capture a real JD body) and counts literal overlap against the
-drafted resume text, plus a few structural/formatting checks. The result is
-a score that visibly and correctly moves when a keyword is added or a gap
-is filled, because it is arithmetic on the actual text, not a guess.
+comparison instead - given a required/preferred keyword list, it counts
+literal overlap against the drafted resume text, plus a few structural/
+formatting checks. The result is a score that visibly and correctly moves
+when a keyword is added or a gap is filled, because it is arithmetic on the
+actual text, not a guess.
 
-This is a deliberately simple, dependency-free heuristic (no NLP library is
-installed in this project - see requirements.txt) - it will not perfectly
-segment every job posting's prose, but it is real, reproducible math over
-the actual text every time, which is the property that was missing.
+Two ways to get the keyword list, both feeding the same scoring math:
+- score_resume_against_keywords(required, preferred, resume_text): the
+  primary path - drafting.py calls this with a keyword list a single AI
+  call already extracted from the job posting (real NLP judgment, the
+  thing AI is actually good at) and cached on the job record, so the same
+  posting always scores against the same keyword list rather than a fresh
+  guess every regenerate.
+- score_resume_ats(posting_text, resume_text): a dependency-free heuristic
+  fallback (no NLP library is installed in this project - see
+  requirements.txt) for when AI extraction hasn't run or isn't available
+  (no API key configured, or a transient failure) - regex-based, will not
+  perfectly segment every posting's prose, but still real, reproducible
+  math over the actual text rather than an AI self-grade.
 """
 
 import re
@@ -221,17 +228,31 @@ def _structure_score(resume_text: str) -> tuple[float, list[str]]:
 
 
 def score_resume_ats(posting_text: str, resume_text: str) -> dict:
-    """The real, deterministic ATS score for one drafted resume against one
-    job posting. Returns {"ats_score": int 0-100, "ats_rationale": str,
-    "ats_next_actions": [str, ...]}. Always recomputed from the actual text
-    passed in - the score moves when the text does, because this is literal
-    keyword-overlap arithmetic plus formatting checks, not an independent
-    AI guess."""
+    """Dependency-free fallback: heuristically extracts keywords from
+    `posting_text` via extract_keywords() (regex-based, no AI call), then
+    scores against them. Use score_resume_against_keywords() instead
+    whenever an AI-extracted keyword list is available - see module
+    docstring."""
     keywords = extract_keywords(posting_text)
-    resume_lower = resume_text.lower()
-
     required = [k for k, v in keywords.items() if v]
     preferred = [k for k, v in keywords.items() if not v]
+    return score_resume_against_keywords(required, preferred, resume_text)
+
+
+def score_resume_against_keywords(
+    required_keywords: list[str], preferred_keywords: list[str], resume_text: str,
+) -> dict:
+    """The real, deterministic ATS score for one drafted resume against an
+    already-extracted required/preferred keyword list (lowercase or not -
+    matching is case-insensitive). Returns {"ats_score": int 0-100,
+    "ats_rationale": str, "ats_next_actions": [str, ...]}. Always
+    recomputed from the actual text passed in - the score moves when the
+    text does, because this is literal keyword-overlap arithmetic plus
+    formatting checks, not an independent AI guess."""
+    required = [k.lower() for k in required_keywords]
+    preferred = [k.lower() for k in preferred_keywords]
+    resume_lower = resume_text.lower()
+
     matched_required = [k for k in required if _phrase_in_text(k, resume_lower)]
     matched_preferred = [k for k in preferred if _phrase_in_text(k, resume_lower)]
 

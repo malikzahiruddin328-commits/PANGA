@@ -25,7 +25,7 @@ from llm_client import (
     get_client as _client,
     is_configured,
 )
-from tailoring.ats_score import score_resume_ats
+from tailoring.ats_score import score_resume_against_keywords, score_resume_ats
 
 RESUME_SPEC = (
     "Tailored resume text for this specific job, written to be ATS-perfect - "
@@ -237,6 +237,86 @@ def generate_target_roles(resume_text: str, industries: list[str], seniority: st
     save_role_skills(ladder_industry, ladder_role, data.get("title_ladder", []))
 
     return data
+
+
+ATS_KEYWORDS_SYSTEM_PROMPT = """You are extracting the literal keywords/skills/tools/certifications a job posting itself asks for, for a deterministic ATS keyword-match scorer downstream - you are NOT scoring or judging fit, just pulling out real terms that are actually present in the posting's text.
+
+Rules:
+- Only extract terms that genuinely appear in the posting (as words/phrases or unmistakable synonyms of them, e.g. "Excel" for "Microsoft Excel") - never invent a skill the posting doesn't mention.
+- required_keywords: terms from a "required"/"minimum qualifications"/"must-have" section, or stated as mandatory even without an explicit section header.
+- preferred_keywords: terms from a "preferred"/"desired"/"nice-to-have"/"bonus" section, or that read as a plus rather than mandatory.
+- If the posting doesn't clearly separate required vs preferred, use your best judgment on which items read as mandatory vs a plus - don't force a 50/50 split.
+- Keep each term short (1-4 words) and in the posting's own wording - e.g. "SQL", "AWS", "Project Management", "Agile", "PMP certification" - not full sentences or restated requirements.
+- If the posting text is boilerplate/empty/has no real requirements in it at all, return empty lists for both - do not pad with generic guesses."""
+
+
+def _ats_keywords_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "required_keywords": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Short (1-4 word) required/must-have terms taken directly from the posting's own wording. Empty list if none are genuinely stated.",
+            },
+            "preferred_keywords": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Short (1-4 word) preferred/nice-to-have terms taken directly from the posting's own wording. Empty list if none are genuinely stated.",
+            },
+        },
+        "required": ["required_keywords", "preferred_keywords"],
+        "additionalProperties": False,
+    }
+
+
+def _extract_ats_keywords(client: "anthropic.Anthropic", job: dict, model: str | None = None) -> tuple[list[str], list[str]]:
+    """One real-NLP-judgment AI call that pulls the literal required/
+    preferred keyword list out of this job's own posting text (title +
+    qualification_summary/description, whichever this job record has - see
+    search/job_store.py). This is the piece regex heuristics can't do well
+    (real language understanding of what's mandatory vs a nice-to-have in
+    messy scraped prose) - everything downstream (the actual score) stays
+    deterministic counting against this list, done by
+    ats_score.score_resume_against_keywords(), not another AI guess.
+
+    Cached on the job record (search.job_store.update_job_ats_keywords) so
+    the same posting always scores against the same keyword list rather
+    than re-extracting (and potentially drifting) on every regenerate -
+    same caching shape as _lookup_company_address's organization_address.
+    Returns ([], []) without caching on any drafting failure, so a
+    transient API error doesn't permanently freeze a job at "no keywords
+    found" - the caller falls back to the local heuristic for that one
+    draft and the next regenerate gets another real attempt."""
+    posting_text = "\n".join(filter(None, [
+        job.get("title"), job.get("qualification_summary"), job.get("description"),
+    ]))
+    if not posting_text.strip():
+        return [], []
+    try:
+        data = call_structured(
+            client,
+            system=ATS_KEYWORDS_SYSTEM_PROMPT,
+            user_content=f"JOB POSTING:\n{posting_text}",
+            schema=_ats_keywords_schema(),
+            max_tokens=1500,
+            model=model,
+            effort="medium",
+            refusal_message="Claude declined to extract ATS keywords.",
+        )
+    except (DraftingNotConfigured, DraftingFailed):
+        return [], []
+
+    required = data.get("required_keywords") or []
+    preferred = data.get("preferred_keywords") or []
+
+    from search.job_store import update_job_ats_keywords
+
+    job["ats_required_keywords"] = required
+    job["ats_preferred_keywords"] = preferred
+    if job.get("source") and job.get("job_id"):
+        update_job_ats_keywords(job["source"], job["job_id"], required, preferred)
+    return required, preferred
 
 
 def _score_schema() -> dict:
@@ -483,12 +563,23 @@ def _draft_one(
 
     if doc_key == "resume":
         resume_text = data.get("text", "")
-        posting_text = "\n".join(filter(None, [
-            (job or {}).get("title"),
-            (job or {}).get("qualification_summary"),
-            (job or {}).get("description"),
-        ]))
-        ats = score_resume_ats(posting_text, resume_text)
+        job = job or {}
+        required_kw = job.get("ats_required_keywords")
+        preferred_kw = job.get("ats_preferred_keywords")
+        if required_kw is not None and preferred_kw is not None:
+            # AI-extracted keyword list already cached on the job record
+            # (generate_documents() ensures this before calling _draft_one) -
+            # the real-NLP-judgment path, see _extract_ats_keywords().
+            ats = score_resume_against_keywords(required_kw, preferred_kw, resume_text)
+        else:
+            # Extraction was never attempted/failed for this job (e.g. no
+            # posting text, or a transient API error) - fall back to the
+            # dependency-free regex heuristic rather than leaving the
+            # resume unscored.
+            posting_text = "\n".join(filter(None, [
+                job.get("title"), job.get("qualification_summary"), job.get("description"),
+            ]))
+            ats = score_resume_ats(posting_text, resume_text)
         return {
             "text": resume_text,
             "suggested_strategy_tag": data.get("suggested_strategy_tag", ""),
@@ -590,6 +681,9 @@ def generate_documents(
         address = _lookup_company_address(client, job["organization"], job.get("location")) or ""
         job["organization_address"] = address
         update_job_address(job.get("source"), job.get("job_id"), address)
+
+    if "resume" in doc_keys and job.get("ats_required_keywords") is None:
+        _extract_ats_keywords(client, job, model)
 
     shared_context = [{
         "type": "text",

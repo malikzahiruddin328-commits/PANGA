@@ -1,4 +1,4 @@
-from tailoring.ats_score import extract_keywords, score_resume_ats
+from tailoring.ats_score import extract_keywords, score_resume_against_keywords, score_resume_ats
 
 POSTING = (
     "Minimum Qualifications: Proficiency with Python, SQL, and AWS. "
@@ -65,6 +65,31 @@ def test_next_actions_flag_missing_required_keywords():
     result = score_resume_ats(POSTING, resume)
     joined = " ".join(result["ats_next_actions"]).lower()
     assert "python" in joined or "sql" in joined or "aws" in joined
+
+
+def test_score_against_explicit_keywords_moves_when_resume_gains_one():
+    # The primary path - drafting.py passes an AI-extracted keyword list
+    # straight to this function instead of routing through the local regex
+    # heuristic, so a clean explicit list should behave identically to the
+    # heuristic path: more real matches -> higher score.
+    resume_without = "PROFESSIONAL EXPERIENCE\nEngineer.\n\nEDUCATION\nBS\n\nSKILLS\nJava"
+    resume_with = resume_without + ", Python, Kubernetes"
+
+    without_score = score_resume_against_keywords(["python", "sql"], ["kubernetes"], resume_without)
+    with_score = score_resume_against_keywords(["python", "sql"], ["kubernetes"], resume_with)
+
+    assert with_score["ats_score"] > without_score["ats_score"]
+
+
+def test_score_against_explicit_keywords_is_case_insensitive():
+    result = score_resume_against_keywords(["Python", "SQL"], [], "SKILLS\npython, sql")
+    assert result["ats_score"] > 50
+
+
+def test_score_against_empty_keyword_lists_falls_back_to_structure_only():
+    resume = "PROFESSIONAL EXPERIENCE\nEngineer.\n\nEDUCATION\nBS\n\nSKILLS\nPython"
+    result = score_resume_against_keywords([], [], resume)
+    assert "structure" in result["ats_rationale"].lower() or "formatting" in result["ats_rationale"].lower()
 
 
 def test_next_actions_flag_missing_structural_elements():
