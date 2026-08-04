@@ -30,6 +30,7 @@ data/ folder itself, same as everything else here.
 
 import difflib
 import hashlib
+import io
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -216,12 +217,7 @@ def write_dossier(source: str, job_id: str) -> Path | None:
     return path
 
 
-def _extract_docx_text(path: Path) -> str:
-    # Deliberately not reused from profile/ingest.py's extract_text() -
-    # same reasoning as linkedin/ingest.py's separate _extract_pdf_text():
-    # the logic is small and the packages serve different concerns, so a
-    # cross-package dependency isn't worth it for ~10 lines.
-    doc = Document(str(path))
+def _extract_docx_text_from_document(doc: Document) -> str:
     parts = [p.text for p in doc.paragraphs if p.text.strip()]
     for table in doc.tables:
         for row in table.rows:
@@ -229,6 +225,55 @@ def _extract_docx_text(path: Path) -> str:
                 if cell.text.strip():
                     parts.append(cell.text)
     return "\n".join(parts)
+
+
+def _extract_docx_text(path: Path) -> str:
+    # Deliberately not reused from profile/ingest.py's extract_text() -
+    # same reasoning as linkedin/ingest.py's separate _extract_pdf_text():
+    # the logic is small and the packages serve different concerns, so a
+    # cross-package dependency isn't worth it for ~10 lines.
+    return _extract_docx_text_from_document(Document(str(path)))
+
+
+def _render_doc_key_to_bytes(doc_key: str, text: str, candidate_name: str | None, job: dict) -> bytes:
+    """The same doc_key -> renderer/params dispatch sync_workspace_documents()
+    uses to write a fresh .docx, factored out so edit-detection can render
+    the SAME stored text through the SAME pipeline before comparing it
+    against what's on disk - see _baseline_docx_text()'s docstring for why
+    this matters."""
+    if doc_key == "cover_letter":
+        return cover_letter_to_docx_bytes(
+            text, company_name=job.get("organization"),
+            company_address=job.get("organization_address"), author=candidate_name,
+        )
+    if doc_key == "resume" and job.get("source") == "USAJOBS":
+        word_count = len(text.split())
+        body_size_pt = 9.0 if word_count > 1100 else 10.0
+        return text_to_docx_bytes(text, author=candidate_name, body_size_pt=body_size_pt)
+    return text_to_docx_bytes(text, author=candidate_name)
+
+
+def _baseline_docx_text(doc_key: str, text: str, candidate_name: str | None, job: dict) -> str:
+    """What _extract_docx_text() would return for `text` if it had just been
+    (re)rendered and never touched since - the correct thing to diff a
+    workspace file against, NOT the raw stored text itself.
+
+    Real bug fixed 2026-08-04 (Zahir hit this live: a cover letter he never
+    touched was reported as "4 lines added, 6 removed"): the renderers
+    inject content that never existed in the raw drafted text at all
+    (cover_letter_to_docx_bytes always adds today's date, the company name,
+    and an address line before the body) and also transform it on the way
+    in (blank lines dropped, "- " bullet markers stripped in favor of the
+    "List Bullet" paragraph style). Comparing raw stored text against
+    text extracted back out of the rendered file meant EVERY document with
+    a bullet, or EVERY cover letter at all, showed a spurious diff on every
+    check - not just here in check_for_edits(), but also in
+    sync_workspace_documents()'s own edit-detection, which was silently
+    creating an unnecessary ".edited-<timestamp>.docx" backup on every
+    single regenerate, edited or not."""
+    return _extract_docx_text_from_document(
+        Document(io.BytesIO(_render_doc_key_to_bytes(doc_key, text, candidate_name, job)))
+    )
 
 
 def sync_workspace_documents(
@@ -284,31 +329,18 @@ def sync_workspace_documents(
                 current_on_disk_text = _extract_docx_text(file_path)
             except Exception:
                 current_on_disk_text = None
-            if current_on_disk_text is not None and current_on_disk_text.strip() != (previous_stored_text or "").strip():
+            # Compare against a freshly-rendered baseline of the PREVIOUS
+            # stored text, not the raw text itself - see _baseline_docx_text()
+            # for why a raw-text comparison here was a real bug (every
+            # regenerate looked like an edit, even when the file was never
+            # touched, spamming spurious .edited-*.docx backups).
+            baseline_text = _baseline_docx_text(doc_key, previous_stored_text or "", candidate_name, job)
+            if current_on_disk_text is not None and current_on_disk_text.strip() != baseline_text.strip():
                 stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%S")
                 backup_name = f"{file_path.stem}.edited-{stamp}{file_path.suffix}"
                 file_path.rename(folder / backup_name)
 
-        if doc_key == "cover_letter":
-            doc_bytes = cover_letter_to_docx_bytes(
-                new_text,
-                company_name=job.get("organization"),
-                company_address=job.get("organization_address"),
-                author=candidate_name,
-            )
-        elif doc_key == "resume" and job.get("source") == "USAJOBS":
-            # USAJOBS hard-rejects any uploaded resume over 2 pages
-            # (confirmed 2026-08-03). drafting.py's RESUME_SPEC_USAJOBS
-            # already caps content to ~900-1100 words for this reason, but
-            # as a safety margin on top of that content cap, shrink the
-            # body font too - 10pt normally, 9pt only if the drafted text
-            # is still running long - rather than relying on word-count
-            # alone to guarantee 2 pages. Zahir's explicit ask 2026-08-03.
-            word_count = len(new_text.split())
-            body_size_pt = 9.0 if word_count > 1100 else 10.0
-            doc_bytes = text_to_docx_bytes(new_text, author=candidate_name, body_size_pt=body_size_pt)
-        else:
-            doc_bytes = text_to_docx_bytes(new_text, author=candidate_name)
+        doc_bytes = _render_doc_key_to_bytes(doc_key, new_text, candidate_name, job)
         file_path.write_bytes(doc_bytes)
 
 
@@ -353,11 +385,17 @@ def check_for_edits(source: str, job_id: str) -> dict:
         except Exception as exc:
             results[doc_key] = {"changed": False, "diff": [], "error": f"Couldn't read {filename}: {exc}"}
             continue
-        if current_text.strip() == stored_text.strip():
+        # Diff against a freshly-rendered baseline of stored_text, not
+        # stored_text itself - see _baseline_docx_text() for why comparing
+        # raw drafted text against text extracted back out of a rendered
+        # .docx was a real bug (every cover letter, and every document with
+        # a bullet, showed a spurious diff on every check).
+        baseline_text = _baseline_docx_text(doc_key, stored_text, candidate_name, job)
+        if current_text.strip() == baseline_text.strip():
             results[doc_key] = {"changed": False, "diff": []}
         else:
             diff = list(difflib.unified_diff(
-                stored_text.splitlines(), current_text.splitlines(),
+                baseline_text.splitlines(), current_text.splitlines(),
                 fromfile="original draft", tofile="your edited version", lineterm="",
             ))
             results[doc_key] = {"changed": True, "diff": diff}
