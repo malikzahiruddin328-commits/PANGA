@@ -134,7 +134,7 @@ _DRAFT_REPLY_SYSTEM_PROMPT = f"""You are composing a short, professional email r
 
 Write 2-4 sentences tailored to the category and the actual subject/snippet content:
 - offer: express genuine interest/thanks, ask about next steps (start date, comp details if not covered, etc).
-- interview_request: confirm enthusiasm and general availability, ask them to propose times (don't invent a specific date/time you don't have).
+- interview_request: confirm enthusiasm. If "Available times" are given below, propose exactly those (don't invent others, and don't offer every one of your open hours - a shortlist reads as a normal, in-demand schedule, not as "I'm free whenever," which is the whole point of only being given a curated few). If no available times are given, ask them to propose times instead (don't invent a specific date/time you don't have).
 - assessment_request: acknowledge receipt, confirm you'll complete it, ask about the deadline if unclear.
 - recruiter_question: answer helpfully based on Zahir's background above if the question is answerable from that; otherwise keep it brief and ask a clarifying question back.
 - rejection: brief, gracious thank-you, express interest in being considered for future roles.
@@ -149,12 +149,21 @@ _DRAFT_REPLY_SCHEMA = {
 }
 
 
-def draft_cta_reply(category: str, subject: str, snippet: str) -> str:
+def draft_cta_reply(category: str, subject: str, snippet: str, available_slots: list[str] | None = None) -> str:
     """category is one of "rejection", "interview_request",
     "assessment_request", "offer", "recruiter_question" (cta_emails.py's
-    stored category field). Returns the composed reply body text."""
+    stored category field). `available_slots` is an optional list of
+    human-readable time strings (e.g. "Tuesday, Aug 5, 2:00-2:30 PM") - the
+    caller is responsible for producing these (see
+    google_calendar_client.curate_believable_slots() for the Google
+    Calendar path) and for this being real availability, not invented;
+    this function just decides whether to use them. Only meaningful for
+    category="interview_request" - ignored for every other category, same
+    as the caller passing None. Returns the composed reply body text."""
     client = get_client()
     content = f"Category: {category}\nSubject: {subject}\nSnippet: {snippet}"
+    if available_slots:
+        content += "\nAvailable times:\n" + "\n".join(f"- {slot}" for slot in available_slots)
     data = call_structured(
         client,
         system=_DRAFT_REPLY_SYSTEM_PROMPT,

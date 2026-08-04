@@ -12,6 +12,7 @@ safety property.
 """
 
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 # See gmail_cta_scan.py's identical comment - real email subjects/senders
@@ -53,11 +54,41 @@ def fulfill_archive_requests(handled_label_id: str) -> int:
     return failures
 
 
+def _get_available_interview_slots() -> list[str] | None:
+    """Best-effort Google Calendar lookup for interview_request replies -
+    see docs/multi-provider-accounts-scope.md Part B. Returns None (not an
+    empty list) on any failure or if Calendar isn't configured, so the
+    caller falls back to draft_cta_reply()'s existing "ask them to propose
+    times" behavior instead of a confusing empty offer. Never raises -
+    a calendar problem should never block CTA draft creation."""
+    try:
+        import google_calendar_client as calendar_client
+
+        if not calendar_client.is_configured():
+            return None
+        now = datetime.now()
+        range_end = now + timedelta(days=7)
+        busy = calendar_client.get_busy_intervals(now, range_end)
+        free_windows = calendar_client.compute_free_windows(now, range_end, busy)
+        slots = calendar_client.curate_believable_slots(free_windows, count=3)
+        return [w.start.strftime("%A, %b %d, %I:%M %p") for w in slots]
+    except Exception as exc:  # noqa: BLE001 - see docstring
+        _log(f"  calendar lookup skipped: {exc}")
+        return None
+
+
 def fulfill_draft_requests() -> int:
     failures = 0
-    for item in get_pending_draft_requests():
+    pending = get_pending_draft_requests()
+    # Fetched once per run, not once per item - availability doesn't
+    # meaningfully change within one 10-minute run, and every
+    # interview_request item this run can reuse the same lookup (avoids
+    # calling the Calendar API once per pending item for no benefit).
+    interview_slots = _get_available_interview_slots() if any(item["category"] == "interview_request" for item in pending) else None
+    for item in pending:
         try:
-            reply_body = draft_cta_reply(item["category"], item["subject"], item["snippet"])
+            slots_for_item = interview_slots if item["category"] == "interview_request" else None
+            reply_body = draft_cta_reply(item["category"], item["subject"], item["snippet"], available_slots=slots_for_item)
             draft_id = gmail_client.create_draft(
                 to=item["sender"], subject=f"Re: {item['subject']}", body=reply_body,
                 reply_to_message_id=item.get("message_id"),
