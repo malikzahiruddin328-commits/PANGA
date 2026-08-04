@@ -27,7 +27,7 @@ from llm_client import (
 )
 from tailoring.ats_score import score_resume_against_keywords, score_resume_ats
 
-RESUME_SPEC = (
+_RESUME_SPEC_COMMON = (
     "Tailored resume text for this specific job, written to be ATS-perfect - "
     "it must parse cleanly in an Applicant Tracking System, not just read "
     "well to a human. Plain text only - no markdown (no **, no #, no "
@@ -42,13 +42,11 @@ RESUME_SPEC = (
     "ATS systems match on literal keyword overlap, not paraphrases. Spell "
     "out acronyms at first use with the acronym in parentheses so both "
     "keyword matching and human readers catch it (e.g. 'Master Data "
-    "Management (MDM)'). If this posting is a US federal government job "
-    "(USAJOBS or similar), follow federal resume conventions: full "
-    "chronological work history with month/year date ranges, hours worked "
-    "per week, and specific, quantifiable accomplishments for each role - "
-    "federal resumes are longer and more detailed than private-sector ones, "
-    "there is no one-page limit. Otherwise (private-sector, retained-search, "
-    "or direct-company postings), the WHOLE document must fit on roughly 2 "
+    "Management (MDM)'). "
+)
+
+_RESUME_SPEC_TWO_PAGE_RULES = (
+    "The WHOLE document must fit on roughly 2 "
     "pages - target a total of about 900-1100 words of body text (excluding "
     "headers/contact/dates), and treat these as hard caps, not suggestions: "
     "- Give full bullet-point detail to ONLY the 3 most recent roles: 5-6 "
@@ -73,6 +71,45 @@ RESUME_SPEC = (
     "noticeably over 2 pages, trim bullet wording and cut the least "
     "job-relevant bullets first - length wins over completeness here."
 )
+
+# USAJOBS itself hard-rejects any uploaded resume PDF over 2 pages at
+# submission time (confirmed directly, 2026-08-03 - Zahir hit the real
+# upload error on a federal-format draft that ran over). Federal resume
+# convention (full chronological detail, hours/week, no page limit) is
+# real practice for federal HR reviewers, but it's moot if USAJOBS won't
+# accept the file - the platform's own hard limit wins. So USAJOBS
+# postings now get the SAME 2-page hard cap as private-sector ones,
+# just with federal-flavored content (hours/week per role, exact
+# month/year dates) folded into that condensed structure wherever it
+# still fits, instead of the old "no page limit" exception.
+RESUME_SPEC_USAJOBS = (
+    _RESUME_SPEC_COMMON
+    + "This is a USAJOBS posting - USAJOBS itself rejects any uploaded "
+    "resume PDF over 2 pages, so the federal 'no page limit' convention "
+    "does not apply here; treat this exactly like the private-sector "
+    "length rules below, with one federal-flavored addition: where space "
+    "allows, note hours worked per week for the most recent 1-2 roles "
+    "only (skip it entirely if it would push a bullet over length). "
+    + _RESUME_SPEC_TWO_PAGE_RULES
+)
+
+RESUME_SPEC = (
+    _RESUME_SPEC_COMMON
+    + "If this posting is a US federal government job other than USAJOBS "
+    "itself (an agency's own careers site, for instance) and that site "
+    "states no page limit, follow full federal resume conventions: full "
+    "chronological work history with month/year date ranges, hours worked "
+    "per week, and specific, quantifiable accomplishments for each role. "
+    "Otherwise (private-sector, retained-search, direct-company, or "
+    "USAJOBS postings), the following hard caps apply: "
+    + _RESUME_SPEC_TWO_PAGE_RULES
+)
+
+
+def _resume_spec_for_job(job: dict) -> str:
+    if (job or {}).get("source") == "USAJOBS":
+        return RESUME_SPEC_USAJOBS
+    return RESUME_SPEC
 
 DOC_SPECS = {
     "resume": RESUME_SPEC,
@@ -119,11 +156,12 @@ Ground rules:
 - Tailor every document specifically to this job posting and organization - reference the actual role, organization name, and what the posting emphasizes. Do not write generic, could-apply-to-any-job text.
 - Return ONLY the documents requested via the structured output schema. No extra commentary.
 
-Writing voice - this must read as a real senior executive's own writing, not AI output:
+Writing voice - under no circumstances may this read as AI-written. It must read as a real senior executive's own writing, full stop:
 - British English prose conventions - phrasing, idiom, and a measured, understated register - but American spellings throughout (e.g. "color" not "colour", "organize" not "organise", "center" not "centre"), since this is for US employers.
 - Vary sentence length and structure line to line; never fall into a uniform rhythm.
 - Do not use these overused AI-writing tells: corporate buzzwords (leverage, spearhead, synergy, robust, cutting-edge, seamless, dynamic, passionate, game-changer); repetitive three-item lists; formulaic openers ("In today's fast-paced environment...", "I am thrilled to apply..."); "not just X, but Y" constructions; excessive em dashes; and stacking multiple adjectives before a noun.
-- Every claim should sound like something this specific person would actually say about his own work - concrete, specific, a little understated rather than oversold."""
+- Every claim should sound like something this specific person would actually say about his own work - concrete, specific, a little understated rather than oversold.
+- Before returning the text, silently re-read it as if you were an AI-detection reviewer looking for generated-text patterns (uniform bullet cadence, hollow superlatives, generic transition phrases). If anything reads as machine-generated, rewrite that line in plainer, more specific, human terms before returning it."""
 
 
 SCORE_SYSTEM_PROMPT = """You are scoring how well one job posting fits this specific candidate, for their personal job-search tool. Read the candidate's master profile below and reason genuinely about fit - never a keyword count.
@@ -375,7 +413,7 @@ def _schema(doc_keys: list[str]) -> dict:
     }
 
 
-def _resume_schema() -> dict:
+def _resume_schema(job: dict | None = None) -> dict:
     # The resume gets a richer schema than the other doc types: alongside
     # the text itself, it carries clarifying_questions for real facts that
     # would close a gap. ats_score/ats_rationale/ats_next_actions are
@@ -390,7 +428,7 @@ def _resume_schema() -> dict:
     return {
         "type": "object",
         "properties": {
-            "text": {"type": "string", "description": RESUME_SPEC},
+            "text": {"type": "string", "description": _resume_spec_for_job(job)},
             "suggested_strategy_tag": {
                 "type": "string",
                 "description": (
@@ -531,7 +569,7 @@ def _draft_one(
     job: dict | None = None,
 ):
     if doc_key == "resume":
-        schema = _resume_schema()
+        schema = _resume_schema(job)
     elif doc_key == "apply_answers":
         schema = _apply_answers_schema()
     else:
@@ -699,7 +737,7 @@ def generate_documents(
     for i, doc_key in enumerate(doc_keys, start=1):
         if on_progress:
             on_progress(i, total, doc_key)
-        results[doc_key] = _draft_one(client, shared_context, doc_key, model, on_progress, i, total, job)
+        results[doc_key] = _draft_one(client, shared_context, doc_key, model, on_progress, i, total, job=job)
     return results
 
 

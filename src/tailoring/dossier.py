@@ -296,6 +296,17 @@ def sync_workspace_documents(
                 company_address=job.get("organization_address"),
                 author=candidate_name,
             )
+        elif doc_key == "resume" and job.get("source") == "USAJOBS":
+            # USAJOBS hard-rejects any uploaded resume over 2 pages
+            # (confirmed 2026-08-03). drafting.py's RESUME_SPEC_USAJOBS
+            # already caps content to ~900-1100 words for this reason, but
+            # as a safety margin on top of that content cap, shrink the
+            # body font too - 10pt normally, 9pt only if the drafted text
+            # is still running long - rather than relying on word-count
+            # alone to guarantee 2 pages. Zahir's explicit ask 2026-08-03.
+            word_count = len(new_text.split())
+            body_size_pt = 9.0 if word_count > 1100 else 10.0
+            doc_bytes = text_to_docx_bytes(new_text, author=candidate_name, body_size_pt=body_size_pt)
         else:
             doc_bytes = text_to_docx_bytes(new_text, author=candidate_name)
         file_path.write_bytes(doc_bytes)

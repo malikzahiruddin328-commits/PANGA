@@ -10,6 +10,10 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
+# Bundled friend-test-package installer binary - large, fetched fresh from
+# python.org for packaging (see installers/README.txt), not source.
+installers/
+
 # OS
 Thumbs.db
 .DS_Store

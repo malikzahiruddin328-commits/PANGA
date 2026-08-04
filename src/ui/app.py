@@ -21,12 +21,16 @@ visible no matter which tab is open.
 """
 
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from debug_log import setup_debug_logging
+setup_debug_logging()
 
 
 def _find_bhangi_src(project_root: Path) -> Path | None:
@@ -95,7 +99,16 @@ from feedback.ui_feedback import get_open_feedback, mark_resolved
 from ui.feedback_widget import render_feedback_widget
 from profile.ingest import load_manifest_result, remove_document, ingest_uploaded_document, resume_text as ingested_resume_text
 from profile.storage import load_profile, update_profile_field
-from bhangi.ui import render_support_page
+try:
+    # Bhangi is a separate, standalone cross-project tool (see
+    # _find_bhangi_src above) - not something this app ships or installs
+    # itself, so a checkout that doesn't have a sibling Bhangi project (any
+    # friend-testing package, for instance - see run_app_friend_test.bat)
+    # previously hard-crashed the WHOLE app on this single import. Missing
+    # Bhangi should only mean "no Support tab", never "no app at all".
+    from bhangi.ui import render_support_page
+except ImportError:
+    render_support_page = None
 from ui.license_gate import render_indicator_and_get_block, render_block_screen
 from licensing.client import release_device, create_portal_session, LicenseNetworkError, LicenseServiceError
 
@@ -161,6 +174,115 @@ def application_status(job: dict) -> str | None:
 
 def job_label(job: dict) -> str:
     return f"{job.get('title')} - {job.get('organization')}"
+
+
+_PROGRESS_CHAR_RE = re.compile(r"([\d,]+) characters")
+
+# Rough expected output length per direct-API call, used only to make a
+# progress bar move smoothly with the real character count instead of
+# sitting frozen for the entire streamed call - not a promise about final
+# length. Every direct-API call in this app reports the same "thinking..."
+# / "writing... (N characters so far)" substatus (llm_client.py's
+# call_structured, Zahir's explicit ask 2026-07-31: "no spinner anywhere
+# should be opaque when the underlying call can report real progress
+# instead"), so one lookup table + one fraction function covers all of
+# them - drafting, scoring, diagnosis, prep, LinkedIn analysis. Resume
+# drafting runs well past everything else here once RESUME_SPEC's real
+# output length is accounted for, so it gets its own higher target.
+_EXPECTED_RESPONSE_CHARS = {
+    "resume": 13_000,
+    "cover_letter": 2_500,
+    "exec_bio": 2_000,
+    "leadership_summary": 2_000,
+    "apply_answers": 3_000,
+    "job_score": 1_500,
+    "prospector_score": 1_500,
+    "diagnosis": 1_200,
+    "learn": 1_200,
+    "prep": 3_000,
+    "linkedin_enhance": 3_000,
+}
+_RESPONSE_CHARS_DEFAULT = 4_000
+_PROGRESS_CAP = 0.92  # never shows 100% until the call actually finishes
+
+
+def progress_fraction(response_key: str, substatus: str | None) -> float:
+    """How far through a direct-API call the current substatus represents,
+    0-1. "thinking..." (no character count yet) shows a small sliver so the
+    bar doesn't sit dead still while Claude reasons before writing anything;
+    "writing... (N characters so far)" scales against a rough expected
+    length for that call, capped below 100% so the visible jump to "Done"
+    always means the response is actually ready, never an estimate that
+    happened to land early."""
+    if not substatus:
+        return 0.0
+    match = _PROGRESS_CHAR_RE.search(substatus)
+    if not match:
+        return 0.05  # "thinking..." or any other pre-writing substatus
+    char_count = int(match.group(1).replace(",", ""))
+    expected = _EXPECTED_RESPONSE_CHARS.get(response_key, _RESPONSE_CHARS_DEFAULT)
+    return min(char_count / expected, _PROGRESS_CAP)
+
+
+_DRAFT_DONE_GREEN = {"light": "#1a7f37", "dark": "#3fb950"}  # config.toml's own greenColor per mode
+
+
+def progress_shimmer_css(container_key: str) -> str:
+    """A <style> block that reskins the st.progress bar inside
+    st.container(key=container_key) with a moving shimmer highlight while
+    it's running, then a solid green fill once it hits 100% - the
+    "shimmer sweep" look Zahir picked from the style comparison (2026-08-03)
+    over three animated alternatives (barber-pole stripes, pulse glow, comet
+    trail).
+
+    Targets the real DOM Streamlit renders for st.progress, confirmed by
+    direct inspection rather than guessed (inspecting a throwaway probe bar
+    at localhost:8504): the visible fill isn't a width-based div, it's a
+    full-width div translateX()'d left and clipped by its parent's
+    overflow:hidden, so a ::after sweep positioned against the fill's own
+    box is naturally masked to only the visible (filled) portion - no need
+    to recompute the sweep's bounds as progress changes. The done-state
+    color swap keys off the real aria-valuenow="100" the ProgressBar sets,
+    so it needs no separate "done" HTML injection - the same static CSS
+    handles both states.
+
+    Reads st.context.theme.type (not a prefers-color-scheme media query)
+    for the done color, since this app defines both [theme.light] and
+    [theme.dark] in config.toml - Zahir can switch modes from Streamlit's
+    own settings menu independent of his OS preference, and only the
+    server-side theme context reflects that choice correctly."""
+    green = _DRAFT_DONE_GREEN.get(st.context.theme.type, _DRAFT_DONE_GREEN["light"])
+    key_sel = f".st-key-{container_key}"
+    return f"""<style>
+{key_sel} [data-testid="stProgressBarTrack"] > div {{
+    position: relative;
+    overflow: hidden;
+}}
+{key_sel} [data-testid="stProgressBarTrack"] > div::after {{
+    content: "";
+    position: absolute;
+    top: 0; bottom: 0; left: -40%;
+    width: 40%;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.55), transparent);
+    animation: panga-progress-shimmer 1.35s ease-in-out infinite;
+}}
+{key_sel} [role="progressbar"][aria-valuenow="100"] [data-testid="stProgressBarTrack"] > div {{
+    background: {green};
+}}
+{key_sel} [role="progressbar"][aria-valuenow="100"] [data-testid="stProgressBarTrack"] > div::after {{
+    content: none;
+    animation: none;
+}}
+@keyframes panga-progress-shimmer {{
+    0% {{ left: -40%; }}
+    100% {{ left: 110%; }}
+}}
+@media (prefers-reduced-motion: reduce) {{
+    {key_sel} [data-testid="stProgressBarTrack"] > div::after {{
+        animation: none;
+    }}
+}}
+</style>"""
 
 
 def format_pay(value) -> str | None:
@@ -1015,7 +1137,9 @@ elif active_tab == "results":
                 steps = [("role", r["name"]) for r in target_roles] + [("series", c) for c in job_series]
                 total_new = 0
                 if steps:
-                    search_bar = st.progress(0, text=f"Searching 1 of {len(steps)}: {steps[0][1]}...")
+                    with st.container(key="search_progress_bar"):
+                        search_bar = st.progress(0, text=f"Searching 1 of {len(steps)}: {steps[0][1]}...")
+                    st.html(progress_shimmer_css("search_progress_bar"))
                     for i, (kind, value) in enumerate(steps, start=1):
                         search_bar.progress((i - 1) / len(steps), text=f"Searching {i} of {len(steps)}: {value}...")
                         if kind == "role":
@@ -1023,7 +1147,7 @@ elif active_tab == "results":
                         else:
                             results = search_jobs(job_category_code=value, results_per_page=100)
                         total_new += save_jobs(results)
-                    search_bar.progress(1.0, text="Done.")
+                    search_bar.progress(1.0, text=":material/check_circle: Done.")
                 st.success(f"Found {total_new} new job(s).")
             except USAJobsNotConfigured as e:
                 st.error(str(e))
@@ -1079,10 +1203,12 @@ elif active_tab == "results":
                 # explicit ask 2026-07-31, "same needs to be here and all
                 # other spinner places") - same thinking/writing
                 # character-count mechanism as document drafting.
-                score_bar = st.progress(0, text="Scoring compatibility...")
+                with st.container(key="job_score_progress_bar"):
+                    score_bar = st.progress(0, text="Scoring compatibility...")
+                st.html(progress_shimmer_css("job_score_progress_bar"))
 
                 def _update_score_progress(substatus):
-                    score_bar.progress(0.5, text=f"Scoring compatibility - {substatus}")
+                    score_bar.progress(progress_fraction("job_score", substatus), text=f"Scoring compatibility - {substatus}")
 
                 try:
                     scored = score_job(job, load_profile(), on_progress=_update_score_progress)
@@ -1090,7 +1216,7 @@ elif active_tab == "results":
                     score_bar.empty()
                     st.toast(f"Saved, but scoring failed: {exc}", icon=":material/warning:")
                 else:
-                    score_bar.progress(1.0, text="Done.")
+                    score_bar.progress(1.0, text=":material/check_circle: Done.")
                     update_job_score(job["source"], job["job_id"], scored["fit_score"], scored["fit_rationale"])
                     st.toast(
                         f"Saved \"{job['title']}\" at {job['organization']} - scored {scored['fit_score']}/100.",
@@ -1326,12 +1452,15 @@ elif active_tab == "results":
                         st.rerun()
                     else:
                         doc_labels = dict(doc_types)
-                        progress_bar = st.progress(0, text=f"Drafting 1 of {len(selected)}: {doc_labels[selected[0]]}...")
+                        with st.container(key="draft_progress_bar"):
+                            progress_bar = st.progress(0, text=f"Drafting 1 of {len(selected)}: {doc_labels[selected[0]]}...")
+                        st.html(progress_shimmer_css("draft_progress_bar"))
 
                         def _update_progress(i, total, doc_key, substatus=None):
                             label = f"Drafting {i} of {total}: {doc_labels[doc_key]}"
                             label += f" — {substatus}" if substatus else "..."
-                            progress_bar.progress((i - 1) / total, text=label)
+                            within_doc = progress_fraction(doc_key, substatus)
+                            progress_bar.progress(((i - 1) + within_doc) / total, text=label)
 
                         try:
                             drafted = generate_documents(job, load_profile(), selected, on_progress=_update_progress)
@@ -1339,7 +1468,7 @@ elif active_tab == "results":
                             progress_bar.empty()
                             st.error(str(exc))
                         else:
-                            progress_bar.progress(1.0, text="Done.")
+                            progress_bar.progress(1.0, text=":material/check_circle: Done.")
                             resume_draft = drafted.get("resume")
                             resume_is_scored = isinstance(resume_draft, dict)
                             upsert_application(
@@ -1461,12 +1590,16 @@ elif active_tab == "results":
                                             else:
                                                 st.session_state[prev_score_key] = current_score
                                                 save_gap_answers(job, answered)
-                                                regen_bar = st.progress(0, text="Regenerating resume with your answers...")
+                                                regen_bar_key = f"regen_progress_bar_{job_key}"
+                                                with st.container(key=regen_bar_key):
+                                                    regen_bar = st.progress(0, text="Regenerating resume with your answers...")
+                                                st.html(progress_shimmer_css(regen_bar_key))
 
                                                 def _update_regen_progress(i, total, doc_key2, substatus=None):
                                                     label = "Regenerating resume"
                                                     label += f" — {substatus}" if substatus else "..."
-                                                    regen_bar.progress((i - 1) / total, text=label)
+                                                    within_doc = progress_fraction(doc_key2, substatus)
+                                                    regen_bar.progress(((i - 1) + within_doc) / total, text=label)
 
                                                 try:
                                                     regen = generate_documents(
@@ -1476,7 +1609,7 @@ elif active_tab == "results":
                                                     regen_bar.empty()
                                                     st.error(str(exc))
                                                 else:
-                                                    regen_bar.progress(1.0, text="Done.")
+                                                    regen_bar.progress(1.0, text=":material/check_circle: Done.")
                                                     new_resume = regen["resume"]
                                                     upsert_application(
                                                         job["source"], job["job_id"], status="under review",
@@ -1521,14 +1654,26 @@ elif active_tab == "results":
                     st.markdown("**Your application folder (edit the Word files directly here):**")
                     st.code(str(workspace_folder), language=None)
                     st.markdown(
-                        "Open this folder in File Explorer and edit the .docx files directly in Word "
-                        "if you want to change anything (each file is named "
-                        "Name_DocType_Role_Company.docx, same convention as before), then click "
-                        "\"Check my edited documents\" below - you'll need to do this before marking "
-                        "the job \"applied\"."
+                        "Edit the .docx files directly in Word if you want to change anything "
+                        "(each file is named Name_DocType_Role_Company.docx, same convention as "
+                        "before), then click \"Check my edited documents\" below - you'll need to "
+                        "do this before marking the job \"applied\"."
                     )
-                    if st.button("Check my edited documents", key=f"checkedits_{job_key}"):
-                        st.session_state[f"editreport_{job_key}"] = check_for_edits(job["source"], job["job_id"])
+                    folder_row = st.container(horizontal=True)
+                    with folder_row:
+                        if st.button("Open folder", key=f"openfolder_{job_key}", icon=":material/folder_open:"):
+                            if workspace_folder.is_dir():
+                                # Local, single-user desktop app (Streamlit and the browser
+                                # both run on Zahir's own machine) - os.startfile() just does
+                                # what double-clicking the folder in Explorer would do. No
+                                # shell involved and workspace_folder is a computed Path from
+                                # job data, never a user-typed string, so there's nothing here
+                                # for shell-injection-style concerns to attach to.
+                                os.startfile(workspace_folder)  # noqa: S606 - Windows-only app, see comment above
+                            else:
+                                st.toast("Folder not created yet - generate a document first.", icon=":material/warning:")
+                        if st.button("Check my edited documents", key=f"checkedits_{job_key}"):
+                            st.session_state[f"editreport_{job_key}"] = check_for_edits(job["source"], job["job_id"])
 
                     # edit_report/what_changed are computed here (if a check
                     # has been run) but RENDERED further below, folded into
@@ -1694,10 +1839,12 @@ elif active_tab == "prospector":
         # Real streaming progress instead of a spinner (Zahir's explicit
         # ask 2026-07-31) - same thinking/writing character-count
         # mechanism as document drafting.
-        score_compute_bar = st.progress(0, text="Reasoning over your real data...")
+        with st.container(key="prospector_score_progress_bar"):
+            score_compute_bar = st.progress(0, text="Reasoning over your real data...")
+        st.html(progress_shimmer_css("prospector_score_progress_bar"))
 
         def _update_score_compute_progress(substatus):
-            score_compute_bar.progress(0.5, text=f"Reasoning over your real data - {substatus}")
+            score_compute_bar.progress(progress_fraction("prospector_score", substatus), text=f"Reasoning over your real data - {substatus}")
 
         try:
             result = compute_prospector_score(score_input, on_progress=_update_score_compute_progress)
@@ -1705,7 +1852,7 @@ elif active_tab == "prospector":
             score_compute_bar.empty()
             st.error(str(exc))
         else:
-            score_compute_bar.progress(1.0, text="Done.")
+            score_compute_bar.progress(1.0, text=":material/check_circle: Done.")
             save_prospector_score(
                 result["score"], result["rationale"], result["next_actions"],
                 score_input["data_points"], datetime.now(timezone.utc).isoformat(),
@@ -1774,14 +1921,16 @@ elif active_tab == "prospector":
                 # explicit ask 2026-07-31) - one company per real search
                 # call, so this is a genuine count, not a simulated one.
                 total = len(missing_website)
-                lookup_bar = st.progress(0, text=f"Looking up website 1 of {total}: {missing_website[0]['company_name']}...")
+                with st.container(key="lookup_progress_bar"):
+                    lookup_bar = st.progress(0, text=f"Looking up website 1 of {total}: {missing_website[0]['company_name']}...")
+                st.html(progress_shimmer_css("lookup_progress_bar"))
                 run_cost = 0.0
                 for i, acc in enumerate(missing_website, start=1):
                     lookup_bar.progress((i - 1) / total, text=f"Looking up website {i} of {total}: {acc['company_name']}...")
                     found, cost = lookup_company_website(acc["company_name"])
                     set_website(acc["company_name"], found or "")
                     run_cost += cost
-                lookup_bar.progress(1.0, text="Done.")
+                lookup_bar.progress(1.0, text=":material/check_circle: Done.")
                 save_website_lookup_cost(run_cost, total)
                 st.rerun()
 
@@ -1945,10 +2094,12 @@ elif active_tab == "prospector":
         if diagnosis_input["rejected_count"] == 0 and diagnosis_input["not_interested_with_reason_count"] == 0:
             st.info("Nothing to diagnose yet - no rejections tracked and no not-interested reasons given so far.")
         else:
-            diag_bar = st.progress(0, text="Looking for patterns in your rejections...")
+            with st.container(key="diag_progress_bar"):
+                diag_bar = st.progress(0, text="Looking for patterns in your rejections...")
+            st.html(progress_shimmer_css("diag_progress_bar"))
 
             def _update_diag_progress(substatus):
-                diag_bar.progress(0.5, text=f"Looking for patterns in your rejections - {substatus}")
+                diag_bar.progress(progress_fraction("diagnosis", substatus), text=f"Looking for patterns in your rejections - {substatus}")
 
             try:
                 result = diagnose(diagnosis_input, on_progress=_update_diag_progress)
@@ -1956,7 +2107,7 @@ elif active_tab == "prospector":
                 diag_bar.empty()
                 st.error(str(exc))
             else:
-                diag_bar.progress(1.0, text="Done.")
+                diag_bar.progress(1.0, text=":material/check_circle: Done.")
                 st.session_state["diagnosis_result"] = result
                 st.rerun()
 
@@ -1982,10 +2133,12 @@ elif active_tab == "prospector":
         if total_inputs == 0:
             st.info("Nothing to analyze yet - come back once there's more history across scoring, target accounts, outreach, or interviews.")
         else:
-            learn_bar = st.progress(0, text="Reasoning over your real data...")
+            with st.container(key="learn_progress_bar"):
+                learn_bar = st.progress(0, text="Reasoning over your real data...")
+            st.html(progress_shimmer_css("learn_progress_bar"))
 
             def _update_learn_progress(substatus):
-                learn_bar.progress(0.5, text=f"Reasoning over your real data - {substatus}")
+                learn_bar.progress(progress_fraction("learn", substatus), text=f"Reasoning over your real data - {substatus}")
 
             try:
                 result = analyze_learn_engine(learn_input, on_progress=_update_learn_progress)
@@ -1993,7 +2146,7 @@ elif active_tab == "prospector":
                 learn_bar.empty()
                 st.error(str(exc))
             else:
-                learn_bar.progress(1.0, text="Done.")
+                learn_bar.progress(1.0, text=":material/check_circle: Done.")
                 for gap in learn_input["known_gaps"]:
                     result.setdefault("known_gaps", []).append(gap)
                 st.session_state["learn_engine_result"] = result
@@ -2040,10 +2193,16 @@ elif active_tab == "prep":
             with gen_col:
                 if st.button("Generate prep", type="primary", key="generate_prep_btn", disabled=(target_job is None)):
                     start_round(target_job["source"], target_job["job_id"], round_label, interviewers=interviewers or None)
-                    prep_bar = st.progress(0, text="Researching the company and interviewer(s)...")
+                    with st.container(key="prep_progress_bar"):
+                        prep_bar = st.progress(0, text="Researching the company and interviewer(s)...")
+                    st.html(progress_shimmer_css("prep_progress_bar"))
 
                     def _update_prep_progress(substatus):
-                        prep_bar.progress(0.6, text=f"Drafting prep content - {substatus}")
+                        # generate_prep only wires on_progress into its second call
+                        # (structuring the research into prep content) - the research
+                        # phase itself reports no substatus, so the bar just holds
+                        # at its "Researching..." starting text until this fires.
+                        prep_bar.progress(progress_fraction("prep", substatus), text=f"Drafting prep content - {substatus}")
 
                     try:
                         result = generate_prep(target_job, load_profile(), interviewers, on_progress=_update_prep_progress)
@@ -2051,7 +2210,7 @@ elif active_tab == "prep":
                         prep_bar.empty()
                         st.error(str(exc))
                     else:
-                        prep_bar.progress(1.0, text="Done.")
+                        prep_bar.progress(1.0, text=":material/check_circle: Done.")
                         save_round(
                             target_job["source"], target_job["job_id"], round_label,
                             interviewers=result["interviewers"] or interviewers,
@@ -2153,10 +2312,12 @@ elif active_tab == "linkedin":
         st.markdown(f"Last saved: {linkedin_data['last_saved']} (from {', '.join(linkedin_data.get('source_files', []))})")
 
         if st.button("Analyze profile", type="primary", disabled=not linkedin_data.get("raw_text")):
-            enhance_bar = st.progress(0, text="Analyzing your LinkedIn profile...")
+            with st.container(key="enhance_progress_bar"):
+                enhance_bar = st.progress(0, text="Analyzing your LinkedIn profile...")
+            st.html(progress_shimmer_css("enhance_progress_bar"))
 
             def _update_enhance_progress(substatus):
-                enhance_bar.progress(0.5, text=f"Analyzing your LinkedIn profile - {substatus}")
+                enhance_bar.progress(progress_fraction("linkedin_enhance", substatus), text=f"Analyzing your LinkedIn profile - {substatus}")
 
             try:
                 context = build_enhancement_context()
@@ -2165,7 +2326,7 @@ elif active_tab == "linkedin":
                 enhance_bar.empty()
                 st.error(str(exc))
             else:
-                enhance_bar.progress(1.0, text="Done.")
+                enhance_bar.progress(1.0, text=":material/check_circle: Done.")
                 save_analysis(
                     result["suggestions"], result["profile_strength_score"], result["profile_strength_rationale"],
                     datetime.now(timezone.utc).isoformat(),
@@ -2244,12 +2405,15 @@ elif active_tab == "linkedin":
 
 elif active_tab == "support":
     render_feedback_widget("support")
-    render_support_page(
-        BHANGI_PROJECT,
-        intro=(
-            "Ran into something broken? Describe it below and attach a "
-            "screenshot and/or a log file if you have one - this gets queued "
-            "for review, same as everything else Panga tracks."
-        ),
-        project_root=PROJECT_ROOT,
-    )
+    if render_support_page is None:
+        st.info("The Support tab isn't available in this build.")
+    else:
+        render_support_page(
+            BHANGI_PROJECT,
+            intro=(
+                "Ran into something broken? Describe it below and attach a "
+                "screenshot and/or a log file if you have one - this gets queued "
+                "for review, same as everything else Panga tracks."
+            ),
+            project_root=PROJECT_ROOT,
+        )

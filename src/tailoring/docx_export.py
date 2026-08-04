@@ -44,10 +44,10 @@ def _looks_like_header(line: str) -> bool:
     return bool(line) and line == line.upper() and any(c.isalpha() for c in line) and len(line) < 60
 
 
-def _set_base_font(doc: Document) -> None:
+def _set_base_font(doc: Document, body_size: "Pt" = BODY_SIZE) -> None:
     normal = doc.styles["Normal"]
     normal.font.name = BODY_FONT
-    normal.font.size = BODY_SIZE
+    normal.font.size = body_size
     # A blank line in the source text used to ALSO get its own empty
     # paragraph on top of this - the two stacked, making the document look
     # sparse ("too many spaces/carriage returns", Zahir's real complaint on
@@ -56,9 +56,19 @@ def _set_base_font(doc: Document) -> None:
     normal.paragraph_format.space_after = Pt(4)
 
 
-def text_to_docx_bytes(text: str, author: str | None = None) -> bytes:
+def text_to_docx_bytes(text: str, author: str | None = None, body_size_pt: float | None = None) -> bytes:
+    """body_size_pt overrides the default 10.5pt body size - used to shrink
+    USAJOBS resumes (10pt, or 9pt if still running long) to fit its hard
+    2-page upload limit (Zahir's explicit ask 2026-08-03: "reduce the size
+    of text to 10 or 9 ... headings needs to be adjusted accordingly").
+    Name/header sizing scales down proportionally with it so the document
+    keeps the same visual hierarchy at any size, not just a smaller body
+    next to an unchanged oversized name."""
+    body_size = Pt(body_size_pt) if body_size_pt else BODY_SIZE
+    name_size = Pt(round((body_size_pt or 10.5) * (NAME_SIZE.pt / 10.5)))
+
     doc = Document()
-    _set_base_font(doc)
+    _set_base_font(doc, body_size)
 
     # python-docx's default Word file properties (Save As dialog, File >
     # Info) list the author as literally "python-docx" - a real, visible
@@ -89,7 +99,7 @@ def text_to_docx_bytes(text: str, author: str | None = None) -> bytes:
             p = doc.add_paragraph()
             run = p.add_run(line)
             run.bold = True
-            run.font.size = NAME_SIZE
+            run.font.size = name_size
             run.font.color.rgb = NAME_ACCENT_COLOR
             seen_name = True
             in_contact_block = True

@@ -155,12 +155,6 @@ echo If anything still looks wrong, run export_feedback_for_zahir.bat
 echo afterwards and send the zip it creates - that's easier than describing
 echo what happened.
 echo.
-rem Tee-Object keeps the console visible (so it doesn't look frozen) while
-rem also writing everything to streamlit_console.log - the second half of
-rem the debug picture alongside data\logs\panga_debug.log (debug_log.py's
-rem in-app logging). Zahir's ask 2026-08-03: an easy-to-diagnose build for
-rem a friend tester, without him needing to screen-share or transcribe a
-rem console window that scrolls away.
 rem --server.fileWatcherType none is required, not optional: this package
 rem ships compiled .pyc instead of .py source (see the build step that
 rem strips .py files after compileall), and Streamlit's hot-reload watcher
@@ -168,4 +162,13 @@ rem cannot read/hash a .pyc module's source to detect real changes -
 rem discovered live 2026-08-03 when it treated every poll as "changed" and
 rem reran the app in an infinite loop, never letting the page settle.
 rem Friends never edit this code, so disabling the watcher costs nothing.
-powershell -NoProfile -Command "& { venv\Scripts\streamlit.exe run src\ui\app.py --server.port 8520 --server.headless false --server.fileWatcherType none --logger.level=debug 2>&1 | Tee-Object -FilePath streamlit_console.log; (Get-Content streamlit_console.log -Raw) | Set-Content streamlit_console.log -Encoding utf8 }"
+rem
+rem Logging note (2026-08-04, real friend-tester crash follow-up): the
+rem previous version used Tee-Object then a post-hoc re-encode to UTF-8
+rem AFTER the process exited - that re-encode step, and possibly some of
+rem Tee-Object's own buffered output, never runs/flushes if the app
+rem crashes hard or the window gets force-closed, which is exactly the
+rem scenario this log exists to capture. Now writes UTF-8 with
+rem AutoFlush=true, one line at a time, so every line is durably on disk
+rem the instant it's printed - no dependency on a clean exit at all.
+powershell -NoProfile -Command "& { $writer = New-Object System.IO.StreamWriter('streamlit_console.log', $false, [System.Text.Encoding]::UTF8); $writer.AutoFlush = $true; try { venv\Scripts\streamlit.exe run src\ui\app.py --server.port 8520 --server.headless false --server.fileWatcherType none --logger.level=debug 2>&1 | ForEach-Object { Write-Host $_; $writer.WriteLine($_) } } finally { $writer.Close() } }"
