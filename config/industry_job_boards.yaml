@@ -191,3 +191,80 @@ retained_search_firms:
 # deliberately NOT listed here - they work in reverse (recruiters search
 # member profiles; there's nothing for Panga to search). See PRD §13 backlog
 # item on executive candidate-network membership value.
+
+# UK oil & gas / energy / nuclear job boards, recon done 2026-08-03 - 11
+# sites checked for scrapeability against Zahir's target sector (UK oil &
+# gas/energy, engineering/technical/project roles), same recon-only pattern
+# as the 2026-07-29 pharma survey above. Only 2 of 11 came back clean
+# public_html; several UK recruiter/aggregator sites (Fircroft root domain,
+# TotalJobs, oilandgasjobsearch.com) failed at the TCP/TLS level on every
+# attempt (curl -v and WebFetch, repeated) rather than a normal HTTP block -
+# noted as blocked since the practical outcome for a plain-requests scraper
+# is the same (no response), even though the cause differs from a clean
+# 403/429.
+uk_energy_job_boards:
+  - name: Fircroft
+    url: "https://www.fircroft.com/jobs"
+    note: "Confirmed BLOCKED 2026-08-03 - TLS handshake reset on every attempt (curl -v: 'schannel: failed to receive handshake, SSL/TLS connection failed'), reproduced on both /jobs and the site root, both via WebFetch (ECONNRESET) and curl. Connection-level bot-blocking, not a normal HTTP status."
+    access_method: blocked
+    status: rejected
+
+  - name: NES Fircroft
+    url: "https://www.nesfircroft.com/jobs"
+    note: "Confirmed JS-RENDERED 2026-08-03 - raw HTML is nav/header/footer/CV-dropoff form only, no listing data, tried both plain /jobs and /jobs?keywords=engineer. Job content loads client-side after page load."
+    access_method: js_rendered
+    status: rejected
+
+  - name: Petroplan
+    url: "https://www.petroplan.com/find-a-job"
+    note: "Confirmed BROKEN 2026-08-03 - consistent HTTP 500 Internal Server Error on /find-a-job across repeated attempts (WebFetch twice + curl -sIL), WordPress backend error (Link header shows wp-json), not bot-blocking but still unusable as a scrape target right now. www.petroplan.com/find-a-job 301s to petroplan.com/find-a-job which then 500s."
+    access_method: blocked
+    status: rejected
+
+  - name: Rigzone
+    url: "https://www.rigzone.com/oil/jobs/search/"
+    note: "Confirmed SCRAPEABLE 2026-08-03 - real listings server-rendered in raw HTML (title/company/location, e.g. 'Warehouse & Yard Operator' - Baker Hughes, Prudhoe Bay AK), '1 - 20 of thousands of Jobs' pagination visible. Global board, not UK-specific, so would need a location/keyword filter to narrow to UK roles - not attempted, recon only. BUILT 2026-08-04 (src/search/industry_boards.py fetch_rigzone_jobs) - confirmed the site's own ?sl=<text> location field filters server-side (143 UK jobs vs. thousands unfiltered), so the scraper passes sl=\"United Kingdom\" instead of scraping everything."
+    access_method: public_html
+    status: built
+
+  - name: Oil & Gas Job Search
+    url: "https://oilandgasjobsearch.com/jobs?title=uk"
+    note: "Confirmed BLOCKED 2026-08-03 - connection timeout on every attempt (WebFetch: ECONNREFUSED; curl -v: 'Connection timed out'), reproduced on both the /jobs search path and the site root. CareerBuilder-owned (acquired 2013), ~12,000 active postings per third-party listings, but unreachable from this environment on repeated tries."
+    access_method: blocked
+    status: rejected
+
+  - name: IChemE Job Board
+    url: "https://jobs.thechemicalengineer.com/jobs/"
+    note: "Confirmed SCRAPEABLE 2026-08-03 - IChemE's job board actually lives at jobs.thechemicalengineer.com (Madgex platform), not icheme.org - server-rendered HTML with real UK listings (e.g. 'Process Engineer (KTP Associate)' - Liverpool, 'Chemical Engineer' - Devon/Cambridgeshire), locations/salary ranges/apply links all in the static markup. Parsing logic WRITTEN 2026-08-04 (src/search/industry_boards.py fetch_icheme_jobs, verified against saved HTML) but NOT wired into the daily run - live-tested 2026-08-04 and Python's requests library gets a 403 from this site's WAF (sjb-nginx, X-Limited-Browser/X-WAF-Banned-IP headers present) on every attempt, even with full browser-style headers, while curl and PowerShell's Invoke-WebRequest hit the identical URL fine. Reads as fingerprinting the HTTP/TLS stack, not blocking on headers/UA string - the original 2026-08-03 recon used curl/WebFetch, which is why it read clean. Needs a client that doesn't trip this (e.g. one of the TLS-fingerprint-mimicking requests forks) before this can ship - not attempted."
+    access_method: blocked
+    status: candidate
+
+  - name: Energy Jobline
+    url: "https://www.energyjobline.com/jobs"
+    note: "Confirmed SCRAPEABLE 2026-08-03 - server-rendered HTML with real listings (e.g. 'Design Interface Engineer', 'Offshore Lifting Lead', 'Senior SAP PP/QM Consultant'), posting dates/recruiter names (NES Fircroft Ltd, KinTec Recruitment Ltd)/locations (Madrid, Abu Dhabi, Manchester, Midland TX) all present. Aggregates from multiple energy recruiters, would need a UK/location filter to narrow results."
+    access_method: public_html
+    status: candidate
+
+  - name: Nuclear Jobs UK
+    url: "https://nuclearjobs.org/jobs"
+    note: "Confirmed JS-RENDERED 2026-08-03 - nuclearjobs.co.uk 301s to nuclearjobs.org; raw HTML on /jobs is nav/category-browse links and a search form template only, no listing data, job content loads dynamically."
+    access_method: js_rendered
+    status: rejected
+
+  - name: CV-Library
+    url: "https://www.cv-library.co.uk/search-jobs?q=oil+gas"
+    note: "Confirmed BLOCKED 2026-08-03 - HTTP 403 Forbidden on the search-jobs page, reproduced identically via WebFetch and curl (both got 403)."
+    access_method: blocked
+    status: rejected
+
+  - name: TotalJobs
+    url: "https://www.totaljobs.com/jobs/oil-and-gas"
+    note: "Confirmed BLOCKED 2026-08-03 - repeated TLS renegotiation then timeout on every attempt (curl -v shows 'schannel: remote party requests renegotiation' looping until a 15s timeout with 0 bytes received; WebFetch timed out at 60s), reproduced on both /jobs/oil-and-gas and the site root. Reads as active anti-bot TLS fingerprinting."
+    access_method: blocked
+    status: rejected
+
+  - name: Talent Scotland
+    url: "https://www.talentscotland.com/work/finding-a-job"
+    note: "Confirmed NO JOB BOARD 2026-08-03 - talentscotland.com 301s to sdi.co.uk/talentscotland (Scottish Development International), a marketing/informational page for businesses considering relocating to Scotland. It has no listings of its own; it links OUT to Indeed, Reed, S1jobs, Agency Central, and JobCentre Plus. Same pattern as Pender & Howe above - not a scrape target, nothing to build against."
+    access_method: public_html
+    status: rejected

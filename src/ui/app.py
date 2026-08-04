@@ -335,6 +335,14 @@ SIGNAL_TYPE_LABELS = {
     "funding_event": "Funding/IPO filing",
     "regulatory_filing": "Regulatory filing (deprecated signal - see note above)",
 }
+# Known channels the "Add a job manually" fallback can attribute a posting
+# to - kept in sync with the sources industry_boards.py/company_sites.py
+# actually search, plus LinkedIn (default, since it's the one channel with
+# no automated search at all) and "Other" for anything not listed.
+MANUAL_JOB_SOURCE_OPTIONS = [
+    "linkedin", "Rigzone", "IChemE Job Board", "Planet Pharma", "BioSpace",
+    "Beacon Hill Life Sciences", "Atrium", "GForce Life Sciences", "Other",
+]
 TAB_ICONS = {
     "cta": ":material/notifications_active:",
     "results": ":material/work:",
@@ -880,16 +888,16 @@ elif active_tab == "results":
     with col2:
         st.markdown("This button only covers USAJOBS.gov directly. ZipRecruiter, Dice, and Indeed are searched automatically once a day by the scheduled task instead (they're MCP connector tools, not reachable from this button).")
 
-    with st.expander("Add a job manually (e.g. from LinkedIn)"):
+    with st.expander("Add a job manually (e.g. from LinkedIn or a site Panga can't search automatically)"):
         st.markdown(
-            "LinkedIn has no public search API and blocks scraping, so this "
-            "is the one channel that works by pasting the posting yourself "
-            "instead of an automated search. The description is saved now "
-            "rather than fetched live later like other channels, since "
-            "LinkedIn URLs often can't be reliably refetched (login wall/"
-            "bot-check)."
+            "For channels with no public search API and no working scraper "
+            "(LinkedIn, or a job board that turned out blocked/JS-rendered), "
+            "this is the way to get a posting into Panga - paste it yourself "
+            "instead of waiting on an automated search. The description is "
+            "saved now rather than fetched live later, since these URLs "
+            "often can't be reliably refetched (login wall/bot-check)."
         )
-        manual_job_fields = ["manual_job_title", "manual_job_org", "manual_job_location", "manual_job_url", "manual_job_description"]
+        manual_job_fields = ["manual_job_title", "manual_job_org", "manual_job_location", "manual_job_url", "manual_job_description", "manual_job_source_other"]
         # Same pattern as the feedback widget's clear-after-save: a widget's
         # own session_state key can only be reset BEFORE that widget is
         # instantiated in a given run, so the save handler below only sets
@@ -902,15 +910,23 @@ elif active_tab == "results":
         manual_org = st.text_input("Organization", key="manual_job_org")
         manual_location = st.text_input("Location", key="manual_job_location")
         manual_url = st.text_input("Posting URL", key="manual_job_url")
-        manual_source = st.text_input("Source", value="linkedin", key="manual_job_source")
+        manual_source_choice = st.selectbox(
+            "Channel this came from", MANUAL_JOB_SOURCE_OPTIONS, key="manual_job_source",
+            help="Pick the site the posting is from, so it groups with the rest of Panga's per-channel data instead of showing up unlabeled.",
+        )
+        manual_source_other = (
+            st.text_input("Channel name", key="manual_job_source_other")
+            if manual_source_choice == "Other" else None
+        )
         manual_description = st.text_area(
             "Paste the job description text", key="manual_job_description", height=200,
         )
+        manual_source = (manual_source_other or "Other") if manual_source_choice == "Other" else manual_source_choice
         if st.button("Save job", type="primary", disabled=not (manual_title and manual_org and manual_url)):
             from search.job_store import add_manual_job, update_job_score
             job = add_manual_job(
                 title=manual_title, organization=manual_org, location=manual_location,
-                description=manual_description, posting_url=manual_url, source=manual_source or "linkedin",
+                description=manual_description, posting_url=manual_url, source=manual_source,
             )
             # A job with no fit_score is hidden by the Results tab regardless
             # of the slider (see the min_score filter above) - without this,

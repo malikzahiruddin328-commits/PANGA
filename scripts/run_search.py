@@ -119,6 +119,13 @@ _INDUSTRY_BOARD_FETCHERS = [
     ("Beacon Hill", industry_boards.fetch_beacon_hill_jobs),
     ("Atrium", industry_boards.fetch_atrium_jobs),
     ("GForce", industry_boards.fetch_gforce_jobs),
+    ("Rigzone", industry_boards.fetch_rigzone_jobs),
+    # IChemE Job Board deliberately NOT wired in here - fetch_icheme_jobs()
+    # below is written and its parsing logic verified against real markup,
+    # but the live site 403s Python's requests library specifically (works
+    # fine via curl/PowerShell's WinHTTP stack) - see the function's
+    # docstring and config/industry_job_boards.yaml. Not safe to run daily
+    # until that's resolved.
 ]
 
 
