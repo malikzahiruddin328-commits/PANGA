@@ -1273,6 +1273,17 @@ elif active_tab == "results":
     if not show_closed:
         ranked = [j for j in ranked if application_status(j) not in CLOSED]
 
+    # Same hide-but-never-delete pattern again (2026-08-05 request): once a
+    # job is marked "applied" there's nothing left to do on it here, so by
+    # default Results should only show jobs still needing a decision -
+    # already-applied jobs stay tracked (CTA/status still update normally)
+    # but no longer crowd out the ones that actually need attention.
+    APPLIED = ("applied",)
+    applied_count = sum(1 for j in ranked if application_status(j) in APPLIED)
+    show_applied = st.checkbox(f"Show {applied_count} job(s) marked 'applied' (hidden by default, nothing is deleted)")
+    if not show_applied:
+        ranked = [j for j in ranked if application_status(j) not in APPLIED]
+
     # Cross-source dedup (2026-07-30): if a company has a direct-site channel
     # (Eisai/AbbVie/IQVIA via company_sites.py) and the same real opening also
     # shows up on a job board (Indeed/ZipRecruiter/Dice/USAJOBS/industry
