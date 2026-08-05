@@ -558,6 +558,20 @@ def _apply_answers_schema() -> dict:
     }
 
 
+def _questions_worth_asking(clarifying_questions: list[dict], ats_score: int) -> list[dict]:
+    """Drops clarifying_questions once ats_score is already maxed at 100 -
+    those questions come from the same drafting call as the resume text,
+    before the deterministic ats_score even exists (see
+    tailoring.ats_score.score_resume_against_keywords()/score_resume_ats()),
+    so the model drafting them has no way to know the real score can't go
+    any higher. A "fact that would raise the score" is meaningless once
+    there's nothing left to raise (Zahir, 2026-08-04: was still seeing
+    these on maxed-score jobs - confusing, pointless)."""
+    if ats_score >= 100:
+        return []
+    return clarifying_questions
+
+
 def _draft_one(
     client: "anthropic.Anthropic",
     shared_context: list[dict],
@@ -624,7 +638,7 @@ def _draft_one(
             "ats_score": ats["ats_score"],
             "ats_rationale": ats["ats_rationale"],
             "ats_next_actions": ats["ats_next_actions"],
-            "clarifying_questions": data.get("clarifying_questions", []),
+            "clarifying_questions": _questions_worth_asking(data.get("clarifying_questions", []), ats["ats_score"]),
         }
     if doc_key == "apply_answers":
         return data.get("apply_answers", [])
