@@ -68,7 +68,7 @@ import yaml
 from search.usajobs import search_jobs, USAJobsNotConfigured
 from search.job_store import load_jobs
 from ranking.prioritize import weight_for, dedupe_across_sources
-from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion, set_strategy_tag, needs_edit_review, record_document_edit_review
+from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion, set_strategy_tag, needs_edit_review, record_document_edit_review, get_applications_with_open_clarifying_questions
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
 from tailoring.interview_prep import load_interview_prep, record_round_outcome, build_prep_context, generate_prep, start_round, save_round
 from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
@@ -395,6 +395,104 @@ def render_outreach_section(key_prefix: str, target_account_name: str | None = N
                 st.warning("Contact name is required.")
 
 
+def render_gap_questions_section(job: dict, app_record: dict) -> None:
+    """The clarifying-questions answer-and-regenerate flow for one job's
+    resume - the Profile Gaps tab's per-job unit. Moved off the Results tab
+    2026-08-04 (Zahir: too much clutter mixed into per-job review) -
+    resume_ats_score/rationale/next_actions stay inline on Results (just
+    informative, no clutter issue), only this interactive part moved here.
+
+    Preserves the 2026-07-31 fix intact: each text_area is keyed by the
+    question's own content + suggested_answer, not its position - keying by
+    position let a later regeneration round's box at the same index
+    silently keep a stale answer under a completely different question."""
+    clarifying_questions = app_record.get("resume_clarifying_questions") or []
+    if not clarifying_questions:
+        return
+
+    job_key = f"{job.get('source')}_{job.get('job_id')}"
+    current_score = app_record.get("resume_ats_score")
+    prev_score_key = f"prev_ats_score_{job_key}"
+
+    st.markdown(
+        "**Answer these to raise the score further - only used if you "
+        "confirm they're true, nothing is ever invented:**"
+    )
+    st.markdown(
+        "Some boxes are pre-filled with a proposed guess (worded "
+        "as a guess, e.g. \"Roughly 8-10 engineers?\") - edit it "
+        "to whatever's actually true, or clear it if it's wrong. "
+        "Nothing pre-filled is saved as-is."
+    )
+    answer_entries = []
+    for q in clarifying_questions:
+        # See the docstring above - question-content keying, not position.
+        q_key = f"gapans_{job_key}_{abs(hash(q['question'] + '|' + (q.get('suggested_answer') or ''))) % 10_000_000}"
+        is_disqualifier = q.get("type") == "disqualifier_check"
+        if is_disqualifier:
+            st.caption(
+                ":material/flag: This answer applies to every "
+                "future job match, not just this one - not a "
+                "guess, so the box starts empty."
+            )
+        answer_value = st.text_area(
+            q["question"], value=q.get("suggested_answer") or "",
+            key=q_key, height=68,
+            placeholder="Type your answer..." if is_disqualifier else None,
+        )
+        answer_entries.append({
+            "skill": q["skill"],
+            "type": q.get("type", "skill_gap"),
+            "answer": answer_value,
+        })
+    if st.button("Save answers & regenerate resume", key=f"gapsave_{job_key}"):
+        answered = [e for e in answer_entries if e["answer"] and e["answer"].strip()]
+        if not answered:
+            st.toast("Answer at least one question first.", icon=":material/warning:")
+        else:
+            st.session_state[prev_score_key] = current_score
+            save_gap_answers(job, answered)
+            regen_bar_key = f"regen_progress_bar_{job_key}"
+            with st.container(key=regen_bar_key):
+                regen_bar = st.progress(0, text="Regenerating resume with your answers...")
+            st.html(progress_shimmer_css(regen_bar_key))
+
+            def _update_regen_progress(i, total, doc_key2, substatus=None):
+                label = "Regenerating resume"
+                label += f" — {substatus}" if substatus else "..."
+                within_doc = progress_fraction(doc_key2, substatus)
+                regen_bar.progress(((i - 1) + within_doc) / total, text=label)
+
+            try:
+                regen = generate_documents(
+                    job, load_profile(), ["resume"], on_progress=_update_regen_progress,
+                )
+            except (DraftingNotConfigured, DraftingFailed) as exc:
+                regen_bar.empty()
+                st.error(str(exc))
+            else:
+                regen_bar.progress(1.0, text=":material/check_circle: Done.")
+                new_resume = regen["resume"]
+                upsert_application(
+                    job["source"], job["job_id"], status="under review",
+                    resume_text=new_resume["text"],
+                    resume_ats_score=new_resume["ats_score"],
+                    resume_ats_rationale=new_resume["ats_rationale"],
+                    resume_ats_next_actions=new_resume["ats_next_actions"],
+                    resume_clarifying_questions=new_resume["clarifying_questions"],
+                    suggested_strategy_tag=new_resume["suggested_strategy_tag"],
+                )
+                sync_workspace_documents(
+                    job["source"], job["job_id"], ["resume"],
+                    {"resume": new_resume["text"]}, load_profile(), job,
+                )
+                st.toast(
+                    f"Resume regenerated - new ATS score {new_resume['ats_score']}/100.",
+                    icon=":material/check_circle:",
+                )
+                st.rerun()
+
+
 def go_to_prep(target: dict) -> None:
     """Jumps to the Interview Prep tab with enough context to hand off to
     Claude Code - the tab itself doesn't generate anything, it just shows
@@ -426,6 +524,7 @@ prep_records = load_interview_prep()
 cta_count = len(all_cta)
 results_count = len(jobs)
 prep_in_progress_count = sum(1 for r in prep_records for round_ in r["rounds"] if round_["status"] == "in_progress")
+gaps_count = len(get_applications_with_open_clarifying_questions())
 
 st.session_state.setdefault("active_tab", "cta")
 
@@ -474,6 +573,7 @@ TAB_ICONS = {
     "results": ":material/work:",
     "prospector": ":material/travel_explore:",
     "prep": ":material/school:",
+    "gaps": ":material/quiz:",
     "linkedin": ":material/badge:",
     "support": ":material/support_agent:",
     "settings": ":material/settings:",
@@ -483,6 +583,7 @@ TABS = [
     ("results", f"Results ({results_count})"),
     ("prospector", "Prospector"),
     ("prep", f"Interview prep ({prep_in_progress_count})" if prep_in_progress_count else "Interview prep"),
+    ("gaps", f"Profile gaps ({gaps_count})" if gaps_count else "Profile gaps"),
     ("linkedin", "LinkedIn"),
     ("support", "Support"),
     ("settings", "Settings"),
@@ -1548,100 +1649,13 @@ elif active_tab == "results":
                                         st.markdown("**How to raise it:**")
                                         for action in next_actions:
                                             st.markdown(f"- {action}")
-                                    clarifying_questions = app_record.get("resume_clarifying_questions") or []
-                                    if clarifying_questions:
+                                    open_questions = app_record.get("resume_clarifying_questions") or []
+                                    if open_questions:
+                                        n = len(open_questions)
                                         st.markdown(
-                                            "**Answer these to raise the score further - only used if you "
-                                            "confirm they're true, nothing is ever invented:**"
+                                            f"*{n} open profile-gap question{'s' if n != 1 else ''} - "
+                                            "see the **Profile gaps** tab to answer.*"
                                         )
-                                        st.markdown(
-                                            "Some boxes are pre-filled with a proposed guess (worded "
-                                            "as a guess, e.g. \"Roughly 8-10 engineers?\") - edit it "
-                                            "to whatever's actually true, or clear it if it's wrong. "
-                                            "Nothing pre-filled is saved as-is."
-                                        )
-                                        job_key = f"{job.get('source')}_{job.get('job_id')}"
-                                        answer_entries = []
-                                        for q in clarifying_questions:
-                                            # Keyed by the question's own content, not its position
-                                            # (qi) - a real bug found 2026-07-31: each regeneration
-                                            # round produces a differently-worded, differently-
-                                            # ordered set of questions, but Streamlit persists a
-                                            # text_area's value across reruns by its key. Keying by
-                                            # position meant a NEW round's box at the same position
-                                            # silently kept the PREVIOUS round's leftover answer text
-                                            # for a completely different question, which then got
-                                            # saved under the new (wrong) skill label - confirmed in
-                                            # gap_interview_answers with several mismatched entries.
-                                            # Also folded in the suggested_answer text (2026-07-31,
-                                            # same bug class caught on the strategy-tag box): the SAME
-                                            # question can recur across rounds with a DIFFERENT
-                                            # suggested answer, and a key on question text alone would
-                                            # silently keep showing the earlier round's stale suggestion.
-                                            q_key = f"gapans_{job_key}_{abs(hash(q['question'] + '|' + (q.get('suggested_answer') or ''))) % 10_000_000}"
-                                            is_disqualifier = q.get("type") == "disqualifier_check"
-                                            if is_disqualifier:
-                                                st.caption(
-                                                    ":material/flag: This answer applies to every "
-                                                    "future job match, not just this one - not a "
-                                                    "guess, so the box starts empty."
-                                                )
-                                            answer_value = st.text_area(
-                                                q["question"], value=q.get("suggested_answer") or "",
-                                                key=q_key, height=68,
-                                                placeholder="Type your answer..." if is_disqualifier else None,
-                                            )
-                                            answer_entries.append({
-                                                "skill": q["skill"],
-                                                "type": q.get("type", "skill_gap"),
-                                                "answer": answer_value,
-                                            })
-                                        if st.button("Save answers & regenerate resume", key=f"gapsave_{job_key}"):
-                                            answered = [e for e in answer_entries if e["answer"] and e["answer"].strip()]
-                                            if not answered:
-                                                st.toast("Answer at least one question first.", icon=":material/warning:")
-                                            else:
-                                                st.session_state[prev_score_key] = current_score
-                                                save_gap_answers(job, answered)
-                                                regen_bar_key = f"regen_progress_bar_{job_key}"
-                                                with st.container(key=regen_bar_key):
-                                                    regen_bar = st.progress(0, text="Regenerating resume with your answers...")
-                                                st.html(progress_shimmer_css(regen_bar_key))
-
-                                                def _update_regen_progress(i, total, doc_key2, substatus=None):
-                                                    label = "Regenerating resume"
-                                                    label += f" — {substatus}" if substatus else "..."
-                                                    within_doc = progress_fraction(doc_key2, substatus)
-                                                    regen_bar.progress(((i - 1) + within_doc) / total, text=label)
-
-                                                try:
-                                                    regen = generate_documents(
-                                                        job, load_profile(), ["resume"], on_progress=_update_regen_progress,
-                                                    )
-                                                except (DraftingNotConfigured, DraftingFailed) as exc:
-                                                    regen_bar.empty()
-                                                    st.error(str(exc))
-                                                else:
-                                                    regen_bar.progress(1.0, text=":material/check_circle: Done.")
-                                                    new_resume = regen["resume"]
-                                                    upsert_application(
-                                                        job["source"], job["job_id"], status="under review",
-                                                        resume_text=new_resume["text"],
-                                                        resume_ats_score=new_resume["ats_score"],
-                                                        resume_ats_rationale=new_resume["ats_rationale"],
-                                                        resume_ats_next_actions=new_resume["ats_next_actions"],
-                                                        resume_clarifying_questions=new_resume["clarifying_questions"],
-                                                        suggested_strategy_tag=new_resume["suggested_strategy_tag"],
-                                                    )
-                                                    sync_workspace_documents(
-                                                        job["source"], job["job_id"], ["resume"],
-                                                        {"resume": new_resume["text"]}, load_profile(), job,
-                                                    )
-                                                    st.toast(
-                                                        f"Resume regenerated - new ATS score {new_resume['ats_score']}/100.",
-                                                        icon=":material/check_circle:",
-                                                    )
-                                                    st.rerun()
                             if doc_key == "resume" and app_record.get("resume_ats_score") is not None:
                                 st.markdown(f"**Resume text (ATS score: {app_record['resume_ats_score']}/100):**")
                             st.code(drafted_text, language=None, wrap_lines=True)
@@ -2301,6 +2315,33 @@ elif active_tab == "prep":
                     record_round_outcome(record["source"], record["job_id"], round_["round_label"], new_outcome, outcome_notes or None)
                     st.toast("Saved.", icon=":material/check_circle:")
                     st.rerun()
+
+elif active_tab == "gaps":
+    render_feedback_widget("gaps")
+
+    st.header("Profile gaps")
+    st.markdown(
+        "Real facts your resumes are currently missing that would raise "
+        "their ATS score, consolidated across every job in one place - "
+        "answer here instead of hunting through each job's Results entry. "
+        "A job drops off this list once its questions are answered and its "
+        "resume regenerated."
+    )
+
+    gap_apps = get_applications_with_open_clarifying_questions()
+    if not gap_apps:
+        st.markdown("Nothing open right now.")
+    else:
+        jobs_by_key = {(j.get("source"), j.get("job_id")): j for j in jobs}
+        for app_record in gap_apps:
+            job = jobs_by_key.get((app_record.get("source"), app_record.get("job_id")))
+            if job is None:
+                continue
+            n = len(app_record.get("resume_clarifying_questions") or [])
+            score = app_record.get("resume_ats_score")
+            score_label = f" - ATS score {score}/100" if score is not None else ""
+            with st.expander(f"{job.get('title', 'Untitled role')} @ {job.get('organization', 'Unknown organization')}{score_label} ({n} open)"):
+                render_gap_questions_section(job, app_record)
 
 elif active_tab == "linkedin":
     render_feedback_widget("linkedin")
