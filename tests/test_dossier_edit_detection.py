@@ -120,6 +120,41 @@ def test_sync_migrates_old_descriptive_filename_without_losing_edits(job):
     assert "added by hand in Word" in backup_text
 
 
+def test_sync_migrates_old_hash_suffixed_filename_without_losing_edits(job):
+    # Same integration-level guarantee as the descriptive-format migration
+    # test above, one format later: a folder created under the brief
+    # 2026-08-05 {Name}_{DocType}_{Organization}_{hash}.docx format (commit
+    # 51120a7, superseded almost immediately when Zahir asked for the
+    # trailing hex string removed) must have its real file found and
+    # renamed forward by the real sync_workspace_documents() call path, not
+    # just by the migration helper in isolation.
+    from docx import Document
+
+    from tailoring.dossier import _legacy_hash_suffixed_workspace_filename, _workspace_filename, dossier_dir
+
+    body = "Dear Hiring Team,\n\nI am excited to apply.\n\nSincerely,\nJane Doe"
+    upsert_application("linkedin", "1", status="under review", cover_letter_text=body)
+
+    folder = dossier_dir("linkedin", "1", "Acme Corp", "Head of IT")
+    old_name = _legacy_hash_suffixed_workspace_filename("cover_letter_text", "Jane Doe", job)
+    sync_workspace_documents("linkedin", "1", ["cover_letter"], {"cover_letter": body}, {"name": "Jane Doe"}, job)
+    new_name = _workspace_filename("cover_letter_text", "Jane Doe", job)
+    (folder / new_name).rename(folder / old_name)
+
+    doc = Document(str(folder / old_name))
+    doc.paragraphs[-1].add_run(" - added by hand in Word.")
+    doc.save(str(folder / old_name))
+
+    sync_workspace_documents("linkedin", "1", ["cover_letter"], {"cover_letter": body}, {"name": "Jane Doe"}, job)
+
+    assert not (folder / old_name).exists()
+    assert (folder / new_name).exists()
+    backups = [p for p in folder.iterdir() if ".edited-" in p.name]
+    assert len(backups) == 1
+    backup_text = "\n".join(p.text for p in Document(str(backups[0])).paragraphs)
+    assert "added by hand in Word" in backup_text
+
+
 def test_regenerate_of_untouched_document_does_not_spam_edited_backup(job):
     # sync_workspace_documents() had the same raw-vs-rendered comparison bug
     # in its own edit-detection - every regenerate of an untouched document

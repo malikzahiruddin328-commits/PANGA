@@ -1,10 +1,13 @@
 from tailoring.dossier import (
     _legacy_descriptive_workspace_filename,
+    _legacy_hash_suffixed_workspace_filename,
     _MAX_WORKSPACE_FILENAME_LEN,
     _migrate_descriptive_filename,
+    _migrate_hash_suffixed_filename,
     _migrate_legacy_filename,
     _slug,
     _workspace_filename,
+    dossier_dir,
 )
 
 
@@ -33,8 +36,7 @@ def test_workspace_filename_drops_title_keeps_name_doctype_org():
     # alone could already run past the new 50-char ceiling on its own.
     job = {"source": "Dice", "job_id": "123", "title": "Head of IT", "organization": "Aerospike"}
     filename = _workspace_filename("resume_text", "Zahir Uddin", job)
-    assert filename.startswith("Zahir_Uddin_Resume_Aerospike_")
-    assert "Head" not in filename and "IT" not in filename.replace("_Uddin_", "")
+    assert filename == "Zahir_Uddin_Resume_Aerospike.docx"
 
 
 def test_workspace_filename_strips_illegal_windows_filename_chars():
@@ -47,8 +49,7 @@ def test_workspace_filename_strips_illegal_windows_filename_chars():
 def test_workspace_filename_skips_missing_parts():
     job = {"source": "Dice", "job_id": "123", "title": None, "organization": None}
     filename = _workspace_filename("resume_text", "Zahir Uddin", job)
-    assert filename.startswith("Zahir_Uddin_Resume_")
-    assert filename.endswith(".docx")
+    assert filename == "Zahir_Uddin_Resume.docx"
 
 
 def test_workspace_filename_stays_under_max_length_with_long_name_and_org():
@@ -85,16 +86,38 @@ def test_workspace_filename_short_field_is_not_truncated_when_other_is_long():
     assert len(filename) <= _MAX_WORKSPACE_FILENAME_LEN
 
 
-def test_workspace_filename_disambiguates_two_different_roles_same_company():
-    # Real scenario Zahir flagged: applying to two different roles at the
-    # same organization must never produce the identical filename, even
-    # though folder context alone keeps the actual files apart - a flat
-    # destination (Downloads, an email) would not.
+def test_workspace_filename_can_collide_across_different_jobs_same_company_by_design():
+    # 2026-08-05: Zahir asked for the disambiguating hash suffix removed
+    # (didn't want a trailing hex string on the filename), even though it
+    # was originally added to guarantee this exact case stays unique.
+    # Accepted tradeoff, documented in _workspace_filename()'s docstring:
+    # two different roles at the same company - same candidate, same doc
+    # type, same organization - can now produce the identical filename.
+    # This is fine WITHIN the app (see the next test - it never actually
+    # collides on disk, each job has its own folder) and only matters if
+    # Zahir manually gathers files out of two different per-job folders
+    # into one flat destination himself (Downloads, an email) - a real but
+    # narrow, low-likelihood case not worth adding cross-folder collision-
+    # scanning complexity to guard against.
     job_a = {"source": "Dice", "job_id": "role-a", "title": "VP Engineering", "organization": "Acme Corp"}
     job_b = {"source": "Dice", "job_id": "role-b", "title": "VP Product", "organization": "Acme Corp"}
     filename_a = _workspace_filename("resume_text", "Zahir Uddin", job_a)
     filename_b = _workspace_filename("resume_text", "Zahir Uddin", job_b)
-    assert filename_a != filename_b
+    assert filename_a == filename_b
+
+
+def test_same_filename_never_collides_on_disk_because_folders_differ():
+    # The actual guarantee that matters in-app: even though the FILENAME can
+    # now be identical across two different jobs at the same company (see
+    # above), each job still gets its own physically separate dossier
+    # folder (_slug() folds in a per-job hash) - so sync_workspace_documents()
+    # never writes two different jobs' documents into the same directory,
+    # meaning an in-app overwrite/collision genuinely cannot happen.
+    job_a = {"source": "Dice", "job_id": "role-a", "title": "VP Engineering", "organization": "Acme Corp"}
+    job_b = {"source": "Dice", "job_id": "role-b", "title": "VP Product", "organization": "Acme Corp"}
+    folder_a = dossier_dir(job_a["source"], job_a["job_id"], job_a["organization"], job_a["title"])
+    folder_b = dossier_dir(job_b["source"], job_b["job_id"], job_b["organization"], job_b["title"])
+    assert folder_a != folder_b
 
 
 def test_workspace_filename_is_stable_for_same_job():
@@ -195,3 +218,45 @@ def test_migrate_descriptive_filename_no_op_when_old_and_new_names_coincide(tmp_
     (folder / new_name).write_text("already current")
     _migrate_descriptive_filename(folder, "resume_text", new_name, "Zahir Uddin", job)
     assert (folder / new_name).read_text() == "already current"
+
+
+def test_migrate_hash_suffixed_filename_renames_when_new_name_absent(tmp_path):
+    # A workspace folder created under the brief 2026-08-05 hash-suffixed
+    # format (commit 51120a7) - superseded almost immediately when Zahir
+    # asked for the trailing hex string removed, but real edits made in
+    # that brief window must still migrate forward, not get orphaned.
+    job = {"source": "Dice", "job_id": "123", "title": "Head of IT", "organization": "Aerospike"}
+    old_name = _legacy_hash_suffixed_workspace_filename("resume_text", "Zahir Uddin", job)
+    new_name = _workspace_filename("resume_text", "Zahir Uddin", job)
+    folder = tmp_path / "aerospike-head-of-it-abc123"
+    folder.mkdir()
+    (folder / old_name).write_text("Zahir's real edited content")
+
+    _migrate_hash_suffixed_filename(folder, "resume_text", new_name, "Zahir Uddin", job)
+
+    assert not (folder / old_name).exists()
+    assert (folder / new_name).read_text() == "Zahir's real edited content"
+
+
+def test_migrate_hash_suffixed_filename_does_not_overwrite_existing_new_file(tmp_path):
+    job = {"source": "Dice", "job_id": "123", "title": "Head of IT", "organization": "Aerospike"}
+    old_name = _legacy_hash_suffixed_workspace_filename("resume_text", "Zahir Uddin", job)
+    new_name = _workspace_filename("resume_text", "Zahir Uddin", job)
+    folder = tmp_path / "aerospike-head-of-it-abc123"
+    folder.mkdir()
+    (folder / old_name).write_text("stale hash-suffixed copy")
+    (folder / new_name).write_text("current real copy")
+
+    _migrate_hash_suffixed_filename(folder, "resume_text", new_name, "Zahir Uddin", job)
+
+    assert (folder / old_name).read_text() == "stale hash-suffixed copy"
+    assert (folder / new_name).read_text() == "current real copy"
+
+
+def test_migrate_hash_suffixed_filename_no_op_when_no_old_file(tmp_path):
+    job = {"source": "Dice", "job_id": "123", "title": "Head of IT", "organization": "Aerospike"}
+    new_name = _workspace_filename("resume_text", "Zahir Uddin", job)
+    folder = tmp_path / "aerospike-head-of-it-abc123"
+    folder.mkdir()
+    _migrate_hash_suffixed_filename(folder, "resume_text", new_name, "Zahir Uddin", job)
+    assert list(folder.iterdir()) == []
