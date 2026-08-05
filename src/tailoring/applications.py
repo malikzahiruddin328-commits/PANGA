@@ -270,6 +270,19 @@ def get_pending_status_suggestions() -> list[dict]:
     return [a for a in load_applications() if a.get("suggested_status")]
 
 
+def get_applications_with_open_clarifying_questions() -> list[dict]:
+    """Every application whose most recent resume draft still has unanswered
+    clarifying_questions - backs the Profile Gaps tab (app.py), which
+    consolidates these across all jobs into one place rather than each
+    living inline on its own job's Results entry (moved 2026-08-04, Zahir:
+    too much clutter mixed into per-job review). A job drops out of this
+    list on its own once its questions are answered and its resume
+    regenerated - either it scores 100 and clarifying_questions comes back
+    empty (see tailoring/drafting.py's _questions_worth_asking()), or a new,
+    smaller set of genuine gaps replaces the old one."""
+    return [a for a in load_applications() if a.get("resume_clarifying_questions")]
+
+
 def confirm_status_suggestion(source: str, job_id: str, accept: bool) -> None:
     """accept=True applies the suggested_status as the real status; either
     way, clears the suggestion so it isn't asked about again."""

@@ -1,14 +1,21 @@
 """Standalone replacement for the panga-cta-fulfillment Claude scheduled
-task (native-packaging branch, 2026-07-31) - ported step-for-step from
+task (native-packaging branch, 2026-07-31; extended 2026-08-04 to fulfill
+requests across every configured inbox account, not just Gmail) - ported
+step-for-step from
 C:\\Users\\User\\.claude\\scheduled-tasks\\panga-cta-fulfillment\\SKILL.md
-(see docs/email-monitoring-task.md), using gmail_client.py in place of the
-MCP connector and tailoring.cta_reasoning.draft_cta_reply() in place of
-live Claude Code reasoning for reply composition.
+(see docs/email-monitoring-task.md), using inbox_accounts.py's
+per-provider adapters (gmail_client.py/microsoft_client.py/imap_client.py -
+no MCP anywhere, see that module's docstring) in place of the MCP
+connector, and tailoring.cta_reasoning.draft_cta_reply() in place of live
+Claude Code reasoning for reply composition.
 
 Runs every 10 minutes (see docs/native-packaging-scope.md's Task Scheduler
-wiring). Only ever creates Gmail DRAFTS, never sends - Zahir reviews and
-sends every reply himself, matching the original SKILL.md's explicit
-safety property.
+wiring). Only ever creates DRAFTS, never sends - Zahir reviews and sends
+every reply himself, matching the original SKILL.md's explicit safety
+property. A cta_emails.json record written before multi-provider support
+has no `provider`/`account` fields - both are read with a "gmail" default
+throughout this file for that reason (see tailoring/cta_emails.py's own
+backward-compatibility note).
 """
 
 import sys
@@ -24,7 +31,7 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-import gmail_client  # noqa: E402
+from inbox_accounts import configured_accounts  # noqa: E402
 from notifications import send_notification  # noqa: E402
 from tailoring.cta_emails import (  # noqa: E402
     get_awaiting_draft_send,
@@ -41,12 +48,24 @@ def _log(message: str) -> None:
     print(message, flush=True)
 
 
-def fulfill_archive_requests(handled_label_id: str) -> int:
+def _account_key(item: dict) -> tuple[str, str]:
+    return item.get("provider", "gmail"), item.get("account", "gmail")
+
+
+def _accounts_by_key(accounts: list) -> dict:
+    return {(a.provider, a.account): a for a in accounts}
+
+
+def fulfill_archive_requests(accounts_by_key: dict) -> int:
     failures = 0
     for item in get_pending_archive_requests():
+        account = accounts_by_key.get(_account_key(item))
+        if account is None:
+            _log(f"  archive skipped for thread {item['thread_id']}: {_account_key(item)} is no longer configured")
+            failures += 1
+            continue
         try:
-            gmail_client.unlabel_thread(item["thread_id"], ["INBOX"])
-            gmail_client.label_thread(item["thread_id"], [handled_label_id])
+            account.archive(item["thread_id"])
             mark_archived(item["thread_id"])
         except Exception as exc:  # noqa: BLE001 - one item's failure shouldn't stop the rest
             _log(f"  archive failed for thread {item['thread_id']}: {exc}")
@@ -77,53 +96,73 @@ def _get_available_interview_slots() -> list[str] | None:
         return None
 
 
-def fulfill_draft_requests() -> int:
+def fulfill_draft_requests(accounts_by_key: dict) -> int:
     failures = 0
     pending = get_pending_draft_requests()
     # Fetched once per run, not once per item - availability doesn't
     # meaningfully change within one 10-minute run, and every
-    # interview_request item this run can reuse the same lookup (avoids
-    # calling the Calendar API once per pending item for no benefit).
+    # interview_request item this run (across every account) can reuse
+    # the same lookup (avoids calling the Calendar API once per pending
+    # item for no benefit).
     interview_slots = _get_available_interview_slots() if any(item["category"] == "interview_request" for item in pending) else None
     for item in pending:
+        account = accounts_by_key.get(_account_key(item))
+        if account is None:
+            _log(f"  draft skipped for thread {item['thread_id']}: {_account_key(item)} is no longer configured")
+            failures += 1
+            continue
         try:
             slots_for_item = interview_slots if item["category"] == "interview_request" else None
             reply_body = draft_cta_reply(item["category"], item["subject"], item["snippet"], available_slots=slots_for_item)
-            draft_id = gmail_client.create_draft(
-                to=item["sender"], subject=f"Re: {item['subject']}", body=reply_body,
-                reply_to_message_id=item.get("message_id"),
+            draft_id, draft_link = account.create_reply_draft(
+                item["sender"], f"Re: {item['subject']}", reply_body, item.get("message_id"),
             )
-            mark_draft_created(item["thread_id"], draft_id)
+            mark_draft_created(item["thread_id"], draft_id, draft_link=draft_link)
         except Exception as exc:  # noqa: BLE001
             _log(f"  draft creation failed for thread {item['thread_id']}: {exc}")
             failures += 1
     return failures
 
 
-def reconcile_sent_drafts() -> None:
+def reconcile_sent_drafts(accounts_by_key: dict) -> None:
     awaiting = get_awaiting_draft_send()
     if not awaiting:
         return
-    current_draft_ids = set(gmail_client.list_drafts())
+    current_ids_cache: dict = {}
     for item in awaiting:
-        if item.get("draft_id") and item["draft_id"] not in current_draft_ids:
+        key = _account_key(item)
+        if key not in current_ids_cache:
+            account = accounts_by_key.get(key)
+            if account is None:
+                current_ids_cache[key] = None
+                continue
+            try:
+                current_ids_cache[key] = set(account.list_current_draft_ids())
+            except Exception as exc:  # noqa: BLE001 - one account's failure shouldn't
+                # block reconciling the others
+                _log(f"  couldn't list current drafts for {key}: {exc}")
+                current_ids_cache[key] = None
+        current_ids = current_ids_cache[key]
+        if current_ids is None:
+            continue
+        if item.get("draft_id") and item["draft_id"] not in current_ids:
             mark_draft_sent(item["thread_id"])
 
 
 def run() -> None:
-    handled_label_id = gmail_client.ensure_label("Panga/Handled")
+    accounts_by_key = _accounts_by_key(configured_accounts())
 
     _log("STEP 1 - Archive fulfillment")
-    failures = fulfill_archive_requests(handled_label_id)
+    failures = fulfill_archive_requests(accounts_by_key)
 
     _log("STEP 2 - Draft fulfillment")
-    failures += fulfill_draft_requests()
+    failures += fulfill_draft_requests(accounts_by_key)
 
     _log("STEP 3 - Reconcile sent drafts")
-    reconcile_sent_drafts()
+    reconcile_sent_drafts(accounts_by_key)
 
     _log("STEP 4 - Second archive pass (picks up anything step 3 just queued)")
-    failures += fulfill_archive_requests(handled_label_id)
+    failures += fulfill_archive_requests(accounts_by_key)
 
     _log("STEP 5 - Notify")
     if failures:

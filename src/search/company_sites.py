@@ -143,6 +143,32 @@ def search_smartrecruiters_jobs(company_name: str, company_id: str, keyword: str
     return jobs
 
 
+def check_smartrecruiters_posting_open(company_id: str, posting_id: str) -> bool:
+    """Freshness check (added 2026-08-05): SmartRecruiters' public API also
+    exposes a single-posting detail endpoint, same base as
+    search_smartrecruiters_jobs() above - a filled/withdrawn posting either
+    404s or comes back with status != "PUBLISHED"."""
+    url = f"https://api.smartrecruiters.com/v1/companies/{company_id}/postings/{posting_id}"
+    response = requests.get(url, timeout=20)
+    if response.status_code == 404:
+        return False
+    response.raise_for_status()
+    return response.json().get("status") == "PUBLISHED"
+
+
+def check_workday_posting_open(tenant: str, site: str, wd_number: int, external_path: str) -> bool:
+    """Freshness check (added 2026-08-05): same Workday CXS JSON API as
+    search_workday_jobs() above, just the per-requisition detail path instead
+    of the list-search path - a closed requisition 404s here rather than
+    returning a job body."""
+    url = f"https://{tenant}.wd{wd_number}.myworkdayjobs.com/wday/cxs/{tenant}/{site}{external_path}"
+    response = requests.get(url, timeout=20)
+    if response.status_code == 404:
+        return False
+    response.raise_for_status()
+    return bool(response.json().get("jobPostingInfo"))
+
+
 if __name__ == "__main__":
     companies = fetch_companies(limit=1000)
     print(f"Found {len(companies)} distinct companies in this page.")
