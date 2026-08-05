@@ -144,3 +144,34 @@ def test_label_thread_merges_categories(monkeypatch):
     monkeypatch.setattr(microsoft_client.requests, "patch", fake_patch)
     microsoft_client.label_thread("m1", ["Panga/Reviewed"])
     assert patched["body"]["categories"] == ["Existing", "Panga/Reviewed"]
+
+
+def test_list_recent_dedupes_and_includes_categories(monkeypatch):
+    monkeypatch.setattr(microsoft_client, "_headers", lambda: {})
+    captured_params = {}
+
+    def fake_get(url, headers, params, timeout):
+        captured_params.update(params)
+        return FakeResponse({"value": [
+            {"id": "m1", "conversationId": "c1", "subject": "First", "receivedDateTime": "2026-08-04T10:00:00Z", "categories": ["Panga/Reviewed"]},
+            {"id": "m2", "conversationId": "c1", "subject": "First (older copy)", "receivedDateTime": "2026-08-04T09:00:00Z", "categories": []},
+            {"id": "m3", "conversationId": "c2", "subject": "Second", "receivedDateTime": "2026-08-03T10:00:00Z", "categories": []},
+        ]})
+    monkeypatch.setattr(microsoft_client.requests, "get", fake_get)
+    results = microsoft_client.list_recent(since_days=2)
+    assert len(results) == 2
+    assert results[0]["categories"] == ["Panga/Reviewed"]
+    assert results[1]["categories"] == []
+    assert "$filter" in captured_params
+    assert "receivedDateTime ge" in captured_params["$filter"]
+
+
+def test_get_message_body_strips_html(monkeypatch):
+    monkeypatch.setattr(microsoft_client, "_headers", lambda: {})
+
+    def fake_get(url, headers, params, timeout):
+        return FakeResponse({"body": {"contentType": "html", "content": "<b>Hi</b> <style>.x{}</style>there"}})
+    monkeypatch.setattr(microsoft_client.requests, "get", fake_get)
+    body = microsoft_client.get_message_body("m1")
+    assert "Hi" in body and "there" in body
+    assert "<b>" not in body and ".x{}" not in body

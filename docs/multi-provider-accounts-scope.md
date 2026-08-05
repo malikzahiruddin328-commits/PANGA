@@ -93,6 +93,71 @@ Code session - not from `scripts/cta_fulfillment.py`'s unattended run.
 
 **Not yet built as of this doc.**
 
+## Status (2026-08-04, second pass)
+
+Parts A and B above (the account-setup wizard's email/calendar login
+flows) were built and merged into master on the original
+`feature/multi-provider-accounts` branch. This second pass, on a fresh
+`feature/multi-provider-scan` branch/worktree (the original branch's
+worktree was cleaned up after merge), closes the gap flagged when that
+work landed: connecting an Outlook/Yahoo/IMAP account through the wizard
+didn't actually make the scheduled scan (`scripts/gmail_cta_scan.py`) or
+fulfillment (`scripts/cta_fulfillment.py`) read that inbox - both were
+still hardcoded to Gmail's client calls throughout, despite the wizard
+letting you connect other providers.
+
+**Zahir's explicit call on taking this on** (relayed via the General hub
+session): yes, extend the scan now, not defer it - his framing was that
+this *completes* the "no MCP anywhere in the app's own runtime" property
+the whole multi-provider effort is built around, not a new scope
+addition. Confirmed there are genuinely zero `mailopoly`/MCP references
+anywhere in `src/` before starting.
+
+**What this pass built**:
+- `src/inbox_accounts.py` - the unified adapter `GmailAccount`/
+  `MicrosoftAccount`/`IMAPAccount` classes present, plus
+  `configured_accounts()` for discovery. "Reviewed"/"CTA" marking is
+  Gmail labels / Outlook categories / a custom IMAP keyword flag
+  (`PangaReviewed`/`PangaCTA`) - three different mechanisms behind one
+  shared interface, chosen so a labeled message stays visible in INBOX
+  for all three providers (not moved to a different folder, which would
+  have been the simpler-but-wrong IMAP-only shortcut).
+- `scripts/gmail_cta_scan.py` and `scripts/cta_fulfillment.py` rewritten
+  to loop over `configured_accounts()` - sequential, not concurrent (see
+  `inbox_accounts.py`'s own docstring for why), one account's failure
+  logged and skipped rather than stopping the whole run. Filenames kept
+  as-is despite no longer being Gmail-only, since Windows Task Scheduler
+  references them by path.
+- `tailoring/cta_emails.py` gained `provider`/`account` fields (both
+  default to `"gmail"` for records/call sites predating this change) so
+  fulfillment knows which account's client to route a given record back
+  to, plus a `web_link` field (replacing the Gmail-only `gmail_link` name;
+  read side falls back to the old key for pre-existing stored records).
+  `mark_draft_created()` takes an explicit `draft_link` now instead of
+  always synthesizing Gmail's URL format.
+- `src/ui/app.py`'s Call to Action tab updated to match: provider-aware
+  "Open in Gmail"/"Open in Outlook"/"Open inbox" button label, and a
+  disabled-with-explanation fallback instead of a broken link when a
+  provider (Outlook, IMAP) has no reliable webmail deep link.
+- Real bug found and fixed *before* building further on it:
+  `imap_client.py` was using IMAP sequence numbers (from plain
+  `search()`/`fetch()`) as if they were persistent UIDs, passing them
+  into a brand-new connection on every call - sequence numbers are only
+  valid within the session that produced them. Switched every SEARCH/
+  FETCH/COPY/STORE call to the `conn.uid(...)` variants; the test suite's
+  FakeImap now hard-fails if the plain (non-UID) methods are ever called
+  again, so this can't silently regress.
+- 25 new tests across `test_inbox_accounts.py`, `test_cta_emails.py`, and
+  `test_cta_fulfillment_routing.py` (the last one deliberately added
+  outside the normal `src/`-only test scope, given how much new
+  account-routing logic this pass introduced). Full suite: 180 passing.
+
+**Not verified live** (same honest limitation as every OAuth/IMAP client
+in this effort): no real Gmail/Outlook/IMAP account was scanned end to
+end from this sandbox. Verification here was code-level - the adapter
+tests confirm each provider's calls happen with the right arguments in
+the right order, not that a real mailbox produces the expected result.
+
 ## Explicitly out of scope for this branch
 
 - Outlook/Microsoft Calendar, Apple/iCloud Calendar - later follow-ons to

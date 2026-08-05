@@ -35,7 +35,7 @@ import yaml  # noqa: E402
 
 from notifications import send_notification  # noqa: E402
 from profile.storage import load_profile  # noqa: E402
-from search import company_sites, industry_boards, job_store, usajobs  # noqa: E402
+from search import company_sites, freshness_check, industry_boards, job_store, usajobs  # noqa: E402
 from tailoring.applications import get_unreviewed_skip_reasons  # noqa: E402
 from tailoring.drafting import DraftingFailed, DraftingNotConfigured, score_job  # noqa: E402
 
@@ -212,6 +212,11 @@ def run() -> None:
 
     _log("STEP 7 - Notify")
     notify(strong_matches, len(unreviewed))
+
+    _log("STEP 8 - Freshness check")
+    checked, marked = freshness_check.check_and_mark_closed_postings()
+    _log(f"  checked {checked} job(s), marked {marked} closed")
+
     _log("Done.")
 
 

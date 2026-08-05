@@ -9,10 +9,24 @@ This module is the one place that plumbing lives now. The original modules
 keep their old public names (DraftingNotConfigured, DraftingFailed,
 DEFAULT_MODEL, _client) as re-exports so no existing import elsewhere in
 the app needs to change.
+
+Reliability (2026-08-05): every call goes through _call_with_retries, which
+gives two layers of protection against Claude-side transient failures -
+(1) bounded retry-with-backoff for overloaded/rate-limit/connection errors,
+(2) a single fallback attempt on a different Claude model if the primary is
+still specifically overloaded after retries. A third layer (a second AI
+provider or a local model) was deliberately deferred: everything observed
+in practice has been isolated single-request blips, not sustained outages,
+and at Claude's normal uptime that residual risk doesn't justify the extra
+engineering and quality compromise a non-Claude fallback would mean. Revisit
+only if a real sustained outage is actually observed - don't rebuild this
+analysis from scratch first.
 """
 
 import json
+import logging
 import os
+import time
 from pathlib import Path
 
 import anthropic
@@ -21,7 +35,70 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(PROJECT_ROOT / ".env")
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_MODEL = "claude-opus-5"
+FALLBACK_MODEL = "claude-sonnet-5"
+
+# Transient errors worth retrying/falling back on. Anything else (bad
+# request, auth, content policy, etc.) propagates on the first attempt.
+# Per anthropic._client._make_status_error, 5xx responses other than 529
+# (overloaded) all surface as the generic InternalServerError - there's no
+# separate ServiceUnavailableError/DeadlineExceededError raised in practice.
+#
+# Errors that arrive mid-stream (call_structured's normal path) are a
+# separate case: the HTTP response already came back 200 before the error
+# event, so the SDK can only classify by status code and falls through to
+# a bare APIStatusError - confirmed live 2026-08-05 hitting a real
+# overloaded_error this way. _error_type() below reads exc.type (which the
+# SDK already parsed from the error body) so those aren't missed.
+_TRANSIENT_ERROR_TYPES = frozenset(
+    {"overloaded_error", "rate_limit_error", "api_error", "timeout_error"}
+)
+
+_MAX_ATTEMPTS = 3  # bounded - CLAUDE.md's no-unconditional-loops rule
+_BACKOFF_BASE_SECONDS = 1
+
+
+def _error_type(exc: BaseException) -> str | None:
+    """The API's own error-type string (e.g. "overloaded_error"). APIStatusError
+    already parses this onto `.type` from the response body in its __init__,
+    regardless of which specific subclass got raised - see
+    _TRANSIENT_ERROR_TYPES above for why the subclass alone isn't reliable."""
+    return getattr(exc, "type", None)
+
+
+def _is_transient(exc: BaseException) -> bool:
+    if isinstance(exc, anthropic.APIConnectionError):
+        return True
+    if isinstance(exc, (anthropic.RateLimitError, anthropic.OverloadedError, anthropic.InternalServerError)):
+        return True
+    return isinstance(exc, anthropic.APIStatusError) and _error_type(exc) in _TRANSIENT_ERROR_TYPES
+
+
+def _is_overloaded(exc: BaseException) -> bool:
+    return isinstance(exc, anthropic.OverloadedError) or _error_type(exc) == "overloaded_error"
+
+
+def _clean_message_for_status_error(exc: anthropic.APIStatusError) -> str:
+    """Human-readable message for an error that's reached the end of the
+    line - retries and model fallback (if applicable) are already
+    exhausted. The full technical detail (status code, error type,
+    request_id) is logged via the standard `logging` module - visible in
+    data/logs/panga_debug.log when PANGA_DEBUG=1 (see debug_log.py) - but
+    never put in the exception message itself, since that string is what
+    app.py's `st.error(str(exc))` shows verbatim to the end user. Zahir hit
+    the raw JSON dump live 2026-08-05 and flagged it directly: a real user
+    has no use for a JSON error blob and no way to act on it."""
+    logger.error(
+        "Claude API call failed (status=%s type=%s request_id=%s): %s",
+        exc.status_code, _error_type(exc), exc.request_id, exc.message,
+    )
+    if _is_transient(exc):
+        return "Claude's servers are temporarily busy - please try again in a moment."
+    if exc.status_code in (401, 403):
+        return "Claude API access problem - check your API key configuration."
+    return "Something went wrong talking to Claude. Please try again."
 
 
 class LLMNotConfigured(Exception):
@@ -30,6 +107,34 @@ class LLMNotConfigured(Exception):
 
 class LLMCallFailed(Exception):
     pass
+
+
+def _call_with_retries(make_request, primary_model: str, on_retry=None):
+    """Runs make_request(model) against `primary_model`, retrying up to
+    _MAX_ATTEMPTS total attempts (with exponential backoff) on transient
+    errors only. If the primary model is still specifically overloaded once
+    retries are exhausted, makes one further attempt against FALLBACK_MODEL
+    instead of continuing to hammer the same overloaded model. Non-transient
+    errors and a failed fallback attempt propagate to the caller unchanged.
+
+    Returns (response, model_actually_used).
+    """
+    last_exc = None
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            return make_request(primary_model), primary_model
+        except anthropic.AnthropicError as exc:
+            if not _is_transient(exc):
+                raise
+            last_exc = exc
+            if attempt < _MAX_ATTEMPTS - 1:
+                if on_retry:
+                    on_retry(attempt + 1)
+                time.sleep(_BACKOFF_BASE_SECONDS * (2**attempt))
+
+    if _is_overloaded(last_exc) and FALLBACK_MODEL != primary_model:
+        return make_request(FALLBACK_MODEL), FALLBACK_MODEL
+    raise last_exc
 
 
 def is_configured() -> bool:
@@ -71,17 +176,23 @@ def call_structured(
 
     Returns the parsed JSON dict. Raises LLMNotConfigured (via the caller's
     own get_client() call, before this function is even reached) and
-    LLMCallFailed on API error, refusal, truncation, or invalid JSON."""
-    kwargs = dict(
-        model=model or os.environ.get("ANTHROPIC_MODEL") or DEFAULT_MODEL,
-        max_tokens=max_tokens,
-        output_config={"effort": effort, "format": {"type": "json_schema", "schema": schema}},
-        system=system,
-        messages=[{"role": "user", "content": user_content}],
-    )
-    if thinking:
-        kwargs["thinking"] = {"type": "adaptive"}
-    try:
+    LLMCallFailed on API error, refusal, truncation, or invalid JSON.
+
+    Transient failures (overloaded/rate-limit/connection errors) are retried
+    with backoff, then retried once more against a fallback model if the
+    primary is still overloaded - see _call_with_retries."""
+    primary_model = model or os.environ.get("ANTHROPIC_MODEL") or DEFAULT_MODEL
+
+    def make_request(call_model):
+        kwargs = dict(
+            model=call_model,
+            max_tokens=max_tokens,
+            output_config={"effort": effort, "format": {"type": "json_schema", "schema": schema}},
+            system=system,
+            messages=[{"role": "user", "content": user_content}],
+        )
+        if thinking:
+            kwargs["thinking"] = {"type": "adaptive"}
         with client.messages.stream(**kwargs) as stream:
             char_count = 0
             last_reported = 0
@@ -94,10 +205,18 @@ def call_structured(
                     if on_progress and char_count - last_reported >= 150:
                         on_progress(f"writing... ({char_count:,} characters so far)")
                         last_reported = char_count
-            response = stream.get_final_message()
+            return stream.get_final_message()
+
+    def report_retry(attempt_number):
+        if on_progress:
+            on_progress("Claude is busy, retrying...")
+
+    try:
+        response, _ = _call_with_retries(make_request, primary_model, on_retry=report_retry)
     except anthropic.APIStatusError as exc:
-        raise LLMCallFailed(f"Claude API error ({exc.status_code}): {exc.message}") from exc
+        raise LLMCallFailed(_clean_message_for_status_error(exc)) from exc
     except anthropic.APIConnectionError as exc:
+        logger.error("Claude API connection error: %s", exc)
         raise LLMCallFailed("Couldn't reach the Claude API - check your internet connection.") from exc
 
     if response.stop_reason == "refusal":
@@ -111,6 +230,7 @@ def call_structured(
     try:
         return json.loads(text_block)
     except json.JSONDecodeError as exc:
+        logger.error("Claude returned invalid JSON: %s | raw text: %r", exc, text_block)
         raise LLMCallFailed("Claude's response wasn't valid - try again.") from exc
 
 
@@ -132,16 +252,27 @@ def call_with_web_search(
     result found", not a hard error) - callers check for an empty string."""
     from api_cost import estimate_response_cost
 
-    call_model = model or DEFAULT_MODEL
-    try:
-        response = client.messages.create(
+    primary_model = model or DEFAULT_MODEL
+
+    def make_request(call_model):
+        return client.messages.create(
             model=call_model,
             max_tokens=max_tokens,
             tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": max_uses}],
             system=system,
             messages=[{"role": "user", "content": user_content}],
         )
-    except (anthropic.APIStatusError, anthropic.APIConnectionError):
+
+    try:
+        response, call_model = _call_with_retries(make_request, primary_model)
+    except anthropic.APIStatusError as exc:
+        logger.error(
+            "Claude web-search call failed (status=%s type=%s request_id=%s): %s",
+            exc.status_code, _error_type(exc), exc.request_id, exc.message,
+        )
+        return "", 0.0
+    except anthropic.APIConnectionError as exc:
+        logger.error("Claude web-search connection error: %s", exc)
         return "", 0.0
 
     cost = estimate_response_cost(response, call_model)
