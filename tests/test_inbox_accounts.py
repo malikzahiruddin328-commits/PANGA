@@ -1,0 +1,137 @@
+"""Tests for inbox_accounts.py's unified adapter - each provider's
+list_recent_unreviewed()/mark_reviewed()/mark_cta()/archive() delegate to
+gmail_client/microsoft_client/imap_client, monkeypatched here at the
+function level (those clients' own protocol correctness is already
+covered by their dedicated test files)."""
+
+import gmail_client
+import imap_client
+import microsoft_client
+
+import inbox_accounts
+
+
+# ---- GmailAccount ----
+
+def test_gmail_list_recent_unreviewed_builds_query_and_maps_fields(monkeypatch):
+    captured = {}
+
+    def fake_search_threads(query, max_results=50):
+        captured["query"] = query
+        return [{"thread_id": "t1", "message_id": "m1", "subject": "Subj", "sender": "a@b.com", "date": "2026-08-04", "snippet": "snip"}]
+    monkeypatch.setattr(gmail_client, "search_threads", fake_search_threads)
+
+    acct = inbox_accounts.GmailAccount()
+    results = acct.list_recent_unreviewed()
+    assert len(results) == 1
+    assert results[0].ref == "t1"
+    assert results[0].message_id == "m1"
+    assert "-label:Panga/Reviewed" in captured["query"]
+    assert "newer_than:2d" in captured["query"]
+
+
+def test_gmail_mark_cta_ensures_labels_once_and_applies_both(monkeypatch):
+    ensure_calls = []
+    label_calls = []
+    monkeypatch.setattr(gmail_client, "ensure_label", lambda name: ensure_calls.append(name) or f"id-{name}")
+    monkeypatch.setattr(gmail_client, "label_thread", lambda ref, ids: label_calls.append((ref, ids)))
+
+    acct = inbox_accounts.GmailAccount()
+    acct.mark_cta("t1")
+    acct.mark_reviewed("t2")  # second call - must NOT re-ensure labels
+    assert ensure_calls == ["Panga/Reviewed", "Panga/Call-to-Action", "Panga/Handled"]
+    assert label_calls == [("t1", ["id-Panga/Reviewed", "id-Panga/Call-to-Action"]), ("t2", ["id-Panga/Reviewed"])]
+
+
+def test_gmail_archive_unlabels_inbox_and_labels_handled(monkeypatch):
+    calls = []
+    monkeypatch.setattr(gmail_client, "ensure_label", lambda name: f"id-{name}")
+    monkeypatch.setattr(gmail_client, "unlabel_thread", lambda ref, ids: calls.append(("unlabel", ref, ids)))
+    monkeypatch.setattr(gmail_client, "label_thread", lambda ref, ids: calls.append(("label", ref, ids)))
+
+    inbox_accounts.GmailAccount().archive("t1")
+    assert calls == [("unlabel", "t1", ["INBOX"]), ("label", "t1", ["id-Panga/Handled"])]
+
+
+# ---- MicrosoftAccount ----
+
+def test_microsoft_list_recent_unreviewed_filters_by_category(monkeypatch):
+    monkeypatch.setattr(microsoft_client, "list_recent", lambda days: [
+        {"message_id": "m1", "subject": "A", "sender": "a@b.com", "date": "d1", "snippet": "s1", "categories": ["Panga/Reviewed"]},
+        {"message_id": "m2", "subject": "B", "sender": "b@b.com", "date": "d2", "snippet": "s2", "categories": []},
+    ])
+    results = inbox_accounts.MicrosoftAccount().list_recent_unreviewed()
+    assert len(results) == 1
+    assert results[0].ref == "m2"
+    assert results[0].message_id == "m2"  # same value for both - Graph marking is per-message
+
+
+def test_microsoft_mark_cta_registers_categories_once(monkeypatch):
+    ensure_calls = []
+    label_calls = []
+    monkeypatch.setattr(microsoft_client, "ensure_label", lambda name: ensure_calls.append(name))
+    monkeypatch.setattr(microsoft_client, "label_thread", lambda ref, names: label_calls.append((ref, names)))
+
+    acct = inbox_accounts.MicrosoftAccount()
+    acct.mark_cta("m1")
+    acct.mark_reviewed("m2")
+    assert ensure_calls == ["Panga/Reviewed", "Panga/Call-to-Action"]  # only once
+    assert label_calls == [("m1", ["Panga/Reviewed", "Panga/Call-to-Action"]), ("m2", ["Panga/Reviewed"])]
+
+
+def test_microsoft_web_link_and_draft_link_are_none(monkeypatch):
+    monkeypatch.setattr(microsoft_client, "create_draft", lambda to, subject, body, reply_to_message_id=None: "draft1")
+    acct = inbox_accounts.MicrosoftAccount()
+    assert acct.web_link("m1") is None
+    draft_id, draft_link = acct.create_reply_draft("to@x.com", "Subj", "Body", "m1")
+    assert draft_id == "draft1"
+    assert draft_link is None
+
+
+# ---- IMAPAccount ----
+
+def test_imap_list_recent_unreviewed_filters_by_keyword_flag(monkeypatch):
+    reviewed = imap_client.MessageSummary(uid="1", subject="A", sender="a@b.com", date="d1", snippet="", flags=frozenset({"PangaReviewed"}))
+    fresh = imap_client.MessageSummary(uid="2", subject="B", sender="b@b.com", date="d2", snippet="", flags=frozenset(), message_id_header="<x@y.com>")
+    monkeypatch.setattr(imap_client, "search_recent", lambda email, since_days: [reviewed, fresh])
+
+    results = inbox_accounts.IMAPAccount("me@yahoo.com").list_recent_unreviewed()
+    assert len(results) == 1
+    assert results[0].ref == "2"
+    assert results[0].message_id == "<x@y.com>"
+    assert results[0].account == "me@yahoo.com"
+
+
+def test_imap_mark_cta_sets_both_keywords(monkeypatch):
+    calls = []
+    monkeypatch.setattr(imap_client, "add_keyword", lambda email, ref, kw: calls.append((email, ref, kw)))
+    inbox_accounts.IMAPAccount("me@yahoo.com").mark_cta("10")
+    assert calls == [("me@yahoo.com", "10", "PangaReviewed"), ("me@yahoo.com", "10", "PangaCTA")]
+
+
+def test_imap_archive_moves_to_handled_folder(monkeypatch):
+    calls = []
+    monkeypatch.setattr(imap_client, "ensure_folder", lambda email, name: calls.append(("ensure", name)))
+    monkeypatch.setattr(imap_client, "move_to_folder", lambda email, ref, dest: calls.append(("move", ref, dest)))
+    inbox_accounts.IMAPAccount("me@yahoo.com").archive("10")
+    assert calls == [("ensure", "Panga.Handled"), ("move", "10", "Panga.Handled")]
+
+
+# ---- configured_accounts() ----
+
+def test_configured_accounts_ordering_and_filtering(monkeypatch):
+    monkeypatch.setattr(gmail_client, "is_configured", lambda: True)
+    monkeypatch.setattr(microsoft_client, "is_configured", lambda: False)
+    monkeypatch.setattr(imap_client, "list_configured_accounts", lambda: ["z@yahoo.com", "a@btinternet.com"])
+
+    accounts = inbox_accounts.configured_accounts()
+    assert [type(a).__name__ for a in accounts] == ["GmailAccount", "IMAPAccount", "IMAPAccount"]
+    imap_accounts = [a for a in accounts if isinstance(a, inbox_accounts.IMAPAccount)]
+    assert [a.account for a in imap_accounts] == ["a@btinternet.com", "z@yahoo.com"]  # alphabetical
+
+
+def test_configured_accounts_empty_when_nothing_configured(monkeypatch):
+    monkeypatch.setattr(gmail_client, "is_configured", lambda: False)
+    monkeypatch.setattr(microsoft_client, "is_configured", lambda: False)
+    monkeypatch.setattr(imap_client, "list_configured_accounts", lambda: [])
+    assert inbox_accounts.configured_accounts() == []
