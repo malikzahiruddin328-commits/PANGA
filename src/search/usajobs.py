@@ -88,6 +88,21 @@ def search_jobs(
     return jobs
 
 
+def check_position_open(position_id: str) -> bool:
+    """Freshness check (added 2026-08-05, PRD-adjacent "closed by employer"
+    automation): USAJOBS' own search API accepts PositionID as a filter, same
+    as Keyword/LocationName above - a closed/expired announcement simply
+    stops appearing in results, no separate status endpoint needed. Omits
+    WhoMayApply so a position that closed to the public but is still
+    internally open isn't misreported (Zahir isn't eligible for those anyway,
+    but "still exists" is the only question this function answers)."""
+    params = {"PositionID": position_id, "ResultsPerPage": 1}
+    response = requests.get(API_URL, headers=_headers(), params=params, timeout=30)
+    response.raise_for_status()
+    data = response.json()
+    return int(data.get("SearchResult", {}).get("SearchResultCount", 0)) > 0
+
+
 if __name__ == "__main__":
     for job in search_jobs(job_category_code="2210", results_per_page=5):
         print(f"{job['title']} - {job['organization']} - {job['location']}")
