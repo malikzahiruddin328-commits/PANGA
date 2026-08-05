@@ -1,8 +1,8 @@
 """Generic IMAP mail client for Yahoo and "any other personal/ISP email"
 (native-packaging's account-setup wizard, "Other" provider path - see
-docs/multi-provider-accounts-scope.md Part A). Mirrors the subset of
+docs/multi-provider-accounts-scope.md). Mirrors the subset of
 gmail_client.py's behavior that has a real IMAP equivalent: search, read,
-draft (never send), and a folder-move analog of Gmail's label/archive
+draft (never send), and a keyword-flag analog of Gmail's label/archive
 behavior.
 
 Auth model: IMAP + app-password (or the account's real password, for
@@ -14,15 +14,34 @@ Credentials are stored per-account at data/imap/<email>.json, encrypted at
 rest via security.crypto_store (same treatment gmail_client.py gives its
 own live token.json).
 
+Every SEARCH/FETCH/COPY/STORE call here uses IMAP's UID variants
+(conn.uid(...)), not plain sequence-number commands - sequence numbers are
+only valid within the single session that produced them and are NOT safe
+to reuse against a fresh connection (which is what every call in this
+module makes, one per function call). An earlier version of this module
+used plain fetch()/search()/copy()/store() and passed the "uid" values
+returned by search() straight into a brand-new connection's fetch() -
+those were actually sequence numbers, not persistent UIDs, and could
+silently point at the wrong message (or no message) after any change to
+mailbox state between calls. Fixed before this module was extended
+further, rather than let new code build on the same bug.
+
 Real IMAP limits vs. Gmail's API, worth knowing before extending this:
 - No native "thread" concept - generic IMAP is message-centric, not
-  thread-centric. search_messages()/get_message() operate per-message,
-  not per-thread; a caller wanting thread-like grouping would need to do
-  it itself from References/In-Reply-To headers, not built in here.
-- No native "label" concept - a message lives in exactly one folder at a
-  time. move_to_folder() is the closest analog to Gmail's label_thread
-  (move into a "Panga/Reviewed"-style folder instead of adding a label
-  alongside INBOX).
+  thread-centric. Every listing function here operates per-message, not
+  per-thread; a caller wanting thread-like grouping would need to do it
+  itself from References/In-Reply-To headers, not built in here.
+- No native "label" concept - inbox_accounts.py's "reviewed"/"CTA"
+  marking uses custom IMAP keyword flags (add_keyword/remove_keyword)
+  rather than moving messages between folders, so a labeled message stays
+  visible in INBOX exactly like a Gmail label does. Not every IMAP server
+  accepts custom keywords (RFC 3501 makes this optional, advertised via
+  the PERMANENTFLAGS response) - add_keyword() raises ImapConnectionError
+  on a server that rejects it, which callers should treat as best-effort
+  (see inbox_accounts.py's own handling).
+- move_to_folder() still exists separately for real folder-move needs
+  (e.g. archiving) - COPY + delete-from-source, since not every server
+  supports the IMAP MOVE extension.
 - Drafts are created by IMAP APPEND straight into the Drafts folder with
   the \\Draft flag set - there is no SMTP send capability anywhere in this
   module, by construction, not just by convention.
@@ -31,7 +50,8 @@ Real IMAP limits vs. Gmail's API, worth knowing before extending this:
 import email as email_lib
 import imaplib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.utils import parseaddr
 from pathlib import Path
@@ -45,6 +65,7 @@ IMAP_DIR = PROJECT_ROOT / "data" / "imap"
 _MAX_RESULTS = 200  # hard bound on any SEARCH result set this module will
                      # walk - matches gmail_client.py's _MAX_PAGES bound.
 _CONNECT_TIMEOUT = 15
+_IMAP_DATE_FORMAT = "%d-%b-%Y"  # RFC 3501's SEARCH date format, e.g. "01-Aug-2026"
 
 
 class ImapNotConfigured(Exception):
@@ -69,10 +90,10 @@ def is_configured(email: str) -> bool:
 
 def list_configured_accounts() -> list[str]:
     """Every email address with saved IMAP credentials, for the
-    account-setup wizard's "already connected" display - IMAP is
-    multi-account by construction (see module docstring), unlike Gmail/
-    Microsoft's single-account modules, so the wizard needs this to show
-    more than one at a time."""
+    account-setup wizard's "already connected" display and for
+    inbox_accounts.py's account discovery - IMAP is multi-account by
+    construction (see module docstring), unlike Gmail/Microsoft's
+    single-account modules."""
     if not IMAP_DIR.is_dir():
         return []
     accounts = []
@@ -122,6 +143,10 @@ def _connect(email: str) -> imaplib.IMAP4_SSL:
     return conn
 
 
+def _uid_bytes(uid) -> bytes:
+    return uid.encode() if isinstance(uid, str) else uid
+
+
 @dataclass
 class MessageSummary:
     uid: str
@@ -129,6 +154,10 @@ class MessageSummary:
     sender: str
     date: str
     snippet: str
+    flags: frozenset = field(default_factory=frozenset)
+    message_id_header: Optional[str] = None  # for reply threading - fetched
+    # alongside the other headers at listing time (see search_messages)
+    # rather than requiring a second per-message fetch later.
 
 
 def _decode_header_value(raw: Optional[str]) -> str:
@@ -174,45 +203,88 @@ def _walk_plain_text(msg) -> str:
     return text
 
 
+def _parse_flags_line(line: bytes) -> tuple[Optional[str], set]:
+    """Parses one line of an untagged FETCH (UID FLAGS) response, e.g.
+    b'3 (UID 12 FLAGS (\\\\Seen PangaReviewed))' - returns (uid, flags),
+    (None, set()) if the line doesn't match the expected shape."""
+    text = line.decode(errors="replace") if isinstance(line, (bytes, bytearray)) else str(line)
+    uid_match = re.search(r"UID (\d+)", text)
+    flags_match = re.search(r"FLAGS \(([^)]*)\)", text)
+    if not uid_match:
+        return None, set()
+    flags = set(flags_match.group(1).split()) if flags_match else set()
+    return uid_match.group(1), flags
+
+
 def search_messages(email: str, criteria: str = "UNSEEN", folder: str = "INBOX", max_results: int = 50) -> list[MessageSummary]:
-    """IMAP SEARCH in `folder` (default the standard IMAP criteria syntax,
-    e.g. "UNSEEN", 'SINCE "01-Aug-2026"'), newest first, capped at
-    min(max_results, _MAX_RESULTS)."""
+    """IMAP SEARCH in `folder` (standard IMAP criteria syntax, e.g.
+    "UNSEEN", 'SINCE "01-Aug-2026"'), newest first, capped at
+    min(max_results, _MAX_RESULTS). Each summary's `flags` is populated
+    (a second, cheap UID FETCH FLAGS call for the whole result set) so
+    callers can filter without a further round trip per message."""
     conn = _connect(email)
     try:
         conn.select(folder, readonly=True)
-        status, data = conn.search(None, criteria)
+        status, data = conn.uid("search", None, criteria)
         if status != "OK":
             raise ImapConnectionError(f"IMAP SEARCH failed: {status}")
         uids = data[0].split()
         uids = uids[-min(max_results, _MAX_RESULTS):]
         uids.reverse()  # newest first
+        if not uids:
+            return []
+
+        flags_by_uid: dict[str, set] = {}
+        status, flag_data = conn.uid("fetch", b",".join(uids), "(FLAGS)")
+        if status == "OK":
+            for line in flag_data:
+                if not line:
+                    continue
+                uid_str, flags = _parse_flags_line(line)
+                if uid_str is not None:
+                    flags_by_uid[uid_str] = flags
 
         summaries = []
         for uid in uids:
-            status, msg_data = conn.fetch(uid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
+            status, msg_data = conn.uid("fetch", uid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID)])")
             if status != "OK" or not msg_data or msg_data[0] is None:
                 continue
             header_text = msg_data[0][1]
             parsed = email_lib.message_from_bytes(header_text)
+            uid_str = uid.decode()
             summaries.append(MessageSummary(
-                uid=uid.decode(),
+                uid=uid_str,
                 subject=_decode_header_value(parsed.get("Subject")) or "(no subject)",
                 sender=_decode_header_value(parsed.get("From")) or "",
                 date=parsed.get("Date") or "",
+                message_id_header=parsed.get("Message-ID"),
                 snippet="",  # generic IMAP has no server-side snippet like Gmail's -
                 # callers needing a body preview should call get_message().
+                flags=frozenset(flags_by_uid.get(uid_str, set())),
             ))
         return summaries
     finally:
         conn.logout()
 
 
+def search_recent(email: str, since_days: int, folder: str = "INBOX", max_results: int = 100) -> list[MessageSummary]:
+    """Messages received in the last `since_days` days - the IMAP
+    equivalent of gmail_client's "newer_than:Nd" search, used by
+    inbox_accounts.py's scan loop. Filtering by "not yet reviewed" happens
+    client-side (see inbox_accounts.py) against each summary's `flags`,
+    not server-side - IMAP SEARCH's SINCE/NOT KEYWORD can technically be
+    combined in one query string, but keeping the two concerns (date
+    range vs. review state) separate here is simpler to get right and to
+    test than composing search-query strings."""
+    since = (datetime.now() - timedelta(days=since_days)).strftime(_IMAP_DATE_FORMAT)
+    return search_messages(email, criteria=f'SINCE "{since}"', folder=folder, max_results=max_results)
+
+
 def get_message(email: str, uid: str, folder: str = "INBOX") -> dict:
     conn = _connect(email)
     try:
         conn.select(folder, readonly=True)
-        status, msg_data = conn.fetch(uid.encode() if isinstance(uid, str) else uid, "(RFC822)")
+        status, msg_data = conn.uid("fetch", _uid_bytes(uid), "(RFC822)")
         if status != "OK" or not msg_data or msg_data[0] is None:
             raise ImapConnectionError(f"Couldn't fetch message {uid}")
         raw = msg_data[0][1]
@@ -222,6 +294,7 @@ def get_message(email: str, uid: str, folder: str = "INBOX") -> dict:
             "subject": _decode_header_value(parsed.get("Subject")) or "(no subject)",
             "sender": _decode_header_value(parsed.get("From")) or "",
             "date": parsed.get("Date") or "",
+            "message_id_header": parsed.get("Message-ID"),
             "body": _walk_plain_text(parsed),
         }
     finally:
@@ -265,19 +338,35 @@ def ensure_folder(email: str, name: str) -> None:
 
 
 def move_to_folder(email: str, uid: str, dest_folder: str, source_folder: str = "INBOX") -> None:
-    """Closest IMAP analog to gmail_client.py's label_thread/archive
-    behavior: moves the message out of source_folder into dest_folder
-    (COPY + delete-from-source, since not every server supports the IMAP
-    MOVE extension)."""
+    """Real folder-move (e.g. archiving), COPY + delete-from-source since
+    not every server supports the IMAP MOVE extension. For non-destructive
+    "label" semantics (leave the message in INBOX, just tag it), use
+    add_keyword() instead - see module docstring."""
     conn = _connect(email)
     try:
         conn.select(source_folder)
-        uid_bytes = uid.encode() if isinstance(uid, str) else uid
-        status, _ = conn.copy(uid_bytes, dest_folder)
+        uid_bytes = _uid_bytes(uid)
+        status, _ = conn.uid("copy", uid_bytes, dest_folder)
         if status != "OK":
             raise ImapConnectionError(f"Couldn't copy message {uid} to {dest_folder!r}")
-        conn.store(uid_bytes, "+FLAGS", "\\Deleted")
+        conn.uid("store", uid_bytes, "+FLAGS", "\\Deleted")
         conn.expunge()
+    finally:
+        conn.logout()
+
+
+def add_keyword(email: str, uid: str, keyword: str, folder: str = "INBOX") -> None:
+    """Sets a custom IMAP keyword flag on one message, non-destructively -
+    the label analog inbox_accounts.py uses for "reviewed"/"CTA" instead
+    of moving the message out of INBOX. Not every server accepts custom
+    keywords (RFC 3501 makes this optional); raises ImapConnectionError on
+    one that doesn't, which callers should treat as best-effort."""
+    conn = _connect(email)
+    try:
+        conn.select(folder)
+        status, response = conn.uid("store", _uid_bytes(uid), "+FLAGS", keyword)
+        if status != "OK":
+            raise ImapConnectionError(f"Couldn't set keyword {keyword!r} on message {uid}: {response}")
     finally:
         conn.logout()
 
@@ -325,7 +414,7 @@ def list_drafts(email: str) -> list[str]:
     conn = _connect(email)
     try:
         conn.select("Drafts", readonly=True)
-        status, data = conn.search(None, "ALL")
+        status, data = conn.uid("search", None, "ALL")
         if status != "OK":
             raise ImapConnectionError(f"IMAP SEARCH failed: {status}")
         return [uid.decode() for uid in data[0].split()[:_MAX_RESULTS]]

@@ -27,6 +27,7 @@ extending this:
 """
 
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -182,6 +183,50 @@ def search_threads(query: str, max_results: int = 50) -> list[dict]:
         if len(summaries) >= max_results:
             break
     return summaries
+
+
+def list_recent(since_days: int, max_results: int = 100) -> list[dict]:
+    """Messages received in the last `since_days` days, one summary per
+    conversation (deduped like search_threads), each including its current
+    `categories` list so callers can filter by "not yet reviewed"
+    client-side (see inbox_accounts.py). Graph's $filter can't reliably
+    express "does NOT have this category" for a multi-value property
+    across API versions, so this fetches by date only and lets the caller
+    check categories in Python instead of fighting the query language for
+    the negation half."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=since_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    data = _get("/me/mailFolders/inbox/messages", params={
+        "$filter": f"receivedDateTime ge {cutoff}",
+        "$top": min(max_results, 50),
+        "$orderby": "receivedDateTime desc",
+        "$select": "id,conversationId,subject,from,receivedDateTime,bodyPreview,categories",
+    })
+    seen_conversations = set()
+    summaries = []
+    for msg in data.get("value", []):
+        conv_id = msg.get("conversationId")
+        if conv_id in seen_conversations:
+            continue
+        seen_conversations.add(conv_id)
+        summary = _message_summary(msg)
+        summary["categories"] = msg.get("categories", [])
+        summaries.append(summary)
+        if len(summaries) >= max_results:
+            break
+    return summaries
+
+
+def get_message_body(message_id: str) -> str:
+    """Full plain-text body of one specific message (not a whole
+    conversation) - used by inbox_accounts.py, which already knows the
+    message id from list_recent() and doesn't need get_thread()'s
+    full-conversation refetch just to read one message."""
+    msg = _get(f"/me/messages/{message_id}", params={"$select": "body"})
+    body = msg.get("body", {}) or {}
+    content = body.get("content", "")
+    if body.get("contentType") == "html":
+        content = _strip_html(content)
+    return content
 
 
 def get_thread(conversation_id: str) -> dict:

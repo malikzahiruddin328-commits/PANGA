@@ -400,7 +400,7 @@ def go_to_prep(target: dict) -> None:
     Claude Code - the tab itself doesn't generate anything, it just shows
     what to ask for. target is either {"kind": "job", "source", "job_id",
     "job_label"} (from Results, where the job is known for certain) or
-    {"kind": "email", "thread_id", "subject", "sender", "gmail_link"} (from
+    {"kind": "email", "thread_id", "subject", "sender", "web_link"} (from
     Call to Action, where the email might not be linked to a tracked
     application yet - Claude resolves that ambiguity in conversation, same
     as the existing suggest_status matching does)."""
@@ -1088,18 +1088,31 @@ elif active_tab == "cta":
             if email.get("snippet"):
                 st.markdown(email["snippet"])
 
+            # "web_link" is the current field name; "gmail_link" is read as a
+            # fallback for records written before multi-provider support
+            # (Outlook/IMAP have no reliable webmail deep link, so this can
+            # legitimately be None - see tailoring/cta_emails.py).
+            open_link = email.get("web_link") or email.get("gmail_link")
+            open_label = {"gmail": "Open in Gmail", "microsoft": "Open in Outlook"}.get(email.get("provider", "gmail"), "Open inbox")
+
             actions = st.columns(4 if cat == "interview_request" else 3)
             with actions[0]:
-                st.link_button("Open in Gmail", email["gmail_link"], key=f"open_cta_{email['thread_id']}")
+                if open_link:
+                    st.link_button(open_label, open_link, key=f"open_cta_{email['thread_id']}")
+                else:
+                    st.button(f"Check {email.get('account', 'your inbox')}", key=f"open_cta_{email['thread_id']}", disabled=True)
             with actions[1]:
                 if email.get("draft_created"):
-                    st.link_button("Open draft", email["draft_link"], key=f"draft_link_{email['thread_id']}")
+                    if email.get("draft_link"):
+                        st.link_button("Open draft", email["draft_link"], key=f"draft_link_{email['thread_id']}")
+                    else:
+                        st.button("Draft created - check Drafts folder", key=f"draft_link_{email['thread_id']}", disabled=True)
                 elif email.get("draft_requested"):
                     st.button("Draft requested...", key=f"draft_pending_{email['thread_id']}", disabled=True)
                 else:
                     if st.button("Draft reply", key=f"draft_cta_{email['thread_id']}"):
                         request_draft(email["thread_id"])
-                        st.toast("Draft requested - will be created in Gmail on the next scan run.", icon=":material/check_circle:")
+                        st.toast("Draft requested - will be created on the next scan run.", icon=":material/check_circle:")
                         st.rerun()
             with actions[2]:
                 if st.button("Dismiss", key=f"dismiss_cta_{email['thread_id']}"):
@@ -1113,7 +1126,7 @@ elif active_tab == "cta":
                             "thread_id": email["thread_id"],
                             "subject": email.get("subject"),
                             "sender": email.get("sender"),
-                            "gmail_link": email["gmail_link"],
+                            "web_link": open_link,
                         })
             st.divider()
 
@@ -2179,7 +2192,8 @@ elif active_tab == "prep":
                 st.markdown(f"**Ready to prep: {prep_target['job_label']}**")
             else:
                 st.markdown(f"**Ready to prep: \"{prep_target['subject']}\"** from {prep_target['sender']}")
-                st.markdown(f"[Open in Gmail]({prep_target['gmail_link']})")
+                if prep_target.get("web_link") or prep_target.get("gmail_link"):
+                    st.markdown(f"[Open in inbox]({prep_target.get('web_link') or prep_target.get('gmail_link')})")
                 job_options = {job_label(j): j for j in jobs}
                 chosen_label = st.selectbox(
                     "Which application is this interview for?", ["-- select --"] + list(job_options.keys()),
