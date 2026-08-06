@@ -543,6 +543,12 @@ def regenerate_resume_and_persist(job: dict, on_progress, success_message: str) 
         job["source"], job["job_id"], ["resume"],
         {"resume": new_resume["text"]}, load_profile(), job,
     )
+    # Same one-shot auto-expand signal the initial "Generate documents"
+    # success path sets (Zahir, 2026-08-06) - a regenerate triggered from
+    # here (answering a gap question, updating the JD text) must surface
+    # its new score/rationale/questions immediately too, not just the
+    # first-ever draft.
+    st.session_state[f"just_drafted_resume_{job['source']}_{job['job_id']}"] = True
     st.toast(success_message.format(score=new_resume["ats_score"]), icon=":material/check_circle:")
     return new_resume
 
@@ -2233,6 +2239,15 @@ elif active_tab == "results":
                                 apply_answers=drafted.get("apply_answers"),
                             )
                             sync_workspace_documents(job["source"], job["job_id"], selected, drafted, load_profile(), job)
+                            if "resume" in selected and resume_is_scored:
+                                # Zahir's explicit ask 2026-08-06: the score,
+                                # "why this score" breakdown, and any outstanding
+                                # gap questions must be part of what he sees the
+                                # moment he generates - not something he has to
+                                # notice or go click open afterward. One-shot -
+                                # popped the next time this expander renders, so
+                                # it doesn't stay force-expanded forever.
+                                st.session_state[f"just_drafted_resume_{job['source']}_{job['job_id']}"] = True
                             st.toast("Documents drafted. Review and download them below, then use them for the actual application.", icon=":material/check_circle:")
                             st.rerun()
 
@@ -2260,7 +2275,19 @@ elif active_tab == "results":
                                     st.code(value, language=None, wrap_lines=True)
                         continue
                     if drafted_text:
-                        with st.expander(f"{doc_label} (drafted)"):
+                        auto_expand = False
+                        if doc_key == "resume":
+                            # Zahir's explicit ask 2026-08-06: right after
+                            # generating (or regenerating - answering a gap
+                            # question, updating the JD text), the score,
+                            # "why this score" breakdown, and any outstanding
+                            # questions must be part of what he sees
+                            # immediately - not behind a click he has to
+                            # remember to make. One-shot: popped here so it
+                            # doesn't stay force-expanded on later, unrelated
+                            # visits to this same job.
+                            auto_expand = st.session_state.pop(f"just_drafted_resume_{job.get('source')}_{job.get('job_id')}", False)
+                        with st.expander(f"{doc_label} (drafted)", expanded=auto_expand):
                             if doc_key == "resume" and app_record.get("resume_ats_score") is not None:
                                 with st.container(border=True):
                                     if _job_has_captured_jd_text(job):

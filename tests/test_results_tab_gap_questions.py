@@ -99,6 +99,105 @@ def test_answering_inline_on_results_tab_saves_and_regenerates(results_app_with_
     assert any(a["skill"] == "Databricks" and "migration" in a["answer"] for a in answers)
 
 
+def test_resume_expander_auto_expands_right_after_answering_a_gap_question(results_app_with_gap_questions, monkeypatch):
+    # Zahir's explicit ask 2026-08-06: the new score/rationale/questions
+    # must be part of what he sees immediately after submitting an answer -
+    # not behind a collapsed expander he has to remember to reopen.
+    import tailoring.drafting as drafting
+
+    def _fake_generate_documents(job, profile, doc_keys, on_progress=None):
+        return {"resume": {
+            "text": "PROFESSIONAL EXPERIENCE\nEngineer.\n\nSKILLS\nPython, Databricks",
+            "suggested_strategy_tag": "", "ats_score": 95,
+            "ats_rationale": "Matched 2/2 keywords.", "ats_next_actions": [], "clarifying_questions": [],
+        }}
+
+    monkeypatch.setattr(drafting, "generate_documents", _fake_generate_documents)
+    monkeypatch.setattr("tailoring.dossier.sync_workspace_documents", lambda *a, **k: None)
+
+    at = results_app_with_gap_questions
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+
+    box = next(t for t in at.text_area if "Databricks" in t.label)
+    box.set_value("Yes, led a 2-year Databricks migration.")
+    save_button = next(b for b in at.button if b.key and b.key.startswith("gapsave_"))
+    save_button.click().run(timeout=30)
+
+    assert not at.exception
+    resume_expander = next(e for e in at.expander if e.label == "Resume (drafted)")
+    assert resume_expander.proto.expanded
+
+
+def test_score_delta_shown_after_answering_a_gap_question(results_app_with_gap_questions, monkeypatch):
+    # Zahir's explicit ask 2026-08-06: changing an answer must visibly show
+    # the old -> new score change, reusing the existing delta-arrow pattern
+    # already built for the JD-update flow, not just a bare new number.
+    import tailoring.drafting as drafting
+
+    def _fake_generate_documents(job, profile, doc_keys, on_progress=None):
+        return {"resume": {
+            "text": "PROFESSIONAL EXPERIENCE\nEngineer.\n\nSKILLS\nPython, Databricks",
+            "suggested_strategy_tag": "", "ats_score": 95,
+            "ats_rationale": "Matched 2/2 keywords.", "ats_next_actions": [], "clarifying_questions": [],
+        }}
+
+    monkeypatch.setattr(drafting, "generate_documents", _fake_generate_documents)
+    monkeypatch.setattr("tailoring.dossier.sync_workspace_documents", lambda *a, **k: None)
+
+    at = results_app_with_gap_questions
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+
+    box = next(t for t in at.text_area if "Databricks" in t.label)
+    box.set_value("Yes, led a 2-year Databricks migration.")
+    save_button = next(b for b in at.button if b.key and b.key.startswith("gapsave_"))
+    save_button.click().run(timeout=30)
+
+    assert not at.exception
+    metric = next(m for m in at.metric if m.label == "ATS compatibility score")
+    assert metric.value == "95/100"
+    assert metric.delta is not None
+    assert "35" in metric.delta  # 95 - 60 (fixture's original score)
+
+
+def test_resume_expander_auto_expands_right_after_first_generate(isolated_data, monkeypatch):
+    from search.job_store import save_jobs, update_job_score
+
+    monkeypatch.setenv("PANGA_TEST_MODE", "1")
+    save_jobs([{"source": "Dice", "job_id": "job2", "title": "Director, Fresh", "organization": "Acme Corp", "location": "Remote", "description": "Requirements: Python."}])
+    update_job_score("Dice", "job2", 85, "Strong match.")
+
+    import tailoring.drafting as drafting
+
+    def _fake_generate_documents(job, profile, doc_keys, on_progress=None):
+        return {"resume": {
+            "text": "PROFESSIONAL EXPERIENCE\nEngineer.\n\nSKILLS\nPython",
+            "suggested_strategy_tag": "", "ats_score": 80,
+            "ats_rationale": "Matched 1/1 keywords.", "ats_next_actions": [], "clarifying_questions": [],
+        }}
+
+    monkeypatch.setattr(drafting, "generate_documents", _fake_generate_documents)
+    monkeypatch.setattr(drafting, "is_configured", lambda: True)
+    monkeypatch.setattr("tailoring.dossier.sync_workspace_documents", lambda *a, **k: None)
+
+    at = AppTest.from_file(APP_PATH)
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+
+    checkbox = next(c for c in at.checkbox if c.key and c.key.startswith("doc_resume_"))
+    checkbox.set_value(True)
+    gen_button = next(b for b in at.button if b.key and b.key.startswith("gendocs_"))
+    gen_button.click().run(timeout=30)
+
+    assert not at.exception
+    resume_expander = next(e for e in at.expander if e.label == "Resume (drafted)")
+    assert resume_expander.proto.expanded
+
+
 def test_gap_question_also_still_appears_on_profile_gaps_tab(results_app_with_gap_questions):
     # Additive, not a replacement - Zahir's explicit requirement, same
     # principle as the JD-box design: Profile Gaps still consolidates
