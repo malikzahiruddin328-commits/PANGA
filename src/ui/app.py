@@ -2071,21 +2071,31 @@ elif active_tab == "results":
                 requested = app_record.get("documents_requested") or []
                 status = app_record.get("status")
 
-                if _job_has_captured_jd_text(job):
-                    pre_job_key = f"pre_{job.get('source')}_{job.get('job_id')}"
-                    updated_text = render_jd_view_or_update_box(job, pre_job_key)
-                    if updated_text is not None:
-                        from search.job_store import update_job_description
+                # Only shown before a resume exists for this job (same
+                # "resume_ats_score is not None" condition the post-hoc
+                # score-card box below uses to appear) - Zahir hit this
+                # live 2026-08-06: once a resume's already drafted, this
+                # proactive box and the post-hoc one showed the exact same
+                # content twice on the same screen. The proactive box's
+                # whole purpose (prompt/view before anything's drafted) is
+                # moot once a draft exists - the post-hoc one takes over
+                # from there, same as it already did before this box existed.
+                if app_record.get("resume_ats_score") is None:
+                    if _job_has_captured_jd_text(job):
+                        pre_job_key = f"pre_{job.get('source')}_{job.get('job_id')}"
+                        updated_text = render_jd_view_or_update_box(job, pre_job_key)
+                        if updated_text is not None:
+                            from search.job_store import update_job_description
 
-                        update_job_description(job["source"], job["job_id"], updated_text)
-                        job["description"] = updated_text
-                        st.toast(
-                            "Updated - whatever you generate next will be tailored against it.",
-                            icon=":material/check_circle:",
-                        )
-                        st.rerun()
-                else:
-                    render_paste_jd_prompt_before_drafting(job)
+                            update_job_description(job["source"], job["job_id"], updated_text)
+                            job["description"] = updated_text
+                            st.toast(
+                                "Updated - whatever you generate next will be tailored against it.",
+                                icon=":material/check_circle:",
+                            )
+                            st.rerun()
+                    else:
+                        render_paste_jd_prompt_before_drafting(job)
 
                 st.markdown("**Documents for this application**")
                 doc_types = [

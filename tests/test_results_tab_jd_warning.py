@@ -27,10 +27,12 @@ def results_app(isolated_data, monkeypatch):
         {"source": "Indeed", "job_id": "nojd1", "title": "Director, No JD", "organization": "Acme Corp", "location": "Remote"},
         {"source": "Dice", "job_id": "withjd1", "title": "Director, With JD", "organization": "Beta Inc", "location": "Remote", "description": "Requirements: Python, SQL."},
         {"source": "Indeed", "job_id": "nojd2", "title": "Director, Never Drafted", "organization": "Gamma LLC", "location": "Remote"},
+        {"source": "Dice", "job_id": "withjd2", "title": "Director, JD Never Drafted", "organization": "Delta Co", "location": "Remote", "description": "Requirements: Go, Rust."},
     ])
     update_job_score("Indeed", "nojd1", 85, "Strong match.")
     update_job_score("Dice", "withjd1", 85, "Strong match.")
     update_job_score("Indeed", "nojd2", 85, "Strong match.")
+    update_job_score("Dice", "withjd2", 85, "Strong match.")
     upsert_application(
         "Indeed", "nojd1", status="under review",
         resume_text="PROFESSIONAL EXPERIENCE\nEngineer.\n\nEDUCATION\nBS\n\nSKILLS\nJava",
@@ -143,20 +145,21 @@ def test_proactive_prompt_shown_before_any_document_has_ever_been_drafted(result
     assert not any(t.key == "jd_paste_Indeed_nojd2" for t in at.text_area)
 
 
-def test_proactive_and_post_hoc_prompts_both_appear_once_a_resume_is_already_drafted(results_app):
-    # Additive, not a replacement (Zahir's explicit requirement): "nojd1"
-    # already has a blind-drafted resume (from the fixture) - the proactive
-    # job-row prompt and the post-hoc score-card prompt must BOTH still be
-    # available, since the proactive one keeps applying to whatever gets
-    # drafted/regenerated next (cover letter, exec bio, etc.), while the
-    # post-hoc one is what actually fixes up the resume already drafted blind.
+def test_proactive_prompt_hidden_once_a_resume_is_already_drafted(results_app):
+    # Real duplicate-UI bug Zahir hit live 2026-08-06: once a resume's
+    # already drafted, the proactive job-row prompt and the post-hoc
+    # score-card prompt showed the exact same content twice on the same
+    # screen. The proactive box's whole purpose (prompt/view before
+    # anything's drafted) is moot once a draft exists - "nojd1" already has
+    # a blind-drafted resume (from the fixture), so only the post-hoc
+    # variant should render now.
     at = results_app
     at.session_state["active_tab"] = "results"
     at.session_state["selected_idx_Indeed"] = 0
     at.run(timeout=30)
 
     assert not at.exception
-    assert any(t.key == "jd_paste_pre_Indeed_nojd1" for t in at.text_area)
+    assert not any(t.key == "jd_paste_pre_Indeed_nojd1" for t in at.text_area)
     assert any(t.key == "jd_paste_Indeed_nojd1" for t in at.text_area)
 
 
@@ -217,10 +220,26 @@ def test_view_update_box_shown_with_existing_text_prefilled_when_jd_present(resu
     assert any(b.key == "jd_view_save_Dice_withjd1" for b in at.button)
     # No fresh-empty-paste-box framing once real text already exists.
     assert not any(t.key == "jd_paste_Dice_withjd1" for t in at.text_area)
+    # "withjd1" already has a drafted resume - the proactive (job-row,
+    # before-drafting) variant must NOT also render here, or it's the same
+    # duplicate-box bug Zahir hit live.
+    assert not any(t.key.startswith("jd_view_pre_Dice_withjd1_") for t in at.text_area)
 
-    # Also present at the proactive (job-row, before-drafting) location.
-    pre_view_box = next(t for t in at.text_area if t.key.startswith("jd_view_pre_Dice_withjd1_"))
-    assert pre_view_box.value == "Requirements: Python, SQL."
+
+def test_proactive_view_box_shown_when_jd_present_but_nothing_drafted_yet(results_app):
+    # The combination that still needs the proactive variant: a job with
+    # captured JD text (auto-captured, e.g. via Dice/Workday/SmartRecruiters)
+    # but no draft yet at all - "withjd2" in the fixture.
+    at = results_app
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 1
+    at.run(timeout=30)
+
+    assert not at.exception
+    pre_view_box = next(t for t in at.text_area if t.key.startswith("jd_view_pre_Dice_withjd2_"))
+    assert pre_view_box.value == "Requirements: Go, Rust."
+    # Nothing's drafted yet, so the post-hoc variant has nothing to attach to.
+    assert not any(t.key.startswith("jd_view_Dice_withjd2_") for t in at.text_area)
 
 
 def test_view_update_box_is_collapsed_by_default(results_app):
