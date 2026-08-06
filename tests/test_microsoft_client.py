@@ -205,3 +205,53 @@ def test_create_draft_reply_extracts_bare_address_too(monkeypatch):
     microsoft_client.create_draft("Some Recruiter <recruiter@example.com>", "Re: Subj", "Body", reply_to_message_id="orig1")
     patch_body = calls[1][1]
     assert patch_body["toRecipients"] == [{"emailAddress": {"address": "recruiter@example.com"}}]
+
+
+class _RecordingLock:
+    def __init__(self, calls, name):
+        self.calls = calls
+        self.name = name
+
+    def __enter__(self):
+        self.calls.append(("enter", self.name))
+        return self
+
+    def __exit__(self, *exc):
+        self.calls.append(("exit", self.name))
+        return False
+
+
+def test_get_access_token_silent_refresh_runs_inside_the_lock(monkeypatch, tmp_path):
+    """2026-08-06 locking fix - same reasoning as gmail_client.py's
+    equivalent test (the scheduled task and a manual sync click are two
+    processes that can both need to silently refresh this token at once)."""
+    monkeypatch.setattr(microsoft_client, "_load_client_id", lambda: "fake-client-id")
+    monkeypatch.setattr(microsoft_client, "_load_token_cache", lambda: object())
+
+    class FakeAccount:
+        pass
+
+    class FakeApp:
+        def __init__(self, *a, **k):
+            pass
+
+        def get_accounts(self):
+            return [FakeAccount()]
+
+        def acquire_token_silent(self, scopes, account):
+            return {"access_token": "silent-token"}
+
+    monkeypatch.setattr(microsoft_client.msal, "PublicClientApplication", FakeApp)
+
+    saved = []
+    monkeypatch.setattr(microsoft_client, "_save_token_cache", lambda cache: saved.append(cache))
+
+    calls = []
+    monkeypatch.setattr(microsoft_client, "locked", lambda name: _RecordingLock(calls, name))
+
+    token = microsoft_client.get_access_token()
+
+    assert token == "silent-token"
+    assert len(saved) == 1
+    assert calls[0] == ("enter", "microsoft_token")
+    assert calls[-1] == ("exit", "microsoft_token")

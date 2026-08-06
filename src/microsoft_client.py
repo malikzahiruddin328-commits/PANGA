@@ -36,6 +36,7 @@ import msal
 import requests
 
 from security.crypto_store import read_text, write_text
+from security.file_lock import locked
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CLIENT_ID_PATH = PROJECT_ROOT / "data" / "microsoft" / "client_id.txt"
@@ -100,21 +101,32 @@ def _save_token_cache(cache: msal.SerializableTokenCache) -> None:
 def get_access_token() -> str:
     """Returns a valid access token, refreshing silently or running the
     one-time interactive consent flow as needed - same shape as
-    gmail_client.py's get_credentials()."""
+    gmail_client.py's get_credentials(), including the same lock-around-
+    silent-refresh-only fix (2026-08-06, see that function's docstring for
+    the full reasoning - the scheduled fulfillment task and a manual
+    "Send and receive" click are now two processes that can both need to
+    silently refresh this same token cache at close to the same moment)."""
     cache = _load_token_cache()
     app = msal.PublicClientApplication(_load_client_id(), authority=AUTHORITY, token_cache=cache)
 
-    accounts = app.get_accounts()
-    result = None
-    if accounts:
-        result = app.acquire_token_silent(SCOPES, account=accounts[0])
+    with locked("microsoft_token"):
+        accounts = app.get_accounts()
+        result = None
+        if accounts:
+            result = app.acquire_token_silent(SCOPES, account=accounts[0])
+        if result is not None:
+            _save_token_cache(cache)
+            return result["access_token"]
 
-    if result is None:
-        # Generous timeout - a real person clicking through Microsoft's
-        # consent screen, same reasoning as gmail_client.py's
-        # run_local_server timeout_seconds=300.
-        result = app.acquire_token_interactive(scopes=SCOPES, timeout=300)
-
+    # No silently-refreshable token - the one-time interactive consent
+    # flow, deliberately OUTSIDE the lock above, same reasoning as
+    # gmail_client.py's get_credentials (a real person clicking through a
+    # browser window can take far longer than the lock's own wait bound,
+    # and an unlocked race here doesn't corrupt anything).
+    # Generous timeout - a real person clicking through Microsoft's
+    # consent screen, same reasoning as gmail_client.py's
+    # run_local_server timeout_seconds=300.
+    result = app.acquire_token_interactive(scopes=SCOPES, timeout=300)
     _save_token_cache(cache)
 
     if not result or "access_token" not in result:

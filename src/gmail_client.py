@@ -34,6 +34,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from security.crypto_store import read_text, write_text
+from security.file_lock import locked
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CREDENTIALS_PATH = PROJECT_ROOT / "data" / "gmail" / "credentials.json"
@@ -119,7 +120,19 @@ def _save_credentials(creds: Credentials) -> None:
 def get_credentials() -> Credentials:
     """Returns valid credentials, refreshing or running the one-time consent
     flow as needed. Raises GmailNotConfigured if Zahir hasn't placed his
-    downloaded OAuth client JSON at data/gmail/credentials.json yet."""
+    downloaded OAuth client JSON at data/gmail/credentials.json yet.
+
+    The load-check-refresh-save sequence runs under a lock (2026-08-06,
+    found proactively while reviewing what the new manual sync button
+    changes about concurrency exposure - see docs/manual-sync-button-scope.md's
+    sibling issue): the scheduled fulfillment task and a manual "Send and
+    receive" click are now two separate processes that can both need to
+    refresh this same token at close to the same moment, and the previous
+    unlocked read-modify-write here was exactly the class of race
+    CLAUDE.md's standing rule already calls out for every other shared
+    store - this one had just been missed. Locking around the network
+    refresh call itself (not just the file write) is deliberate: it
+    serializes concurrent refresh attempts, not just concurrent writes."""
     if not is_configured():
         raise GmailNotConfigured(
             "No Gmail OAuth client found. In Google Cloud Console, create a "
@@ -128,18 +141,27 @@ def get_credentials() -> Credentials:
             f"{CREDENTIALS_PATH}."
         )
 
-    creds = _load_cached_credentials()
-    if creds and creds.valid:
-        return creds
-
-    if creds and creds.expired and creds.refresh_token:
-        try:
-            creds.refresh(Request())
-            _save_credentials(creds)
+    with locked("gmail_token"):
+        creds = _load_cached_credentials()
+        if creds and creds.valid:
             return creds
-        except RefreshError:
-            creds = None  # refresh token itself revoked/expired - fall through to re-consent
 
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+                _save_credentials(creds)
+                return creds
+            except RefreshError:
+                creds = None  # refresh token itself revoked/expired - fall through to re-consent
+
+    # No valid or refreshable cached token - the one-time interactive
+    # consent flow, deliberately OUTSIDE the lock above: this needs a real
+    # person clicking through a browser window, which can take far longer
+    # than the lock's own wait bound (security/file_lock.py's
+    # _MAX_WAIT_SECONDS), and two processes both hitting first-time
+    # consent at once doesn't corrupt anything even unlocked - each just
+    # uses its own in-memory result regardless of which write to
+    # token.json ends up "winning".
     flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_PATH), SCOPES)
     # Generous timeout - this is a real person clicking through Google's
     # consent screen (reading scopes, maybe switching accounts), not an
