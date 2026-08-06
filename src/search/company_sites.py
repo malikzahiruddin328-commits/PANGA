@@ -27,12 +27,62 @@ import os
 from pathlib import Path
 
 import requests
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(PROJECT_ROOT / ".env")
 
 API_URL = "https://api.fda.gov/drug/drugsfda.json"
+
+
+def _html_to_text(html: str | None) -> str | None:
+    if not html:
+        return None
+    return BeautifulSoup(html, "html.parser").get_text("\n", strip=True) or None
+
+
+def _fetch_workday_job_description(tenant: str, site: str, wd_number: int, external_path: str) -> str | None:
+    """Real posting text for one Workday requisition - the list-search
+    response search_workday_jobs() calls only has title/location/pay, no
+    description at all (live-confirmed 2026-08-06 while auditing why ATS
+    keyword extraction was coming back empty for every non-USAJOBS job -
+    see tailoring/ats_score.py). Same CXS per-requisition detail endpoint
+    check_workday_posting_open() below already calls successfully for
+    freshness-checking - reusing an endpoint already proven reachable, not
+    a new live-fetch risk. Returns None on any failure (network error,
+    unexpected shape) rather than raising - one job's description fetch
+    failing must not break the whole search."""
+    url = f"https://{tenant}.wd{wd_number}.myworkdayjobs.com/wday/cxs/{tenant}/{site}{external_path}"
+    try:
+        response = requests.get(url, timeout=20)
+        response.raise_for_status()
+        return _html_to_text(response.json().get("jobPostingInfo", {}).get("jobDescription"))
+    except Exception:
+        return None
+
+
+def _fetch_smartrecruiters_job_description(company_id: str, posting_id: str) -> str | None:
+    """Real posting text for one SmartRecruiters posting - same reasoning
+    as _fetch_workday_job_description() above, one platform over. The
+    detail endpoint's jobAd.sections separates jobDescription from
+    qualifications (live-confirmed 2026-08-06) - qualifications is
+    concatenated in since it's exactly the required/preferred-skills text
+    tailoring/ats_score.py's keyword extraction looks for. Returns None on
+    any failure, same fail-soft reasoning as the Workday version."""
+    url = f"https://api.smartrecruiters.com/v1/companies/{company_id}/postings/{posting_id}"
+    try:
+        response = requests.get(url, timeout=20)
+        response.raise_for_status()
+        sections = response.json().get("jobAd", {}).get("sections", {})
+        parts = [
+            _html_to_text((sections.get(key) or {}).get("text"))
+            for key in ("jobDescription", "qualifications")
+        ]
+        text = "\n\n".join(p for p in parts if p)
+        return text or None
+    except Exception:
+        return None
 
 
 def _params(limit: int, skip: int, search: str | None) -> dict:
@@ -89,15 +139,17 @@ def search_workday_jobs(company_name: str, tenant: str, site: str, wd_number: in
     base_url = f"https://{tenant}.wd{wd_number}.myworkdayjobs.com/{site}"
     jobs = []
     for posting in data.get("jobPostings", []):
-        posting_url = base_url + (posting.get("externalPath") or "")
+        external_path = posting.get("externalPath")
+        posting_url = base_url + (external_path or "")
         jobs.append({
             "source": company_name,
-            "job_id": posting.get("externalPath"),
+            "job_id": external_path,
             "title": posting.get("title"),
             "organization": company_name,
             "location": posting.get("locationsText"),
             "pay_min": None,
             "pay_max": None,
+            "description": _fetch_workday_job_description(tenant, site, wd_number, external_path),
             "posting_url": posting_url,
             "apply_url": posting_url,
         })
@@ -128,15 +180,17 @@ def search_smartrecruiters_jobs(company_name: str, company_id: str, keyword: str
             elif field.get("fieldLabel") == "Salary Max":
                 pay_max = field.get("valueLabel")
 
-        posting_url = f"https://jobs.smartrecruiters.com/{company_name}/{posting.get('id')}"
+        posting_id = posting.get("id")
+        posting_url = f"https://jobs.smartrecruiters.com/{company_name}/{posting_id}"
         jobs.append({
             "source": company_name,
-            "job_id": posting.get("id"),
+            "job_id": posting_id,
             "title": posting.get("name"),
             "organization": company_name,
             "location": location_text,
             "pay_min": pay_min,
             "pay_max": pay_max,
+            "description": _fetch_smartrecruiters_job_description(company_id, posting_id),
             "posting_url": posting_url,
             "apply_url": posting_url,
         })
