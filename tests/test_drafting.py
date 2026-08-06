@@ -8,17 +8,31 @@ from tailoring.drafting import (
 )
 
 
-def test_resume_spec_allows_dropping_rank_prefixes_and_seniority_parentheticals():
+def test_resume_spec_conditionally_keeps_or_drops_rank_prefixes_by_target_seniority():
     # Real complaint 2026-08-06 (Zahir, via Mirror): titles carrying a rank
     # prefix ("Vice President, Head of Applications") or a seniority
     # parenthetical ("Head of IT (CIO-equivalent)") make a role below that
-    # level look like he's applying beneath himself. Both resume specs
-    # (private-sector and USAJOBS) must tell the AI it may drop these,
-    # since master_profile.json's own title field carries the prefix and
-    # nothing else in the pipeline strips it.
+    # level look like he's applying beneath himself - but for a VP+ target
+    # role, those same qualifiers support the case he's already operated
+    # at that level, so this has to be a per-job judgment call (confirmed
+    # with Zahir 2026-08-06), not a blanket strip-always rule.
     for spec in (RESUME_SPEC, RESUME_SPEC_USAJOBS):
         assert "rank-prefix" in spec
         assert "not inventing or embellishing" in spec
+        assert "VP-level or higher, KEEP" in spec
+        assert "below VP-level, DROP" in spec
+
+
+def test_resume_spec_folds_target_role_alignment_into_summary_not_its_own_header():
+    # Real problem Zahir hit live 2026-08-06: a job-application portal's
+    # own auto-parser expected the first employer entry right after the
+    # summary, saw the old standalone bold-caps "TARGET ROLE ALIGNMENT"
+    # header there instead, and parsed its content straight into the
+    # Company field of Work Experience 1. It's not a standard ATS section,
+    # so it must not be styled to look like one anymore.
+    for spec in (RESUME_SPEC, RESUME_SPEC_USAJOBS):
+        assert "Do NOT give the job-to-experience alignment content its own separate" in spec
+        assert "fold this content directly into the PROFESSIONAL SUMMARY" in spec
 
 
 def test_maxed_score_suppresses_clarifying_questions():

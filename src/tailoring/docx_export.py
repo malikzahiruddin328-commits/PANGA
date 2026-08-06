@@ -147,7 +147,11 @@ def text_to_docx_bytes(text: str, author: str | None = None, body_size_pt: float
             # or several (phone/email/LinkedIn/work authorization each on
             # their own line, seen in real generations), centered either
             # way like the contact line in his resume. Ends at the first
-            # blank line, header, or bullet.
+            # blank line, header, or bullet. Deliberately plain text, not a
+            # w:hyperlink field (confirmed correct 2026-08-06, Mirror/
+            # Zahir's ATS-parser review) - plain text is the safer choice
+            # for ATS extraction of email/phone/LinkedIn; don't "improve"
+            # this into real hyperlink objects later.
             p = doc.add_paragraph(line)
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             continue
@@ -163,10 +167,16 @@ def text_to_docx_bytes(text: str, author: str | None = None, body_size_pt: float
             # Colored to match his name (his explicit request 2026-07-31),
             # a deliberate departure from his own resume file (whose actual
             # headers are plain black) - not a mismatch, an update he asked
-            # for on top of it.
-            p = doc.add_paragraph()
+            # for on top of it. Also tagged with the real "Heading 2" style,
+            # not just visual bold (Mirror/Zahir, 2026-08-06): some ATS/
+            # recruiter tools detect section boundaries from paragraph
+            # style metadata, not visual weight alone - the run-level
+            # overrides below keep the existing compact look on top of it.
+            p = doc.add_paragraph(style="Heading 2")
             run = p.add_run(line)
             run.bold = True
+            run.font.name = BODY_FONT
+            run.font.size = body_size
             run.font.color.rgb = NAME_ACCENT_COLOR
             continue
 
@@ -180,7 +190,10 @@ def text_to_docx_bytes(text: str, author: str | None = None, body_size_pt: float
             # tried to pad with - literal spaces/tabs in the drafted text
             # don't reliably line up since this is a proportional font).
             prefix = line[: date_match.start()].rstrip(" \t")
-            date_part = line[date_match.start() :].strip()
+            # Separator normalized to a plain hyphen regardless of whether
+            # the drafted text used an en-dash or "to" (Mirror/Zahir,
+            # 2026-08-06): a few older ATS parsers mis-tokenize en-dashes.
+            date_part = f"{date_match.group('start')} - {date_match.group('end')}"
             p = doc.add_paragraph()
             p.paragraph_format.tab_stops.add_tab_stop(_right_tab_position(doc), WD_TAB_ALIGNMENT.RIGHT)
             p.add_run(prefix).bold = True

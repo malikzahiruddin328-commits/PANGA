@@ -122,6 +122,18 @@ it could just as easily have taken out another session's live check. This
 is the same "route judgment calls through the hub" principle applied to
 shared infrastructure, not just decisions.)
 
+## Processing LinkedIn job-alert emails into job records
+
+There is no automated script for this yet - it's currently done by a
+Claude Code session manually reading Zahir's LinkedIn email digests and
+adding postings via `add_manual_job()`. **Add every listing found, never
+skip one because it looks like the wrong industry/vertical** (Zahir's
+explicit instruction, 2026-08-06) - industry/vertical relevance is the
+scoring pipeline's job (`fit_score`, shown to Zahir so he can judge for
+himself), not a reason to silently never add a record in the first place.
+A dropped-at-intake job never even reaches him to evaluate; a low-scored
+one still does.
+
 ## Merging a finished worktree branch into master
 
 Panga usually has several sessions working in parallel worktrees. When a
