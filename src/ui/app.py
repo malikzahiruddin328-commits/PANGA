@@ -1654,6 +1654,20 @@ elif active_tab == "results":
                         with st.expander(f"{doc_label} (drafted)"):
                             if doc_key == "resume" and app_record.get("resume_ats_score") is not None:
                                 with st.container(border=True):
+                                    has_jd_text = bool((job.get("qualification_summary") or job.get("description") or "").strip())
+                                    if not has_jd_text:
+                                        # Real gap found 2026-08-06: several sources (ZipRecruiter,
+                                        # Indeed, the industry job boards) never capture any real
+                                        # posting text at all - the score below still gets computed
+                                        # (structure/formatting only), but it must never look like a
+                                        # real requirement-matched score when there was no requirement
+                                        # text to match against in the first place.
+                                        st.warning(
+                                            "No job description available for this posting - this "
+                                            "score reflects resume structure/formatting only, not "
+                                            "real requirement matching against the job.",
+                                            icon=":material/warning:",
+                                        )
                                     current_score = app_record["resume_ats_score"]
                                     prev_score_key = f"prev_ats_score_{job.get('source')}_{job.get('job_id')}"
                                     # Set right before a regenerate call below, popped (shown once,
