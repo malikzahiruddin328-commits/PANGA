@@ -43,3 +43,24 @@ smartrecruiters:
 greenhouse: []
 
 lever: []
+
+# iCIMS (Slice 3, 2026-08-06) deliberately has NO platform key here, unlike
+# the 4 above - recon found it's not buildable the same way. Unlike
+# Greenhouse/Lever, there's no consistent public API across tenants and no
+# directory of which companies use it (same "no directory" problem
+# search_workday_jobs()'s docstring already flags for Workday, worse here).
+# Tested 8 real candidate URLs (careers-<company>.icims.com pattern): 7
+# 404'd (wrong tenant name guesses - no way to discover the right one
+# without already knowing it), the one that resolved (Six Flags,
+# careers-sixflags.icims.com) turned out to be a JS-rendered SPA shell
+# (empty #portal div, loads cdn02.icims.com's platform JS bundle) - same
+# js_rendered category industry_job_boards.yaml already uses for 14 other
+# rejected sources, not reachable with plain requests/BeautifulSoup.
+# Building this would mean introducing a headless-browser dependency
+# (Playwright/Selenium) - something this codebase has consistently NOT
+# done for every other js_rendered candidate found so far (see
+# docs/daily-job-search-task.md - 4 of 19 original industry-board
+# candidates hit this exact wall and were left unbuilt). Recommending the
+# same call here rather than introducing that dependency for one platform
+# with no confirmed target company yet - flagged back to Zahir/General,
+# not decided unilaterally.
