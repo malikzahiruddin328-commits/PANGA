@@ -25,7 +25,7 @@ import re
 from datetime import date
 
 from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
 from docx.shared import Pt, RGBColor
 
 NAME_ACCENT_COLOR = RGBColor(0x00, 0x78, 0x6C)  # Zahir's own teal, from his real resume's Title run
@@ -33,9 +33,45 @@ BODY_FONT = "Times New Roman"
 BODY_SIZE = Pt(10.5)
 NAME_SIZE = Pt(20)
 
-_DATE_RANGE_RE = re.compile(
-    r"\b(19|20)\d{2}\b.{0,15}(-|–|to)\s*(\b(19|20)\d{2}\b|present)", re.IGNORECASE,
+_MONTH_RE = (
+    r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|"
+    r"Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+"
 )
+_DATE_TOKEN_RE = rf"(?:{_MONTH_RE})?(?:19|20)\d{{2}}"
+# Anchored to the END of the line - a date range is always the trailing
+# part of a company/title line, never something that can appear mid-
+# sentence. Real gap found 2026-08-06 (Mirror/Zahir): the old version of
+# this regex required only whitespace between the dash and the closing
+# year, so it silently never matched RESUME_SPEC's own requested "Month
+# YYYY - Month YYYY" format (the month name in the middle failed \s*) -
+# every date-range line in a real generated resume fell through to a
+# plain, unbolded, non-right-aligned paragraph instead of this branch.
+_DATE_RANGE_RE = re.compile(
+    rf"(?P<start>{_DATE_TOKEN_RE})\s*(?:-|–|to)\s*(?P<end>{_DATE_TOKEN_RE}|present)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _right_tab_position(doc: Document):
+    """Distance from the left margin to the right margin - where a
+    right-aligned tab stop needs to sit so text after it lands flush
+    against the right edge of the page regardless of company-name length."""
+    section = doc.sections[0]
+    return section.page_width - section.left_margin - section.right_margin
+
+
+def _normalize_name_case(line: str) -> str:
+    """Real complaint 2026-08-06 (Zahir, via Mirror): a generated resume's
+    name rendered in ALL CAPS - a documented ATS-compatibility problem
+    (auto-parsers can mis-split all-caps names), not just a style
+    preference. The drafted text sometimes echoes the name in whatever
+    casing the candidate's original source resume used (RESUME_SPEC's
+    "never invent/embellish" instruction means the AI won't normalize this
+    on its own), so this can't be left to prompt compliance alone - force
+    title case here regardless of what casing the drafted text contains."""
+    if line == line.upper() and any(c.isalpha() for c in line):
+        return line.title()
+    return line
 
 
 def _looks_like_header(line: str) -> bool:
@@ -97,7 +133,7 @@ def text_to_docx_bytes(text: str, author: str | None = None, body_size_pt: float
             # Title run in Zahir's own resume - bold, larger, his own accent
             # color rather than a generic default.
             p = doc.add_paragraph()
-            run = p.add_run(line)
+            run = p.add_run(_normalize_name_case(line))
             run.bold = True
             run.font.size = name_size
             run.font.color.rgb = NAME_ACCENT_COLOR
@@ -134,12 +170,22 @@ def text_to_docx_bytes(text: str, author: str | None = None, body_size_pt: float
             run.font.color.rgb = NAME_ACCENT_COLOR
             continue
 
-        if _DATE_RANGE_RE.search(line) and len(line) < 120:
-            # Company/role lines carrying a date range - bold, same as the
-            # "SK Life Science, Inc. (SKLSI)  09/2018 - 01/2026" pattern in
-            # his real resume.
+        date_match = _DATE_RANGE_RE.search(line) if len(line) < 120 else None
+        if date_match:
+            # Company/role lines carrying a date range - bold, and the date
+            # itself right-aligned against the page margin regardless of
+            # how long the company/title text before it is, matching the
+            # "SK Life Science, Inc. (SKLSI)      09/2018 - 01/2026" layout
+            # in his real resume (a real tab stop, not whitespace the AI
+            # tried to pad with - literal spaces/tabs in the drafted text
+            # don't reliably line up since this is a proportional font).
+            prefix = line[: date_match.start()].rstrip(" \t")
+            date_part = line[date_match.start() :].strip()
             p = doc.add_paragraph()
-            p.add_run(line).bold = True
+            p.paragraph_format.tab_stops.add_tab_stop(_right_tab_position(doc), WD_TAB_ALIGNMENT.RIGHT)
+            p.add_run(prefix).bold = True
+            p.add_run("\t").bold = True
+            p.add_run(date_part).bold = True
             continue
 
         doc.add_paragraph(line)

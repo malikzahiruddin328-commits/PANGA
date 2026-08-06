@@ -1,9 +1,24 @@
 from tailoring.drafting import (
+    RESUME_SPEC,
+    RESUME_SPEC_USAJOBS,
     _merge_keyword_gap_questions,
     _questions_worth_asking,
     _suggested_answer_for_keyword_gap,
     save_gap_answers,
 )
+
+
+def test_resume_spec_allows_dropping_rank_prefixes_and_seniority_parentheticals():
+    # Real complaint 2026-08-06 (Zahir, via Mirror): titles carrying a rank
+    # prefix ("Vice President, Head of Applications") or a seniority
+    # parenthetical ("Head of IT (CIO-equivalent)") make a role below that
+    # level look like he's applying beneath himself. Both resume specs
+    # (private-sector and USAJOBS) must tell the AI it may drop these,
+    # since master_profile.json's own title field carries the prefix and
+    # nothing else in the pipeline strips it.
+    for spec in (RESUME_SPEC, RESUME_SPEC_USAJOBS):
+        assert "rank-prefix" in spec
+        assert "not inventing or embellishing" in spec
 
 
 def test_maxed_score_suppresses_clarifying_questions():

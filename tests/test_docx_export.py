@@ -1,7 +1,7 @@
 import io
 
 from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
 
 from tailoring.docx_export import NAME_ACCENT_COLOR, NAME_SIZE, BODY_FONT, BODY_SIZE, text_to_docx_bytes
 
@@ -81,6 +81,57 @@ def test_date_range_line_is_bold_not_centered():
     role_para = next(p for p in doc.paragraphs if "Acme Corp" in p.text)
     assert role_para.runs[0].bold is True
     assert role_para.alignment != WD_ALIGN_PARAGRAPH.CENTER
+
+
+def test_date_range_in_the_real_month_yyyy_format_still_matches_and_right_aligns():
+    # Real bug found 2026-08-06 (Mirror/Zahir): the old date-range regex
+    # required only whitespace between the dash and the closing year, so
+    # it never matched RESUME_SPEC's own requested "Month YYYY - Month
+    # YYYY" format (the month name in the middle broke it) - every date
+    # line in a real generated resume fell through to a plain, unbolded,
+    # unaligned paragraph instead of this branch. This is the format the
+    # app actually produces, not the MM/YYYY shorthand in SAMPLE_RESUME.
+    text = (
+        "Jane Doe\njane@example.com\n\nPROFESSIONAL EXPERIENCE\n"
+        "Acme Corp - Springfield, IL \t\t September 2018 - January 2026\n"
+        "- Did a thing.\n"
+    )
+    doc = _load(text_to_docx_bytes(text))
+    role_para = next(p for p in doc.paragraphs if "Acme Corp" in p.text)
+    assert [r.text for r in role_para.runs] == [
+        "Acme Corp - Springfield, IL",
+        "\t",
+        "September 2018 - January 2026",
+    ]
+    assert all(r.bold for r in role_para.runs)
+    tab_stops = list(role_para.paragraph_format.tab_stops)
+    assert len(tab_stops) == 1
+    assert tab_stops[0].alignment == WD_TAB_ALIGNMENT.RIGHT
+
+
+def test_date_range_ending_in_present_still_right_aligns():
+    text = "Jane Doe\njane@example.com\n\nPROFESSIONAL EXPERIENCE\nAcme Corp June 2020 - Present\n"
+    doc = _load(text_to_docx_bytes(text))
+    role_para = next(p for p in doc.paragraphs if "Acme Corp" in p.text)
+    assert role_para.runs[-1].text == "June 2020 - Present"
+    assert len(list(role_para.paragraph_format.tab_stops)) == 1
+
+
+def test_all_caps_name_is_rendered_in_title_case():
+    # Real bug found 2026-08-06 (Mirror/Zahir): a drafted resume sometimes
+    # echoes the candidate's name in whatever casing the source resume
+    # used, including ALL CAPS - a documented ATS-parsing problem, not
+    # just style. Must be normalized regardless of the drafted text's
+    # casing, not left to prompt compliance alone.
+    text = "JANE DOE\njane@example.com\n"
+    doc = _load(text_to_docx_bytes(text))
+    name_para = doc.paragraphs[0]
+    assert name_para.runs[0].text == "Jane Doe"
+
+
+def test_mixed_case_name_is_left_untouched():
+    doc = _load(text_to_docx_bytes(SAMPLE_RESUME))
+    assert doc.paragraphs[0].runs[0].text == "Jane Doe"
 
 
 def test_bullet_line_uses_list_bullet_style():

@@ -42,7 +42,15 @@ _RESUME_SPEC_COMMON = (
     "ATS systems match on literal keyword overlap, not paraphrases. Spell "
     "out acronyms at first use with the acronym in parentheses so both "
     "keyword matching and human readers catch it (e.g. 'Master Data "
-    "Management (MDM)'). "
+    "Management (MDM)'). When a role's title in the master profile carries "
+    "a leading rank-prefix (e.g. 'Vice President, Head of Applications') "
+    "or a parenthetical seniority-equivalence note (e.g. 'Head of IT "
+    "(CIO-equivalent)'), you may print just the working title itself (e.g. "
+    "'Head of Applications', 'Head of IT') and drop the prefix/parenthetical "
+    "- for a role below that level, keeping the higher-rank qualifier on "
+    "the printed title reads as applying beneath your level. Dropping a "
+    "qualifier like this is not inventing or embellishing; keep the "
+    "employer, dates, and bullet content for that role exactly as given. "
 )
 
 _RESUME_SPEC_TWO_PAGE_RULES = (
