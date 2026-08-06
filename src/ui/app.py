@@ -109,8 +109,12 @@ try:
     # previously hard-crashed the WHOLE app on this single import. Missing
     # Bhangi should only mean "no Support tab", never "no app at all".
     from bhangi.ui import render_support_page
+    from bhangi.issues import create_issue as bhangi_create_issue
+    from bhangi.build_info import detect_build as bhangi_detect_build
 except ImportError:
     render_support_page = None
+    bhangi_create_issue = None
+    bhangi_detect_build = None
 from ui.license_gate import render_indicator_and_get_block, render_block_screen
 from licensing.client import release_device, create_portal_session, LicenseNetworkError, LicenseServiceError
 
@@ -846,6 +850,43 @@ if active_tab == "settings":
             else:
                 st.toast("Saved job-board sources.", icon=":material/check_circle:")
                 st.rerun()
+
+    if bhangi_create_issue is not None:
+        # Same "no Bhangi checkout -> feature quietly absent, not an error"
+        # rule as the Support tab above - this is a convenience on top of
+        # Bhangi, not something worth alarming a friend-testing build about.
+        with st.expander("Request a new job-board source", expanded=False):
+            st.markdown(
+                "Know a job board or company career site that isn't listed "
+                "above? Describe it here instead of adding it to your own "
+                "code - this files a ticket the same way the Support tab "
+                "does, so it's tracked and doesn't get lost."
+            )
+            request_board_name = st.text_input("Job board or company name", key="request_source_name")
+            request_board_url = st.text_input("Careers page / job board URL", key="request_source_url")
+            request_board_notes = st.text_area(
+                "Anything else worth knowing? (optional)",
+                placeholder="e.g. which roles you'd expect to find there, or why it's worth adding",
+                key="request_source_notes",
+            )
+            if st.button("Submit request", disabled=not request_board_name.strip() or not request_board_url.strip()):
+                description_parts = [f"URL: {request_board_url.strip()}"]
+                if request_board_notes.strip():
+                    description_parts.append(f"Notes: {request_board_notes.strip()}")
+                description_parts.append("Requested from Settings > Job-board sources > Request a new job-board source.")
+                try:
+                    build = bhangi_detect_build(PROJECT_ROOT) if bhangi_detect_build is not None else None
+                    bhangi_create_issue(
+                        BHANGI_PROJECT, f"New job source request: {request_board_name.strip()}",
+                        "\n".join(description_parts), build=build,
+                    )
+                except Exception as exc:
+                    st.error(f"Failed to submit request: {exc}")
+                else:
+                    for key in ("request_source_name", "request_source_url", "request_source_notes"):
+                        del st.session_state[key]
+                    st.toast("Request submitted - thanks, this has been queued for review.", icon=":material/check_circle:")
+                    st.rerun()
 
     st.subheader("USAJOBS job series")
     st.markdown("See \"Occupations and job series\" on usajobs.gov for codes. This runs alongside keyword search (not instead of it) - government classification is inconsistent, so restricting to one series alone would miss real matches filed under a different code. The compatibility score, not this filter, is what actually screens for relevance.")
