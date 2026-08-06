@@ -558,9 +558,36 @@ def _apply_answers_schema() -> dict:
     }
 
 
+def _suggested_answer_for_keyword_gap(term: str, profile: dict | None) -> str:
+    """A genuine, honest starting guess for a missing-required-keyword
+    question - Zahir's explicit correction 2026-08-06: an empty box was the
+    wrong call even here. He'd rather see *something* to react to and edit
+    than compose an answer from scratch, same "accept or edit" bar as every
+    other suggested_answer in this app - it just has to stay honestly
+    hedged, never asserted as fact, same as those.
+
+    Cheap, deterministic, no AI call: if the term (or a close variant)
+    appears anywhere in the candidate's full profile - not just the resume
+    text this specific draft produced, which the deterministic scorer
+    already confirmed doesn't mention it - that's a genuine, real signal
+    worth surfacing (the profile may cover experience this particular
+    tailored resume didn't happen to include). If it doesn't appear
+    anywhere at all, there is truly no real basis to guess yes or no, so
+    the honest starting text says exactly that rather than inventing
+    confidence - still real text to edit, not a blank box."""
+    profile_text_lower = json.dumps(profile or {}, default=str).lower()
+    if term.lower() in profile_text_lower:
+        return (
+            f"Your profile may already mention \"{term}\" - can you confirm "
+            "and briefly describe your real experience with it?"
+        )
+    return "Unknown - please describe your real experience (if any) with this."
+
+
 def _merge_keyword_gap_questions(
     clarifying_questions: list[dict], missing_required_keywords: list[str],
     previously_answered_skills: list[str] | None = None,
+    profile: dict | None = None,
 ) -> list[dict]:
     """Folds missing-required-keyword gaps into the same clarifying_questions
     structure Profile Gaps already uses, instead of leaving them as inert
@@ -573,10 +600,10 @@ def _merge_keyword_gap_questions(
     Each missing required keyword becomes a real skill_gap question -
     answerable, persisted via save_gap_answers() into the master profile's
     gap_interview_answers exactly like every other skill_gap question, and
-    actually read back into the next regenerate. suggested_answer is left
-    empty rather than guessed - there's no real basis to hedge a guess at
-    whether the candidate has a specific named skill, unlike a number/scope
-    question the AI can reasonably estimate from context.
+    actually read back into the next regenerate. suggested_answer comes from
+    _suggested_answer_for_keyword_gap() - a real, honestly-hedged starting
+    guess (Zahir, 2026-08-06: even "unknown, please fill in" beats a blank
+    box - something to react to and edit, not compose from scratch).
 
     Deduped two ways:
     - Against the AI-generated clarifying_questions passed in (by substring
@@ -607,7 +634,7 @@ def _merge_keyword_gap_questions(
                 "experience with it? If so, briefly describe it so it can be "
                 "added to your resume."
             ),
-            "suggested_answer": "",
+            "suggested_answer": _suggested_answer_for_keyword_gap(term, profile),
         })
     return merged
 
@@ -690,7 +717,7 @@ def _draft_one(
         previously_answered_skills = [a.get("skill") for a in (profile or {}).get("gap_interview_answers", [])]
         merged_questions = _merge_keyword_gap_questions(
             data.get("clarifying_questions", []), ats.get("missing_required_keywords", []),
-            previously_answered_skills,
+            previously_answered_skills, profile,
         )
         return {
             "text": resume_text,
