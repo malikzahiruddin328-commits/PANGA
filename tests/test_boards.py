@@ -1,4 +1,58 @@
+import search.boards as boards
 from search.boards import normalize_dice_job, normalize_indeed_jobs, normalize_ziprecruiter_job
+
+
+class _FakeResponse:
+    def __init__(self, text, status_code=200):
+        self.text = text
+        self.status_code = status_code
+        self.ok = status_code < 400
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+# Card with a company logo (name wrapped in <a>) - the common case.
+_CARD_WITH_LOGO = """
+<div data-testid="job-card" data-job-guid="guid-with-logo">
+  <a data-testid="job-search-job-detail-link" href="/job-detail/guid-with-logo">Chief Information Officer</a>
+  <a href="/company-profile/x"><p data-testid="job-card-company-name">Acme Corp</p></a>
+  <p>Ann Arbor, Michigan<!-- -->&#8226;<!-- -->Today</p>
+  <div aria-labelledby="salary-label"><p>USD 190,000.00 - 240,000.00 per year</p></div>
+</div>
+"""
+
+# Card with no logo (name <p> is a direct sibling of location, not wrapped
+# in <a>) - the real "Conexus" shape that crashed the first parser version.
+_CARD_WITHOUT_LOGO = """
+<div data-testid="job-card" data-job-guid="guid-without-logo">
+  <a data-testid="job-search-job-detail-link" href="/job-detail/guid-without-logo">CIO</a>
+  <p data-testid="job-card-company-name">Conexus</p>
+  <p>Irvine, California<!-- -->&#8226;<!-- -->Today</p>
+  <div aria-labelledby="salary-label"><p>USD 350,000.00 per year</p></div>
+</div>
+"""
+
+# Card with no salary block at all.
+_CARD_NO_SALARY = """
+<div data-testid="job-card" data-job-guid="guid-no-salary">
+  <a data-testid="job-search-job-detail-link" href="/job-detail/guid-no-salary">Deputy CIO</a>
+  <p data-testid="job-card-company-name">State of Kansas</p>
+  <p>No location provided</p>
+</div>
+"""
+
+# Card with no title link at all - should be skipped entirely.
+_CARD_NO_TITLE_LINK = """
+<div data-testid="job-card" data-job-guid="guid-orphan">
+  <p data-testid="job-card-company-name">Ghost Inc</p>
+</div>
+"""
+
+
+def _search_page(*cards):
+    return "<html><body>" + "".join(cards) + "</body></html>"
 
 
 def test_normalize_dice_job_id_stable_despite_different_guid():
@@ -43,6 +97,77 @@ def test_stable_job_id_differs_for_genuinely_different_postings():
     raw_a = {"guid": "g1", "title": "CIO", "companyName": "Acme Corp", "jobLocation": {"displayName": "Remote"}}
     raw_b = {"guid": "g2", "title": "VP Engineering", "companyName": "Acme Corp", "jobLocation": {"displayName": "Remote"}}
     assert normalize_dice_job(raw_a)["job_id"] != normalize_dice_job(raw_b)["job_id"]
+
+
+def test_fetch_dice_jobs_parses_card_with_company_logo(monkeypatch):
+    monkeypatch.setattr(boards.requests, "get", lambda url, params=None, headers=None, timeout=None: _FakeResponse(_search_page(_CARD_WITH_LOGO)))
+    jobs = boards.fetch_dice_jobs("Chief Information Officer")
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert job["source"] == "Dice"
+    assert job["title"] == "Chief Information Officer"
+    assert job["organization"] == "Acme Corp"
+    assert job["location"] == "Ann Arbor, Michigan"
+    assert job["pay_min"] == "190000"
+    assert job["pay_max"] == "240000"
+    assert job["posting_url"] == "https://www.dice.com/job-detail/guid-with-logo"
+
+
+def test_fetch_dice_jobs_parses_card_without_company_logo(monkeypatch):
+    # Real bug found 2026-08-06: a company without a logo has its name <p>
+    # as a direct sibling of the location <p>, not wrapped in an <a> like
+    # the common case - this crashed the first version of the parser.
+    monkeypatch.setattr(boards.requests, "get", lambda url, params=None, headers=None, timeout=None: _FakeResponse(_search_page(_CARD_WITHOUT_LOGO)))
+    jobs = boards.fetch_dice_jobs("CIO")
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert job["organization"] == "Conexus"
+    assert job["location"] == "Irvine, California"
+    assert job["pay_min"] == "350000"
+    assert job["pay_max"] == "350000"
+
+
+def test_fetch_dice_jobs_handles_missing_salary(monkeypatch):
+    monkeypatch.setattr(boards.requests, "get", lambda url, params=None, headers=None, timeout=None: _FakeResponse(_search_page(_CARD_NO_SALARY)))
+    jobs = boards.fetch_dice_jobs("Deputy CIO")
+    assert jobs[0]["pay_min"] is None
+    assert jobs[0]["pay_max"] is None
+    assert jobs[0]["location"] == "No location provided"
+
+
+def test_fetch_dice_jobs_skips_cards_without_a_title_link(monkeypatch):
+    monkeypatch.setattr(boards.requests, "get", lambda url, params=None, headers=None, timeout=None: _FakeResponse(_search_page(_CARD_NO_TITLE_LINK, _CARD_WITH_LOGO)))
+    jobs = boards.fetch_dice_jobs("CIO")
+    assert len(jobs) == 1
+    assert jobs[0]["organization"] == "Acme Corp"
+
+
+def test_fetch_dice_jobs_respects_limit(monkeypatch):
+    monkeypatch.setattr(boards.requests, "get", lambda url, params=None, headers=None, timeout=None: _FakeResponse(_search_page(_CARD_WITH_LOGO, _CARD_WITHOUT_LOGO, _CARD_NO_SALARY)))
+    jobs = boards.fetch_dice_jobs("CIO", limit=2)
+    assert len(jobs) == 2
+
+
+def test_fetch_dice_jobs_id_stable_across_repeat_fetches_of_same_posting(monkeypatch):
+    # Direct-scrape guid is empirically stable (verified live) - unlike
+    # normalize_dice_job()'s MCP-path guid, no _stable_job_id() substitution
+    # was needed at the guid level, but the two calls must still agree.
+    monkeypatch.setattr(boards.requests, "get", lambda url, params=None, headers=None, timeout=None: _FakeResponse(_search_page(_CARD_WITH_LOGO)))
+    job1 = boards.fetch_dice_jobs("CIO")[0]
+    job2 = boards.fetch_dice_jobs("CIO")[0]
+    assert job1["job_id"] == job2["job_id"]
+
+
+def test_fetch_dice_jobs_id_matches_mcp_path_for_same_content():
+    # The whole point of unifying both Dice code paths onto _stable_job_id():
+    # the same real posting found via either path must dedupe against
+    # itself under source="Dice", regardless of which path found it first.
+    scraped = boards._stable_job_id("Dice", "Chief Information Officer", "Acme Corp", "Ann Arbor, Michigan")
+    mcp_normalized = normalize_dice_job({
+        "guid": "totally-different-mcp-guid", "title": "Chief Information Officer",
+        "companyName": "Acme Corp", "jobLocation": {"displayName": "Ann Arbor, Michigan"},
+    })
+    assert scraped == mcp_normalized["job_id"]
 
 
 def test_normalize_dice_job_captures_summary_as_description():
