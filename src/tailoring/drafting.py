@@ -558,6 +558,60 @@ def _apply_answers_schema() -> dict:
     }
 
 
+def _merge_keyword_gap_questions(
+    clarifying_questions: list[dict], missing_required_keywords: list[str],
+    previously_answered_skills: list[str] | None = None,
+) -> list[dict]:
+    """Folds missing-required-keyword gaps into the same clarifying_questions
+    structure Profile Gaps already uses, instead of leaving them as inert
+    "How to raise it" bullet text with no way to answer or act on it (real
+    gap Zahir hit live 2026-08-06: ats_next_actions and clarifying_questions
+    were built as two disconnected systems - one a static list, the other
+    the real interactive, savable, drafts-feeding mechanism - and "add
+    Databricks" belonged in the second one, not sitting inert in the first).
+
+    Each missing required keyword becomes a real skill_gap question -
+    answerable, persisted via save_gap_answers() into the master profile's
+    gap_interview_answers exactly like every other skill_gap question, and
+    actually read back into the next regenerate. suggested_answer is left
+    empty rather than guessed - there's no real basis to hedge a guess at
+    whether the candidate has a specific named skill, unlike a number/scope
+    question the AI can reasonably estimate from context.
+
+    Deduped two ways:
+    - Against the AI-generated clarifying_questions passed in (by substring
+      match against each existing question's own "skill" label, case-
+      insensitive, either direction) - the AI may have already asked about
+      the same skill in its own words this same round.
+    - Against previously_answered_skills (pass profile["gap_interview_answers"]'s
+      skill labels) - without this, a keyword the candidate already said
+      "no, I don't have that" to would keep coming back as a "new" question
+      on every single regenerate forever, since the deterministic keyword
+      match has no memory of its own and the resume text will never
+      naturally gain a skill the candidate confirmed they don't have. This
+      is the same profile/interview.py._already_answered() precedent this
+      module's own gap-detection already follows - a real answer (even a
+      "no") means don't ask again, not just a real yes."""
+    already_asked_lower = [(q.get("skill") or "").lower() for q in clarifying_questions if q.get("skill")]
+    already_asked_lower += [s.lower() for s in (previously_answered_skills or []) if s]
+    merged = list(clarifying_questions)
+    for term in missing_required_keywords:
+        term_lower = term.lower()
+        if any(term_lower in skill or skill in term_lower for skill in already_asked_lower):
+            continue
+        merged.append({
+            "type": "skill_gap",
+            "skill": term,
+            "question": (
+                f"The posting requires \"{term}\" - do you have real, genuine "
+                "experience with it? If so, briefly describe it so it can be "
+                "added to your resume."
+            ),
+            "suggested_answer": "",
+        })
+    return merged
+
+
 def _questions_worth_asking(clarifying_questions: list[dict], ats_score: int) -> list[dict]:
     """Drops clarifying_questions once ats_score is already maxed at 100 -
     those questions come from the same drafting call as the resume text,
@@ -581,6 +635,7 @@ def _draft_one(
     doc_index: int = 1,
     doc_total: int = 1,
     job: dict | None = None,
+    profile: dict | None = None,
 ):
     if doc_key == "resume":
         schema = _resume_schema(job)
@@ -632,13 +687,18 @@ def _draft_one(
                 job.get("title"), job.get("qualification_summary"), job.get("description"),
             ]))
             ats = score_resume_ats(posting_text, resume_text)
+        previously_answered_skills = [a.get("skill") for a in (profile or {}).get("gap_interview_answers", [])]
+        merged_questions = _merge_keyword_gap_questions(
+            data.get("clarifying_questions", []), ats.get("missing_required_keywords", []),
+            previously_answered_skills,
+        )
         return {
             "text": resume_text,
             "suggested_strategy_tag": data.get("suggested_strategy_tag", ""),
             "ats_score": ats["ats_score"],
             "ats_rationale": ats["ats_rationale"],
             "ats_next_actions": ats["ats_next_actions"],
-            "clarifying_questions": _questions_worth_asking(data.get("clarifying_questions", []), ats["ats_score"]),
+            "clarifying_questions": _questions_worth_asking(merged_questions, ats["ats_score"]),
         }
     if doc_key == "apply_answers":
         return data.get("apply_answers", [])
@@ -751,7 +811,7 @@ def generate_documents(
     for i, doc_key in enumerate(doc_keys, start=1):
         if on_progress:
             on_progress(i, total, doc_key)
-        results[doc_key] = _draft_one(client, shared_context, doc_key, model, on_progress, i, total, job=job)
+        results[doc_key] = _draft_one(client, shared_context, doc_key, model, on_progress, i, total, job=job, profile=profile)
     return results
 
 

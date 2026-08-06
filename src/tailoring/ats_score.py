@@ -245,10 +245,23 @@ def score_resume_against_keywords(
     """The real, deterministic ATS score for one drafted resume against an
     already-extracted required/preferred keyword list (lowercase or not -
     matching is case-insensitive). Returns {"ats_score": int 0-100,
-    "ats_rationale": str, "ats_next_actions": [str, ...]}. Always
-    recomputed from the actual text passed in - the score moves when the
-    text does, because this is literal keyword-overlap arithmetic plus
-    formatting checks, not an independent AI guess."""
+    "ats_rationale": str, "ats_next_actions": [str, ...],
+    "missing_required_keywords": [str, ...]}. Always recomputed from the
+    actual text passed in - the score moves when the text does, because
+    this is literal keyword-overlap arithmetic plus formatting checks, not
+    an independent AI guess.
+
+    missing_required_keywords is returned separately from ats_next_actions
+    (2026-08-06, real gap Zahir hit live): these are the specific,
+    answerable "does the candidate actually have this" gaps, and
+    drafting.py merges them into the resume's real clarifying_questions
+    flow (the same interactive, savable mechanism Profile Gaps already
+    uses) rather than leaving them as inert bullet-point text with no way
+    to answer or act on them - see
+    tailoring.drafting._merge_keyword_gap_questions(). ats_next_actions
+    keeps only what's genuinely just informational/directive (structural
+    formatting fixes, optional preferred-keyword suggestions) - things
+    there's no real fact to "answer", just an edit to make."""
     required = [k.lower() for k in required_keywords]
     preferred = [k.lower() for k in preferred_keywords]
     resume_lower = resume_text.lower()
@@ -295,10 +308,13 @@ def score_resume_against_keywords(
     missing_required = [k for k in required if k not in matched_required]
     missing_preferred = [k for k in preferred if k not in matched_preferred]
 
-    # Structural fixes go first - a resume an ATS can't even parse (no
+    # Structural fixes first - a resume an ATS can't even parse (no
     # headers, no plain-text contact info) is a bigger problem than any
-    # single missing keyword, and these are capped at 4 possible checks so
-    # they can never crowd out every keyword suggestion below.
+    # single missing keyword. Missing REQUIRED keywords are deliberately
+    # NOT listed here (see missing_required_keywords below and the
+    # docstring above) - those are real, answerable "do you have this"
+    # gaps and belong in clarifying_questions, not a static bullet next to
+    # ones that are just formatting edits.
     next_actions = []
     if "headers" in failed_checks:
         next_actions.append("Use standard section headers (e.g. PROFESSIONAL EXPERIENCE, EDUCATION, SKILLS) so ATS parsers recognize them.")
@@ -310,18 +326,15 @@ def score_resume_against_keywords(
         next_actions.append("Put contact info (email/phone) as plain text at the very top of the document.")
 
     remaining = max(0, 6 - len(next_actions))
-    required_slots = min(len(missing_required), max(1, remaining - 1) if missing_preferred else remaining)
-    for term in missing_required[:required_slots]:
-        next_actions.append(f"Add the required term \"{term}\" from the posting if your real experience supports it.")
-    remaining = max(0, 6 - len(next_actions))
     for term in missing_preferred[:remaining]:
         next_actions.append(f"Consider adding the preferred term \"{term}\" if it genuinely applies.")
 
-    if not next_actions:
+    if not next_actions and not missing_required:
         next_actions.append("Resume already covers the posting's extractable keywords and standard formatting well.")
 
     return {
         "ats_score": ats_score,
         "ats_rationale": rationale,
         "ats_next_actions": next_actions[:6],
+        "missing_required_keywords": missing_required,
     }

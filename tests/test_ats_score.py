@@ -60,11 +60,38 @@ def test_score_falls_back_to_structure_only_when_posting_has_no_extractable_text
     assert 0 <= result["ats_score"] <= 100
 
 
-def test_next_actions_flag_missing_required_keywords():
+def test_missing_required_keywords_returned_separately_from_next_actions():
+    # 2026-08-06: missing REQUIRED keywords used to show up as static
+    # "How to raise it" bullet text with no way to answer/act on them.
+    # drafting.py now turns these into real, answerable clarifying
+    # questions instead (_merge_keyword_gap_questions) - so this function
+    # must expose the raw list separately, and ats_next_actions must NOT
+    # duplicate them as inert text.
     resume = "PROFESSIONAL EXPERIENCE\nEngineer.\n\nEDUCATION\nBS\n\nSKILLS\nJava"
     result = score_resume_ats(POSTING, resume)
+    assert set(result["missing_required_keywords"]) >= {"python", "sql", "aws"}
     joined = " ".join(result["ats_next_actions"]).lower()
-    assert "python" in joined or "sql" in joined or "aws" in joined
+    assert "python" not in joined and "sql" not in joined and "aws" not in joined
+
+
+def test_missing_required_keywords_empty_when_all_matched():
+    result = score_resume_against_keywords(["python", "sql"], [], "SKILLS\nPython, SQL")
+    assert result["missing_required_keywords"] == []
+
+
+def test_next_actions_does_not_falsely_claim_resume_is_complete_when_required_keywords_still_missing():
+    # Real edge case: structure checks all pass and there are no missing
+    # PREFERRED keywords, but required keywords are still missing (now
+    # living only in clarifying_questions, not ats_next_actions) - must
+    # not fall back to "Resume already covers... well", which would be a
+    # false claim while real gaps still exist.
+    resume = (
+        "jane@example.com\n\nPROFESSIONAL EXPERIENCE\nEngineer - Acme - Jan 2020 - Present\n"
+        "- Did things.\n\nEDUCATION\nBS\n\nSKILLS\nJava"
+    )
+    result = score_resume_against_keywords(["python", "sql"], [], resume)
+    assert result["missing_required_keywords"] == ["python", "sql"]
+    assert "already covers" not in " ".join(result["ats_next_actions"]).lower()
 
 
 def test_score_against_explicit_keywords_moves_when_resume_gains_one():
