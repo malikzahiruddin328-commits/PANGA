@@ -60,9 +60,9 @@ _SKIP_STATUSES = {
 
 # Per-site "posting closed" phrase, matched case-insensitively against the
 # fetched page text. Starts empty for sites we haven't confirmed real
-# wording on yet (Dice and the industry boards) - those rely on the
-# 404-on-removal heuristic alone until a real closure is observed and the
-# wording can be added here, same as LinkedIn/ZipRecruiter were confirmed.
+# wording on yet (the industry boards) - those rely on the 404-on-removal
+# heuristic alone until a real closure is observed and the wording can be
+# added here, same as LinkedIn/ZipRecruiter/Dice were confirmed.
 #
 # ZipRecruiter and Indeed postings both live-tested as always returning None
 # here (confirmed 2026-08-05) - both domains 403 Python's `requests` library
@@ -72,9 +72,17 @@ _SKIP_STATUSES = {
 # confirmed closed-phrases above are correct but currently unreachable by
 # this fetcher - fail-safe means these two sources just never get marked
 # closed automatically until that's solved, not a bug in the phrase match.
+#
+# Dice (added 2026-08-06, alongside boards.fetch_dice_jobs()) doesn't 404 a
+# removed posting - the detail page still 200s but its <title> becomes "job
+# not found | dice.com" (confirmed live against a real and a fake guid), and
+# unlike ZipRecruiter/Indeed, plain `requests` reaches it fine (no WAF
+# block) - so this phrase is actually reachable by this fetcher, not just
+# documented like the two above.
 _CLOSED_PHRASES = {
     "LinkedIn": ["no longer accepting applications"],
     "ZipRecruiter": ["this job post has expired"],
+    "Dice": ["job not found"],
 }
 
 

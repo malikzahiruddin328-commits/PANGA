@@ -7,15 +7,16 @@ be invoked from Windows Task Scheduler in a standalone build.
 Ported step-for-step from
 C:\\Users\\User\\.claude\\scheduled-tasks\\panga-daily-job-search\\SKILL.md,
 with one deliberate scope cut: STEP 2 (ZipRecruiter/Dice/Indeed via MCP
-connector tools) is dropped entirely - see docs/native-packaging-scope.md's
-Phase 1 spike. Neither ZipRecruiter nor Dice expose anything reachable
-outside that connector (ZipRecruiter's only API is a "Publisher Partner"
-program built for job-aggregator sites, not a personal search tool; Dice's
-old unofficial public endpoint no longer resolves), and Indeed's own
-connector tool has no non-MCP equivalent either. These three sources are
-simply unavailable in a standalone build; USAJOBS + company-site ATS APIs +
-industry-board scraping (steps 1, 3, 4) are unaffected, since none of those
-ever depended on MCP.
+connector tools) is dropped - see docs/native-packaging-scope.md's Phase 1
+spike. ZipRecruiter has no API usable outside that connector (only a
+"Publisher Partner" program built for job-aggregator sites, not a personal
+search tool) and Indeed's connector tool has no non-MCP equivalent either -
+both genuinely unavailable in a standalone build. Dice is the exception
+(investigated fresh 2026-08-06, see search/boards.py's fetch_dice_jobs()):
+its search-results page turned out to be plain server-rendered HTML, no MCP
+needed - STEP 2c below covers it directly. USAJOBS + company-site ATS APIs +
+industry-board scraping + Adzuna (steps 1, 2b, 3, 4) are also unaffected,
+since none of those ever depended on MCP either.
 """
 
 import sys
@@ -35,7 +36,7 @@ import yaml  # noqa: E402
 
 from notifications import send_notification  # noqa: E402
 from profile.storage import load_profile  # noqa: E402
-from search import aggregators, company_sites, freshness_check, industry_boards, job_sources, job_store, usajobs  # noqa: E402
+from search import aggregators, boards, company_sites, freshness_check, industry_boards, job_sources, job_store, usajobs  # noqa: E402
 from tailoring.applications import get_unreviewed_skip_reasons  # noqa: E402
 from tailoring.drafting import DraftingFailed, DraftingNotConfigured, score_job  # noqa: E402
 
@@ -94,6 +95,20 @@ def search_aggregators(target_roles: list[dict], countries: list[str]) -> int:
                 return added
             except Exception as exc:  # noqa: BLE001 - one (role, country) pair's failure shouldn't stop the rest
                 _log(f"  [aggregators] Adzuna search failed for {role['name']!r} / {country!r}: {exc}")
+    return added
+
+
+def search_dice(target_roles: list[dict]) -> int:
+    """Direct scrape, no MCP - see boards.fetch_dice_jobs()'s docstring for
+    why this is safe to run unattended (server-rendered, plain `requests`
+    reaches it fine, unlike ZipRecruiter/Indeed's WAF)."""
+    added = 0
+    for role in target_roles:
+        try:
+            jobs = boards.fetch_dice_jobs(role["name"], limit=25)
+            added += job_store.save_jobs(jobs)
+        except Exception as exc:  # noqa: BLE001 - one role's failure shouldn't stop the rest
+            _log(f"  [boards] Dice search failed for {role['name']!r}: {exc}")
     return added
 
 
@@ -231,11 +246,15 @@ def run() -> None:
     added = search_usajobs(target_roles, job_series)
     _log(f"  added {added} new job(s)")
 
-    _log("STEP 2 - ZipRecruiter/Dice/Indeed: skipped (not available outside the Claude Code MCP "
+    _log("STEP 2 - ZipRecruiter/Indeed: skipped (not available outside the Claude Code MCP "
          "connector - see docs/native-packaging-scope.md Phase 1 spike)")
 
     _log("STEP 2b - Adzuna aggregator")
     added = search_aggregators(target_roles, settings.get("aggregator_countries", []))
+    _log(f"  added {added} new job(s)")
+
+    _log("STEP 2c - Dice (direct scrape, no MCP needed - see boards.fetch_dice_jobs())")
+    added = search_dice(target_roles)
     _log(f"  added {added} new job(s)")
 
     _log("STEP 3 - Company career sites")
