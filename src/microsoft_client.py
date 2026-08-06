@@ -28,6 +28,7 @@ extending this:
 
 import re
 from datetime import datetime, timedelta, timezone
+from email.utils import parseaddr
 from pathlib import Path
 from typing import Optional
 
@@ -299,11 +300,19 @@ def create_draft(to: str, subject: str, body: str, reply_to_message_id: Optional
     Graph's own createReply action so the draft threads onto that message
     natively, then overwrites its auto-quoted body/recipient with the
     drafted text - same "plain reply, not quoted-and-blended" intent as
-    gmail_client.py's MIMEText-from-scratch approach."""
+    gmail_client.py's MIMEText-from-scratch approach. `to` may be a bare
+    address or a "Name <email@domain.com>" form - only the address part is
+    used (Graph rejects the display-name form in toRecipients.emailAddress.address),
+    same extraction gmail_client.py's create_draft already does; this
+    module was missing it until now, a real gap since inbox_accounts.py
+    passes every provider a raw sender-header string uniformly."""
+    _, address = parseaddr(to)
+    address = address or to
+
     if reply_to_message_id:
         draft = _post(f"/me/messages/{reply_to_message_id}/createReply", {})
         _patch(f"/me/messages/{draft['id']}", {
-            "toRecipients": [{"emailAddress": {"address": to}}],
+            "toRecipients": [{"emailAddress": {"address": address}}],
             "body": {"contentType": "text", "content": body},
         })
         return draft["id"]
@@ -314,7 +323,7 @@ def create_draft(to: str, subject: str, body: str, reply_to_message_id: Optional
     draft = _post("/me/messages", {
         "subject": subject,
         "body": {"contentType": "text", "content": body},
-        "toRecipients": [{"emailAddress": {"address": to}}],
+        "toRecipients": [{"emailAddress": {"address": address}}],
     })
     return draft["id"]
 

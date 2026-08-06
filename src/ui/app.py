@@ -95,6 +95,7 @@ import imap_client
 import microsoft_client
 import google_calendar_client
 from email_providers import detect_imap_settings
+from fulfillment import get_last_synced_at, get_pending_count, run_full_fulfillment
 from feedback.ui_feedback import get_open_feedback, mark_resolved
 from ui.feedback_widget import render_feedback_widget
 from profile.ingest import load_manifest_result, remove_document, ingest_uploaded_document, resume_text as ingested_resume_text
@@ -174,6 +175,29 @@ def application_status(job: dict) -> str | None:
 
 def job_label(job: dict) -> str:
     return f"{job.get('title')} - {job.get('organization')}"
+
+
+def _format_last_synced(iso_timestamp: str | None) -> str:
+    """Human-readable "Last synced ..." line for the Call to Action tab's
+    status card. `iso_timestamp` is fulfillment.get_last_synced_at()'s
+    return value - None if fulfillment has never completed a run."""
+    if not iso_timestamp:
+        return "Never synced yet"
+    try:
+        synced_at = datetime.fromisoformat(iso_timestamp)
+    except ValueError:
+        return "Last synced: unknown"
+    now = datetime.now(timezone.utc) if synced_at.tzinfo else datetime.now()
+    minutes = max(0, int((now - synced_at).total_seconds() // 60))
+    if minutes < 1:
+        return "Last synced just now"
+    if minutes < 60:
+        return f"Last synced {minutes} minute{'s' if minutes != 1 else ''} ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"Last synced {hours} hour{'s' if hours != 1 else ''} ago"
+    days = hours // 24
+    return f"Last synced {days} day{'s' if days != 1 else ''} ago"
 
 
 _PROGRESS_CHAR_RE = re.compile(r"([\d,]+) characters")
@@ -357,16 +381,19 @@ def render_outreach_section(key_prefix: str, target_account_name: str | None = N
                 update_outreach_status(o["outreach_id"], new_o_status)
                 st.rerun()
         with oc2:
-            if o["channel"] == "email" and o.get("contact_email") and not o.get("gmail_draft_id") and not o.get("draft_requested"):
+            if o["channel"] == "email" and o.get("contact_email") and not (o.get("draft_id") or o.get("gmail_draft_id")) and not o.get("draft_requested"):
                 if st.button("Request draft", key=f"{key_prefix}_reqdraft_{o['outreach_id']}"):
                     request_draft(o["outreach_id"])
-                    st.toast("Flagged - the background fulfillment task will create a real Gmail draft shortly.", icon=":material/check_circle:")
+                    st.toast("Flagged - will create a real draft on the next sync (2x/day, or click \"Send and receive\" on Call to Action).", icon=":material/check_circle:")
                     st.rerun()
             elif o.get("draft_requested"):
                 st.markdown("Draft requested, not yet created")
         with oc3:
-            if o.get("gmail_draft_link"):
-                st.link_button("Open draft", o["gmail_draft_link"], key=f"{key_prefix}_opendraft_{o['outreach_id']}")
+            draft_link = o.get("draft_link") or o.get("gmail_draft_link")
+            if draft_link:
+                st.link_button("Open draft", draft_link, key=f"{key_prefix}_opendraft_{o['outreach_id']}")
+            elif o.get("draft_id") or o.get("gmail_draft_id"):
+                st.button("Draft created - check Drafts folder", key=f"{key_prefix}_opendraft_{o['outreach_id']}", disabled=True)
         new_o_tag = st.text_input(
             "Strategy tag (optional)", value=o.get("strategy_tag") or "",
             key=f"{key_prefix}_otag_{o['outreach_id']}", label_visibility="collapsed",
@@ -1146,6 +1173,35 @@ elif active_tab == "cta":
 
     st.header("Call to action")
     st.markdown("Emails the Gmail scan flagged as needing a reply or a decision.")
+
+    with st.container(border=True):
+        sync_pending = get_pending_count()
+        sync_icon, sync_headline = (":material/task_alt:", "All caught up") if sync_pending == 0 else (
+            ":material/sync:", f"{sync_pending} update{'s' if sync_pending != 1 else ''} to send",
+        )
+        sync_cols = st.columns([1, 4, 2], vertical_alignment="center")
+        with sync_cols[0]:
+            st.markdown(f"## {sync_icon}")
+        with sync_cols[1]:
+            st.markdown(f"**{sync_headline}**")
+            st.caption(_format_last_synced(get_last_synced_at()))
+        with sync_cols[2]:
+            if st.button("Send and receive", type="primary", key="manual_sync_button", width="stretch"):
+                with st.spinner("Syncing - archiving, drafting replies, checking sent drafts..."):
+                    sync_summary = run_full_fulfillment()
+                parts = []
+                if sync_summary["archived"]:
+                    parts.append(f"{sync_summary['archived']} archived")
+                if sync_summary["cta_drafts"]:
+                    parts.append(f"{sync_summary['cta_drafts']} repl{'ies' if sync_summary['cta_drafts'] != 1 else 'y'} drafted")
+                if sync_summary["outreach_drafts"]:
+                    parts.append(f"{sync_summary['outreach_drafts']} outreach draft{'s' if sync_summary['outreach_drafts'] != 1 else ''} created")
+                summary_text = ", ".join(parts) if parts else "nothing was pending"
+                if sync_summary["failures"]:
+                    st.toast(f"Synced with {sync_summary['failures']} failure(s) - {summary_text}. Try again shortly.", icon=":material/warning:")
+                else:
+                    st.toast(f"Synced: {summary_text}.", icon=":material/check_circle:")
+                st.rerun()
 
     r1, r2 = st.columns([1, 5])
     with r1:
