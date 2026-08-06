@@ -7,15 +7,16 @@ be invoked from Windows Task Scheduler in a standalone build.
 Ported step-for-step from
 C:\\Users\\User\\.claude\\scheduled-tasks\\panga-daily-job-search\\SKILL.md,
 with one deliberate scope cut: STEP 2 (ZipRecruiter/Dice/Indeed via MCP
-connector tools) is dropped entirely - see docs/native-packaging-scope.md's
-Phase 1 spike. Neither ZipRecruiter nor Dice expose anything reachable
-outside that connector (ZipRecruiter's only API is a "Publisher Partner"
-program built for job-aggregator sites, not a personal search tool; Dice's
-old unofficial public endpoint no longer resolves), and Indeed's own
-connector tool has no non-MCP equivalent either. These three sources are
-simply unavailable in a standalone build; USAJOBS + company-site ATS APIs +
-industry-board scraping (steps 1, 3, 4) are unaffected, since none of those
-ever depended on MCP.
+connector tools) is dropped - see docs/native-packaging-scope.md's Phase 1
+spike. ZipRecruiter has no API usable outside that connector (only a
+"Publisher Partner" program built for job-aggregator sites, not a personal
+search tool) and Indeed's connector tool has no non-MCP equivalent either -
+both genuinely unavailable in a standalone build. Dice is the exception
+(investigated fresh 2026-08-06, see search/boards.py's fetch_dice_jobs()):
+its search-results page turned out to be plain server-rendered HTML, no MCP
+needed - STEP 2c below covers it directly. USAJOBS + company-site ATS APIs +
+industry-board scraping + Adzuna (steps 1, 2b, 3, 4) are also unaffected,
+since none of those ever depended on MCP either.
 """
 
 import sys
@@ -35,32 +36,12 @@ import yaml  # noqa: E402
 
 from notifications import send_notification  # noqa: E402
 from profile.storage import load_profile  # noqa: E402
-from search import company_sites, freshness_check, industry_boards, job_store, usajobs  # noqa: E402
+from search import aggregators, boards, company_sites, freshness_check, industry_boards, job_sources, job_store, usajobs  # noqa: E402
 from tailoring.applications import get_unreviewed_skip_reasons  # noqa: E402
 from tailoring.drafting import DraftingFailed, DraftingNotConfigured, score_job  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SETTINGS_PATH = PROJECT_ROOT / "config" / "settings.yaml"
-
-# STEP 3's known-companies list, ported verbatim from the SKILL.md (kept
-# here rather than in settings.yaml since it's this script's own concern,
-# not something the Streamlit app or any other consumer reads).
-_WORKDAY_COMPANIES = [
-    dict(company_name="Eisai", tenant="eisai", site="eisai", wd_number=5, limit=15),
-    dict(
-        company_name="IQVIA", tenant="iqvia", site="IQVIA", wd_number=1, limit=15,
-        # Zahir asked 2026-07-30 that IQVIA be US-only (large global CRO,
-        # most listings are outside the US) - this facet ID is IQVIA's
-        # Workday "Location_Country = United States of America" value,
-        # confirmed live 2026-07-30. If this starts erroring/returning 0
-        # results, rediscover it per company_sites.search_workday_jobs()'s
-        # own docstring.
-        applied_facets={"Location_Country": ["bc33aa3152ec42d4995f4791a106ed09"]},
-    ),
-]
-_SMARTRECRUITERS_COMPANIES = [
-    dict(company_name="AbbVie", company_id="abbvie", limit=15),
-]
 
 
 def _load_settings() -> dict:
@@ -89,10 +70,55 @@ def search_usajobs(target_roles: list[dict], job_series: list[str]) -> int:
     return added
 
 
-def search_company_sites(target_roles: list[dict]) -> int:
+def search_aggregators(target_roles: list[dict], countries: list[str]) -> int:
+    """Adzuna, per role per country. Skips the whole step (not an error)
+    if credentials aren't set up, same as USAJOBS/Gmail/drafting today.
+    Stops making further Adzuna calls the moment the daily call budget is
+    used up rather than letting later (role, country) pairs fail one by
+    one with the same error - see aggregators.py's own docstring for why
+    this needs a real budget check, not just a rate-limit sleep."""
+    if not aggregators.is_configured():
+        _log("  [aggregators] Adzuna not configured (ADZUNA_APP_ID/ADZUNA_APP_KEY not in .env) - skipping")
+        return 0
+    if not countries:
+        _log("  [aggregators] no Adzuna search countries configured in Settings - skipping")
+        return 0
+
     added = 0
     for role in target_roles:
-        for company in _WORKDAY_COMPANIES:
+        for country in countries:
+            try:
+                jobs = aggregators.fetch_adzuna_jobs(role["name"], country, limit=25)
+                added += job_store.save_jobs(jobs)
+            except aggregators.AdzunaBudgetExceeded as exc:
+                _log(f"  [aggregators] {exc} - stopping Adzuna search for the rest of this run")
+                return added
+            except Exception as exc:  # noqa: BLE001 - one (role, country) pair's failure shouldn't stop the rest
+                _log(f"  [aggregators] Adzuna search failed for {role['name']!r} / {country!r}: {exc}")
+    return added
+
+
+def search_dice(target_roles: list[dict]) -> int:
+    """Direct scrape, no MCP - see boards.fetch_dice_jobs()'s docstring for
+    why this is safe to run unattended (server-rendered, plain `requests`
+    reaches it fine, unlike ZipRecruiter/Indeed's WAF)."""
+    added = 0
+    for role in target_roles:
+        try:
+            jobs = boards.fetch_dice_jobs(role["name"], limit=25)
+            added += job_store.save_jobs(jobs)
+        except Exception as exc:  # noqa: BLE001 - one role's failure shouldn't stop the rest
+            _log(f"  [boards] Dice search failed for {role['name']!r}: {exc}")
+    return added
+
+
+def search_company_sites(target_roles: list[dict]) -> int:
+    """Companies come from config/job_sources.yaml (user-managed from the
+    Settings tab, not hardcoded here) - see search/job_sources.py."""
+    sources = job_sources.load_job_sources()
+    added = 0
+    for role in target_roles:
+        for company in sources["workday"]:
             try:
                 jobs = company_sites.search_workday_jobs(
                     company["company_name"], company["tenant"], company["site"], company["wd_number"],
@@ -102,7 +128,7 @@ def search_company_sites(target_roles: list[dict]) -> int:
                 added += job_store.save_jobs(jobs)
             except Exception as exc:  # noqa: BLE001 - one company's failure shouldn't stop the rest
                 _log(f"  [company_sites] Workday search failed for {company['company_name']} / {role['name']!r}: {exc}")
-        for company in _SMARTRECRUITERS_COMPANIES:
+        for company in sources["smartrecruiters"]:
             try:
                 jobs = company_sites.search_smartrecruiters_jobs(
                     company["company_name"], company["company_id"], keyword=role["name"], limit=company["limit"],
@@ -110,6 +136,35 @@ def search_company_sites(target_roles: list[dict]) -> int:
                 added += job_store.save_jobs(jobs)
             except Exception as exc:  # noqa: BLE001
                 _log(f"  [company_sites] SmartRecruiters search failed for {company['company_name']} / {role['name']!r}: {exc}")
+    return added
+
+
+def search_ats_boards() -> int:
+    """Greenhouse/Lever companies from config/job_sources.yaml. Unlike
+    search_company_sites() above, this is NOT called per target role -
+    neither platform's public API supports server-side keyword search, so
+    looping it by role would just refetch the identical full board N
+    times for zero extra data. One fetch per company, same shape as
+    search_industry_boards() below; compatibility scoring is what
+    actually filters for relevance, same as those sources."""
+    sources = job_sources.load_job_sources()
+    added = 0
+    for company in sources["greenhouse"]:
+        try:
+            jobs = company_sites.search_greenhouse_jobs(
+                company["company_name"], company["board_token"], limit=company["limit"],
+            )
+            added += job_store.save_jobs(jobs)
+        except Exception as exc:  # noqa: BLE001 - one company's failure shouldn't stop the rest
+            _log(f"  [company_sites] Greenhouse search failed for {company['company_name']}: {exc}")
+    for company in sources["lever"]:
+        try:
+            jobs = company_sites.search_lever_jobs(
+                company["company_name"], company["company_slug"], limit=company["limit"],
+            )
+            added += job_store.save_jobs(jobs)
+        except Exception as exc:  # noqa: BLE001
+            _log(f"  [company_sites] Lever search failed for {company['company_name']}: {exc}")
     return added
 
 
@@ -191,11 +246,23 @@ def run() -> None:
     added = search_usajobs(target_roles, job_series)
     _log(f"  added {added} new job(s)")
 
-    _log("STEP 2 - ZipRecruiter/Dice/Indeed: skipped (not available outside the Claude Code MCP "
+    _log("STEP 2 - ZipRecruiter/Indeed: skipped (not available outside the Claude Code MCP "
          "connector - see docs/native-packaging-scope.md Phase 1 spike)")
+
+    _log("STEP 2b - Adzuna aggregator")
+    added = search_aggregators(target_roles, settings.get("aggregator_countries", []))
+    _log(f"  added {added} new job(s)")
+
+    _log("STEP 2c - Dice (direct scrape, no MCP needed - see boards.fetch_dice_jobs())")
+    added = search_dice(target_roles)
+    _log(f"  added {added} new job(s)")
 
     _log("STEP 3 - Company career sites")
     added = search_company_sites(target_roles)
+    _log(f"  added {added} new job(s)")
+
+    _log("STEP 3b - Greenhouse/Lever company boards")
+    added = search_ats_boards()
     _log(f"  added {added} new job(s)")
 
     _log("STEP 4 - Industry job boards")

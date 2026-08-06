@@ -223,6 +223,96 @@ def check_workday_posting_open(tenant: str, site: str, wd_number: int, external_
     return bool(response.json().get("jobPostingInfo"))
 
 
+def search_greenhouse_jobs(company_name: str, board_token: str, limit: int = 50) -> list[dict]:
+    """board_token is the identifier in the company's own
+    boards.greenhouse.io/{board_token} careers URL, e.g. "stripe". Public
+    job board API, no auth required - meant for syndication, same
+    intended-use basis as search_smartrecruiters_jobs() above.
+
+    No server-side keyword search on this endpoint (unlike Workday/
+    SmartRecruiters) - it always returns the company's whole open-jobs
+    list. Deliberately NOT called per-role in a loop the way Workday/
+    SmartRecruiters are (see run_search.py's search_ats_boards()) -
+    fetching the same full board once per target role would be wasted
+    requests for zero extra data, same reasoning as the industry-board
+    fetchers in industry_boards.py. Compatibility scoring, not this
+    function, is what actually filters for relevance."""
+    url = f"https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs"
+    response = requests.get(url, timeout=20)
+    response.raise_for_status()
+    data = response.json()
+
+    jobs = []
+    for posting in data.get("jobs", [])[:limit]:
+        posting_url = posting.get("absolute_url")
+        jobs.append({
+            "source": company_name,
+            "job_id": str(posting.get("id")),
+            "title": posting.get("title"),
+            "organization": company_name,
+            "location": (posting.get("location") or {}).get("name"),
+            "pay_min": None,
+            "pay_max": None,
+            "posting_url": posting_url,
+            "apply_url": posting_url,
+        })
+    return jobs
+
+
+def search_lever_jobs(company_name: str, company_slug: str, limit: int = 50) -> list[dict]:
+    """company_slug is the identifier in the company's own
+    jobs.lever.co/{company_slug} careers URL, e.g. "netflix". Public
+    postings API, no auth required. Same "no server-side keyword search,
+    fetch once per company not per role" reasoning as
+    search_greenhouse_jobs() above - see run_search.py's
+    search_ats_boards()."""
+    url = f"https://api.lever.co/v0/postings/{company_slug}"
+    response = requests.get(url, params={"mode": "json"}, timeout=20)
+    response.raise_for_status()
+    data = response.json()
+
+    jobs = []
+    for posting in data[:limit]:
+        posting_url = posting.get("hostedUrl")
+        location = (posting.get("categories") or {}).get("location")
+        jobs.append({
+            "source": company_name,
+            "job_id": str(posting.get("id")),
+            "title": posting.get("text"),
+            "organization": company_name,
+            "location": location,
+            "pay_min": None,
+            "pay_max": None,
+            "posting_url": posting_url,
+            "apply_url": posting.get("applyUrl") or posting_url,
+        })
+    return jobs
+
+
+def check_greenhouse_posting_open(board_token: str, job_id: str) -> bool:
+    """Freshness check: Greenhouse's single-job endpoint - a filled/closed
+    requisition 404s here rather than returning a job body (confirmed
+    2026-08-05, same shape as check_workday_posting_open())."""
+    url = f"https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs/{job_id}"
+    response = requests.get(url, timeout=20)
+    if response.status_code == 404:
+        return False
+    response.raise_for_status()
+    return True
+
+
+def check_lever_posting_open(company_slug: str, posting_id: str) -> bool:
+    """Freshness check: Lever's single-posting endpoint - a filled/closed
+    posting 404s here (confirmed 2026-08-05, same shape as
+    check_smartrecruiters_posting_open())."""
+    url = f"https://api.lever.co/v0/postings/{company_slug}/{posting_id}"
+    response = requests.get(url, params={"mode": "json"}, timeout=20)
+    if response.status_code == 404:
+        return False
+    response.raise_for_status()
+    return True
+
+
 if __name__ == "__main__":
     companies = fetch_companies(limit=1000)
     print(f"Found {len(companies)} distinct companies in this page.")

@@ -67,6 +67,8 @@ import yaml
 
 from search.usajobs import search_jobs, USAJobsNotConfigured
 from search.job_store import load_jobs
+from search.job_sources import load_job_sources, save_job_sources
+from search.aggregators import ADZUNA_COUNTRIES, is_configured as adzuna_is_configured
 from ranking.prioritize import weight_for, dedupe_across_sources
 from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion, set_strategy_tag, needs_edit_review, record_document_edit_review, get_applications_with_open_clarifying_questions
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
@@ -108,8 +110,12 @@ try:
     # previously hard-crashed the WHOLE app on this single import. Missing
     # Bhangi should only mean "no Support tab", never "no app at all".
     from bhangi.ui import render_support_page
+    from bhangi.issues import create_issue as bhangi_create_issue
+    from bhangi.build_info import detect_build as bhangi_detect_build
 except ImportError:
     render_support_page = None
+    bhangi_create_issue = None
+    bhangi_detect_build = None
 from ui.license_gate import render_indicator_and_get_block, render_block_screen
 from licensing.client import release_device, create_portal_session, LicenseNetworkError, LicenseServiceError
 
@@ -948,6 +954,155 @@ if active_tab == "settings":
         key=f"roles_editor_{gen_counter}",
     )
 
+    st.subheader("Job-board sources")
+    st.markdown(
+        "Company career sites Panga searches directly, in addition to "
+        "USAJOBS and the built-in industry boards - add or remove "
+        "companies here, no code change needed. Covers companies whose "
+        "careers site runs on Workday, SmartRecruiters, Greenhouse, or "
+        "Lever; find a company's own tenant/ID from its careers URL (see "
+        "the field hints below)."
+    )
+    with st.expander("Manage companies", expanded=False):
+        job_sources_data = load_job_sources()
+
+        st.markdown("**Workday** - tenant/site/wd_number come from the company's own myworkdayjobs.com URL, e.g. \"eisai.wd5.myworkdayjobs.com/eisai\" -> tenant \"eisai\", site \"eisai\", WD # 5.")
+        workday_rows = st.data_editor(
+            [
+                {"company_name": c["company_name"], "tenant": c["tenant"], "site": c["site"], "wd_number": c["wd_number"], "limit": c["limit"]}
+                for c in job_sources_data["workday"]
+            ],
+            num_rows="dynamic",
+            column_config={
+                "company_name": st.column_config.TextColumn("Company", required=True),
+                "tenant": st.column_config.TextColumn("Tenant", required=True),
+                "site": st.column_config.TextColumn("Site", required=True),
+                "wd_number": st.column_config.NumberColumn("WD #", required=True, min_value=1),
+                "limit": st.column_config.NumberColumn("Max results", required=True, min_value=1, max_value=100),
+            },
+            key="job_sources_workday_editor",
+        )
+
+        st.markdown("**SmartRecruiters** - company ID is the identifier in the company's careers.smartrecruiters.com/{id} URL, e.g. \"abbvie\".")
+        smartrecruiters_rows = st.data_editor(
+            [
+                {"company_name": c["company_name"], "company_id": c["company_id"], "limit": c["limit"]}
+                for c in job_sources_data["smartrecruiters"]
+            ],
+            num_rows="dynamic",
+            column_config={
+                "company_name": st.column_config.TextColumn("Company", required=True),
+                "company_id": st.column_config.TextColumn("Company ID", required=True),
+                "limit": st.column_config.NumberColumn("Max results", required=True, min_value=1, max_value=100),
+            },
+            key="job_sources_smartrecruiters_editor",
+        )
+
+        st.markdown("**Greenhouse** - board token is the identifier in the company's boards.greenhouse.io/{token} URL, e.g. \"stripe\".")
+        greenhouse_rows = st.data_editor(
+            [
+                {"company_name": c["company_name"], "board_token": c["board_token"], "limit": c["limit"]}
+                for c in job_sources_data["greenhouse"]
+            ],
+            num_rows="dynamic",
+            column_config={
+                "company_name": st.column_config.TextColumn("Company", required=True),
+                "board_token": st.column_config.TextColumn("Board token", required=True),
+                "limit": st.column_config.NumberColumn("Max results", required=True, min_value=1, max_value=100),
+            },
+            key="job_sources_greenhouse_editor",
+        )
+
+        st.markdown("**Lever** - company slug is the identifier in the company's jobs.lever.co/{slug} URL, e.g. \"palantir\".")
+        lever_rows = st.data_editor(
+            [
+                {"company_name": c["company_name"], "company_slug": c["company_slug"], "limit": c["limit"]}
+                for c in job_sources_data["lever"]
+            ],
+            num_rows="dynamic",
+            column_config={
+                "company_name": st.column_config.TextColumn("Company", required=True),
+                "company_slug": st.column_config.TextColumn("Company slug", required=True),
+                "limit": st.column_config.NumberColumn("Max results", required=True, min_value=1, max_value=100),
+            },
+            key="job_sources_lever_editor",
+        )
+
+        if st.button("Save job-board sources"):
+            # Advanced per-company filters (e.g. IQVIA's US-only facet) aren't
+            # exposed in this table - carry them over by company_name so
+            # editing/re-saving the list above doesn't silently drop them.
+            existing_facets = {c["company_name"]: c.get("applied_facets") for c in job_sources_data["workday"]}
+            new_workday = []
+            for row in workday_rows:
+                entry = {
+                    "company_name": row["company_name"], "tenant": row["tenant"], "site": row["site"],
+                    "wd_number": int(row["wd_number"]), "limit": int(row["limit"]),
+                }
+                facets = existing_facets.get(row["company_name"])
+                if facets:
+                    entry["applied_facets"] = facets
+                new_workday.append(entry)
+            new_smartrecruiters = [
+                {"company_name": row["company_name"], "company_id": row["company_id"], "limit": int(row["limit"])}
+                for row in smartrecruiters_rows
+            ]
+            new_greenhouse = [
+                {"company_name": row["company_name"], "board_token": row["board_token"], "limit": int(row["limit"])}
+                for row in greenhouse_rows
+            ]
+            new_lever = [
+                {"company_name": row["company_name"], "company_slug": row["company_slug"], "limit": int(row["limit"])}
+                for row in lever_rows
+            ]
+            try:
+                save_job_sources({
+                    "workday": new_workday, "smartrecruiters": new_smartrecruiters,
+                    "greenhouse": new_greenhouse, "lever": new_lever,
+                })
+            except Exception as exc:
+                st.error(f"Failed to save job-board sources: {exc}")
+            else:
+                st.toast("Saved job-board sources.", icon=":material/check_circle:")
+                st.rerun()
+
+    if bhangi_create_issue is not None:
+        # Same "no Bhangi checkout -> feature quietly absent, not an error"
+        # rule as the Support tab above - this is a convenience on top of
+        # Bhangi, not something worth alarming a friend-testing build about.
+        with st.expander("Request a new job-board source", expanded=False):
+            st.markdown(
+                "Know a job board or company career site that isn't listed "
+                "above? Describe it here instead of adding it to your own "
+                "code - this files a ticket the same way the Support tab "
+                "does, so it's tracked and doesn't get lost."
+            )
+            request_board_name = st.text_input("Job board or company name", key="request_source_name")
+            request_board_url = st.text_input("Careers page / job board URL", key="request_source_url")
+            request_board_notes = st.text_area(
+                "Anything else worth knowing? (optional)",
+                placeholder="e.g. which roles you'd expect to find there, or why it's worth adding",
+                key="request_source_notes",
+            )
+            if st.button("Submit request", disabled=not request_board_name.strip() or not request_board_url.strip()):
+                description_parts = [f"URL: {request_board_url.strip()}"]
+                if request_board_notes.strip():
+                    description_parts.append(f"Notes: {request_board_notes.strip()}")
+                description_parts.append("Requested from Settings > Job-board sources > Request a new job-board source.")
+                try:
+                    build = bhangi_detect_build(PROJECT_ROOT) if bhangi_detect_build is not None else None
+                    bhangi_create_issue(
+                        BHANGI_PROJECT, f"New job source request: {request_board_name.strip()}",
+                        "\n".join(description_parts), build=build,
+                    )
+                except Exception as exc:
+                    st.error(f"Failed to submit request: {exc}")
+                else:
+                    for key in ("request_source_name", "request_source_url", "request_source_notes"):
+                        del st.session_state[key]
+                    st.toast("Request submitted - thanks, this has been queued for review.", icon=":material/check_circle:")
+                    st.rerun()
+
     st.subheader("USAJOBS job series")
     st.markdown("See \"Occupations and job series\" on usajobs.gov for codes. This runs alongside keyword search (not instead of it) - government classification is inconsistent, so restricting to one series alone would miss real matches filed under a different code. The compatibility score, not this filter, is what actually screens for relevance.")
     job_series_text = st.text_area(
@@ -955,10 +1110,21 @@ if active_tab == "settings":
         value="\n".join(settings.get("usajobs_job_series", [])),
     )
 
+    st.subheader("Adzuna search countries")
+    if adzuna_is_configured():
+        st.markdown("Which countries to search via the Adzuna aggregator, in addition to USAJOBS/company sites/industry boards. Adzuna's free tier has a daily call limit shared across every role x country combination below, so keep this to countries you're actually job-hunting in.")
+    else:
+        st.markdown("Not set up yet - free registration at [developer.adzuna.com](https://developer.adzuna.com/), then add ADZUNA_APP_ID/ADZUNA_APP_KEY to your .env file. The countries picked below take effect once that's done.")
+    aggregator_countries = st.multiselect(
+        "Countries", sorted(ADZUNA_COUNTRIES), default=settings.get("aggregator_countries", []),
+        format_func=lambda c: c.upper(),
+    )
+
     if st.button("Save settings"):
         settings["target_roles"] = roles_df
         settings["industries"] = [line.strip() for line in industries_text.splitlines() if line.strip()]
         settings["usajobs_job_series"] = [line.strip() for line in job_series_text.splitlines() if line.strip()]
+        settings["aggregator_countries"] = aggregator_countries
         try:
             save_settings(settings)
             update_profile_field("seniority", seniority_text.strip())

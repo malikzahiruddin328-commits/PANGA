@@ -31,7 +31,9 @@ flowchart TD
 
 **search/** - finding and storing jobs
 - `job_store.py` - the `jobs` table (JSON, encrypted). `load_jobs`/`save_jobs`/`update_job_score`/`update_job_address`.
-- `usajobs.py`, `boards.py`, `industry_boards.py`, `company_sites.py` - one source-channel each, all normalize into the same job shape.
+- `usajobs.py`, `boards.py`, `industry_boards.py`, `company_sites.py` - one source-channel each, all normalize into the same job shape. `company_sites.py` covers Workday/SmartRecruiters/Greenhouse/Lever ATS platforms. `boards.py` is mixed: ZipRecruiter/Indeed are MCP-only (normalize functions, no direct fetch), Dice is a direct scrape (`fetch_dice_jobs()`, confirmed 2026-08-06 the search-results page is server-rendered HTML, no MCP needed) - see the module docstring before assuming all 3 need the MCP connector.
+- `job_sources.py` - user-managed ATS company list (`config/job_sources.yaml`, plain YAML, file-locked) backing `company_sites.py` - editable from the Settings tab's "Job-board sources" section instead of a hardcoded list in `scripts/run_search.py`. `freshness_check.py` also derives its per-company closed-posting checks from this store.
+- `aggregators.py` - Adzuna aggregator API client (`fetch_adzuna_jobs()`), credential-gated via .env same as `usajobs.py`, plus a persisted daily call-budget guard (`data/adzuna_call_budget.yaml`, file-locked) since the free tier's daily cap is real and shared across every (role, country) search combination. Countries to search are user-picked in the Settings tab, stored in `settings.aggregator_countries`.
 
 **ranking/**
 - `prioritize.py` - sorts/dedupes the combined job list (fit_score, role-weight, cross-source dedup).
@@ -69,7 +71,7 @@ flowchart TD
 
 **src/security/file_lock.py** (native-packaging branch) - `locked(name)`, a cross-process advisory lock for a JSON store's whole read-modify-write critical section. Added because this branch's standalone scheduled scripts are the first *unattended* writers to jobs.json/applications.json/cta_emails.json running alongside the Streamlit app - wrapped around job_store.py's and applications.py's and cta_emails.py's write functions.
 
-**scripts/** (native-packaging branch) - standalone replacements for the 3 Claude Code scheduled tasks, run via native Windows Task Scheduler instead (see `docs/native-packaging-task-scheduler.md`): `run_search.py` (daily job search + direct-API fit scoring), `gmail_cta_scan.py` (Gmail classification via gmail_client.py + tailoring/cta_reasoning.py), `cta_fulfillment.py` (archive/draft fulfillment + reconciliation). `install_scheduled_tasks.ps1`/`uninstall_scheduled_tasks.ps1` register/remove the Windows Task Scheduler entries.
+**scripts/** (native-packaging branch) - standalone replacements for the 3 Claude Code scheduled tasks, run via native Windows Task Scheduler instead (see `docs/native-packaging-task-scheduler.md`): `run_search.py` (daily job search + direct-API fit scoring), `gmail_cta_scan.py` (Gmail classification via gmail_client.py + tailoring/cta_reasoning.py), `cta_fulfillment.py` (archive/draft fulfillment + reconciliation). `install_scheduled_tasks.ps1`/`uninstall_scheduled_tasks.ps1` register/remove the Windows Task Scheduler entries. `backfill_jd_text.py`/`dedupe_boards_jobs.py` are one-off data-repair scripts (not scheduled) - run manually when their own docstring's triggering bug applies, not part of the daily flow.
 
 **src/tailoring/cta_reasoning.py** (native-packaging branch) - direct-API replacement for the CTA scan/fulfillment tasks' live-session reasoning: `classify_thread()`, `match_application_confirmation()`, `draft_cta_reply()`. Used by `scripts/gmail_cta_scan.py` and `scripts/cta_fulfillment.py`.
 

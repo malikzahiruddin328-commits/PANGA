@@ -91,3 +91,106 @@ def test_search_smartrecruiters_jobs_includes_description(monkeypatch):
     )
     jobs = company_sites.search_smartrecruiters_jobs("AbbVie", "abbvie")
     assert jobs[0]["description"] == "Real JD text."
+
+
+def test_search_greenhouse_jobs_parses_real_response_shape(monkeypatch):
+    monkeypatch.setattr(
+        company_sites.requests, "get",
+        lambda url, timeout=None: _FakeResponse({
+            "jobs": [{
+                "id": 8023928, "title": "Account Executive, Bridge",
+                "location": {"name": "London"},
+                "absolute_url": "https://stripe.com/jobs/search?gh_jid=8023928",
+            }],
+        }),
+    )
+    jobs = company_sites.search_greenhouse_jobs("Stripe", "stripe")
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert job["source"] == "Stripe"
+    assert job["job_id"] == "8023928"
+    assert job["title"] == "Account Executive, Bridge"
+    assert job["organization"] == "Stripe"
+    assert job["location"] == "London"
+    assert job["posting_url"] == "https://stripe.com/jobs/search?gh_jid=8023928"
+    assert job["apply_url"] == job["posting_url"]
+
+
+def test_search_greenhouse_jobs_respects_limit(monkeypatch):
+    monkeypatch.setattr(
+        company_sites.requests, "get",
+        lambda url, timeout=None: _FakeResponse({"jobs": [{"id": i, "title": "Role"} for i in range(5)]}),
+    )
+    jobs = company_sites.search_greenhouse_jobs("Stripe", "stripe", limit=2)
+    assert len(jobs) == 2
+
+
+def test_search_greenhouse_jobs_handles_missing_location(monkeypatch):
+    monkeypatch.setattr(
+        company_sites.requests, "get",
+        lambda url, timeout=None: _FakeResponse({"jobs": [{"id": 1, "title": "Role", "absolute_url": "https://x"}]}),
+    )
+    jobs = company_sites.search_greenhouse_jobs("Stripe", "stripe")
+    assert jobs[0]["location"] is None
+
+
+def test_search_lever_jobs_parses_real_response_shape(monkeypatch):
+    monkeypatch.setattr(
+        company_sites.requests, "get",
+        lambda url, params=None, timeout=None: _FakeResponse([{
+            "id": "abc-123", "text": "Administrative Business Partner",
+            "categories": {"location": "London, United Kingdom"},
+            "hostedUrl": "https://jobs.lever.co/palantir/abc-123",
+            "applyUrl": "https://jobs.lever.co/palantir/abc-123/apply",
+        }]),
+    )
+    jobs = company_sites.search_lever_jobs("Palantir", "palantir")
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert job["source"] == "Palantir"
+    assert job["job_id"] == "abc-123"
+    assert job["title"] == "Administrative Business Partner"
+    assert job["organization"] == "Palantir"
+    assert job["location"] == "London, United Kingdom"
+    assert job["posting_url"] == "https://jobs.lever.co/palantir/abc-123"
+    assert job["apply_url"] == "https://jobs.lever.co/palantir/abc-123/apply"
+
+
+def test_search_lever_jobs_falls_back_to_hosted_url_when_no_apply_url(monkeypatch):
+    monkeypatch.setattr(
+        company_sites.requests, "get",
+        lambda url, params=None, timeout=None: _FakeResponse([{
+            "id": "abc-123", "text": "Role", "hostedUrl": "https://jobs.lever.co/x/abc-123",
+        }]),
+    )
+    jobs = company_sites.search_lever_jobs("X", "x")
+    assert jobs[0]["apply_url"] == "https://jobs.lever.co/x/abc-123"
+
+
+def test_search_lever_jobs_respects_limit(monkeypatch):
+    monkeypatch.setattr(
+        company_sites.requests, "get",
+        lambda url, params=None, timeout=None: _FakeResponse([{"id": str(i), "text": "Role"} for i in range(5)]),
+    )
+    jobs = company_sites.search_lever_jobs("X", "x", limit=2)
+    assert len(jobs) == 2
+
+
+def test_check_greenhouse_posting_open_true_for_real_posting(monkeypatch):
+    monkeypatch.setattr(company_sites.requests, "get", lambda url, timeout=None: _FakeResponse({"id": 1}, status_code=200))
+    assert company_sites.check_greenhouse_posting_open("stripe", "1") is True
+
+
+def test_check_greenhouse_posting_open_false_for_removed_posting(monkeypatch):
+    monkeypatch.setattr(company_sites.requests, "get", lambda url, timeout=None: _FakeResponse({}, status_code=404))
+    assert company_sites.check_greenhouse_posting_open("stripe", "999") is False
+
+
+def test_check_lever_posting_open_true_for_real_posting(monkeypatch):
+    monkeypatch.setattr(company_sites.requests, "get", lambda url, params=None, timeout=None: _FakeResponse({"id": "1"}, status_code=200))
+    assert company_sites.check_lever_posting_open("palantir", "1") is True
+
+
+def test_check_lever_posting_open_false_for_removed_posting(monkeypatch):
+    monkeypatch.setattr(company_sites.requests, "get", lambda url, params=None, timeout=None: _FakeResponse({}, status_code=404))
+    assert company_sites.check_lever_posting_open("palantir", "not-a-real-id") is False

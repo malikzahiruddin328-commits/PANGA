@@ -1,0 +1,66 @@
+# User-managed ATS company list (PRD §13 "Job-board search - industry &
+# location agnostic channels"), replacing what used to be two hardcoded
+# Python lists in scripts/run_search.py (_WORKDAY_COMPANIES /
+# _SMARTRECRUITERS_COMPANIES). Editable from the Settings tab's "Job-board
+# sources" section - see src/search/job_sources.py for the load/save API
+# and src/search/company_sites.py for what each platform's fields mean
+# (tenant/site/wd_number for Workday, company_id for SmartRecruiters,
+# board_token for Greenhouse, company_slug for Lever).
+#
+# The workday/smartrecruiters entries are the same companies/settings that
+# were previously hardcoded - migrated here verbatim as Slice 1 of this
+# build (2026-08-05). greenhouse/lever were added in Slice 2 (both have
+# real public JSON APIs, confirmed live against real company boards - see
+# company_sites.search_greenhouse_jobs()/search_lever_jobs() docstrings) -
+# empty by default, no companies seeded, since these are genuinely new
+# sources Zahir hasn't picked companies for yet.
+
+workday:
+  - company_name: Eisai
+    tenant: eisai
+    site: eisai
+    wd_number: 5
+    limit: 15
+  - company_name: IQVIA
+    tenant: iqvia
+    site: IQVIA
+    wd_number: 1
+    limit: 15
+    # Zahir asked 2026-07-30 that IQVIA be US-only (large global CRO, most
+    # listings are outside the US) - this facet ID is IQVIA's Workday
+    # "Location_Country = United States of America" value, confirmed
+    # 2026-07-30. If this starts erroring/returning 0 results, rediscover
+    # it per company_sites.search_workday_jobs()'s own docstring.
+    applied_facets:
+      Location_Country:
+        - bc33aa3152ec42d4995f4791a106ed09
+
+smartrecruiters:
+  - company_name: AbbVie
+    company_id: abbvie
+    limit: 15
+
+greenhouse: []
+
+lever: []
+
+# iCIMS (Slice 3, 2026-08-06) deliberately has NO platform key here, unlike
+# the 4 above - recon found it's not buildable the same way. Unlike
+# Greenhouse/Lever, there's no consistent public API across tenants and no
+# directory of which companies use it (same "no directory" problem
+# search_workday_jobs()'s docstring already flags for Workday, worse here).
+# Tested 8 real candidate URLs (careers-<company>.icims.com pattern): 7
+# 404'd (wrong tenant name guesses - no way to discover the right one
+# without already knowing it), the one that resolved (Six Flags,
+# careers-sixflags.icims.com) turned out to be a JS-rendered SPA shell
+# (empty #portal div, loads cdn02.icims.com's platform JS bundle) - same
+# js_rendered category industry_job_boards.yaml already uses for 14 other
+# rejected sources, not reachable with plain requests/BeautifulSoup.
+# Building this would mean introducing a headless-browser dependency
+# (Playwright/Selenium) - something this codebase has consistently NOT
+# done for every other js_rendered candidate found so far (see
+# docs/daily-job-search-task.md - 4 of 19 original industry-board
+# candidates hit this exact wall and were left unbuilt). Recommending the
+# same call here rather than introducing that dependency for one platform
+# with no confirmed target company yet - flagged back to Zahir/General,
+# not decided unilaterally.
