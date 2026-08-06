@@ -35,7 +35,7 @@ import yaml  # noqa: E402
 
 from notifications import send_notification  # noqa: E402
 from profile.storage import load_profile  # noqa: E402
-from search import company_sites, freshness_check, industry_boards, job_sources, job_store, usajobs  # noqa: E402
+from search import aggregators, company_sites, freshness_check, industry_boards, job_sources, job_store, usajobs  # noqa: E402
 from tailoring.applications import get_unreviewed_skip_reasons  # noqa: E402
 from tailoring.drafting import DraftingFailed, DraftingNotConfigured, score_job  # noqa: E402
 
@@ -66,6 +66,34 @@ def search_usajobs(target_roles: list[dict], job_series: list[str]) -> int:
             added += job_store.save_jobs(jobs)
         except Exception as exc:  # noqa: BLE001
             _log(f"  [usajobs] job-series search failed for {code!r}: {exc}")
+    return added
+
+
+def search_aggregators(target_roles: list[dict], countries: list[str]) -> int:
+    """Adzuna, per role per country. Skips the whole step (not an error)
+    if credentials aren't set up, same as USAJOBS/Gmail/drafting today.
+    Stops making further Adzuna calls the moment the daily call budget is
+    used up rather than letting later (role, country) pairs fail one by
+    one with the same error - see aggregators.py's own docstring for why
+    this needs a real budget check, not just a rate-limit sleep."""
+    if not aggregators.is_configured():
+        _log("  [aggregators] Adzuna not configured (ADZUNA_APP_ID/ADZUNA_APP_KEY not in .env) - skipping")
+        return 0
+    if not countries:
+        _log("  [aggregators] no Adzuna search countries configured in Settings - skipping")
+        return 0
+
+    added = 0
+    for role in target_roles:
+        for country in countries:
+            try:
+                jobs = aggregators.fetch_adzuna_jobs(role["name"], country, limit=25)
+                added += job_store.save_jobs(jobs)
+            except aggregators.AdzunaBudgetExceeded as exc:
+                _log(f"  [aggregators] {exc} - stopping Adzuna search for the rest of this run")
+                return added
+            except Exception as exc:  # noqa: BLE001 - one (role, country) pair's failure shouldn't stop the rest
+                _log(f"  [aggregators] Adzuna search failed for {role['name']!r} / {country!r}: {exc}")
     return added
 
 
@@ -205,6 +233,10 @@ def run() -> None:
 
     _log("STEP 2 - ZipRecruiter/Dice/Indeed: skipped (not available outside the Claude Code MCP "
          "connector - see docs/native-packaging-scope.md Phase 1 spike)")
+
+    _log("STEP 2b - Adzuna aggregator")
+    added = search_aggregators(target_roles, settings.get("aggregator_countries", []))
+    _log(f"  added {added} new job(s)")
 
     _log("STEP 3 - Company career sites")
     added = search_company_sites(target_roles)

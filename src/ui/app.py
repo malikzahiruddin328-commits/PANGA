@@ -68,6 +68,7 @@ import yaml
 from search.usajobs import search_jobs, USAJobsNotConfigured
 from search.job_store import load_jobs
 from search.job_sources import load_job_sources, save_job_sources
+from search.aggregators import ADZUNA_COUNTRIES, is_configured as adzuna_is_configured
 from ranking.prioritize import weight_for, dedupe_across_sources
 from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion, set_strategy_tag, needs_edit_review, record_document_edit_review, get_applications_with_open_clarifying_questions
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
@@ -853,10 +854,21 @@ if active_tab == "settings":
         value="\n".join(settings.get("usajobs_job_series", [])),
     )
 
+    st.subheader("Adzuna search countries")
+    if adzuna_is_configured():
+        st.markdown("Which countries to search via the Adzuna aggregator, in addition to USAJOBS/company sites/industry boards. Adzuna's free tier has a daily call limit shared across every role x country combination below, so keep this to countries you're actually job-hunting in.")
+    else:
+        st.markdown("Not set up yet - free registration at [developer.adzuna.com](https://developer.adzuna.com/), then add ADZUNA_APP_ID/ADZUNA_APP_KEY to your .env file. The countries picked below take effect once that's done.")
+    aggregator_countries = st.multiselect(
+        "Countries", sorted(ADZUNA_COUNTRIES), default=settings.get("aggregator_countries", []),
+        format_func=lambda c: c.upper(),
+    )
+
     if st.button("Save settings"):
         settings["target_roles"] = roles_df
         settings["industries"] = [line.strip() for line in industries_text.splitlines() if line.strip()]
         settings["usajobs_job_series"] = [line.strip() for line in job_series_text.splitlines() if line.strip()]
+        settings["aggregator_countries"] = aggregator_countries
         try:
             save_settings(settings)
             update_profile_field("seniority", seniority_text.strip())
