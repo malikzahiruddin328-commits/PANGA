@@ -432,6 +432,71 @@ def _job_has_captured_jd_text(job: dict) -> bool:
     return bool((job.get("qualification_summary") or job.get("description") or "").strip())
 
 
+def _regenerate_with_progress(job: dict, key_suffix: str, working_message: str, success_message: str) -> None:
+    """Shared progress-bar-then-regenerate sequence for both the paste-a-JD
+    flow and the view/update-an-existing-JD flow below - both end in the
+    exact same "show a shimmering progress bar while
+    regenerate_resume_and_persist() runs, then either clear it on failure
+    or mark it done and rerun" sequence, so it's factored out rather than
+    duplicated a third time."""
+    regen_bar_key = f"jd_regen_progress_bar_{key_suffix}"
+    with st.container(key=regen_bar_key):
+        regen_bar = st.progress(0, text=working_message)
+    st.html(progress_shimmer_css(regen_bar_key))
+
+    def _update_regen_progress(i, total, doc_key2, substatus=None):
+        label = "Rescoring resume"
+        label += f" — {substatus}" if substatus else "..."
+        within_doc = progress_fraction(doc_key2, substatus)
+        regen_bar.progress(((i - 1) + within_doc) / total, text=label)
+
+    new_resume = regenerate_resume_and_persist(job, _update_regen_progress, success_message)
+    if new_resume is None:
+        regen_bar.empty()
+    else:
+        regen_bar.progress(1.0, text=":material/check_circle: Done.")
+        st.rerun()
+
+
+def render_jd_view_or_update_box(job: dict, key_prefix: str) -> str | None:
+    """Collapsed-by-default view of a job's currently-stored JD text,
+    editable in place - Zahir's ask 2026-08-06: the paste box was write-
+    only (paste, save, rescore, and the pasted text was never visible
+    again). Shown whenever a job already has real JD text - the opposite
+    branch from the no-JD paste prompts, so the two never fight each
+    other (a job is always in exactly one state at a time: needs a paste,
+    or already has text to view/update).
+
+    Collapsed by default per Zahir's explicit ask, so a job that's fine as-
+    is doesn't clutter the row/score-card with an open text box. Keyed on
+    a hash of the current text (not just key_prefix alone) - the same
+    stale-widget-value pattern CLAUDE.md's HCI standard already calls out
+    elsewhere in this file (strategy-tag/clarifying-question boxes):
+    Streamlit ignores a new `value=` once a `key` already has session-
+    state, so if the stored text ever changes some other way while this
+    key stays constant, the box would keep silently showing the old text.
+
+    Returns the new text if the user clicked "Update job description" with
+    genuinely changed, non-blank text - None otherwise (including "clicked
+    but nothing changed", which shows an info toast instead of pretending
+    to save). The caller decides what happens next (persist only vs.
+    persist + regenerate a draft), since that differs between the
+    proactive (before-drafting) and post-hoc (already-drafted) call sites."""
+    current_text = job.get("description") or job.get("qualification_summary") or ""
+    text_key = f"jd_view_{key_prefix}_{abs(hash(current_text)) % 10_000_000}"
+    with st.expander("View / update job description", expanded=False):
+        updated_text = st.text_area("Job description", value=current_text, key=text_key, height=150)
+        if st.button("Update job description", key=f"jd_view_save_{key_prefix}"):
+            stripped = updated_text.strip()
+            if not stripped:
+                st.toast("The job description can't be cleared here - paste replacement text instead.", icon=":material/warning:")
+            elif stripped == current_text.strip():
+                st.toast("No changes to save.", icon=":material/info:")
+            else:
+                return stripped
+    return None
+
+
 def render_paste_jd_notice() -> None:
     """The shared "why there's no JD text" framing - Zahir's explicit
     product direction 2026-08-06: this must never read as a limitation to
@@ -532,26 +597,10 @@ def render_paste_jd_prompt(job: dict) -> None:
 
             update_job_description(job["source"], job["job_id"], pasted_jd.strip())
             job["description"] = pasted_jd.strip()
-            regen_bar_key = f"jd_regen_progress_bar_{job_key}"
-            with st.container(key=regen_bar_key):
-                regen_bar = st.progress(0, text="Rescoring against the pasted description...")
-            st.html(progress_shimmer_css(regen_bar_key))
-
-            def _update_regen_progress(i, total, doc_key2, substatus=None):
-                label = "Rescoring resume"
-                label += f" — {substatus}" if substatus else "..."
-                within_doc = progress_fraction(doc_key2, substatus)
-                regen_bar.progress(((i - 1) + within_doc) / total, text=label)
-
-            new_resume = regenerate_resume_and_persist(
-                job, _update_regen_progress,
+            _regenerate_with_progress(
+                job, job_key, "Rescoring against the pasted description...",
                 "Resume rescored against the pasted description - new ATS score {score}/100.",
             )
-            if new_resume is None:
-                regen_bar.empty()
-            else:
-                regen_bar.progress(1.0, text=":material/check_circle: Done.")
-                st.rerun()
 
 
 def render_gap_questions_section(job: dict, app_record: dict) -> None:
@@ -1601,6 +1650,7 @@ elif active_tab == "results":
                     "Pay": pay,
                     "Score": job.get("fit_score"),
                     "Status": application_status(job) or "-",
+                    "JD": "✓" if _job_has_captured_jd_text(job) else "–",
                     "Posting": job.get("posting_url"),
                 })
             df = pd.DataFrame(table_rows)
@@ -1635,6 +1685,10 @@ elif active_tab == "results":
                     "Role": st.column_config.ButtonColumn(
                         "Role", type="tertiary", alignment="left",
                         on_click=_activate_row, key=role_click_key,
+                    ),
+                    "JD": st.column_config.TextColumn(
+                        "JD", alignment="left", width="small",
+                        help="Whether Panga has this posting's job description text to score and tailor against.",
                     ),
                 }),
                 key=f"table_{channel}",
@@ -1688,7 +1742,20 @@ elif active_tab == "results":
                 requested = app_record.get("documents_requested") or []
                 status = app_record.get("status")
 
-                if not _job_has_captured_jd_text(job):
+                if _job_has_captured_jd_text(job):
+                    pre_job_key = f"pre_{job.get('source')}_{job.get('job_id')}"
+                    updated_text = render_jd_view_or_update_box(job, pre_job_key)
+                    if updated_text is not None:
+                        from search.job_store import update_job_description
+
+                        update_job_description(job["source"], job["job_id"], updated_text)
+                        job["description"] = updated_text
+                        st.toast(
+                            "Updated - whatever you generate next will be tailored against it.",
+                            icon=":material/check_circle:",
+                        )
+                        st.rerun()
+                else:
                     render_paste_jd_prompt_before_drafting(job)
 
                 st.markdown("**Documents for this application**")
@@ -1796,7 +1863,19 @@ elif active_tab == "results":
                         with st.expander(f"{doc_label} (drafted)"):
                             if doc_key == "resume" and app_record.get("resume_ats_score") is not None:
                                 with st.container(border=True):
-                                    if not _job_has_captured_jd_text(job):
+                                    if _job_has_captured_jd_text(job):
+                                        job_key = f"{job.get('source')}_{job.get('job_id')}"
+                                        updated_text = render_jd_view_or_update_box(job, job_key)
+                                        if updated_text is not None:
+                                            from search.job_store import update_job_description
+
+                                            update_job_description(job["source"], job["job_id"], updated_text)
+                                            job["description"] = updated_text
+                                            _regenerate_with_progress(
+                                                job, f"update_{job_key}", "Rescoring against the updated description...",
+                                                "Resume rescored against the updated description - new ATS score {score}/100.",
+                                            )
+                                    else:
                                         render_paste_jd_prompt(job)
                                     current_score = app_record["resume_ats_score"]
                                     prev_score_key = f"prev_ats_score_{job.get('source')}_{job.get('job_id')}"
