@@ -1,0 +1,37 @@
+# User-managed ATS company list (PRD §13 "Job-board search - industry &
+# location agnostic channels"), replacing what used to be two hardcoded
+# Python lists in scripts/run_search.py (_WORKDAY_COMPANIES /
+# _SMARTRECRUITERS_COMPANIES). Editable from the Settings tab's "Job-board
+# sources" section - see src/search/job_sources.py for the load/save API
+# and src/search/company_sites.py for what each platform's fields mean
+# (tenant/site/wd_number for Workday, company_id for SmartRecruiters).
+#
+# These 3 entries are the same companies/settings that were previously
+# hardcoded - migrated here verbatim as the first slice of this build
+# (2026-08-05), before any new platform is added, so the only change on
+# day one is *where* this data lives, not what it searches.
+
+workday:
+  - company_name: Eisai
+    tenant: eisai
+    site: eisai
+    wd_number: 5
+    limit: 15
+  - company_name: IQVIA
+    tenant: iqvia
+    site: IQVIA
+    wd_number: 1
+    limit: 15
+    # Zahir asked 2026-07-30 that IQVIA be US-only (large global CRO, most
+    # listings are outside the US) - this facet ID is IQVIA's Workday
+    # "Location_Country = United States of America" value, confirmed
+    # 2026-07-30. If this starts erroring/returning 0 results, rediscover
+    # it per company_sites.search_workday_jobs()'s own docstring.
+    applied_facets:
+      Location_Country:
+        - bc33aa3152ec42d4995f4791a106ed09
+
+smartrecruiters:
+  - company_name: AbbVie
+    company_id: abbvie
+    limit: 15

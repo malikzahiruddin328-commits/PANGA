@@ -35,32 +35,12 @@ import yaml  # noqa: E402
 
 from notifications import send_notification  # noqa: E402
 from profile.storage import load_profile  # noqa: E402
-from search import company_sites, freshness_check, industry_boards, job_store, usajobs  # noqa: E402
+from search import company_sites, freshness_check, industry_boards, job_sources, job_store, usajobs  # noqa: E402
 from tailoring.applications import get_unreviewed_skip_reasons  # noqa: E402
 from tailoring.drafting import DraftingFailed, DraftingNotConfigured, score_job  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SETTINGS_PATH = PROJECT_ROOT / "config" / "settings.yaml"
-
-# STEP 3's known-companies list, ported verbatim from the SKILL.md (kept
-# here rather than in settings.yaml since it's this script's own concern,
-# not something the Streamlit app or any other consumer reads).
-_WORKDAY_COMPANIES = [
-    dict(company_name="Eisai", tenant="eisai", site="eisai", wd_number=5, limit=15),
-    dict(
-        company_name="IQVIA", tenant="iqvia", site="IQVIA", wd_number=1, limit=15,
-        # Zahir asked 2026-07-30 that IQVIA be US-only (large global CRO,
-        # most listings are outside the US) - this facet ID is IQVIA's
-        # Workday "Location_Country = United States of America" value,
-        # confirmed live 2026-07-30. If this starts erroring/returning 0
-        # results, rediscover it per company_sites.search_workday_jobs()'s
-        # own docstring.
-        applied_facets={"Location_Country": ["bc33aa3152ec42d4995f4791a106ed09"]},
-    ),
-]
-_SMARTRECRUITERS_COMPANIES = [
-    dict(company_name="AbbVie", company_id="abbvie", limit=15),
-]
 
 
 def _load_settings() -> dict:
@@ -90,9 +70,12 @@ def search_usajobs(target_roles: list[dict], job_series: list[str]) -> int:
 
 
 def search_company_sites(target_roles: list[dict]) -> int:
+    """Companies come from config/job_sources.yaml (user-managed from the
+    Settings tab, not hardcoded here) - see search/job_sources.py."""
+    sources = job_sources.load_job_sources()
     added = 0
     for role in target_roles:
-        for company in _WORKDAY_COMPANIES:
+        for company in sources["workday"]:
             try:
                 jobs = company_sites.search_workday_jobs(
                     company["company_name"], company["tenant"], company["site"], company["wd_number"],
@@ -102,7 +85,7 @@ def search_company_sites(target_roles: list[dict]) -> int:
                 added += job_store.save_jobs(jobs)
             except Exception as exc:  # noqa: BLE001 - one company's failure shouldn't stop the rest
                 _log(f"  [company_sites] Workday search failed for {company['company_name']} / {role['name']!r}: {exc}")
-        for company in _SMARTRECRUITERS_COMPANIES:
+        for company in sources["smartrecruiters"]:
             try:
                 jobs = company_sites.search_smartrecruiters_jobs(
                     company["company_name"], company["company_id"], keyword=role["name"], limit=company["limit"],

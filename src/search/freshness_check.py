@@ -31,7 +31,7 @@ import time
 
 import requests
 
-from search import company_sites, job_store, usajobs
+from search import company_sites, job_sources, job_store, usajobs
 from tailoring import applications
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
@@ -56,18 +56,6 @@ _SKIP_STATUSES = {
     "interview scheduled",
     "offer",
     "rejected",
-}
-
-# Mirrors scripts/run_search.py's _WORKDAY_COMPANIES / _SMARTRECRUITERS_COMPANIES
-# lists (company_name -> platform identifiers). Kept as a separate small
-# table rather than importing run_search.py (a script, not a package module)
-# - update alongside that file if a company is added/removed there.
-_WORKDAY_COMPANIES = {
-    "Eisai": dict(tenant="eisai", site="eisai", wd_number=5),
-    "IQVIA": dict(tenant="iqvia", site="IQVIA", wd_number=1),
-}
-_SMARTRECRUITERS_COMPANIES = {
-    "AbbVie": "abbvie",
 }
 
 # Per-site "posting closed" phrase, matched case-insensitively against the
@@ -97,26 +85,36 @@ def _check_usajobs(job: dict) -> bool | None:
         return None
 
 
-def _check_smartrecruiters(job: dict) -> bool | None:
-    company_id = _SMARTRECRUITERS_COMPANIES.get(job["source"])
-    if not company_id:
-        return None
+def _check_smartrecruiters(job: dict, company: dict) -> bool | None:
     try:
-        return company_sites.check_smartrecruiters_posting_open(company_id, job["job_id"])
+        return company_sites.check_smartrecruiters_posting_open(company["company_id"], job["job_id"])
     except Exception:  # noqa: BLE001
         return None
 
 
-def _check_workday(job: dict) -> bool | None:
-    company = _WORKDAY_COMPANIES.get(job["source"])
-    if not company:
-        return None
+def _check_workday(job: dict, company: dict) -> bool | None:
     try:
         return company_sites.check_workday_posting_open(
             company["tenant"], company["site"], company["wd_number"], job["job_id"],
         )
     except Exception:  # noqa: BLE001
         return None
+
+
+def build_api_source_lookup() -> dict:
+    """source (company_name) -> (check function, company dict), built fresh
+    from config/job_sources.yaml each run rather than a hardcoded table -
+    so a company added via the Settings tab's "Job-board sources" section
+    gets freshness-checked too, without a matching code change here. Built
+    once per check_and_mark_closed_postings() run, not per-job, since this
+    would otherwise mean one job_sources.yaml read+lock per posting."""
+    sources = job_sources.load_job_sources()
+    lookup = {}
+    for company in sources["workday"]:
+        lookup[company["company_name"]] = (_check_workday, company)
+    for company in sources["smartrecruiters"]:
+        lookup[company["company_name"]] = (_check_smartrecruiters, company)
+    return lookup
 
 
 def _check_via_page_text(job: dict) -> bool | None:
@@ -139,20 +137,18 @@ def _check_via_page_text(job: dict) -> bool | None:
     return True
 
 
-# source -> (check function, per-request delay). USAJOBS/SmartRecruiters/
-# Workday are official JSON APIs (cheap, low risk); everything else falls
-# back to a real page fetch, which gets the longer delay.
-_API_SOURCES = {
-    "USAJOBS": _check_usajobs,
-    "AbbVie": _check_smartrecruiters,
-    "Eisai": _check_workday,
-    "IQVIA": _check_workday,
-}
-
-
-def check_posting_open(job: dict) -> bool | None:
-    check_fn = _API_SOURCES.get(job.get("source"), _check_via_page_text)
-    return check_fn(job)
+def check_posting_open(job: dict, api_sources: dict) -> bool | None:
+    """api_sources is USAJOBS plus whatever build_api_source_lookup()
+    resolved from config/job_sources.yaml for this run - everything else
+    (industry boards, LinkedIn, ZipRecruiter, ...) falls back to a real
+    page fetch, which gets the longer delay (see the caller)."""
+    source = job.get("source")
+    if source == "USAJOBS":
+        return _check_usajobs(job)
+    if source in api_sources:
+        check_fn, company = api_sources[source]
+        return check_fn(job, company)
+    return _check_via_page_text(job)
 
 
 def check_and_mark_closed_postings(min_fit_score: int = MIN_FIT_SCORE) -> tuple[int, int]:
@@ -160,6 +156,7 @@ def check_and_mark_closed_postings(min_fit_score: int = MIN_FIT_SCORE) -> tuple[
     >=min_fit_score jobs taken once at the start - not O(n^2), and immune to
     the store growing mid-run since save_jobs() only appends."""
     candidates = [j for j in job_store.load_jobs() if (j.get("fit_score") or 0) >= min_fit_score]
+    api_sources = build_api_source_lookup()
 
     checked = 0
     marked = 0
@@ -172,9 +169,9 @@ def check_and_mark_closed_postings(min_fit_score: int = MIN_FIT_SCORE) -> tuple[
             continue
 
         checked += 1
-        is_api_source = source in _API_SOURCES
+        is_api_source = source == "USAJOBS" or source in api_sources
         try:
-            is_open = check_posting_open(job)
+            is_open = check_posting_open(job, api_sources)
         except Exception:  # noqa: BLE001 - one posting's failure shouldn't stop the run
             is_open = None
         time.sleep(API_CHECK_DELAY_SECONDS if is_api_source else SCRAPE_CHECK_DELAY_SECONDS)

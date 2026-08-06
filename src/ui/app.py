@@ -67,6 +67,7 @@ import yaml
 
 from search.usajobs import search_jobs, USAJobsNotConfigured
 from search.job_store import load_jobs
+from search.job_sources import load_job_sources, save_job_sources
 from ranking.prioritize import weight_for, dedupe_across_sources
 from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion, set_strategy_tag, needs_edit_review, record_document_edit_review, get_applications_with_open_clarifying_questions
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
@@ -732,6 +733,77 @@ if active_tab == "settings":
         },
         key=f"roles_editor_{gen_counter}",
     )
+
+    st.subheader("Job-board sources")
+    st.markdown(
+        "Company career sites Panga searches directly, in addition to "
+        "USAJOBS and the built-in industry boards - add or remove "
+        "companies here, no code change needed. Covers companies whose "
+        "careers site runs on Workday or SmartRecruiters; find a "
+        "company's own tenant/ID from its careers URL (see the field "
+        "hints below)."
+    )
+    with st.expander("Manage companies", expanded=False):
+        job_sources_data = load_job_sources()
+
+        st.markdown("**Workday** - tenant/site/wd_number come from the company's own myworkdayjobs.com URL, e.g. \"eisai.wd5.myworkdayjobs.com/eisai\" -> tenant \"eisai\", site \"eisai\", WD # 5.")
+        workday_rows = st.data_editor(
+            [
+                {"company_name": c["company_name"], "tenant": c["tenant"], "site": c["site"], "wd_number": c["wd_number"], "limit": c["limit"]}
+                for c in job_sources_data["workday"]
+            ],
+            num_rows="dynamic",
+            column_config={
+                "company_name": st.column_config.TextColumn("Company", required=True),
+                "tenant": st.column_config.TextColumn("Tenant", required=True),
+                "site": st.column_config.TextColumn("Site", required=True),
+                "wd_number": st.column_config.NumberColumn("WD #", required=True, min_value=1),
+                "limit": st.column_config.NumberColumn("Max results", required=True, min_value=1, max_value=100),
+            },
+            key="job_sources_workday_editor",
+        )
+
+        st.markdown("**SmartRecruiters** - company ID is the identifier in the company's careers.smartrecruiters.com/{id} URL, e.g. \"abbvie\".")
+        smartrecruiters_rows = st.data_editor(
+            [
+                {"company_name": c["company_name"], "company_id": c["company_id"], "limit": c["limit"]}
+                for c in job_sources_data["smartrecruiters"]
+            ],
+            num_rows="dynamic",
+            column_config={
+                "company_name": st.column_config.TextColumn("Company", required=True),
+                "company_id": st.column_config.TextColumn("Company ID", required=True),
+                "limit": st.column_config.NumberColumn("Max results", required=True, min_value=1, max_value=100),
+            },
+            key="job_sources_smartrecruiters_editor",
+        )
+
+        if st.button("Save job-board sources"):
+            # Advanced per-company filters (e.g. IQVIA's US-only facet) aren't
+            # exposed in this table - carry them over by company_name so
+            # editing/re-saving the list above doesn't silently drop them.
+            existing_facets = {c["company_name"]: c.get("applied_facets") for c in job_sources_data["workday"]}
+            new_workday = []
+            for row in workday_rows:
+                entry = {
+                    "company_name": row["company_name"], "tenant": row["tenant"], "site": row["site"],
+                    "wd_number": int(row["wd_number"]), "limit": int(row["limit"]),
+                }
+                facets = existing_facets.get(row["company_name"])
+                if facets:
+                    entry["applied_facets"] = facets
+                new_workday.append(entry)
+            new_smartrecruiters = [
+                {"company_name": row["company_name"], "company_id": row["company_id"], "limit": int(row["limit"])}
+                for row in smartrecruiters_rows
+            ]
+            try:
+                save_job_sources({"workday": new_workday, "smartrecruiters": new_smartrecruiters})
+            except Exception as exc:
+                st.error(f"Failed to save job-board sources: {exc}")
+            else:
+                st.toast("Saved job-board sources.", icon=":material/check_circle:")
+                st.rerun()
 
     st.subheader("USAJOBS job series")
     st.markdown("See \"Occupations and job series\" on usajobs.gov for codes. This runs alongside keyword search (not instead of it) - government classification is inconsistent, so restricting to one series alone would miss real matches filed under a different code. The compatibility score, not this filter, is what actually screens for relevance.")

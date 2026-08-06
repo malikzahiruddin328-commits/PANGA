@@ -12,6 +12,12 @@
       "runtimeExecutable": "venv/Scripts/streamlit.exe",
       "runtimeArgs": ["run", "src/ui/app.py", "--server.headless", "true", "--server.port", "8504"],
       "port": 8504
+    },
+    {
+      "name": "job-sources-preview",
+      "runtimeExecutable": "../../../venv/Scripts/streamlit.exe",
+      "runtimeArgs": ["run", "src/ui/app.py", "--server.headless", "true", "--server.port", "8532", "--server.fileWatcherType", "none"],
+      "port": 8532
     }
   ]
 }
