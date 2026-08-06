@@ -422,6 +422,165 @@ def render_outreach_section(key_prefix: str, target_account_name: str | None = N
                 st.warning("Contact name is required.")
 
 
+def regenerate_resume_and_persist(job: dict, on_progress, success_message: str) -> dict | None:
+    """Regenerates just the resume for one job and persists the fresh text/
+    score/rationale/next_actions/clarifying_questions/strategy_tag, then
+    syncs the workspace .docx - the exact sequence both the clarifying-
+    questions regenerate flow and the paste-a-JD regenerate flow end in, so
+    it's shared rather than duplicated between them. Shows the toast itself
+    on success (success_message gets `.format(score=...)` applied); on
+    failure shows the error via st.error and returns None - the caller is
+    still responsible for creating/clearing its own progress bar, since
+    that UI differs slightly between callers."""
+    try:
+        regen = generate_documents(job, load_profile(), ["resume"], on_progress=on_progress)
+    except (DraftingNotConfigured, DraftingFailed) as exc:
+        st.error(str(exc))
+        return None
+    new_resume = regen["resume"]
+    upsert_application(
+        job["source"], job["job_id"], status="under review",
+        resume_text=new_resume["text"],
+        resume_ats_score=new_resume["ats_score"],
+        resume_ats_rationale=new_resume["ats_rationale"],
+        resume_ats_next_actions=new_resume["ats_next_actions"],
+        resume_clarifying_questions=new_resume["clarifying_questions"],
+        suggested_strategy_tag=new_resume["suggested_strategy_tag"],
+    )
+    sync_workspace_documents(
+        job["source"], job["job_id"], ["resume"],
+        {"resume": new_resume["text"]}, load_profile(), job,
+    )
+    st.toast(success_message.format(score=new_resume["ats_score"]), icon=":material/check_circle:")
+    return new_resume
+
+
+def _job_has_captured_jd_text(job: dict) -> bool:
+    return bool((job.get("qualification_summary") or job.get("description") or "").strip())
+
+
+def render_paste_jd_notice() -> None:
+    """The shared "why there's no JD text" framing - Zahir's explicit
+    product direction 2026-08-06: this must never read as a limitation to
+    apologize for. Some job sites intentionally block automated fetching to
+    protect themselves and their users from scraping/bots - Panga
+    respecting that instead of trying to bypass it is a deliberate,
+    security-conscious design choice, not a gap. Shared by both the
+    proactive (before any document is drafted) and post-hoc (an already-
+    drafted resume's score card) paste prompts below, so the framing can't
+    drift between the two."""
+    st.info(
+        "We don't have this posting's full description yet - some job "
+        "sites intentionally block automated access to protect themselves "
+        "and their users from scraping, and Panga respects that rather "
+        "than trying to bypass it. Paste the job description below and "
+        "we'll tailor against it directly.",
+        icon=":material/shield:",
+    )
+
+
+def render_paste_jd_prompt_before_drafting(job: dict) -> None:
+    """Proactive paste-JD prompt - Zahir's follow-up ask 2026-08-06: the
+    post-hoc version below only ever appeared after a resume had already
+    been drafted blind against no real JD text, buried inside that
+    drafted resume's own expander. The actual ask is for this to be
+    available BEFORE any document gets generated at all, right at the
+    job-row level next to the doc-type checkboxes/Generate button, so the
+    very first document Panga drafts for this job - resume, cover letter,
+    exec bio, leadership summary, or the Apply Assist packet, not just the
+    resume - is already tailored against the real JD rather than drafted
+    blind and fixed up after the fact.
+
+    Saving here does NOT trigger a regenerate the way the post-hoc version
+    does - nothing has been drafted yet to regenerate. It just persists
+    the text via search.job_store.update_job_description() (clears the
+    stale empty ats_required_keywords/ats_preferred_keywords cache too),
+    so whatever gets drafted next through the normal "Generate documents"
+    button reads it naturally through the same generate_documents() call
+    every draft already goes through - no new downstream code path.
+
+    This is additive, not a replacement: the post-hoc render_paste_jd_prompt()
+    stays in place too, so someone who already has a blind-drafted resume
+    can still paste a JD there and get everything correctly redrafted."""
+    render_paste_jd_notice()
+    job_key = f"{job.get('source')}_{job.get('job_id')}"
+    pasted_jd = st.text_area(
+        "Paste the job description", key=f"jd_paste_pre_{job_key}", height=120,
+        placeholder="Paste the full job posting text here...",
+        label_visibility="collapsed",
+    )
+    if st.button("Save job description", key=f"jd_paste_pre_save_{job_key}"):
+        if not pasted_jd.strip():
+            st.toast("Paste the job description text first.", icon=":material/warning:")
+        else:
+            from search.job_store import update_job_description
+
+            update_job_description(job["source"], job["job_id"], pasted_jd.strip())
+            job["description"] = pasted_jd.strip()
+            st.toast(
+                "Saved - whatever you generate next will be tailored against it.",
+                icon=":material/check_circle:",
+            )
+            st.rerun()
+
+
+def render_paste_jd_prompt(job: dict) -> None:
+    """Post-hoc active fallback for a job with no captured JD text
+    (ZipRecruiter, Indeed, the industry job boards - confirmed live
+    2026-08-06 that these sources genuinely have no real posting text
+    available, either because the site blocks automated access or no
+    detail-page fetch exists yet). Lives inside an already-drafted resume's
+    own score card - kept as a fallback for resumes drafted blind before
+    render_paste_jd_prompt_before_drafting() existed, or for anyone who
+    skips the proactive prompt and drafts anyway. See that function's
+    docstring for the proactive version, which is now the primary path.
+
+    Saving goes through the exact same read path every other job already
+    uses - search.job_store.update_job_description() sets job["description"]
+    (which tailoring.drafting._extract_ats_keywords() already reads) and
+    clears any stale empty ats_required_keywords/ats_preferred_keywords
+    cache, so the regenerate below re-extracts for real instead of reusing
+    the old "nothing found" result. Unlike the proactive version, this one
+    DOES immediately regenerate the resume - a draft already exists here
+    and needs to catch up, whereas the proactive version has nothing yet
+    to regenerate."""
+    render_paste_jd_notice()
+    job_key = f"{job.get('source')}_{job.get('job_id')}"
+    pasted_jd = st.text_area(
+        "Paste the job description", key=f"jd_paste_{job_key}", height=120,
+        placeholder="Paste the full job posting text here...",
+        label_visibility="collapsed",
+    )
+    if st.button("Save & rescore", key=f"jd_paste_save_{job_key}"):
+        if not pasted_jd.strip():
+            st.toast("Paste the job description text first.", icon=":material/warning:")
+        else:
+            from search.job_store import update_job_description
+
+            update_job_description(job["source"], job["job_id"], pasted_jd.strip())
+            job["description"] = pasted_jd.strip()
+            regen_bar_key = f"jd_regen_progress_bar_{job_key}"
+            with st.container(key=regen_bar_key):
+                regen_bar = st.progress(0, text="Rescoring against the pasted description...")
+            st.html(progress_shimmer_css(regen_bar_key))
+
+            def _update_regen_progress(i, total, doc_key2, substatus=None):
+                label = "Rescoring resume"
+                label += f" — {substatus}" if substatus else "..."
+                within_doc = progress_fraction(doc_key2, substatus)
+                regen_bar.progress(((i - 1) + within_doc) / total, text=label)
+
+            new_resume = regenerate_resume_and_persist(
+                job, _update_regen_progress,
+                "Resume rescored against the pasted description - new ATS score {score}/100.",
+            )
+            if new_resume is None:
+                regen_bar.empty()
+            else:
+                regen_bar.progress(1.0, text=":material/check_circle: Done.")
+                st.rerun()
+
+
 def render_gap_questions_section(job: dict, app_record: dict) -> None:
     """The clarifying-questions answer-and-regenerate flow for one job's
     resume - the Profile Gaps tab's per-job unit. Moved off the Results tab
@@ -490,33 +649,13 @@ def render_gap_questions_section(job: dict, app_record: dict) -> None:
                 within_doc = progress_fraction(doc_key2, substatus)
                 regen_bar.progress(((i - 1) + within_doc) / total, text=label)
 
-            try:
-                regen = generate_documents(
-                    job, load_profile(), ["resume"], on_progress=_update_regen_progress,
-                )
-            except (DraftingNotConfigured, DraftingFailed) as exc:
+            new_resume = regenerate_resume_and_persist(
+                job, _update_regen_progress, "Resume regenerated - new ATS score {score}/100.",
+            )
+            if new_resume is None:
                 regen_bar.empty()
-                st.error(str(exc))
             else:
                 regen_bar.progress(1.0, text=":material/check_circle: Done.")
-                new_resume = regen["resume"]
-                upsert_application(
-                    job["source"], job["job_id"], status="under review",
-                    resume_text=new_resume["text"],
-                    resume_ats_score=new_resume["ats_score"],
-                    resume_ats_rationale=new_resume["ats_rationale"],
-                    resume_ats_next_actions=new_resume["ats_next_actions"],
-                    resume_clarifying_questions=new_resume["clarifying_questions"],
-                    suggested_strategy_tag=new_resume["suggested_strategy_tag"],
-                )
-                sync_workspace_documents(
-                    job["source"], job["job_id"], ["resume"],
-                    {"resume": new_resume["text"]}, load_profile(), job,
-                )
-                st.toast(
-                    f"Resume regenerated - new ATS score {new_resume['ats_score']}/100.",
-                    icon=":material/check_circle:",
-                )
                 st.rerun()
 
 
@@ -1605,6 +1744,9 @@ elif active_tab == "results":
                 requested = app_record.get("documents_requested") or []
                 status = app_record.get("status")
 
+                if not _job_has_captured_jd_text(job):
+                    render_paste_jd_prompt_before_drafting(job)
+
                 st.markdown("**Documents for this application**")
                 doc_types = [
                     ("resume", "Resume"),
@@ -1710,6 +1852,8 @@ elif active_tab == "results":
                         with st.expander(f"{doc_label} (drafted)"):
                             if doc_key == "resume" and app_record.get("resume_ats_score") is not None:
                                 with st.container(border=True):
+                                    if not _job_has_captured_jd_text(job):
+                                        render_paste_jd_prompt(job)
                                     current_score = app_record["resume_ats_score"]
                                     prev_score_key = f"prev_ats_score_{job.get('source')}_{job.get('job_id')}"
                                     # Set right before a regenerate call below, popped (shown once,

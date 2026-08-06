@@ -33,6 +33,12 @@ def normalize_ziprecruiter_job(raw: dict) -> dict:
 
 
 def normalize_dice_job(raw: dict) -> dict:
+    # "summary" is a real (if truncated, ~500 char) excerpt of the actual
+    # posting text, already present in Dice's own search response - live-
+    # confirmed 2026-08-06 while auditing why ATS keyword extraction was
+    # coming back empty for non-USAJOBS jobs (see tailoring/ats_score.py).
+    # Captured as "description" so drafting.py's _extract_ats_keywords()
+    # picks it up the same way it already does for USAJOBS/LinkedIn jobs.
     return {
         "source": "Dice",
         "job_id": raw.get("guid"),
@@ -43,6 +49,7 @@ def normalize_dice_job(raw: dict) -> dict:
         "pay_min": None,
         "pay_max": None,
         "salary_text": raw.get("salary"),
+        "description": raw.get("summary"),
         "posting_url": raw.get("detailsPageUrl"),
         "apply_url": raw.get("detailsPageUrl"),
     }
