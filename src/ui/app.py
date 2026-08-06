@@ -97,6 +97,7 @@ import imap_client
 import microsoft_client
 import google_calendar_client
 from email_providers import detect_imap_settings
+from fulfillment import get_last_synced_at, get_pending_count, run_full_fulfillment
 from feedback.ui_feedback import get_open_feedback, mark_resolved
 from ui.feedback_widget import render_feedback_widget
 from profile.ingest import load_manifest_result, remove_document, ingest_uploaded_document, resume_text as ingested_resume_text
@@ -180,6 +181,29 @@ def application_status(job: dict) -> str | None:
 
 def job_label(job: dict) -> str:
     return f"{job.get('title')} - {job.get('organization')}"
+
+
+def _format_last_synced(iso_timestamp: str | None) -> str:
+    """Human-readable "Last synced ..." line for the Call to Action tab's
+    status card. `iso_timestamp` is fulfillment.get_last_synced_at()'s
+    return value - None if fulfillment has never completed a run."""
+    if not iso_timestamp:
+        return "Never synced yet"
+    try:
+        synced_at = datetime.fromisoformat(iso_timestamp)
+    except ValueError:
+        return "Last synced: unknown"
+    now = datetime.now(timezone.utc) if synced_at.tzinfo else datetime.now()
+    minutes = max(0, int((now - synced_at).total_seconds() // 60))
+    if minutes < 1:
+        return "Last synced just now"
+    if minutes < 60:
+        return f"Last synced {minutes} minute{'s' if minutes != 1 else ''} ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"Last synced {hours} hour{'s' if hours != 1 else ''} ago"
+    days = hours // 24
+    return f"Last synced {days} day{'s' if days != 1 else ''} ago"
 
 
 _PROGRESS_CHAR_RE = re.compile(r"([\d,]+) characters")
@@ -363,16 +387,19 @@ def render_outreach_section(key_prefix: str, target_account_name: str | None = N
                 update_outreach_status(o["outreach_id"], new_o_status)
                 st.rerun()
         with oc2:
-            if o["channel"] == "email" and o.get("contact_email") and not o.get("gmail_draft_id") and not o.get("draft_requested"):
+            if o["channel"] == "email" and o.get("contact_email") and not (o.get("draft_id") or o.get("gmail_draft_id")) and not o.get("draft_requested"):
                 if st.button("Request draft", key=f"{key_prefix}_reqdraft_{o['outreach_id']}"):
                     request_draft(o["outreach_id"])
-                    st.toast("Flagged - the background fulfillment task will create a real Gmail draft shortly.", icon=":material/check_circle:")
+                    st.toast("Flagged - will create a real draft on the next sync (2x/day, or click \"Send and receive\" on Call to Action).", icon=":material/check_circle:")
                     st.rerun()
             elif o.get("draft_requested"):
                 st.markdown("Draft requested, not yet created")
         with oc3:
-            if o.get("gmail_draft_link"):
-                st.link_button("Open draft", o["gmail_draft_link"], key=f"{key_prefix}_opendraft_{o['outreach_id']}")
+            draft_link = o.get("draft_link") or o.get("gmail_draft_link")
+            if draft_link:
+                st.link_button("Open draft", draft_link, key=f"{key_prefix}_opendraft_{o['outreach_id']}")
+            elif o.get("draft_id") or o.get("gmail_draft_id"):
+                st.button("Draft created - check Drafts folder", key=f"{key_prefix}_opendraft_{o['outreach_id']}", disabled=True)
         new_o_tag = st.text_input(
             "Strategy tag (optional)", value=o.get("strategy_tag") or "",
             key=f"{key_prefix}_otag_{o['outreach_id']}", label_visibility="collapsed",
@@ -436,6 +463,71 @@ def regenerate_resume_and_persist(job: dict, on_progress, success_message: str) 
 
 def _job_has_captured_jd_text(job: dict) -> bool:
     return bool((job.get("qualification_summary") or job.get("description") or "").strip())
+
+
+def _regenerate_with_progress(job: dict, key_suffix: str, working_message: str, success_message: str) -> None:
+    """Shared progress-bar-then-regenerate sequence for both the paste-a-JD
+    flow and the view/update-an-existing-JD flow below - both end in the
+    exact same "show a shimmering progress bar while
+    regenerate_resume_and_persist() runs, then either clear it on failure
+    or mark it done and rerun" sequence, so it's factored out rather than
+    duplicated a third time."""
+    regen_bar_key = f"jd_regen_progress_bar_{key_suffix}"
+    with st.container(key=regen_bar_key):
+        regen_bar = st.progress(0, text=working_message)
+    st.html(progress_shimmer_css(regen_bar_key))
+
+    def _update_regen_progress(i, total, doc_key2, substatus=None):
+        label = "Rescoring resume"
+        label += f" — {substatus}" if substatus else "..."
+        within_doc = progress_fraction(doc_key2, substatus)
+        regen_bar.progress(((i - 1) + within_doc) / total, text=label)
+
+    new_resume = regenerate_resume_and_persist(job, _update_regen_progress, success_message)
+    if new_resume is None:
+        regen_bar.empty()
+    else:
+        regen_bar.progress(1.0, text=":material/check_circle: Done.")
+        st.rerun()
+
+
+def render_jd_view_or_update_box(job: dict, key_prefix: str) -> str | None:
+    """Collapsed-by-default view of a job's currently-stored JD text,
+    editable in place - Zahir's ask 2026-08-06: the paste box was write-
+    only (paste, save, rescore, and the pasted text was never visible
+    again). Shown whenever a job already has real JD text - the opposite
+    branch from the no-JD paste prompts, so the two never fight each
+    other (a job is always in exactly one state at a time: needs a paste,
+    or already has text to view/update).
+
+    Collapsed by default per Zahir's explicit ask, so a job that's fine as-
+    is doesn't clutter the row/score-card with an open text box. Keyed on
+    a hash of the current text (not just key_prefix alone) - the same
+    stale-widget-value pattern CLAUDE.md's HCI standard already calls out
+    elsewhere in this file (strategy-tag/clarifying-question boxes):
+    Streamlit ignores a new `value=` once a `key` already has session-
+    state, so if the stored text ever changes some other way while this
+    key stays constant, the box would keep silently showing the old text.
+
+    Returns the new text if the user clicked "Update job description" with
+    genuinely changed, non-blank text - None otherwise (including "clicked
+    but nothing changed", which shows an info toast instead of pretending
+    to save). The caller decides what happens next (persist only vs.
+    persist + regenerate a draft), since that differs between the
+    proactive (before-drafting) and post-hoc (already-drafted) call sites."""
+    current_text = job.get("description") or job.get("qualification_summary") or ""
+    text_key = f"jd_view_{key_prefix}_{abs(hash(current_text)) % 10_000_000}"
+    with st.expander("View / update job description", expanded=False):
+        updated_text = st.text_area("Job description", value=current_text, key=text_key, height=150)
+        if st.button("Update job description", key=f"jd_view_save_{key_prefix}"):
+            stripped = updated_text.strip()
+            if not stripped:
+                st.toast("The job description can't be cleared here - paste replacement text instead.", icon=":material/warning:")
+            elif stripped == current_text.strip():
+                st.toast("No changes to save.", icon=":material/info:")
+            else:
+                return stripped
+    return None
 
 
 def render_paste_jd_notice() -> None:
@@ -538,26 +630,10 @@ def render_paste_jd_prompt(job: dict) -> None:
 
             update_job_description(job["source"], job["job_id"], pasted_jd.strip())
             job["description"] = pasted_jd.strip()
-            regen_bar_key = f"jd_regen_progress_bar_{job_key}"
-            with st.container(key=regen_bar_key):
-                regen_bar = st.progress(0, text="Rescoring against the pasted description...")
-            st.html(progress_shimmer_css(regen_bar_key))
-
-            def _update_regen_progress(i, total, doc_key2, substatus=None):
-                label = "Rescoring resume"
-                label += f" — {substatus}" if substatus else "..."
-                within_doc = progress_fraction(doc_key2, substatus)
-                regen_bar.progress(((i - 1) + within_doc) / total, text=label)
-
-            new_resume = regenerate_resume_and_persist(
-                job, _update_regen_progress,
+            _regenerate_with_progress(
+                job, job_key, "Rescoring against the pasted description...",
                 "Resume rescored against the pasted description - new ATS score {score}/100.",
             )
-            if new_resume is None:
-                regen_bar.empty()
-            else:
-                regen_bar.progress(1.0, text=":material/check_circle: Done.")
-                st.rerun()
 
 
 def render_gap_questions_section(job: dict, app_record: dict) -> None:
@@ -1452,6 +1528,35 @@ elif active_tab == "cta":
     st.header("Call to action")
     st.markdown("Emails the Gmail scan flagged as needing a reply or a decision.")
 
+    with st.container(border=True):
+        sync_pending = get_pending_count()
+        sync_icon, sync_headline = (":material/task_alt:", "All caught up") if sync_pending == 0 else (
+            ":material/sync:", f"{sync_pending} update{'s' if sync_pending != 1 else ''} to send",
+        )
+        sync_cols = st.columns([1, 4, 2], vertical_alignment="center")
+        with sync_cols[0]:
+            st.markdown(f"## {sync_icon}")
+        with sync_cols[1]:
+            st.markdown(f"**{sync_headline}**")
+            st.caption(_format_last_synced(get_last_synced_at()))
+        with sync_cols[2]:
+            if st.button("Send and receive", type="primary", key="manual_sync_button", width="stretch"):
+                with st.spinner("Syncing - archiving, drafting replies, checking sent drafts..."):
+                    sync_summary = run_full_fulfillment()
+                parts = []
+                if sync_summary["archived"]:
+                    parts.append(f"{sync_summary['archived']} archived")
+                if sync_summary["cta_drafts"]:
+                    parts.append(f"{sync_summary['cta_drafts']} repl{'ies' if sync_summary['cta_drafts'] != 1 else 'y'} drafted")
+                if sync_summary["outreach_drafts"]:
+                    parts.append(f"{sync_summary['outreach_drafts']} outreach draft{'s' if sync_summary['outreach_drafts'] != 1 else ''} created")
+                summary_text = ", ".join(parts) if parts else "nothing was pending"
+                if sync_summary["failures"]:
+                    st.toast(f"Synced with {sync_summary['failures']} failure(s) - {summary_text}. Try again shortly.", icon=":material/warning:")
+                else:
+                    st.toast(f"Synced: {summary_text}.", icon=":material/check_circle:")
+                st.rerun()
+
     r1, r2 = st.columns([1, 5])
     with r1:
         if st.button("Refresh"):
@@ -1767,6 +1872,7 @@ elif active_tab == "results":
                     "Pay": pay,
                     "Score": job.get("fit_score"),
                     "Status": application_status(job) or "-",
+                    "JD": "✓" if _job_has_captured_jd_text(job) else "–",
                     "Posting": job.get("posting_url"),
                 })
             df = pd.DataFrame(table_rows)
@@ -1801,6 +1907,10 @@ elif active_tab == "results":
                     "Role": st.column_config.ButtonColumn(
                         "Role", type="tertiary", alignment="left",
                         on_click=_activate_row, key=role_click_key,
+                    ),
+                    "JD": st.column_config.TextColumn(
+                        "JD", alignment="left", width="small",
+                        help="Whether Panga has this posting's job description text to score and tailor against.",
                     ),
                 }),
                 key=f"table_{channel}",
@@ -1854,7 +1964,20 @@ elif active_tab == "results":
                 requested = app_record.get("documents_requested") or []
                 status = app_record.get("status")
 
-                if not _job_has_captured_jd_text(job):
+                if _job_has_captured_jd_text(job):
+                    pre_job_key = f"pre_{job.get('source')}_{job.get('job_id')}"
+                    updated_text = render_jd_view_or_update_box(job, pre_job_key)
+                    if updated_text is not None:
+                        from search.job_store import update_job_description
+
+                        update_job_description(job["source"], job["job_id"], updated_text)
+                        job["description"] = updated_text
+                        st.toast(
+                            "Updated - whatever you generate next will be tailored against it.",
+                            icon=":material/check_circle:",
+                        )
+                        st.rerun()
+                else:
                     render_paste_jd_prompt_before_drafting(job)
 
                 st.markdown("**Documents for this application**")
@@ -1962,7 +2085,19 @@ elif active_tab == "results":
                         with st.expander(f"{doc_label} (drafted)"):
                             if doc_key == "resume" and app_record.get("resume_ats_score") is not None:
                                 with st.container(border=True):
-                                    if not _job_has_captured_jd_text(job):
+                                    if _job_has_captured_jd_text(job):
+                                        job_key = f"{job.get('source')}_{job.get('job_id')}"
+                                        updated_text = render_jd_view_or_update_box(job, job_key)
+                                        if updated_text is not None:
+                                            from search.job_store import update_job_description
+
+                                            update_job_description(job["source"], job["job_id"], updated_text)
+                                            job["description"] = updated_text
+                                            _regenerate_with_progress(
+                                                job, f"update_{job_key}", "Rescoring against the updated description...",
+                                                "Resume rescored against the updated description - new ATS score {score}/100.",
+                                            )
+                                    else:
                                         render_paste_jd_prompt(job)
                                     current_score = app_record["resume_ats_score"]
                                     prev_score_key = f"prev_ats_score_{job.get('source')}_{job.get('job_id')}"

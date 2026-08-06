@@ -182,3 +182,108 @@ def test_proactive_save_persists_description_without_drafting_anything(results_a
     from search.job_store import load_jobs
     job = next(j for j in load_jobs() if j["job_id"] == "nojd2")
     assert job["description"] == "Requirements: Python, AWS."
+
+
+def test_jd_column_shown_in_results_table(results_app):
+    # Zahir's ask 2026-08-06: a column he can scan across the whole table
+    # at a glance, instead of opening each job to find out.
+    at = results_app
+    at.session_state["active_tab"] = "results"
+    at.run(timeout=30)
+
+    assert not at.exception
+    rows = {}
+    for d in at.dataframe:
+        df = d.value
+        assert "JD" in df.columns
+        rows.update(dict(zip(df["Role"], df["JD"])))
+
+    assert rows["Director, No JD"] == "–"
+    assert rows["Director, Never Drafted"] == "–"
+    assert rows["Director, With JD"] == "✓"
+
+
+def test_view_update_box_shown_with_existing_text_prefilled_when_jd_present(results_app):
+    # Retrieval ask 2026-08-06: the paste box was write-only - Zahir wants
+    # to see what's already stored, not just overwrite it blind.
+    at = results_app
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+
+    assert not at.exception
+    view_box = next(t for t in at.text_area if t.key.startswith("jd_view_Dice_withjd1_"))
+    assert view_box.value == "Requirements: Python, SQL."
+    assert any(b.key == "jd_view_save_Dice_withjd1" for b in at.button)
+    # No fresh-empty-paste-box framing once real text already exists.
+    assert not any(t.key == "jd_paste_Dice_withjd1" for t in at.text_area)
+
+    # Also present at the proactive (job-row, before-drafting) location.
+    pre_view_box = next(t for t in at.text_area if t.key.startswith("jd_view_pre_Dice_withjd1_"))
+    assert pre_view_box.value == "Requirements: Python, SQL."
+
+
+def test_view_update_box_is_collapsed_by_default(results_app):
+    at = results_app
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+
+    expanders = [e for e in at.expander if e.label == "View / update job description"]
+    assert len(expanders) >= 1
+    assert all(not e.proto.expanded for e in expanders)
+
+
+def test_clicking_update_with_unchanged_text_shows_info_toast_and_does_not_regenerate(results_app, monkeypatch):
+    import tailoring.drafting as drafting
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("generate_documents must not be called when nothing changed")
+
+    monkeypatch.setattr(drafting, "generate_documents", _fail_if_called)
+
+    at = results_app
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+
+    save_button = next(b for b in at.button if b.key == "jd_view_save_Dice_withjd1")
+    save_button.click().run(timeout=30)
+
+    assert not at.exception
+
+
+def test_updating_jd_text_persists_and_rescores(results_app, monkeypatch):
+    import tailoring.drafting as drafting
+
+    def _fake_generate_documents(job, profile, doc_keys, on_progress=None):
+        assert job["description"] == "Requirements: Kubernetes, updated."
+        return {"resume": {
+            "text": "PROFESSIONAL EXPERIENCE\nEngineer.\n\nSKILLS\nKubernetes",
+            "suggested_strategy_tag": "",
+            "ats_score": 77,
+            "ats_rationale": "Matched 1/1 keywords.",
+            "ats_next_actions": [],
+            "clarifying_questions": [],
+        }}
+
+    monkeypatch.setattr(drafting, "generate_documents", _fake_generate_documents)
+    monkeypatch.setattr("tailoring.dossier.sync_workspace_documents", lambda *a, **k: None)
+
+    at = results_app
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+
+    view_box = next(t for t in at.text_area if t.key.startswith("jd_view_Dice_withjd1_"))
+    view_box.set_value("Requirements: Kubernetes, updated.")
+    save_button = next(b for b in at.button if b.key == "jd_view_save_Dice_withjd1")
+    save_button.click().run(timeout=30)
+
+    assert not at.exception
+    from search.job_store import load_jobs
+    from tailoring.applications import get_application
+    job = next(j for j in load_jobs() if j["job_id"] == "withjd1")
+    assert job["description"] == "Requirements: Kubernetes, updated."
+    app_record = get_application("Dice", "withjd1")
+    assert app_record["resume_ats_score"] == 77
