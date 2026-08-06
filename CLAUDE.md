@@ -93,6 +93,25 @@ zombie instances on ports nobody had reserved). `panga-ui-rm-verify`
 (8509) is reserved exclusively for Release Manager's merge-verification -
 no other session should use it.
 
+**Testing a worktree's own unmerged code, not the main checkout:** the
+named slots in `.claude/launch.json` (via the Browser tool's `preview_start`)
+always run from the main checkout's directory, regardless of which worktree
+you call them from - fine for Release Manager's post-merge checks, useless
+for live-verifying a branch that hasn't merged yet. There's also no
+per-worktree `venv/` - it only exists at the root checkout. To live-test a
+worktree's own code, run streamlit manually from inside that worktree using
+the root venv's absolute path, e.g. (adjust the branch name and port - pick
+an unused slot from the 8501-8509 range, same rule as always):
+
+```
+cd .claude/worktrees/<branch-name>
+"C:\Users\User\Desktop\Myra\Panga\venv\Scripts\streamlit.exe" run src/ui/app.py --server.headless true --server.port 8506
+```
+
+(2026-08-06: UI refinement hit this while live-verifying the CTA-stat-strip
+branch and had to figure it out ad hoc - documenting so the next session
+doesn't have to.)
+
 **Never kill a process on a shared port without confirming you own it
 first.** Check its command line / start time / working directory before
 killing - don't infer ownership just because it's inconvenient or recent.
