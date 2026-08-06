@@ -96,6 +96,35 @@ def search_company_sites(target_roles: list[dict]) -> int:
     return added
 
 
+def search_ats_boards() -> int:
+    """Greenhouse/Lever companies from config/job_sources.yaml. Unlike
+    search_company_sites() above, this is NOT called per target role -
+    neither platform's public API supports server-side keyword search, so
+    looping it by role would just refetch the identical full board N
+    times for zero extra data. One fetch per company, same shape as
+    search_industry_boards() below; compatibility scoring is what
+    actually filters for relevance, same as those sources."""
+    sources = job_sources.load_job_sources()
+    added = 0
+    for company in sources["greenhouse"]:
+        try:
+            jobs = company_sites.search_greenhouse_jobs(
+                company["company_name"], company["board_token"], limit=company["limit"],
+            )
+            added += job_store.save_jobs(jobs)
+        except Exception as exc:  # noqa: BLE001 - one company's failure shouldn't stop the rest
+            _log(f"  [company_sites] Greenhouse search failed for {company['company_name']}: {exc}")
+    for company in sources["lever"]:
+        try:
+            jobs = company_sites.search_lever_jobs(
+                company["company_name"], company["company_slug"], limit=company["limit"],
+            )
+            added += job_store.save_jobs(jobs)
+        except Exception as exc:  # noqa: BLE001
+            _log(f"  [company_sites] Lever search failed for {company['company_name']}: {exc}")
+    return added
+
+
 _INDUSTRY_BOARD_FETCHERS = [
     ("Planet Pharma", industry_boards.fetch_planet_pharma_jobs),
     ("BioSpace", industry_boards.fetch_biospace_jobs),
@@ -179,6 +208,10 @@ def run() -> None:
 
     _log("STEP 3 - Company career sites")
     added = search_company_sites(target_roles)
+    _log(f"  added {added} new job(s)")
+
+    _log("STEP 3b - Greenhouse/Lever company boards")
+    added = search_ats_boards()
     _log(f"  added {added} new job(s)")
 
     _log("STEP 4 - Industry job boards")

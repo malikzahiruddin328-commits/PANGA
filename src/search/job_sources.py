@@ -27,7 +27,7 @@ from security.file_lock import locked
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 JOB_SOURCES_PATH = PROJECT_ROOT / "config" / "job_sources.yaml"
 
-PLATFORMS = ["workday", "smartrecruiters"]
+PLATFORMS = ["workday", "smartrecruiters", "greenhouse", "lever"]
 
 
 def _empty() -> dict:

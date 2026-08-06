@@ -739,9 +739,9 @@ if active_tab == "settings":
         "Company career sites Panga searches directly, in addition to "
         "USAJOBS and the built-in industry boards - add or remove "
         "companies here, no code change needed. Covers companies whose "
-        "careers site runs on Workday or SmartRecruiters; find a "
-        "company's own tenant/ID from its careers URL (see the field "
-        "hints below)."
+        "careers site runs on Workday, SmartRecruiters, Greenhouse, or "
+        "Lever; find a company's own tenant/ID from its careers URL (see "
+        "the field hints below)."
     )
     with st.expander("Manage companies", expanded=False):
         job_sources_data = load_job_sources()
@@ -778,6 +778,36 @@ if active_tab == "settings":
             key="job_sources_smartrecruiters_editor",
         )
 
+        st.markdown("**Greenhouse** - board token is the identifier in the company's boards.greenhouse.io/{token} URL, e.g. \"stripe\".")
+        greenhouse_rows = st.data_editor(
+            [
+                {"company_name": c["company_name"], "board_token": c["board_token"], "limit": c["limit"]}
+                for c in job_sources_data["greenhouse"]
+            ],
+            num_rows="dynamic",
+            column_config={
+                "company_name": st.column_config.TextColumn("Company", required=True),
+                "board_token": st.column_config.TextColumn("Board token", required=True),
+                "limit": st.column_config.NumberColumn("Max results", required=True, min_value=1, max_value=100),
+            },
+            key="job_sources_greenhouse_editor",
+        )
+
+        st.markdown("**Lever** - company slug is the identifier in the company's jobs.lever.co/{slug} URL, e.g. \"palantir\".")
+        lever_rows = st.data_editor(
+            [
+                {"company_name": c["company_name"], "company_slug": c["company_slug"], "limit": c["limit"]}
+                for c in job_sources_data["lever"]
+            ],
+            num_rows="dynamic",
+            column_config={
+                "company_name": st.column_config.TextColumn("Company", required=True),
+                "company_slug": st.column_config.TextColumn("Company slug", required=True),
+                "limit": st.column_config.NumberColumn("Max results", required=True, min_value=1, max_value=100),
+            },
+            key="job_sources_lever_editor",
+        )
+
         if st.button("Save job-board sources"):
             # Advanced per-company filters (e.g. IQVIA's US-only facet) aren't
             # exposed in this table - carry them over by company_name so
@@ -797,8 +827,19 @@ if active_tab == "settings":
                 {"company_name": row["company_name"], "company_id": row["company_id"], "limit": int(row["limit"])}
                 for row in smartrecruiters_rows
             ]
+            new_greenhouse = [
+                {"company_name": row["company_name"], "board_token": row["board_token"], "limit": int(row["limit"])}
+                for row in greenhouse_rows
+            ]
+            new_lever = [
+                {"company_name": row["company_name"], "company_slug": row["company_slug"], "limit": int(row["limit"])}
+                for row in lever_rows
+            ]
             try:
-                save_job_sources({"workday": new_workday, "smartrecruiters": new_smartrecruiters})
+                save_job_sources({
+                    "workday": new_workday, "smartrecruiters": new_smartrecruiters,
+                    "greenhouse": new_greenhouse, "lever": new_lever,
+                })
             except Exception as exc:
                 st.error(f"Failed to save job-board sources: {exc}")
             else:

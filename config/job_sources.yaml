@@ -4,12 +4,16 @@
 # _SMARTRECRUITERS_COMPANIES). Editable from the Settings tab's "Job-board
 # sources" section - see src/search/job_sources.py for the load/save API
 # and src/search/company_sites.py for what each platform's fields mean
-# (tenant/site/wd_number for Workday, company_id for SmartRecruiters).
+# (tenant/site/wd_number for Workday, company_id for SmartRecruiters,
+# board_token for Greenhouse, company_slug for Lever).
 #
-# These 3 entries are the same companies/settings that were previously
-# hardcoded - migrated here verbatim as the first slice of this build
-# (2026-08-05), before any new platform is added, so the only change on
-# day one is *where* this data lives, not what it searches.
+# The workday/smartrecruiters entries are the same companies/settings that
+# were previously hardcoded - migrated here verbatim as Slice 1 of this
+# build (2026-08-05). greenhouse/lever were added in Slice 2 (both have
+# real public JSON APIs, confirmed live against real company boards - see
+# company_sites.search_greenhouse_jobs()/search_lever_jobs() docstrings) -
+# empty by default, no companies seeded, since these are genuinely new
+# sources Zahir hasn't picked companies for yet.
 
 workday:
   - company_name: Eisai
@@ -35,3 +39,7 @@ smartrecruiters:
   - company_name: AbbVie
     company_id: abbvie
     limit: 15
+
+greenhouse: []
+
+lever: []

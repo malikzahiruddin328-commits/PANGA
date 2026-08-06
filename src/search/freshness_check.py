@@ -101,6 +101,20 @@ def _check_workday(job: dict, company: dict) -> bool | None:
         return None
 
 
+def _check_greenhouse(job: dict, company: dict) -> bool | None:
+    try:
+        return company_sites.check_greenhouse_posting_open(company["board_token"], job["job_id"])
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _check_lever(job: dict, company: dict) -> bool | None:
+    try:
+        return company_sites.check_lever_posting_open(company["company_slug"], job["job_id"])
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def build_api_source_lookup() -> dict:
     """source (company_name) -> (check function, company dict), built fresh
     from config/job_sources.yaml each run rather than a hardcoded table -
@@ -114,6 +128,10 @@ def build_api_source_lookup() -> dict:
         lookup[company["company_name"]] = (_check_workday, company)
     for company in sources["smartrecruiters"]:
         lookup[company["company_name"]] = (_check_smartrecruiters, company)
+    for company in sources["greenhouse"]:
+        lookup[company["company_name"]] = (_check_greenhouse, company)
+    for company in sources["lever"]:
+        lookup[company["company_name"]] = (_check_lever, company)
     return lookup
 
 

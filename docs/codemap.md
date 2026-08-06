@@ -31,7 +31,8 @@ flowchart TD
 
 **search/** - finding and storing jobs
 - `job_store.py` - the `jobs` table (JSON, encrypted). `load_jobs`/`save_jobs`/`update_job_score`/`update_job_address`.
-- `usajobs.py`, `boards.py`, `industry_boards.py`, `company_sites.py` - one source-channel each, all normalize into the same job shape.
+- `usajobs.py`, `boards.py`, `industry_boards.py`, `company_sites.py` - one source-channel each, all normalize into the same job shape. `company_sites.py` covers Workday/SmartRecruiters/Greenhouse/Lever ATS platforms.
+- `job_sources.py` - user-managed ATS company list (`config/job_sources.yaml`, plain YAML, file-locked) backing `company_sites.py` - editable from the Settings tab's "Job-board sources" section instead of a hardcoded list in `scripts/run_search.py`. `freshness_check.py` also derives its per-company closed-posting checks from this store.
 
 **ranking/**
 - `prioritize.py` - sorts/dedupes the combined job list (fit_score, role-weight, cross-source dedup).
