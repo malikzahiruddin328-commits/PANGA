@@ -105,10 +105,13 @@ def test_results_caption_keeps_the_scanned_total_visible(results_app):
     at.run(timeout=30)
 
     assert not at.exception
-    captions = [c.value for c in at.caption if "scanned" in c.value]
-    assert captions
-    assert "3 job(s) scanned" in captions[0]
-    assert "2 match" in captions[0]
+    # st.markdown, not st.caption - this project's standing readability
+    # rule (Mirror's fine-needle audit caught this exact call, added in
+    # the batch just before this one, as a straggler, 2026-08-06).
+    scanned_lines = [m.value for m in at.markdown if "scanned" in m.value]
+    assert scanned_lines
+    assert "3 job(s) scanned" in scanned_lines[0]
+    assert "2 match" in scanned_lines[0]
 
 
 def test_pass_dialog_shows_categorized_reasons_not_open_text(results_app):

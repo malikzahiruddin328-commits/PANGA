@@ -155,7 +155,17 @@ def _render_email_signin() -> None:
         try:
             client.request_login_code(email)
         except client.LicenseServiceError as e:
-            st.warning(f"Couldn't send a new code right now ({e}) - if you already have one from a recent email, you can still enter it below.")
+            # Was st.warning() immediately followed by the unconditional
+            # st.rerun() below - rendered for a fraction of a second before
+            # the rerun wiped it, never actually seen (this project's
+            # standing anti-pattern, this instance found by a new
+            # regression test added alongside Mirror's fine-needle audit,
+            # 2026-08-06 - not one Mirror itself listed). st.toast()
+            # survives a rerun.
+            st.toast(
+                f"Couldn't send a new code right now ({e}) - if you already have one from a recent email, you can still enter it below.",
+                icon=":material/warning:",
+            )
         st.rerun()
 
     pending_email = st.session_state.get("license_signin_pending_email")
@@ -191,7 +201,7 @@ def _render_anthropic_connect_placeholder() -> None:
         st.button("Connect an account I already have", key="anthropic_connect_existing", disabled=True)
     with c2:
         st.button("I don't have one — set one up", key="anthropic_connect_new", disabled=True)
-    st.caption("Coming soon — waiting on native-packaging's direct-API support.")
+    st.markdown("Coming soon — waiting on native-packaging's direct-API support.")
     if st.button("Skip for now", key="anthropic_connect_skip"):
         _run_check_in()
         st.rerun()

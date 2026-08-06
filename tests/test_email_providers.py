@@ -28,6 +28,18 @@ def test_known_preset_yahoo():
     assert result.source == "preset"
 
 
+def test_known_preset_verizon_uses_the_real_aol_hosted_imap_host():
+    # Real bug (Mirror's fine-needle audit, 2026-08-06): this preset used
+    # to be "outgoing.verizon.net", an SMTP-relay-style name, not IMAP.
+    # Verizon.net mail is AOL-hosted since 2017 and shares AOL's own IMAP
+    # host - confirmed live against Mozilla's ISPDB at fix time, not
+    # assumed from memory.
+    result = detect_imap_settings("someone@verizon.net")
+    assert result.host == "imap.aol.com"
+    assert result.port == 993
+    assert result.source == "preset"
+
+
 def test_known_preset_case_insensitive_domain():
     result = detect_imap_settings("someone@BTInternet.com")
     assert result.host == "mail.btinternet.com"

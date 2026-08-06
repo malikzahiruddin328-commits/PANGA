@@ -233,24 +233,6 @@ st.html(
     unsafe_allow_javascript=True,
 )
 
-# st.caption() renders at a fixed 60% opacity - a Streamlit framework
-# default, not something Panga's own code sets per call. Paired with this
-# app's light-theme textColor/backgroundColor (#4A1B0C on #ffffff), that
-# measures ~4.16:1 - under WCAG 1.4.3's 4.5:1 minimum (Mirror's "sweep for
-# other instances of the same [opacity] pattern" following the badge
-# contrast finding above). Captions appear throughout the app (helper
-# text, "Last synced...", disclaimers), so this is deliberately a small,
-# global nudge rather than touching each call site - bumped to 68%
-# opacity (~5.3:1, real margin above the minimum, still visibly
-# de-emphasized relative to normal text) rather than removing the dimming
-# altogether, which would erase the visual hierarchy captions exist for.
-# Dark theme's default already measures ~6.3:1 even at 60% (light text
-# gaining perceptual luminance faster than dark text loses it, at the
-# same alpha) - left alone rather than "fixing" something already
-# compliant, so it stays gated to light mode only.
-if st.context.theme.type == "light":
-    st.html("<style>[data-testid=\"stCaptionContainer\"] { opacity: 0.68 !important; }</style>")
-
 
 def load_settings() -> dict:
     return yaml.safe_load(SETTINGS_PATH.read_text(encoding="utf-8"))
@@ -808,7 +790,7 @@ def render_gap_questions_section(job: dict, app_record: dict) -> None:
         q_key = f"gapans_{job_key}_{abs(hash(q['question'] + '|' + (q.get('suggested_answer') or ''))) % 10_000_000}"
         is_disqualifier = q.get("type") == "disqualifier_check"
         if is_disqualifier:
-            st.caption(
+            st.markdown(
                 ":material/flag: This answer applies to every "
                 "future job match, not just this one - not a "
                 "guess, so the box starts empty."
@@ -885,8 +867,8 @@ def render_answered_gap_questions() -> None:
             entry_key = abs(hash(f"{skill}|{entry.get('date_captured', '')}")) % 10_000_000
 
             if is_disqualifier:
-                st.caption(":material/flag: Applies to every future job match, not just one.")
-            st.caption(f"Confirmed {entry.get('date_captured', 'date unknown')} - {entry.get('role_context', '')}")
+                st.markdown(":material/flag: Applies to every future job match, not just one.")
+            st.markdown(f"Confirmed {entry.get('date_captured', 'date unknown')} - {entry.get('role_context', '')}")
             new_answer = st.text_area(
                 question_text, value=entry.get("answer", ""),
                 key=f"answered_edit_{entry_key}", height=68,
@@ -961,6 +943,51 @@ def _pass_reason_dialog(source: str, job_id: str, label: str) -> None:
     with cancel_col:
         if st.button("Cancel", key="pass_reason_cancel"):
             st.session_state.pop("pass_dialog_pending", None)
+            st.rerun()
+
+
+@st.dialog("Disconnect this account?")
+def _confirm_imap_disconnect(acct: str) -> None:
+    # Used to delete credentials immediately on click, no undo, no
+    # confirmation at all (Mirror's fine-needle audit, 2026-08-06).
+    st.markdown(
+        f"Disconnect **{acct}**? This deletes its stored credentials "
+        "immediately - there's no undo. You'd need to reconnect and "
+        "re-enter them from scratch to use this account again."
+    )
+    confirm_col, cancel_col = st.columns(2)
+    with confirm_col:
+        if st.button("Disconnect", type="primary", key="imap_disconnect_confirm"):
+            imap_client.remove_account(acct)
+            st.session_state.pop("imap_disconnect_pending", None)
+            st.toast(f"Disconnected {acct}.", icon=":material/check_circle:")
+            st.rerun()
+    with cancel_col:
+        if st.button("Cancel", key="imap_disconnect_cancel"):
+            st.session_state.pop("imap_disconnect_pending", None)
+            st.rerun()
+
+
+@st.dialog("Replace your recovery code?")
+def _confirm_recovery_code_regen() -> None:
+    # Used to invalidate the existing code immediately on click, before
+    # the "it stops working" warning above had actually been read as a
+    # real consequence about to happen, not just background text (Mirror's
+    # fine-needle audit, 2026-08-06).
+    st.markdown(
+        "Generating a new recovery code immediately replaces the current "
+        "one - the old code stops working right away, even if you haven't "
+        "saved the new one anywhere yet."
+    )
+    confirm_col, cancel_col = st.columns(2)
+    with confirm_col:
+        if st.button("Generate new code", type="primary", key="recovery_code_regen_confirm"):
+            st.session_state["new_recovery_code"] = generate_recovery_code()
+            st.session_state.pop("recovery_code_regen_pending", None)
+            st.rerun()
+    with cancel_col:
+        if st.button("Cancel", key="recovery_code_regen_cancel"):
+            st.session_state.pop("recovery_code_regen_pending", None)
             st.rerun()
 
 
@@ -1191,9 +1218,9 @@ if active_tab == "settings":
                 )
                 st.rerun()
     if not has_resume:
-        st.caption("Upload a resume above first.")
+        st.markdown("Upload a resume above first.")
     elif not industries_text.strip():
-        st.caption("Add at least one target industry/vertical above first.")
+        st.markdown("Add at least one target industry/vertical above first.")
 
     st.subheader("Target roles")
     gen_counter = st.session_state.get("target_roles_gen_counter", 0)
@@ -1593,9 +1620,16 @@ if active_tab == "settings":
         if connected:
             st.success(f"Already connected: {', '.join(connected)}")
             for acct in connected:
+                # Used to delete credentials immediately on click, no undo,
+                # no confirmation at all (Mirror's fine-needle audit,
+                # 2026-08-06). Same st.dialog confirm-step pattern as
+                # Generate recovery code below.
                 if st.button(f"Disconnect {acct}", key=f"imap_disconnect_{acct}"):
-                    imap_client.remove_account(acct)
-                    st.rerun()
+                    st.session_state["imap_disconnect_pending"] = acct
+
+        pending_disconnect = st.session_state.get("imap_disconnect_pending")
+        if pending_disconnect:
+            _confirm_imap_disconnect(pending_disconnect)
 
         st.markdown("**Connect another account**" if connected else "**Connect an account**")
         imap_email = st.text_input(
@@ -1642,7 +1676,15 @@ if active_tab == "settings":
                     except (imap_client.ImapConnectionError, imap_client.ImapNotConfigured) as exc:
                         st.error(f"Saved, but the connection test failed: {exc}")
                     else:
-                        st.success(f"Connected - {imap_email} is ready to use.")
+                        # Was st.success() immediately followed by
+                        # st.rerun() - the message rendered for a fraction
+                        # of a second before the rerun wiped the page, so
+                        # it was never actually seen (the exact app-wide
+                        # anti-pattern this project's standing rule already
+                        # eliminated everywhere else - Mirror's fine-needle
+                        # audit caught this one remaining straggler,
+                        # 2026-08-06). st.toast() survives a rerun.
+                        st.toast(f"Connected - {imap_email} is ready to use.", icon=":material/check_circle:")
                         st.rerun()
 
     st.divider()
@@ -1657,7 +1699,7 @@ if active_tab == "settings":
     if google_calendar_client.is_configured():
         st.success("Google Calendar access found - see \"Test connection\" below.")
         if google_calendar_client.using_gmail_credentials():
-            st.caption("Using the same Google sign-in already set up for Gmail above.")
+            st.markdown("Using the same Google sign-in already set up for Gmail above.")
     else:
         st.info("Not set up yet - set up Gmail above first (Calendar can reuse that same sign-in), or add a separate Google Cloud OAuth client for Calendar only.")
 
@@ -1685,13 +1727,27 @@ if active_tab == "settings":
         "the original key."
     )
 
-    if has_recovery_code():
+    recovery_code_exists = has_recovery_code()
+    if recovery_code_exists:
         st.markdown("A recovery code already exists for this data. Generating a new one below replaces it - the old code stops working.")
     else:
         st.markdown("No recovery code has been generated yet - your data has no recovery path if this Windows account is lost.")
 
-    if st.button("Generate recovery code"):
-        st.session_state["new_recovery_code"] = generate_recovery_code()
+    # Used to invalidate the old code immediately on click, before the
+    # user had actually seen the "it stops working" warning above land as
+    # a real consequence, not just background text (Mirror's fine-needle
+    # audit, 2026-08-06). Only gated behind a confirm step when there's an
+    # existing code to lose - generating the first-ever code isn't
+    # destructive, nothing to confirm away.
+    if recovery_code_exists:
+        if st.button("Generate recovery code"):
+            st.session_state["recovery_code_regen_pending"] = True
+    else:
+        if st.button("Generate recovery code"):
+            st.session_state["new_recovery_code"] = generate_recovery_code()
+
+    if st.session_state.get("recovery_code_regen_pending"):
+        _confirm_recovery_code_regen()
 
     if st.session_state.get("new_recovery_code"):
         st.warning(
@@ -1794,7 +1850,7 @@ elif active_tab == "cta":
             st.markdown(f"## {sync_icon}")
         with sync_cols[1]:
             st.markdown(f"**{sync_headline}**")
-            st.caption(_format_last_synced(get_last_synced_at()))
+            st.markdown(_format_last_synced(get_last_synced_at()))
         with sync_cols[2]:
             if st.button("Send and receive", type="primary", key="manual_sync_button", width="stretch"):
                 with st.spinner("Syncing - archiving, drafting replies, checking sent drafts..."):
@@ -2114,8 +2170,10 @@ elif active_tab == "results":
     # each other (this line always reflects the real, live ranked list,
     # unlike the badge above the tabs, which can lag one rerun behind while
     # actively changing a filter - see compute_results_ranked()'s
-    # docstring).
-    st.caption(f"{len(jobs)} job(s) scanned, {len(ranked)} match your profile and current filters.")
+    # docstring). st.markdown, not st.caption - this project's standing
+    # readability rule (Mirror's fine-needle audit caught this exact call
+    # as one of the still-remaining violations, 2026-08-06).
+    st.markdown(f"{len(jobs)} job(s) scanned, {len(ranked)} match your profile and current filters.")
 
     # Grouped by channel (source) per Zahir's request 2026-07-29 - each
     # channel (USAJOBS, Dice, ZipRecruiter, etc.) gets its own section.
@@ -3108,6 +3166,18 @@ elif active_tab == "prep":
                             status="ready",
                         )
                         st.session_state["prep_target"] = None
+                        # Was collapsing immediately - status flipping to
+                        # "ready" made the expander's own expanded=(status
+                        # == "in_progress") go False the instant the content
+                        # that was just generated became available, so
+                        # seeing it needed a scroll-down and a re-click
+                        # (Mirror's fine-needle audit, 2026-08-06). Same
+                        # one-shot force-expand session_state pattern as the
+                        # Results tab's just-drafted-resume flag above -
+                        # popped (consumed) the moment this round's
+                        # expander renders, so it doesn't stay
+                        # force-expanded on later, unrelated visits.
+                        st.session_state[f"just_generated_prep_{target_job['source']}_{target_job['job_id']}_{round_label}"] = True
                         st.toast("Interview prep ready.", icon=":material/check_circle:")
                         st.rerun()
             with clear_col:
@@ -3125,7 +3195,10 @@ elif active_tab == "prep":
 
         for round_ in record["rounds"]:
             status_note = "in progress" if round_["status"] == "in_progress" else round_["status"]
-            with st.expander(f"{round_['round_label']} - {status_note}", expanded=(round_["status"] == "in_progress")):
+            just_generated = st.session_state.pop(
+                f"just_generated_prep_{record['source']}_{record['job_id']}_{round_['round_label']}", False,
+            )
+            with st.expander(f"{round_['round_label']} - {status_note}", expanded=(round_["status"] == "in_progress" or just_generated)):
                 logistics = " - ".join(v for v in [round_.get("date"), round_.get("format")] if v)
                 if logistics:
                     st.markdown(logistics)

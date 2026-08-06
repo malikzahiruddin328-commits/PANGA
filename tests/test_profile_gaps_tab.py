@@ -137,5 +137,7 @@ def test_disqualifier_answer_shows_the_applies_everywhere_flag(gaps_app):
     at.run(timeout=30)
 
     assert not at.exception
-    captions = [c.value for c in at.caption]
-    assert any("every future job match" in c for c in captions)
+    # st.markdown, not st.caption - this project's standing readability
+    # rule (no st.caption anywhere in Panga, full-contrast text only).
+    markdowns = [m.value for m in at.markdown]
+    assert any("every future job match" in m for m in markdowns)

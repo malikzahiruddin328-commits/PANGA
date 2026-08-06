@@ -53,7 +53,17 @@ _KNOWN_PRESETS = {
     "aol.com": ImapSettings("imap.aol.com", 993, "aol.com", "preset"),
     "icloud.com": ImapSettings("imap.mail.me.com", 993, "icloud.com", "preset"),
     "me.com": ImapSettings("imap.mail.me.com", 993, "me.com", "preset"),
-    "verizon.net": ImapSettings("outgoing.verizon.net", 993, "verizon.net", "preset"),
+    # Was "outgoing.verizon.net" - an SMTP-relay-style name (Verizon's own
+    # real outgoing/SMTP host, not IMAP), presented as a confirmed preset
+    # with no "couldn't auto-confirm" warning (Mirror's fine-needle audit,
+    # 2026-08-06 - a Verizon user would get full UI confidence in a host
+    # that just fails its connection test). Verizon.net mail has been
+    # AOL-hosted since Verizon's 2017 transition, so it uses AOL's own IMAP
+    # host directly - confirmed live against Mozilla's ISPDB (the same
+    # autoconfig.thunderbird.net source _query_ispdb() already falls back
+    # to below), not assumed from memory: imap.aol.com/993, identical to
+    # the aol.com preset two lines up.
+    "verizon.net": ImapSettings("imap.aol.com", 993, "verizon.net", "preset"),
     "btinternet.com": ImapSettings("mail.btinternet.com", 993, "btinternet.com", "preset"),
 }
 
