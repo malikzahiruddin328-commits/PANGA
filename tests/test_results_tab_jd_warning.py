@@ -26,9 +26,11 @@ def results_app(isolated_data, monkeypatch):
     save_jobs([
         {"source": "Indeed", "job_id": "nojd1", "title": "Director, No JD", "organization": "Acme Corp", "location": "Remote"},
         {"source": "Dice", "job_id": "withjd1", "title": "Director, With JD", "organization": "Beta Inc", "location": "Remote", "description": "Requirements: Python, SQL."},
+        {"source": "Indeed", "job_id": "nojd2", "title": "Director, Never Drafted", "organization": "Gamma LLC", "location": "Remote"},
     ])
     update_job_score("Indeed", "nojd1", 85, "Strong match.")
     update_job_score("Dice", "withjd1", 85, "Strong match.")
+    update_job_score("Indeed", "nojd2", 85, "Strong match.")
     upsert_application(
         "Indeed", "nojd1", status="under review",
         resume_text="PROFESSIONAL EXPERIENCE\nEngineer.\n\nEDUCATION\nBS\n\nSKILLS\nJava",
@@ -122,3 +124,61 @@ def test_pasting_jd_and_saving_stores_description_and_rescoring(results_app, mon
     assert job["description"] == "Requirements: Kubernetes, Terraform."
     app_record = get_application("Indeed", "nojd1")
     assert app_record["resume_ats_score"] == 88
+
+
+def test_proactive_prompt_shown_before_any_document_has_ever_been_drafted(results_app):
+    # Zahir's follow-up ask 2026-08-06: the paste option must be available
+    # BEFORE the first draft, not only reactively after a resume's already
+    # been drafted blind - job "nojd2" has no application/draft at all yet.
+    at = results_app
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Indeed"] = 1
+    at.run(timeout=30)
+
+    assert not at.exception
+    assert any(t.key == "jd_paste_pre_Indeed_nojd2" for t in at.text_area)
+    assert any(b.key == "jd_paste_pre_save_Indeed_nojd2" for b in at.button)
+    # Nothing's been drafted yet, so the post-hoc (already-drafted) variant
+    # genuinely has nothing to attach to.
+    assert not any(t.key == "jd_paste_Indeed_nojd2" for t in at.text_area)
+
+
+def test_proactive_and_post_hoc_prompts_both_appear_once_a_resume_is_already_drafted(results_app):
+    # Additive, not a replacement (Zahir's explicit requirement): "nojd1"
+    # already has a blind-drafted resume (from the fixture) - the proactive
+    # job-row prompt and the post-hoc score-card prompt must BOTH still be
+    # available, since the proactive one keeps applying to whatever gets
+    # drafted/regenerated next (cover letter, exec bio, etc.), while the
+    # post-hoc one is what actually fixes up the resume already drafted blind.
+    at = results_app
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Indeed"] = 0
+    at.run(timeout=30)
+
+    assert not at.exception
+    assert any(t.key == "jd_paste_pre_Indeed_nojd1" for t in at.text_area)
+    assert any(t.key == "jd_paste_Indeed_nojd1" for t in at.text_area)
+
+
+def test_proactive_save_persists_description_without_drafting_anything(results_app, monkeypatch):
+    import tailoring.drafting as drafting
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("generate_documents must not be called by the proactive (pre-drafting) save path")
+
+    monkeypatch.setattr(drafting, "generate_documents", _fail_if_called)
+
+    at = results_app
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Indeed"] = 1
+    at.run(timeout=30)
+
+    paste_box = next(t for t in at.text_area if t.key == "jd_paste_pre_Indeed_nojd2")
+    paste_box.set_value("Requirements: Python, AWS.")
+    save_button = next(b for b in at.button if b.key == "jd_paste_pre_save_Indeed_nojd2")
+    save_button.click().run(timeout=30)
+
+    assert not at.exception
+    from search.job_store import load_jobs
+    job = next(j for j in load_jobs() if j["job_id"] == "nojd2")
+    assert job["description"] == "Requirements: Python, AWS."

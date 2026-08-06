@@ -428,27 +428,20 @@ def regenerate_resume_and_persist(job: dict, on_progress, success_message: str) 
     return new_resume
 
 
-def render_paste_jd_prompt(job: dict) -> None:
-    """Active fallback for a job with no captured JD text (ZipRecruiter,
-    Indeed, the industry job boards - confirmed live 2026-08-06 that these
-    sources genuinely have no real posting text available, either because
-    the site blocks automated access or no detail-page fetch exists yet).
+def _job_has_captured_jd_text(job: dict) -> bool:
+    return bool((job.get("qualification_summary") or job.get("description") or "").strip())
 
-    Zahir's explicit product direction: this must never read as a
-    limitation to apologize for. Some job sites intentionally block
-    automated fetching to protect themselves and their users from
-    scraping/bots - Panga respecting that instead of trying to bypass it is
-    a deliberate, security-conscious design choice, not a gap. The paste
-    box lives right here on the score card itself, no navigation required
-    (CLAUDE.md's HCI standard).
 
-    Saving goes through the exact same read path every other job already
-    uses - search.job_store.update_job_description() sets job["description"]
-    (which tailoring.drafting._extract_ats_keywords() already reads) and
-    clears any stale empty ats_required_keywords/ats_preferred_keywords
-    cache, so the regenerate below re-extracts for real instead of reusing
-    the old "nothing found" result. No new downstream scoring/drafting code
-    path - this only fills the gap on the read side."""
+def render_paste_jd_notice() -> None:
+    """The shared "why there's no JD text" framing - Zahir's explicit
+    product direction 2026-08-06: this must never read as a limitation to
+    apologize for. Some job sites intentionally block automated fetching to
+    protect themselves and their users from scraping/bots - Panga
+    respecting that instead of trying to bypass it is a deliberate,
+    security-conscious design choice, not a gap. Shared by both the
+    proactive (before any document is drafted) and post-hoc (an already-
+    drafted resume's score card) paste prompts below, so the framing can't
+    drift between the two."""
     st.info(
         "We don't have this posting's full description yet - some job "
         "sites intentionally block automated access to protect themselves "
@@ -457,6 +450,74 @@ def render_paste_jd_prompt(job: dict) -> None:
         "we'll tailor against it directly.",
         icon=":material/shield:",
     )
+
+
+def render_paste_jd_prompt_before_drafting(job: dict) -> None:
+    """Proactive paste-JD prompt - Zahir's follow-up ask 2026-08-06: the
+    post-hoc version below only ever appeared after a resume had already
+    been drafted blind against no real JD text, buried inside that
+    drafted resume's own expander. The actual ask is for this to be
+    available BEFORE any document gets generated at all, right at the
+    job-row level next to the doc-type checkboxes/Generate button, so the
+    very first document Panga drafts for this job - resume, cover letter,
+    exec bio, leadership summary, or the Apply Assist packet, not just the
+    resume - is already tailored against the real JD rather than drafted
+    blind and fixed up after the fact.
+
+    Saving here does NOT trigger a regenerate the way the post-hoc version
+    does - nothing has been drafted yet to regenerate. It just persists
+    the text via search.job_store.update_job_description() (clears the
+    stale empty ats_required_keywords/ats_preferred_keywords cache too),
+    so whatever gets drafted next through the normal "Generate documents"
+    button reads it naturally through the same generate_documents() call
+    every draft already goes through - no new downstream code path.
+
+    This is additive, not a replacement: the post-hoc render_paste_jd_prompt()
+    stays in place too, so someone who already has a blind-drafted resume
+    can still paste a JD there and get everything correctly redrafted."""
+    render_paste_jd_notice()
+    job_key = f"{job.get('source')}_{job.get('job_id')}"
+    pasted_jd = st.text_area(
+        "Paste the job description", key=f"jd_paste_pre_{job_key}", height=120,
+        placeholder="Paste the full job posting text here...",
+        label_visibility="collapsed",
+    )
+    if st.button("Save job description", key=f"jd_paste_pre_save_{job_key}"):
+        if not pasted_jd.strip():
+            st.toast("Paste the job description text first.", icon=":material/warning:")
+        else:
+            from search.job_store import update_job_description
+
+            update_job_description(job["source"], job["job_id"], pasted_jd.strip())
+            job["description"] = pasted_jd.strip()
+            st.toast(
+                "Saved - whatever you generate next will be tailored against it.",
+                icon=":material/check_circle:",
+            )
+            st.rerun()
+
+
+def render_paste_jd_prompt(job: dict) -> None:
+    """Post-hoc active fallback for a job with no captured JD text
+    (ZipRecruiter, Indeed, the industry job boards - confirmed live
+    2026-08-06 that these sources genuinely have no real posting text
+    available, either because the site blocks automated access or no
+    detail-page fetch exists yet). Lives inside an already-drafted resume's
+    own score card - kept as a fallback for resumes drafted blind before
+    render_paste_jd_prompt_before_drafting() existed, or for anyone who
+    skips the proactive prompt and drafts anyway. See that function's
+    docstring for the proactive version, which is now the primary path.
+
+    Saving goes through the exact same read path every other job already
+    uses - search.job_store.update_job_description() sets job["description"]
+    (which tailoring.drafting._extract_ats_keywords() already reads) and
+    clears any stale empty ats_required_keywords/ats_preferred_keywords
+    cache, so the regenerate below re-extracts for real instead of reusing
+    the old "nothing found" result. Unlike the proactive version, this one
+    DOES immediately regenerate the resume - a draft already exists here
+    and needs to catch up, whereas the proactive version has nothing yet
+    to regenerate."""
+    render_paste_jd_notice()
     job_key = f"{job.get('source')}_{job.get('job_id')}"
     pasted_jd = st.text_area(
         "Paste the job description", key=f"jd_paste_{job_key}", height=120,
@@ -1627,6 +1688,9 @@ elif active_tab == "results":
                 requested = app_record.get("documents_requested") or []
                 status = app_record.get("status")
 
+                if not _job_has_captured_jd_text(job):
+                    render_paste_jd_prompt_before_drafting(job)
+
                 st.markdown("**Documents for this application**")
                 doc_types = [
                     ("resume", "Resume"),
@@ -1732,8 +1796,7 @@ elif active_tab == "results":
                         with st.expander(f"{doc_label} (drafted)"):
                             if doc_key == "resume" and app_record.get("resume_ats_score") is not None:
                                 with st.container(border=True):
-                                    has_jd_text = bool((job.get("qualification_summary") or job.get("description") or "").strip())
-                                    if not has_jd_text:
+                                    if not _job_has_captured_jd_text(job):
                                         render_paste_jd_prompt(job)
                                     current_score = app_record["resume_ats_score"]
                                     prev_score_key = f"prev_ats_score_{job.get('source')}_{job.get('job_id')}"
