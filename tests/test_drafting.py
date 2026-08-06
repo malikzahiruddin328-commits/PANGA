@@ -1,4 +1,9 @@
-from tailoring.drafting import _merge_keyword_gap_questions, _questions_worth_asking, save_gap_answers
+from tailoring.drafting import (
+    _merge_keyword_gap_questions,
+    _questions_worth_asking,
+    _suggested_answer_for_keyword_gap,
+    save_gap_answers,
+)
 
 
 def test_maxed_score_suppresses_clarifying_questions():
@@ -16,6 +21,26 @@ def test_empty_questions_stay_empty_regardless_of_score():
     assert _questions_worth_asking([], 100) == []
 
 
+def test_suggested_answer_for_keyword_gap_is_honest_when_no_signal_at_all():
+    result = _suggested_answer_for_keyword_gap("Databricks", {"name": "Jane Doe", "seniority": "Director"})
+    assert result != ""
+    # Never asserted as fact - must not claim the candidate has the skill.
+    assert "unknown" in result.lower() or "please describe" in result.lower()
+
+
+def test_suggested_answer_for_keyword_gap_surfaces_a_real_profile_mention():
+    profile = {"name": "Jane Doe", "notes": "Led a Databricks migration in 2023."}
+    result = _suggested_answer_for_keyword_gap("Databricks", profile)
+    assert "Databricks" in result
+    # Still hedged/asking for confirmation, not stated as settled fact.
+    assert "confirm" in result.lower() or "?" in result
+
+
+def test_suggested_answer_for_keyword_gap_handles_none_profile():
+    result = _suggested_answer_for_keyword_gap("Databricks", None)
+    assert result != ""
+
+
 def test_merge_keyword_gap_questions_adds_a_real_skill_gap_question():
     # 2026-08-06: missing required keywords used to sit as inert
     # ats_next_actions bullet text - now they become real, answerable
@@ -26,9 +51,9 @@ def test_merge_keyword_gap_questions_adds_a_real_skill_gap_question():
     assert q["type"] == "skill_gap"
     assert q["skill"] == "Databricks"
     assert "Databricks" in q["question"]
-    # No fabricated guess - there's no honest basis to hedge whether the
-    # candidate has a specific named skill, unlike a number/scope question.
-    assert q["suggested_answer"] == ""
+    # Zahir's correction 2026-08-06: even here, a real starting guess beats
+    # a blank box - never fabricated as a fact, but something to react to.
+    assert q["suggested_answer"] != ""
 
 
 def test_merge_keyword_gap_questions_adds_one_per_missing_keyword():

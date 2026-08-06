@@ -2296,13 +2296,16 @@ elif active_tab == "results":
                                         st.markdown("**How to raise it:**")
                                         for action in next_actions:
                                             st.markdown(f"- {action}")
-                                    open_questions = app_record.get("resume_clarifying_questions") or []
-                                    if open_questions:
-                                        n = len(open_questions)
-                                        st.markdown(
-                                            f"*{n} open profile-gap question{'s' if n != 1 else ''} - "
-                                            "see the **Profile gaps** tab to answer.*"
-                                        )
+                                    # Inline here, not just a pointer to the Profile Gaps tab
+                                    # (Zahir's correction 2026-08-06, live-testing: expanding a
+                                    # specific job's score card is a clear signal of focus on
+                                    # THIS job - he wants to answer right there, not context-
+                                    # switch to a separate tab). Profile Gaps still exists for
+                                    # scanning across every job at once; this is additive, not a
+                                    # replacement - same shared render_gap_questions_section(),
+                                    # same "Save answers & regenerate resume" behavior, just
+                                    # rendered in both places now.
+                                    render_gap_questions_section(job, app_record)
                             if doc_key == "resume" and app_record.get("resume_ats_score") is not None:
                                 st.markdown(f"**Resume text (ATS score: {app_record['resume_ats_score']}/100):**")
                             st.code(drafted_text, language=None, wrap_lines=True)
