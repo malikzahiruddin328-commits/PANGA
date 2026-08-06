@@ -269,6 +269,51 @@ def job_label(job: dict) -> str:
     return f"{job.get('title')} - {job.get('organization')}"
 
 
+# Shared with the Results tab's own filtering pipeline below, so a status
+# string typo can't make the two silently disagree about which jobs count
+# as hidden-by-default.
+NOT_INTERESTED_STATUSES = ("not interested", "not-interested")  # handle both forms - see applications.py note
+CLOSED_STATUSES = ("closed by employer",)
+APPLIED_STATUSES = ("applied",)
+
+
+def compute_results_ranked(
+    jobs: list[dict], target_roles: list[dict], min_score: int,
+    show_not_interested: bool, show_closed: bool, show_applied: bool,
+) -> list[dict]:
+    """The same rank/filter/dedup pipeline the Results tab's own "N job(s)"
+    heading computes (score threshold, the three hide-by-default statuses,
+    cross-source dedup) - pulled out so the Results tab's nav-bar badge can
+    show that same number instead of the raw unfiltered job-store total
+    (Zahir's explicit ask 2026-08-06: the badge should reflect what he'll
+    actually action, not everything ever scanned). The badge is rendered
+    before the tab itself runs, so it calls this with whatever the filter
+    widgets were last set to (via their session_state keys, defaulting to
+    each widget's own default if the tab's never been visited yet) - the
+    page below calls it again with that run's live widget values once
+    they've actually rendered. One real consequence: if you change a
+    filter while ON the Results tab, the badge can lag one rerun behind the
+    page's own heading until the next interaction - a fresh call each rerun
+    would need the widgets to render before the nav bar does, which they
+    can't. Doesn't compute the intermediate hidden-by-each-filter counts
+    the page's own checkbox labels show - those still live inline below,
+    since they need the running total at each stage, not just the end
+    result."""
+    def sort_key(job):
+        has_score = "fit_score" in job
+        return (has_score, job.get("fit_score", -1), weight_for(job.get("title"), target_roles))
+
+    ranked = sorted(jobs, key=sort_key, reverse=True)
+    ranked = [j for j in ranked if "fit_score" in j and j["fit_score"] >= min_score]
+    if not show_not_interested:
+        ranked = [j for j in ranked if application_status(j) not in NOT_INTERESTED_STATUSES]
+    if not show_closed:
+        ranked = [j for j in ranked if application_status(j) not in CLOSED_STATUSES]
+    if not show_applied:
+        ranked = [j for j in ranked if application_status(j) not in APPLIED_STATUSES]
+    return dedupe_across_sources(ranked)
+
+
 def _format_last_synced(iso_timestamp: str | None) -> str:
     """Human-readable "Last synced ..." line for the Call to Action tab's
     status card. `iso_timestamp` is fulfillment.get_last_synced_at()'s
@@ -881,6 +926,44 @@ def go_to_prep(target: dict) -> None:
     st.rerun()
 
 
+# Structured reasons for the inline "Pass" action below (Zahir's explicit
+# ask, relayed via hub 2026-08-06): categories, not open-ended prose, since
+# the plan is to look for patterns across them later. Deliberately reuses
+# applications.py's existing skip_reason field/storage rather than adding a
+# parallel one - the category (or free text for "Something else") becomes
+# the skip_reason string exactly like the existing full-detail-panel "Why
+# not interested?" box already does, so get_unreviewed_skip_reasons() and
+# the rest of that review loop keep working unchanged on both paths.
+PASS_REASON_CATEGORIES = [
+    "Wrong seniority level",
+    "Not my industry/domain",
+    "Comp too low",
+    "Location doesn't work",
+    "Something else",
+]
+
+
+@st.dialog("Why pass on this job?")
+def _pass_reason_dialog(source: str, job_id: str, label: str) -> None:
+    st.markdown(f"**{label}**")
+    reason_category = st.radio("Reason", PASS_REASON_CATEGORIES, key="pass_reason_category")
+    free_text = ""
+    if reason_category == "Something else":
+        free_text = st.text_area("What's the reason?", key="pass_reason_free_text")
+    confirm_col, cancel_col = st.columns(2)
+    with confirm_col:
+        if st.button("Confirm pass", type="primary", key="pass_reason_confirm"):
+            skip_reason = free_text.strip() if reason_category == "Something else" and free_text.strip() else reason_category
+            upsert_application(source, job_id, status="not interested", skip_reason=skip_reason)
+            st.session_state.pop("pass_dialog_pending", None)
+            st.toast("Marked not interested.", icon=":material/check_circle:")
+            st.rerun()
+    with cancel_col:
+        if st.button("Cancel", key="pass_reason_cancel"):
+            st.session_state.pop("pass_dialog_pending", None)
+            st.rerun()
+
+
 title_col, license_col = st.columns([5, 1])
 with title_col:
     st.title("Panga - Job Search")
@@ -896,7 +979,27 @@ all_cta = get_active_cta_emails()
 prep_records = load_interview_prep()
 
 cta_count = len(all_cta)
-results_count = len(jobs)
+# Was len(jobs) - the raw, unfiltered job-store total (1225), not what the
+# tab actually shows once its own score-threshold and hide-by-default
+# filters run (46) - every other tab badge here is an actionable count
+# ("Call to action (7)" = emails needing a reply, "Profile gaps (16)" =
+# open questions), so Results should follow suit rather than being the one
+# outlier showing "everything ever scanned" (Zahir's explicit ask,
+# 2026-08-06). Reads the filter widgets' own session_state keys rather
+# than recomputing them here, since they're real widgets defined further
+# below - falls back to each widget's own default (matching what a
+# first-ever visit to the tab would show) if it hasn't been visited yet
+# this session.
+results_settings = load_settings()
+results_target_roles = results_settings.get("target_roles", [])
+results_count = len(compute_results_ranked(
+    jobs, results_target_roles,
+    min_score=st.session_state.get("results_min_score", 70),
+    show_not_interested=st.session_state.get("results_show_not_interested", False),
+    show_closed=st.session_state.get("results_show_closed", False),
+    show_applied=st.session_state.get("results_show_applied", False),
+))
+results_total_scanned = len(jobs)
 prep_in_progress_count = sum(1 for r in prep_records for round_ in r["rounds"] if round_["status"] == "in_progress")
 gaps_count = len(get_applications_with_open_clarifying_questions())
 
@@ -1954,10 +2057,15 @@ elif active_tab == "results":
 
     unscored_count = sum(1 for j in jobs if "fit_score" not in j)
     scored_count = len(jobs) - unscored_count
+    # Explicit, stable keys (rather than the auto-generated ones these had
+    # before) so compute_results_ranked() can read each filter's current
+    # value from st.session_state for the nav-bar badge above, before this
+    # widget has rendered on a given run.
     min_score = st.slider(
         "Minimum compatibility score",
         0, 100, 70,
         help="Hides low-fit results (e.g. unrelated roles pulled in by broad keyword matches).",
+        key="results_min_score",
     )
     # Unscored jobs are hidden by default, NOT always shown - showing
     # unscored jobs regardless of the slider defeated the purpose of scoring
@@ -1967,11 +2075,13 @@ elif active_tab == "results":
     # jobs from "Run now" won't show here until one of those has run.
     ranked = [j for j in ranked if "fit_score" in j and j["fit_score"] >= min_score]
 
-    NOT_INTERESTED = ("not interested", "not-interested")  # handle both forms - see applications.py note
-    not_interested_count = sum(1 for j in ranked if application_status(j) in NOT_INTERESTED)
-    show_not_interested = st.checkbox(f"Show {not_interested_count} job(s) marked 'not interested' (hidden by default, nothing is deleted)")
+    not_interested_count = sum(1 for j in ranked if application_status(j) in NOT_INTERESTED_STATUSES)
+    show_not_interested = st.checkbox(
+        f"Show {not_interested_count} job(s) marked 'not interested' (hidden by default, nothing is deleted)",
+        key="results_show_not_interested",
+    )
     if not show_not_interested:
-        ranked = [j for j in ranked if application_status(j) not in NOT_INTERESTED]
+        ranked = [j for j in ranked if application_status(j) not in NOT_INTERESTED_STATUSES]
 
     # Separate from "not interested" (Zahir's own preference) - this is the
     # posting itself having closed on the source site (LinkedIn showing "No
@@ -1980,22 +2090,26 @@ elif active_tab == "results":
     # a distinct status/count rather than folding into NOT_INTERESTED so the
     # two different reasons ("I don't want it" vs. "it's gone") stay visible
     # as different information, not conflated into one bucket.
-    CLOSED = ("closed by employer",)
-    closed_count = sum(1 for j in ranked if application_status(j) in CLOSED)
-    show_closed = st.checkbox(f"Show {closed_count} job(s) marked 'closed by employer' (hidden by default, nothing is deleted)")
+    closed_count = sum(1 for j in ranked if application_status(j) in CLOSED_STATUSES)
+    show_closed = st.checkbox(
+        f"Show {closed_count} job(s) marked 'closed by employer' (hidden by default, nothing is deleted)",
+        key="results_show_closed",
+    )
     if not show_closed:
-        ranked = [j for j in ranked if application_status(j) not in CLOSED]
+        ranked = [j for j in ranked if application_status(j) not in CLOSED_STATUSES]
 
     # Same hide-but-never-delete pattern again (2026-08-05 request): once a
     # job is marked "applied" there's nothing left to do on it here, so by
     # default Results should only show jobs still needing a decision -
     # already-applied jobs stay tracked (CTA/status still update normally)
     # but no longer crowd out the ones that actually need attention.
-    APPLIED = ("applied",)
-    applied_count = sum(1 for j in ranked if application_status(j) in APPLIED)
-    show_applied = st.checkbox(f"Show {applied_count} job(s) marked 'applied' (hidden by default, nothing is deleted)")
+    applied_count = sum(1 for j in ranked if application_status(j) in APPLIED_STATUSES)
+    show_applied = st.checkbox(
+        f"Show {applied_count} job(s) marked 'applied' (hidden by default, nothing is deleted)",
+        key="results_show_applied",
+    )
     if not show_applied:
-        ranked = [j for j in ranked if application_status(j) not in APPLIED]
+        ranked = [j for j in ranked if application_status(j) not in APPLIED_STATUSES]
 
     # Cross-source dedup (2026-07-30): if a company has a direct-site channel
     # (Eisai/AbbVie/IQVIA via company_sites.py) and the same real opening also
@@ -2008,6 +2122,15 @@ elif active_tab == "results":
         st.markdown(f"{unscored_count} job(s) found but not yet compatibility-scored - hidden until the next scoring pass (daily scheduled task, or ask Claude to score them now).")
 
     st.subheader(f"{len(ranked)} job(s)")
+    # Zahir's explicit ask alongside the badge fix above: don't lose the
+    # 1225 total scanned entirely just because the badge/heading now leads
+    # with the actionable 46 - keep that transparency, right where both
+    # numbers are simultaneously known and can't drift out of sync with
+    # each other (this line always reflects the real, live ranked list,
+    # unlike the badge above the tabs, which can lag one rerun behind while
+    # actively changing a filter - see compute_results_ranked()'s
+    # docstring).
+    st.caption(f"{len(jobs)} job(s) scanned, {len(ranked)} match your profile and current filters.")
 
     # Grouped by channel (source) per Zahir's request 2026-07-29 - each
     # channel (USAJOBS, Dice, ZipRecruiter, etc.) gets its own section.
@@ -2050,7 +2173,27 @@ elif active_tab == "results":
         if cross_source_merged:
             dup_notes.append(f"{cross_source_merged} job-board posting(s) matched to this direct listing")
         dup_note = f", {'; '.join(dup_notes)}" if dup_notes else ""
-        with st.expander(f"{channel} ({len(deduped)}{dup_note})", expanded=False):
+        # Investigated a reported inconsistency (2026-08-06, relayed via
+        # hub): USAJOBS seen expanded on page load while Indeed was
+        # correctly collapsed. Could not reproduce with a genuinely fresh
+        # session - a brand-new browser tab against a brand-new server
+        # process shows every channel (USAJOBS included) starting
+        # collapsed, matching the flat expanded=False every channel gets
+        # here (no per-channel branching exists in this loop - all sources,
+        # job boards and direct-company-sites alike, go through this same
+        # code). No expander-related key ever gets written to
+        # st.session_state elsewhere in this file either. Best explanation:
+        # without an explicit key, an expander's open/closed state lives
+        # only in the frontend's React tree, never synced to Python - once
+        # a channel is opened by hand in an already-connected browser tab,
+        # that tab keeps remembering it across reruns even though the
+        # underlying script always initializes to collapsed; a real hard
+        # reload resets it. Added an explicit, stable key below anyway -
+        # not a fix for a bug that didn't reproduce in the code, but it
+        # makes each expander's identity explicit rather than relying on
+        # Streamlit's implicit auto-generated one, which is better practice
+        # regardless and removes one hypothetical variable if this recurs.
+        with st.expander(f"{channel} ({len(deduped)}{dup_note})", expanded=False, key=f"channel_expander_{channel}"):
             table_rows = []
             for job in deduped:
                 pay_min, pay_max = format_pay(job.get("pay_min")), format_pay(job.get("pay_max"))
@@ -2063,6 +2206,7 @@ elif active_tab == "results":
                     "Status": application_status(job) or "-",
                     "JD": "✓" if _job_has_captured_jd_text(job) else "–",
                     "Posting": job.get("posting_url"),
+                    "Pass": "Pass",  # ButtonColumn's label comes from the cell value itself - same word every row on purpose
                 })
             df = pd.DataFrame(table_rows)
 
@@ -2087,6 +2231,31 @@ elif active_tab == "results":
                     st.session_state[selected_idx_key] = click["row"]
                     st.session_state[scroll_pending_key] = True
 
+            # Inline "Pass" (Zahir's explicit ask, relayed via hub
+            # 2026-08-06): marking a job "not interested" used to mean
+            # activating the row, scrolling to its full detail panel, and
+            # finding "Mark status" among three side-by-side fields - too
+            # many steps for what should be a quick, one-click pass. This
+            # button is reachable straight from the table, same ButtonColumn
+            # mechanism as the existing Role click-to-activate above. The
+            # callback only records WHICH job was clicked (same
+            # default-arg-closure pattern as _activate_row, needed because
+            # `deduped` is rebound each loop iteration) - the actual dialog
+            # is opened once, after the channel loop ends, never from inside
+            # a callback or from inside this loop, since Streamlit only
+            # allows one dialog function call per script run.
+            pass_click_key = f"passclick_{channel}"
+
+            def _trigger_pass(pass_click_key=pass_click_key, channel_deduped=deduped):
+                click = st.session_state.get(pass_click_key)
+                if click:
+                    clicked_job = channel_deduped[click["row"]]
+                    st.session_state["pass_dialog_pending"] = {
+                        "source": clicked_job.get("source"),
+                        "job_id": clicked_job.get("job_id"),
+                        "label": job_label(clicked_job),
+                    }
+
             st.dataframe(
                 df,
                 hide_index=True,
@@ -2100,6 +2269,11 @@ elif active_tab == "results":
                     "JD": st.column_config.TextColumn(
                         "JD", alignment="left", width="small",
                         help="Whether Panga has this posting's job description text to score and tailor against.",
+                    ),
+                    "Pass": st.column_config.ButtonColumn(
+                        "Pass", type="tertiary", alignment="left", width="small",
+                        help="Mark not interested, with a structured reason for later pattern analysis - doesn't affect what's shown to you.",
+                        on_click=_trigger_pass, key=pass_click_key,
                     ),
                 }),
                 key=f"table_{channel}",
@@ -2510,6 +2684,14 @@ elif active_tab == "results":
                         st.rerun()
                 st.divider()
                 render_outreach_section(f"job_{job.get('source')}_{job.get('job_id')}", job_source=job.get("source"), job_id=job.get("job_id"))
+
+    # Opened once, after every channel's table has had a chance to set it
+    # (Streamlit allows only one dialog function call per script run) -
+    # never call _pass_reason_dialog from inside the per-channel loop or
+    # from a callback.
+    pending_pass = st.session_state.get("pass_dialog_pending")
+    if pending_pass:
+        _pass_reason_dialog(pending_pass["source"], pending_pass["job_id"], pending_pass["label"])
 
 elif active_tab == "prospector":
     render_feedback_widget("prospector")

@@ -128,6 +128,58 @@ def match_application_confirmation(thread_summary: dict, full_body: str, candida
     )
 
 
+_CTA_MATCH_SYSTEM_PROMPT = """You are matching a job-search email (a rejection, interview request, or offer) to a specific job record from Zahir Uddin's job-search tool "Panga", so his application status can be updated automatically. Only report a match if you are genuinely confident - if the email doesn't give enough detail to distinguish between multiple candidate jobs (e.g. two identically-titled postings at different companies, or the email is generic/ambiguous about which role it's about), do not guess; report matched=false instead. A wrong match is worse than no match - it would silently mark the wrong application as rejected/interviewing/offered."""
+
+# Same shape as _MATCH_SCHEMA above, kept as its own object rather than
+# shared so each prompt's schema description text stays accurate to what
+# it's actually describing (a "confirmation" email there, any of
+# rejection/interview_request/offer here).
+_CTA_MATCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "matched": {"type": "boolean"},
+        "source": {"type": "string", "description": "The matched job's source field. Empty string if matched=false."},
+        "job_id": {"type": "string", "description": "The matched job's job_id field. Empty string if matched=false."},
+        "reason": {"type": "string", "description": "One sentence: what the email said, or why no confident match exists."},
+    },
+    "required": ["matched", "source", "job_id", "reason"],
+    "additionalProperties": False,
+}
+
+
+def match_cta_application(category: str, thread_summary: dict, full_body: str, candidate_jobs: list[dict]) -> dict:
+    """Matches a rejection/interview_request/offer email to a specific
+    application - same "confident match or explicitly no match" pattern
+    as match_application_confirmation above, extended to the CTA
+    categories that actually represent a status transition (see
+    scripts/gmail_cta_scan.py's _CTA_STATUS_BY_CATEGORY for why
+    assessment_request/recruiter_question are deliberately excluded - a
+    question or an assessment ask isn't a status change, and there's no
+    corresponding value in applications.py's status lifecycle for either).
+    `candidate_jobs` is every application not already in a terminal status
+    (rejected/not interested/save for later/closed by employer) - the
+    caller is responsible for that filtering, this function only matches
+    within whatever list it's handed. Returns {"matched": bool, "source":
+    str, "job_id": str, "reason": str}."""
+    client = get_client()
+    content = (
+        f"CATEGORY: {category}\n"
+        f"Subject: {thread_summary.get('subject', '')}\n"
+        f"From: {thread_summary.get('sender', '')}\nBody:\n{full_body}\n\n"
+        "CANDIDATE APPLICATIONS (not yet in a final/closed status):\n" + json.dumps(candidate_jobs, indent=2, default=str)
+    )
+    return call_structured(
+        client,
+        system=_CTA_MATCH_SYSTEM_PROMPT,
+        user_content=content,
+        schema=_CTA_MATCH_SCHEMA,
+        max_tokens=500,
+        effort="medium",
+        thinking=False,
+        refusal_message="Claude declined to match this email. Treating as no match for safety.",
+    )
+
+
 _DRAFT_REPLY_SYSTEM_PROMPT = f"""You are composing a short, professional email reply on Zahir Uddin's behalf, for his job-search tool "Panga". This becomes a Gmail DRAFT only - it is never sent automatically, Zahir reviews and sends it himself, so err toward a reasonable draft rather than declining.
 
 {_TARGETING_CONTEXT}
