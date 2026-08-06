@@ -31,6 +31,8 @@ def isolated_data(tmp_path, monkeypatch):
     import tailoring.dossier as dossier
     import tailoring.interview_prep as interview_prep
     import tailoring.cta_emails as cta_emails
+    import prospector.outreach as outreach
+    import fulfillment
 
     monkeypatch.setattr(job_store, "JOBS_PATH", tmp_path / "jobs.json")
     monkeypatch.setattr(applications, "APPLICATIONS_PATH", tmp_path / "applications.json")
@@ -39,4 +41,6 @@ def isolated_data(tmp_path, monkeypatch):
     monkeypatch.setattr(dossier, "DOSSIER_DIR", tmp_path / "dossiers")
     monkeypatch.setattr(interview_prep, "INTERVIEW_PREP_PATH", tmp_path / "interview_prep.json")
     monkeypatch.setattr(cta_emails, "CTA_EMAILS_PATH", tmp_path / "cta_emails.json")
+    monkeypatch.setattr(outreach, "OUTREACH_PATH", tmp_path / "outreach.json")
+    monkeypatch.setattr(fulfillment, "SYNC_STATUS_PATH", tmp_path / "fulfillment_status.json")
     return tmp_path

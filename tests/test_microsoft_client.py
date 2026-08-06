@@ -175,3 +175,33 @@ def test_get_message_body_strips_html(monkeypatch):
     body = microsoft_client.get_message_body("m1")
     assert "Hi" in body and "there" in body
     assert "<b>" not in body and ".x{}" not in body
+
+
+def test_create_draft_extracts_bare_address_from_display_name_format(monkeypatch):
+    monkeypatch.setattr(microsoft_client, "_headers", lambda: {})
+    posted = {}
+
+    def fake_post(url, headers, json, timeout):
+        posted["body"] = json
+        return FakeResponse({"id": "draft1"})
+    monkeypatch.setattr(microsoft_client.requests, "post", fake_post)
+    microsoft_client.create_draft("Some Recruiter <recruiter@example.com>", "Subj", "Body")
+    assert posted["body"]["toRecipients"] == [{"emailAddress": {"address": "recruiter@example.com"}}]
+
+
+def test_create_draft_reply_extracts_bare_address_too(monkeypatch):
+    monkeypatch.setattr(microsoft_client, "_headers", lambda: {})
+    calls = []
+
+    def fake_post(url, headers, json, timeout):
+        calls.append(("post", json))
+        return FakeResponse({"id": "draft2"})
+
+    def fake_patch(url, headers, json, timeout):
+        calls.append(("patch", json))
+        return FakeResponse({}, status_code=204)
+    monkeypatch.setattr(microsoft_client.requests, "post", fake_post)
+    monkeypatch.setattr(microsoft_client.requests, "patch", fake_patch)
+    microsoft_client.create_draft("Some Recruiter <recruiter@example.com>", "Re: Subj", "Body", reply_to_message_id="orig1")
+    patch_body = calls[1][1]
+    assert patch_body["toRecipients"] == [{"emailAddress": {"address": "recruiter@example.com"}}]
