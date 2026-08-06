@@ -1898,11 +1898,31 @@ elif active_tab == "cta":
             st.rerun()
 
     counts = {cat: sum(1 for e in all_cta if e.get("category") == cat) for cat in CATEGORY_ORDER}
-    stat_cols = st.columns(len(CATEGORY_ORDER))
-    for col, cat in zip(stat_cols, CATEGORY_ORDER):
-        with col:
-            st.badge(CATEGORY_LABELS[cat], color=CATEGORY_COLORS[cat])
-            st.metric("Count", counts[cat], label_visibility="collapsed")
+    # Compact single-line stat strip (Zahir's live-testing feedback,
+    # 2026-08-06): 5x st.columns()+st.metric() each claimed a full
+    # 1/5-width column for a single digit - mostly empty space, since
+    # st.columns() always spans the full container width regardless of how
+    # little its content needs, so there's no column-ratio fix for that.
+    # Reuses the real st.badge() widget (theme-correct light/dark, same
+    # semantic colors already used elsewhere on this tab) with label+count
+    # folded into one string, then a scoped CSS rule (same
+    # .st-key-{container} pattern as progress_shimmer_css) reflows the
+    # normally block-stacked badges into one wrapping horizontal row.
+    stat_strip_key = "cta_stat_strip"
+    st.html(f"""<style>
+.st-key-{stat_strip_key}[data-testid="stVerticalBlock"] {{
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    align-items: center;
+}}
+.st-key-{stat_strip_key} [data-testid="stElementContainer"] {{
+    width: auto;
+}}
+</style>""")
+    with st.container(key=stat_strip_key):
+        for cat in CATEGORY_ORDER:
+            st.badge(f"{CATEGORY_LABELS[cat]} **{counts[cat]}**", color=CATEGORY_COLORS[cat])
 
     f1, f2 = st.columns([1, 2])
     with f1:
