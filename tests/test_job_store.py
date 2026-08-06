@@ -76,3 +76,34 @@ def test_update_job_ats_keywords_caches_empty_lists_as_a_real_value(isolated_dat
     job = job_store.load_jobs()[0]
     assert job["ats_required_keywords"] == []
     assert job["ats_preferred_keywords"] == []
+
+
+def test_update_job_description_sets_description(isolated_data):
+    job_store.save_jobs([{"source": "Eisai", "job_id": "1", "title": "Director"}])
+    job_store.update_job_description("Eisai", "1", "Real JD text.")
+    job = job_store.load_jobs()[0]
+    assert job["description"] == "Real JD text."
+
+
+def test_update_job_description_clears_stale_empty_ats_keyword_cache(isolated_data):
+    # Real bug this guards against: if a job was cached with empty keyword
+    # lists BEFORE it had any real JD text, drafting.py's
+    # _extract_ats_keywords() would treat that empty cache as "already
+    # tried, genuinely nothing there" forever - even after real text is
+    # backfilled - since it only re-attempts when the keys are absent, not
+    # merely empty. Backfilling description must reset that cache so the
+    # next regenerate re-extracts for real.
+    job_store.save_jobs([{"source": "Eisai", "job_id": "1", "title": "Director"}])
+    job_store.update_job_ats_keywords("Eisai", "1", [], [])
+    job_store.update_job_description("Eisai", "1", "Real JD text.")
+    job = job_store.load_jobs()[0]
+    assert job["description"] == "Real JD text."
+    assert "ats_required_keywords" not in job
+    assert "ats_preferred_keywords" not in job
+
+
+def test_update_job_description_no_op_when_job_not_found(isolated_data):
+    job_store.save_jobs([{"source": "Eisai", "job_id": "1", "title": "Director"}])
+    job_store.update_job_description("Eisai", "does-not-exist", "text")
+    job = job_store.load_jobs()[0]
+    assert "description" not in job

@@ -123,6 +123,32 @@ def update_job_ats_keywords(source: str, job_id: str, required_keywords: list[st
         write_json(JOBS_PATH, jobs)
 
 
+def update_job_description(source: str, job_id: str, description: str) -> None:
+    """Backfills real JD text onto an already-saved job record (2026-08-06:
+    company_sites.py's Workday/SmartRecruiters searches now capture this at
+    search time for new jobs, via scripts/backfill_jd_text.py for jobs
+    saved before that fix existed).
+
+    Also clears any previously-cached ats_required_keywords/
+    ats_preferred_keywords: those were computed from empty text before this
+    backfill ran, and drafting.py's _extract_ats_keywords() only re-attempts
+    extraction when those keys are absent, not when they're merely an empty
+    list (a real, deliberately "sticky" cache - see its own docstring) - so
+    without clearing them here, a backfilled job would keep looking like
+    extraction was already tried and genuinely found nothing, even though
+    real text is now available. Clearing them lets the next resume
+    regenerate re-extract for real."""
+    with locked("jobs"):
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("source") == source and job.get("job_id") == job_id:
+                job["description"] = description
+                job.pop("ats_required_keywords", None)
+                job.pop("ats_preferred_keywords", None)
+                break
+        write_json(JOBS_PATH, jobs)
+
+
 def update_job_score(source: str, job_id: str, fit_score: int, fit_rationale: str) -> None:
     """fit_score is 0-100: how well this job matches the master profile,
     per PRD §3 "Fit + Tailoring". Computed by Claude reasoning over the job
