@@ -34,6 +34,7 @@ def isolated_data(tmp_path, monkeypatch):
     import prospector.outreach as outreach
     import fulfillment
     import profile.storage as profile_storage
+    import profile.ingest as profile_ingest
 
     monkeypatch.setattr(job_store, "JOBS_PATH", tmp_path / "jobs.json")
     monkeypatch.setattr(applications, "APPLICATIONS_PATH", tmp_path / "applications.json")
@@ -51,4 +52,13 @@ def isolated_data(tmp_path, monkeypatch):
     # now so every test gets the same safety by construction, not by each
     # test file remembering to do it itself.
     monkeypatch.setattr(profile_storage, "MASTER_PROFILE_PATH", tmp_path / "master_profile.json")
+    # Same class of gap as MASTER_PROFILE_PATH above - profile/ingest.py's
+    # manifest/raw-text store was never isolated either, so any test that
+    # uploads/removes a document would silently touch the real data/profile
+    # folder. PROJECT_ROOT must move too: ingest_uploaded_document() computes
+    # each entry's "extracted_to" via out_path.relative_to(PROJECT_ROOT), which
+    # raises ValueError if OUTPUT_DIR isn't actually under PROJECT_ROOT.
+    monkeypatch.setattr(profile_ingest, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(profile_ingest, "OUTPUT_DIR", tmp_path / "profile_raw")
+    monkeypatch.setattr(profile_ingest, "MANIFEST_RESULT_PATH", tmp_path / "profile_raw" / "manifest_result.json")
     return tmp_path

@@ -1107,19 +1107,34 @@ if active_tab == "settings":
 
     st.header("Your documents")
     st.markdown(
-        "One shared place to manage everything Panga reads from - your "
-        "resume and other background documents, your LinkedIn profile "
-        "export, and your LinkedIn connections export."
+        "Upload your resume and other background documents here, plus your "
+        "LinkedIn profile export and LinkedIn connections export."
     )
 
     st.subheader("Resume & other source documents")
     st.markdown(
-        "\"Resume\" feeds the gap-probing interview directly. \"Context\" is "
-        "background material like an executive bio or leadership summary. "
-        "\"Reference\" is an example of a previously-tailored application - "
-        "used as a style example, not copied verbatim."
+        "\"Resume\" feeds the gap-probing interview and your target-role "
+        "suggestions - it does **not** feed what gets drafted into tailored "
+        "documents or how postings are scored against you. Those pull from "
+        "your master profile (built from a one-time structuring pass over "
+        "your resume, not automatically kept in sync) - re-uploading a "
+        "resume here won't change drafted documents until that profile is "
+        "updated too. \"Context\" is background material like an executive "
+        "bio or leadership summary. \"Reference\" is an example of a "
+        "previously-tailored application - used as a style example, not "
+        "copied verbatim."
     )
     manifest_entries = load_manifest_result()
+    resume_entries = [e for e in manifest_entries if e["category"] == "resume"]
+    if len(resume_entries) > 1:
+        st.warning(
+            f"{len(resume_entries)} documents are tagged \"resume\" "
+            f"({', '.join(e['source_file'] for e in resume_entries)}). Their "
+            "text is being blended together for the gap interview and "
+            "target-role suggestions, which can mix outdated and current "
+            "content. Keep only your current resume tagged \"resume\" - "
+            "remove the others below, or re-tag them as \"context\"."
+        )
     if manifest_entries:
         manifest_df = pd.DataFrame([{
             "File": e["source_file"],
@@ -3284,9 +3299,8 @@ elif active_tab == "linkedin":
     st.header("LinkedIn profile enhancement")
     st.markdown(
         "Uploads for your LinkedIn profile and connections live in Settings "
-        "now, alongside your resume and other source documents - one shared "
-        "place to manage everything Panga reads from. This tab shows the "
-        "analysis and suggestions once you've uploaded there and run the "
+        "now, alongside your resume and other source documents. This tab "
+        "shows the analysis and suggestions once you've uploaded there and run the "
         "analysis below - it compares your export against your master "
         "profile and target-role skills, and drafts suggested rewrites. "
         "Suggestions below are yours to copy and paste into LinkedIn's own "
