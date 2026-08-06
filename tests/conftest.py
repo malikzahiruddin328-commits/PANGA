@@ -33,6 +33,7 @@ def isolated_data(tmp_path, monkeypatch):
     import tailoring.cta_emails as cta_emails
     import prospector.outreach as outreach
     import fulfillment
+    import profile.storage as profile_storage
 
     monkeypatch.setattr(job_store, "JOBS_PATH", tmp_path / "jobs.json")
     monkeypatch.setattr(applications, "APPLICATIONS_PATH", tmp_path / "applications.json")
@@ -43,4 +44,11 @@ def isolated_data(tmp_path, monkeypatch):
     monkeypatch.setattr(cta_emails, "CTA_EMAILS_PATH", tmp_path / "cta_emails.json")
     monkeypatch.setattr(outreach, "OUTREACH_PATH", tmp_path / "outreach.json")
     monkeypatch.setattr(fulfillment, "SYNC_STATUS_PATH", tmp_path / "fulfillment_status.json")
+    # Real gap found 2026-08-06: profile/storage.py's MASTER_PROFILE_PATH was
+    # never added here despite being exactly the kind of store this fixture
+    # exists to isolate - one test file (test_dossier_edit_detection.py) had
+    # been patching it ad hoc in its own fixture instead. Covered centrally
+    # now so every test gets the same safety by construction, not by each
+    # test file remembering to do it itself.
+    monkeypatch.setattr(profile_storage, "MASTER_PROFILE_PATH", tmp_path / "master_profile.json")
     return tmp_path

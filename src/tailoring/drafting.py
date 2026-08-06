@@ -823,7 +823,10 @@ def save_gap_answers(job: dict, answered_questions: list[dict]) -> None:
     available to every future job's drafting, not just this one.
     answered_questions is the subset of clarifying_questions the candidate
     actually typed a real answer for (blank ones already filtered out by the
-    caller), each a {"skill":, "type":, "answer":} dict - "type" ==
+    caller), each a {"skill":, "type":, "answer":, "question":} dict -
+    "question" is optional (older callers may omit it) and is stored so the
+    Profile Gaps tab's "previously answered" view can show what was
+    actually asked, not just the short skill label. "type" ==
     "disqualifier_check" is saved with is_disqualifier=True so
     SCORE_SYSTEM_PROMPT applies it to every future job, not just this one;
     anything else (including missing/old-shape entries) saves as an ordinary
@@ -841,5 +844,5 @@ def save_gap_answers(job: dict, answered_questions: list[dict]) -> None:
             continue
         save_answer(
             skill=q["skill"], role_context=role_context, answer=answer, date_captured=today,
-            is_disqualifier=(q.get("type") == "disqualifier_check"),
+            question=q.get("question", ""), is_disqualifier=(q.get("type") == "disqualifier_check"),
         )

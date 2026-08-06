@@ -771,6 +771,7 @@ def render_gap_questions_section(job: dict, app_record: dict) -> None:
             "skill": q["skill"],
             "type": q.get("type", "skill_gap"),
             "answer": answer_value,
+            "question": q["question"],
         })
     if st.button("Save answers & regenerate resume", key=f"gapsave_{job_key}"):
         answered = [e for e in answer_entries if e["answer"] and e["answer"].strip()]
@@ -798,6 +799,66 @@ def render_gap_questions_section(job: dict, app_record: dict) -> None:
             else:
                 regen_bar.progress(1.0, text=":material/check_circle: Done.")
                 st.rerun()
+
+
+def render_answered_gap_questions() -> None:
+    """Retrievable/editable history of every confirmed gap answer - Zahir's
+    ask 2026-08-06: once a question is genuinely answered, it correctly
+    drops out of the "open" list forever (both the AI's own dedup and
+    _merge_keyword_gap_questions's profile-history check stop re-asking it)
+    - but that meant there was no way to go back and see or edit what was
+    actually answered. Same "retrievable, editable" principle already built
+    for the JD-paste box, applied here.
+
+    Profile-wide, not per-job (gap_interview_answers lives on the master
+    profile - a confirmed fact applies to every future job's scoring, not
+    just the one that first surfaced it) - a single top-level section here,
+    unlike the per-job "open questions" list above it. Collapsed by default
+    (same as the JD view/update box) so a candidate with nothing to review
+    isn't shown a wall of settled history.
+
+    Editing calls profile.interview.save_answer() again, which now updates
+    the existing entry in place (2026-08-06 fix - it used to silently
+    append a duplicate for the same skill instead of reflecting the
+    current, latest answer)."""
+    profile = load_profile()
+    answers = profile.get("gap_interview_answers", [])
+    if not answers:
+        return
+
+    with st.expander(f"Previously answered ({len(answers)})", expanded=False):
+        for entry in answers:
+            skill = entry.get("skill", "")
+            question_text = entry.get("question") or f"Confirm: {skill}"
+            is_disqualifier = entry.get("is_disqualifier", False)
+            entry_key = abs(hash(f"{skill}|{entry.get('date_captured', '')}")) % 10_000_000
+
+            if is_disqualifier:
+                st.caption(":material/flag: Applies to every future job match, not just one.")
+            st.caption(f"Confirmed {entry.get('date_captured', 'date unknown')} - {entry.get('role_context', '')}")
+            new_answer = st.text_area(
+                question_text, value=entry.get("answer", ""),
+                key=f"answered_edit_{entry_key}", height=68,
+            )
+            if st.button("Update answer", key=f"answered_save_{entry_key}"):
+                stripped = new_answer.strip()
+                if not stripped:
+                    st.toast("Can't clear an answer here - edit it to replacement text instead.", icon=":material/warning:")
+                elif stripped == (entry.get("answer") or "").strip():
+                    st.toast("No changes to save.", icon=":material/info:")
+                else:
+                    from datetime import date
+
+                    from profile.interview import save_answer
+
+                    save_answer(
+                        skill=skill, role_context=entry.get("role_context", ""), answer=stripped,
+                        date_captured=date.today().isoformat(), question=question_text,
+                        is_disqualifier=is_disqualifier,
+                    )
+                    st.toast("Answer updated.", icon=":material/check_circle:")
+                    st.rerun()
+            st.divider()
 
 
 def go_to_prep(target: dict) -> None:
@@ -2929,6 +2990,8 @@ elif active_tab == "gaps":
             score_label = f" - ATS score {score}/100" if score is not None else ""
             with st.expander(f"{job.get('title', 'Untitled role')} @ {job.get('organization', 'Unknown organization')}{score_label} ({n} open)"):
                 render_gap_questions_section(job, app_record)
+
+    render_answered_gap_questions()
 
 elif active_tab == "linkedin":
     render_feedback_widget("linkedin")

@@ -1,4 +1,4 @@
-from tailoring.drafting import _merge_keyword_gap_questions, _questions_worth_asking
+from tailoring.drafting import _merge_keyword_gap_questions, _questions_worth_asking, save_gap_answers
 
 
 def test_maxed_score_suppresses_clarifying_questions():
@@ -83,3 +83,31 @@ def test_merge_keyword_gap_questions_previously_answered_dedup_is_case_insensiti
 def test_merge_keyword_gap_questions_still_asks_about_a_different_unanswered_skill():
     merged = _merge_keyword_gap_questions([], ["Databricks", "Terraform"], previously_answered_skills=["Databricks"])
     assert {q["skill"] for q in merged} == {"Terraform"}
+
+
+def test_save_gap_answers_threads_the_question_text_through(isolated_data):
+    # The "Previously answered" view (app.py) needs the original question
+    # wording, not just the short skill label - must survive the full
+    # save_gap_answers -> profile.interview.save_answer round trip.
+    from profile.storage import load_profile
+
+    job = {"title": "Director", "organization": "Acme"}
+    save_gap_answers(job, [{
+        "skill": "Databricks", "type": "skill_gap", "answer": "Yes, 3 years.",
+        "question": "Do you have real experience with Databricks?",
+    }])
+
+    answers = load_profile()["gap_interview_answers"]
+    assert answers[0]["question"] == "Do you have real experience with Databricks?"
+
+
+def test_save_gap_answers_tolerates_missing_question_field(isolated_data):
+    # Older-shape entries (before "question" was threaded through) must not
+    # crash this call - question is optional.
+    from profile.storage import load_profile
+
+    job = {"title": "Director", "organization": "Acme"}
+    save_gap_answers(job, [{"skill": "Databricks", "type": "skill_gap", "answer": "Yes."}])
+
+    answers = load_profile()["gap_interview_answers"]
+    assert answers[0]["question"] == ""

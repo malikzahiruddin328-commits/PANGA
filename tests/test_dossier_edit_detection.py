@@ -6,9 +6,8 @@ from tailoring.dossier import check_for_edits, sync_workspace_documents
 
 
 @pytest.fixture
-def job(isolated_data, monkeypatch):
+def job(isolated_data):
     import profile.storage as storage
-    monkeypatch.setattr(storage, "MASTER_PROFILE_PATH", isolated_data / "master_profile.json")
     storage.save_profile({"name": "Jane Doe"})
 
     j = {
