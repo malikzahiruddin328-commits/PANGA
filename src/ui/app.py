@@ -165,6 +165,92 @@ CONFIG_PATH = PROJECT_ROOT / ".streamlit" / "config.toml"
 
 st.set_page_config(page_title="Panga - Job Search", page_icon=":material/work:", layout="wide")
 
+# Every st.button(..., icon=...) in this app pairs the icon with a real,
+# non-empty text label (tab nav, "Generate my target roles...", "Open
+# folder", etc.) - the icon is always decorative reinforcement, never the
+# button's only content. But st.button's icon= parameter renders as a bare
+# <span data-testid="stIconMaterial">notifications_active</span> with no
+# aria-hidden/aria-label at all, and the <button> itself ships an explicit
+# but EMPTY aria-label="" (confirmed by inspecting the real DOM). Verified
+# directly against Chrome's own accessibility tree (not just guessed from
+# the ARIA spec text) that an empty aria-label doesn't fall through to the
+# button's visible text the way a *missing* aria-label would - Chrome
+# treats the attribute's mere presence as authoritative and computes an
+# empty accessible name. First pass here only added aria-hidden to the
+# icon span and left that empty aria-label alone - re-checked the
+# accessibility tree afterward (this file's "verify against real data"
+# habit, not just "looks right in code") and found every tab button had
+# gone from a garbled name ("notifications_activeCall to action (7)",
+# Mirror's original finding) to NO name at all, which is worse. Fixing
+# both in the same pass: hide the redundant icon from assistive tech AND
+# set a real aria-label on the button from its own visible text, so the
+# empty one Streamlit ships never gets a chance to win.
+#
+# Diverges from Mirror's literal suggestion (copy task_alt's role="img" +
+# aria-label pattern) on purpose: task_alt is a *standalone* icon with no
+# adjacent text, where labeling the icon itself is the right fix. These
+# icons duplicate a visible label right next to them - labeling the icon
+# too would double-announce ("notifications_active icon, Call to action,
+# 7 items"). Labeling the button directly (from its own text) gets to
+# "Call to action, 7 items" with nothing redundant. Flagged back to
+# Mirror/hub for review since it departs from the literal ask.
+#
+# Can't pass either attribute through the icon= parameter (Python-level
+# API, no such option) - patches the DOM after the fact instead, same
+# technique already used elsewhere in this file for the scroll-into-view
+# anchor. A MutationObserver (not a one-shot query) because Streamlit
+# re-renders these buttons on every tab switch/interaction; the guard flag
+# makes re-running this script block on every rerun a no-op after the
+# first real pass.
+st.html(
+    """
+    <script>
+    (function () {
+        function fixDecorativeIconButtons(root) {
+            root.querySelectorAll('[data-testid="stIconMaterial"]').forEach(function (icon) {
+                var btn = icon.closest('button');
+                var labelEl = btn && btn.querySelector('[data-testid="stMarkdownContainer"]');
+                if (!labelEl) return;
+                icon.setAttribute('aria-hidden', 'true');
+                var labelText = labelEl.textContent.trim();
+                if (labelText) btn.setAttribute('aria-label', labelText);
+            });
+        }
+        fixDecorativeIconButtons(document);
+        if (window.__pangaIconA11yObserver) return;
+        var observer = new MutationObserver(function (mutations) {
+            mutations.forEach(function (m) {
+                m.addedNodes.forEach(function (n) {
+                    if (n.nodeType === 1) fixDecorativeIconButtons(n);
+                });
+            });
+        });
+        observer.observe(document.body, {childList: true, subtree: true});
+        window.__pangaIconA11yObserver = observer;
+    })();
+    </script>
+    """,
+    unsafe_allow_javascript=True,
+)
+
+# st.caption() renders at a fixed 60% opacity - a Streamlit framework
+# default, not something Panga's own code sets per call. Paired with this
+# app's light-theme textColor/backgroundColor (#4A1B0C on #ffffff), that
+# measures ~4.16:1 - under WCAG 1.4.3's 4.5:1 minimum (Mirror's "sweep for
+# other instances of the same [opacity] pattern" following the badge
+# contrast finding above). Captions appear throughout the app (helper
+# text, "Last synced...", disclaimers), so this is deliberately a small,
+# global nudge rather than touching each call site - bumped to 68%
+# opacity (~5.3:1, real margin above the minimum, still visibly
+# de-emphasized relative to normal text) rather than removing the dimming
+# altogether, which would erase the visual hierarchy captions exist for.
+# Dark theme's default already measures ~6.3:1 even at 60% (light text
+# gaining perceptual luminance faster than dark text loses it, at the
+# same alpha) - left alone rather than "fixing" something already
+# compliant, so it stays gated to light mode only.
+if st.context.theme.type == "light":
+    st.html("<style>[data-testid=\"stCaptionContainer\"] { opacity: 0.68 !important; }</style>")
+
 
 def load_settings() -> dict:
     return yaml.safe_load(SETTINGS_PATH.read_text(encoding="utf-8"))
@@ -1559,7 +1645,15 @@ elif active_tab == "cta":
 
     r1, r2 = st.columns([1, 5])
     with r1:
-        if st.button("Refresh"):
+        # Was labeled "Refresh", which read as "go check Gmail again" -
+        # it's actually just st.rerun(), no Gmail call at all (Mirror's
+        # first UI/UX review pass, 2026-08-06). "Send and receive" above is
+        # the one that does real syncing; this button's real, honest
+        # purpose is re-reading the on-disk CTA/application stores without
+        # a Gmail round-trip - useful right after a scheduled task updates
+        # them in the background, or after an action taken elsewhere in
+        # the app. Kept, just renamed to say what it actually does.
+        if st.button("Reload view", help="Re-reads the current data without contacting Gmail - use \"Send and receive\" above for a real sync."):
             st.rerun()
 
     counts = {cat: sum(1 for e in all_cta if e.get("category") == cat) for cat in CATEGORY_ORDER}
@@ -1631,7 +1725,20 @@ elif active_tab == "cta":
                     st.rerun()
             if cat == "interview_request":
                 with actions[3]:
-                    if st.button("Prep for this interview", key=f"prep_cta_{email['thread_id']}"):
+                    # Mirror's first UI/UX review pass (2026-08-06) flagged
+                    # these 4 buttons as same-weight with no hierarchy - not
+                    # fixed by consolidating them (checked against CLAUDE.md's
+                    # "is this really one decision?" test: Open in Gmail,
+                    # Draft reply, Dismiss, and Prep for this interview are 4
+                    # genuinely independent actions a candidate takes at
+                    # different times for different reasons, not steps of one
+                    # decision). What was missing is visual weight - this is
+                    # the one action specific to interview_request and the
+                    # highest-value next step, so it gets type="primary" like
+                    # "Send and receive" above does for the same reason (the
+                    # one action in its row worth drawing the eye to); the
+                    # other 3 stay default/secondary.
+                    if st.button("Prep for this interview", key=f"prep_cta_{email['thread_id']}", type="primary"):
                         go_to_prep({
                             "kind": "email",
                             "thread_id": email["thread_id"],
