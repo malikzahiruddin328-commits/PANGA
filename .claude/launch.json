@@ -1,5 +1,6 @@
 {
   "version": "0.0.1",
+  "_comment": "Dev/test range only: 8501-8509. Production is ALWAYS port 8510, launched only via run_app.bat (which kills-and-restarts on that port) - never add 8510 or anything outside 8501-8509 here. Any session doing manual live-verification must pick one of the named slots below rather than inventing a port ad hoc (2026-08-06, after a port-sprawl leak - see Panga/CLAUDE.md's 'Be proactive, not reactive' section). If you need a slot and all of these are in use, that's a signal to finish and preview_stop an existing one, not to freelance a new port.",
   "configurations": [
     {
       "name": "panga-ui",
@@ -12,6 +13,37 @@
       "runtimeExecutable": "venv/Scripts/streamlit.exe",
       "runtimeArgs": ["run", "src/ui/app.py", "--server.headless", "true", "--server.port", "8504"],
       "port": 8504
+    },
+    {
+      "name": "panga-ui-manual-1",
+      "runtimeExecutable": "venv/Scripts/streamlit.exe",
+      "runtimeArgs": ["run", "src/ui/app.py", "--server.headless", "true", "--server.port", "8505"],
+      "port": 8505
+    },
+    {
+      "name": "panga-ui-manual-2",
+      "runtimeExecutable": "venv/Scripts/streamlit.exe",
+      "runtimeArgs": ["run", "src/ui/app.py", "--server.headless", "true", "--server.port", "8506"],
+      "port": 8506
+    },
+    {
+      "name": "panga-ui-manual-3",
+      "runtimeExecutable": "venv/Scripts/streamlit.exe",
+      "runtimeArgs": ["run", "src/ui/app.py", "--server.headless", "true", "--server.port", "8507"],
+      "port": 8507
+    },
+    {
+      "name": "panga-ui-manual-4",
+      "runtimeExecutable": "venv/Scripts/streamlit.exe",
+      "runtimeArgs": ["run", "src/ui/app.py", "--server.headless", "true", "--server.port", "8508"],
+      "port": 8508
+    },
+    {
+      "name": "panga-ui-rm-verify",
+      "_comment": "Reserved exclusively for Release Manager's merge-verification live-checks (added 2026-08-06 after a port-kill incident on a shared slot). No other session should use this port.",
+      "runtimeExecutable": "venv/Scripts/streamlit.exe",
+      "runtimeArgs": ["run", "src/ui/app.py", "--server.headless", "true", "--server.port", "8509"],
+      "port": 8509
     }
   ]
 }

@@ -50,6 +50,59 @@ when explicitly asked.
   hold every UI change to, the same way the checks above apply to every
   code change.
 
+## Be proactive, not reactive — on everything, not just UI
+
+Every session working in this repo (not just the hub) should anticipate
+foreseeable problems and fix/flag them before they cause a real bug or a
+Zahir report, not wait to be told. This extends the existing HCI and
+race-condition/performance checks above into a general standing posture:
+
+- If you're about to establish a new pattern that other sessions will also
+  do in parallel (a new scheduled process, a new shared file, a new way of
+  spinning up a dev server), ask what breaks at scale once several sessions
+  are doing it independently, and fix that up front - don't wait for
+  someone to hit the collision.
+- If you notice something adjacent to your task that's wrong, stale, or
+  risky (a comment claiming behavior the code doesn't have, a leaked
+  process, an untested assumption), flag it or fix it (if in scope) rather
+  than only doing the narrow thing you were asked for. This is the same
+  instinct behind the JD-fetch gap, the port-sprawl cleanup, and the
+  Mirror doc-vs-code audit - each was worth catching before Zahir had to
+  name the exact problem.
+- Verify against real data/state before reporting something as fact - a
+  claim (yours or another session's) that looks right in code or in a
+  self-reported summary can still be wrong in practice. Check the actual
+  running state, the actual stored data, the actual file on disk.
+- When you finish a task, do a quick "what would break next" pass before
+  reporting done - not just "does this satisfy the literal ask."
+
+2026-08-06: Zahir made this explicit after having to personally spot and
+name a port-isolation issue (prod vs. test dev-server ports colliding)
+that was a predictable consequence of the multi-session setup itself -
+his point wasn't that the fix was wrong, it's that this class of thing
+should be caught proactively, not reactively explained to the AI by him.
+
+**Port convention (concrete example of the above):** production is always
+port 8510, launched only via `run_app.bat` (which kills-and-restarts on
+that port - never anything else touches 8510). Dev/test live-verification
+uses one of the named slots in `.claude/launch.json` (8501-8509 range) -
+never invent an ad hoc port. If every slot is in use, stop one (see
+"stop preview servers" below) rather than freelancing a new number -
+that's exactly the anti-pattern that caused a real leak (2026-08-06, 4
+zombie instances on ports nobody had reserved). `panga-ui-rm-verify`
+(8509) is reserved exclusively for Release Manager's merge-verification -
+no other session should use it.
+
+**Never kill a process on a shared port without confirming you own it
+first.** Check its command line / start time / working directory before
+killing - don't infer ownership just because it's inconvenient or recent.
+If you can't confirm it's yours, ask the hub rather than kill-and-see.
+(2026-08-06: Release Manager killed two PIDs on a shared manual-verify
+slot based on inference, not confirmation - no harm done this time, but
+it could just as easily have taken out another session's live check. This
+is the same "route judgment calls through the hub" principle applied to
+shared infrastructure, not just decisions.)
+
 ## Merging a finished worktree branch into master
 
 Panga usually has several sessions working in parallel worktrees. When a
