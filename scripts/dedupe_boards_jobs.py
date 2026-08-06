@@ -65,6 +65,8 @@ if str(SRC) not in sys.path:
 
 from search import job_store  # noqa: E402
 from search.boards import _normalize_for_hash, _stable_job_id  # noqa: E402
+from security.crypto_store import write_json  # noqa: E402
+from security.file_lock import locked  # noqa: E402
 from tailoring import applications, dossier  # noqa: E402
 
 _AFFECTED_SOURCES = {"Indeed", "ZipRecruiter", "Dice"}
@@ -146,62 +148,76 @@ def _backup(path: Path) -> Path | None:
 
 
 def dedupe(apply: bool = False) -> dict:
-    jobs = job_store.load_jobs()
-    apps = applications.load_applications()
-    plan = plan_merge(jobs, apps)
+    """Holds BOTH the "jobs" and "applications" file locks for the entire
+    load-plan-write cycle, not just around the final write - added
+    2026-08-06 after a proactive self-review caught that the first version
+    only locked (in fact, didn't lock at all) the write step, leaving a
+    real TOCTOU gap: the plan is computed from a snapshot taken at the
+    start, so anything else that wrote jobs.json/applications.json between
+    that read and this script's write-back would have been silently
+    discarded when this script wrote its own (now-stale) full list back.
+    Verified after the fact that the original --apply run against the real
+    store didn't actually collide with anything (file mtimes and record
+    counts checked immediately after matched exactly what this script
+    itself reported, with no other process running at the time) - but the
+    gap was real regardless of this one run's luck, so it's closed here,
+    not left for next time."""
+    with locked("jobs"), locked("applications"):
+        jobs = job_store.load_jobs()
+        apps = applications.load_applications()
+        plan = plan_merge(jobs, apps)
 
-    if not plan["groups"]:
-        _log("No duplicate groups found - nothing to do.")
-        return {"groups_merged": 0, "records_removed": 0, "applications_migrated": 0, "dossiers_moved": 0}
+        if not plan["groups"]:
+            _log("No duplicate groups found - nothing to do.")
+            return {"groups_merged": 0, "records_removed": 0, "applications_migrated": 0, "dossiers_moved": 0}
 
-    _log(f"Found {len(plan['groups'])} duplicate group(s), {len(plan['removed'])} record(s) to remove.")
-    for job, old_id, new_id in plan["renames"]:
-        _log(f"  [rename] {job['source']} / {job.get('title')!r} at {job.get('organization')!r}: {old_id!r} -> {new_id!r}")
-    for job in plan["removed"]:
-        _log(f"  [remove] {job['source']} / {job.get('title')!r} at {job.get('organization')!r} ({job.get('job_id')})")
+        _log(f"Found {len(plan['groups'])} duplicate group(s), {len(plan['removed'])} record(s) to remove.")
+        for job, old_id, new_id in plan["renames"]:
+            _log(f"  [rename] {job['source']} / {job.get('title')!r} at {job.get('organization')!r}: {old_id!r} -> {new_id!r}")
+        for job in plan["removed"]:
+            _log(f"  [remove] {job['source']} / {job.get('title')!r} at {job.get('organization')!r} ({job.get('job_id')})")
 
-    if not apply:
-        _log("\nDry run only - nothing written. Re-run with --apply to perform this merge.")
+        if not apply:
+            _log("\nDry run only - nothing written. Re-run with --apply to perform this merge.")
+            return {
+                "groups_merged": len(plan["groups"]), "records_removed": len(plan["removed"]),
+                "applications_migrated": len(plan["app_migrations"]), "dossiers_moved": 0,
+            }
+
+        jobs_backup = _backup(job_store.JOBS_PATH)
+        apps_backup = _backup(applications.APPLICATIONS_PATH)
+        _log(f"\nBacked up jobs.json -> {jobs_backup}")
+        _log(f"Backed up applications.json -> {apps_backup}")
+
+        dossiers_moved = 0
+        for job, old_id, new_id in plan["renames"]:
+            old_dir = dossier.dossier_dir(job["source"], old_id, job.get("organization"), job.get("title"))
+            new_dir = dossier.dossier_dir(job["source"], new_id, job.get("organization"), job.get("title"))
+            if old_dir.exists() and old_dir != new_dir:
+                shutil.move(str(old_dir), str(new_dir))
+                dossiers_moved += 1
+                _log(f"  [dossier moved] {old_dir.name} -> {new_dir.name}")
+            job["job_id"] = new_id
+
+        if plan["app_migrations"]:
+            for app in apps:
+                for source, old_id, new_id in plan["app_migrations"]:
+                    if app["source"] == source and app.get("job_id") == old_id:
+                        app["job_id"] = new_id
+            applications._save_all(apps)
+
+        removed_ids = {id(job) for job in plan["removed"]}
+        remaining_jobs = [job for job in jobs if id(job) not in removed_ids]
+        write_json(job_store.JOBS_PATH, remaining_jobs)
+
+        _log(
+            f"\nDone. Merged {len(plan['groups'])} group(s), removed {len(plan['removed'])} duplicate record(s), "
+            f"migrated {len(plan['app_migrations'])} application(s), moved {dossiers_moved} dossier folder(s)."
+        )
         return {
             "groups_merged": len(plan["groups"]), "records_removed": len(plan["removed"]),
-            "applications_migrated": len(plan["app_migrations"]), "dossiers_moved": 0,
+            "applications_migrated": len(plan["app_migrations"]), "dossiers_moved": dossiers_moved,
         }
-
-    jobs_backup = _backup(job_store.JOBS_PATH)
-    apps_backup = _backup(applications.APPLICATIONS_PATH)
-    _log(f"\nBacked up jobs.json -> {jobs_backup}")
-    _log(f"Backed up applications.json -> {apps_backup}")
-
-    dossiers_moved = 0
-    for job, old_id, new_id in plan["renames"]:
-        old_dir = dossier.dossier_dir(job["source"], old_id, job.get("organization"), job.get("title"))
-        new_dir = dossier.dossier_dir(job["source"], new_id, job.get("organization"), job.get("title"))
-        if old_dir.exists() and old_dir != new_dir:
-            shutil.move(str(old_dir), str(new_dir))
-            dossiers_moved += 1
-            _log(f"  [dossier moved] {old_dir.name} -> {new_dir.name}")
-        job["job_id"] = new_id
-
-    if plan["app_migrations"]:
-        for app in apps:
-            for source, old_id, new_id in plan["app_migrations"]:
-                if app["source"] == source and app.get("job_id") == old_id:
-                    app["job_id"] = new_id
-        applications._save_all(apps)
-
-    removed_ids = {id(job) for job in plan["removed"]}
-    remaining_jobs = [job for job in jobs if id(job) not in removed_ids]
-    from security.crypto_store import write_json
-    write_json(job_store.JOBS_PATH, remaining_jobs)
-
-    _log(
-        f"\nDone. Merged {len(plan['groups'])} group(s), removed {len(plan['removed'])} duplicate record(s), "
-        f"migrated {len(plan['app_migrations'])} application(s), moved {dossiers_moved} dossier folder(s)."
-    )
-    return {
-        "groups_merged": len(plan["groups"]), "records_removed": len(plan["removed"]),
-        "applications_migrated": len(plan["app_migrations"]), "dossiers_moved": dossiers_moved,
-    }
 
 
 if __name__ == "__main__":
