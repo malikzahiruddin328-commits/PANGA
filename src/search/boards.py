@@ -27,6 +27,7 @@ deciding when the stopgap itself comes off, not something to do unilaterally
 mid-investigation.
 """
 
+import hashlib
 import re
 
 import requests
@@ -35,15 +36,46 @@ from bs4 import BeautifulSoup
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 
+def _normalize_for_hash(text: str | None) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def _stable_job_id(source: str, title: str | None, organization: str | None, location: str | None) -> str:
+    """job_store.save_jobs() dedupes on (source, job_id), which only works
+    if job_id is actually stable across repeated searches for the same real
+    posting - confirmed live in production data 2026-08-06 that it wasn't,
+    for every source in this module: Indeed reissues its redirect URL,
+    ZipRecruiter's match_token is a per-request signed token, and even
+    Dice's MCP-path "guid" (which looks like a stable database ID) turned
+    out to rotate too - the same real "VP, Data Product Manager" at Ledgent
+    Technology, San Diego showed up under two different guids in the real
+    store. (Dice's own DIRECT-scrape guid, from fetch_dice_jobs() below,
+    empirically IS stable across repeated fetches - verified live, same
+    guid both times for every posting checked - but both paths write
+    source="Dice", so unifying the id scheme here also dedupes across the
+    two Dice code paths, not just within either one.)
+
+    Content-based instead: normalized (lowercased, whitespace-collapsed)
+    title+organization+location, hashed - same "derive stability from
+    stable inputs" idea as tailoring/dossier.py's _job_hash(), just applied
+    to fields that are actually stable here rather than to an already-
+    stable job_id. Real tradeoff, accepted: two genuinely different
+    postings with identical title/org/location would now collide - far
+    rarer than the every-run duplication this replaces."""
+    key = "|".join(_normalize_for_hash(v) for v in (title, organization, location))
+    return hashlib.sha1(f"{source}:{key}".encode()).hexdigest()[:16]
+
+
 def normalize_ziprecruiter_job(raw: dict) -> dict:
     salary = raw.get("salary") or {}
+    title, organization, location = raw.get("title"), raw.get("company"), raw.get("location")
     return {
         "source": "ZipRecruiter",
-        "job_id": raw.get("job_redirect_url"),
-        "title": raw.get("title"),
-        "organization": raw.get("company"),
+        "job_id": _stable_job_id("ZipRecruiter", title, organization, location),
+        "title": title,
+        "organization": organization,
         "department": None,
-        "location": raw.get("location"),
+        "location": location,
         "pay_min": salary.get("min_annual"),
         "pay_max": salary.get("max_annual"),
         "posting_url": raw.get("job_redirect_url"),
@@ -58,13 +90,15 @@ def normalize_dice_job(raw: dict) -> dict:
     # coming back empty for non-USAJOBS jobs (see tailoring/ats_score.py).
     # Captured as "description" so drafting.py's _extract_ats_keywords()
     # picks it up the same way it already does for USAJOBS/LinkedIn jobs.
+    title, organization = raw.get("title"), raw.get("companyName")
+    location = (raw.get("jobLocation") or {}).get("displayName")
     return {
         "source": "Dice",
-        "job_id": raw.get("guid"),
-        "title": raw.get("title"),
-        "organization": raw.get("companyName"),
+        "job_id": _stable_job_id("Dice", title, organization, location),
+        "title": title,
+        "organization": organization,
         "department": None,
-        "location": (raw.get("jobLocation") or {}).get("displayName"),
+        "location": location,
         "pay_min": None,
         "pay_max": None,
         "salary_text": raw.get("salary"),
@@ -78,9 +112,11 @@ def normalize_indeed_jobs(raw_text: str) -> list[dict]:
     """Unlike the other two, Indeed's search_jobs tool returns one formatted
     markdown string for the whole result set, not structured JSON - this
     parses it. The "Job Id" field (e.g. "JOBSEARCH_1") is just a per-response
-    sequence number, not stable across searches, so the short code embedded
-    in the View Job URL is used as job_id instead - the only stable
-    identifier available for dedup."""
+    sequence number, not stable across searches. The View Job URL was used
+    as job_id for a while, on the assumption it was the only stable
+    identifier available - turned out not to be true either (confirmed live
+    2026-08-06, Indeed reissues the redirect URL on repeat searches for the
+    same posting); see _stable_job_id()'s docstring for the current fix."""
     blocks = re.split(r"\*\*Job Title:\*\*", raw_text)[1:]
 
     def field(block: str, label: str) -> str | None:
@@ -92,6 +128,7 @@ def normalize_indeed_jobs(raw_text: str) -> list[dict]:
     for block in blocks:
         block = "**Job Title:**" + block
         url = field(block, "View Job URL")
+        title, organization, location = field(block, "Job Title"), field(block, "Company"), field(block, "Location")
         compensation = field(block, "Compensation") or ""
         # \.\d+ optional group keeps cents attached to the number they belong
         # to (e.g. "87,509.62" is one number, not "87509" + a stray "62").
@@ -101,11 +138,11 @@ def normalize_indeed_jobs(raw_text: str) -> list[dict]:
 
         jobs.append({
             "source": "Indeed",
-            "job_id": url,
-            "title": field(block, "Job Title"),
-            "organization": field(block, "Company"),
+            "job_id": _stable_job_id("Indeed", title, organization, location),
+            "title": title,
+            "organization": organization,
             "department": None,
-            "location": field(block, "Location"),
+            "location": location,
             "pay_min": pay_min,
             "pay_max": pay_max,
             "posting_url": url,
@@ -169,11 +206,20 @@ def fetch_dice_jobs(keyword: str, limit: int = 25) -> list[dict]:
 
         guid = card.get("data-job-guid")
         posting_url = f"https://www.dice.com/job-detail/{guid}" if guid else None
+        title = title_link.get_text(strip=True)
+        organization = company_el.get_text(strip=True) if company_el else None
         jobs.append({
             "source": "Dice",
-            "job_id": guid,
-            "title": title_link.get_text(strip=True),
-            "organization": company_el.get_text(strip=True) if company_el else None,
+            # data-job-guid itself is empirically stable across repeat
+            # fetches of this direct-scrape path (verified live) - but
+            # normalize_dice_job()'s MCP path shares this same source="Dice"
+            # label and its guid is NOT stable (see _stable_job_id()'s
+            # docstring), so using the same content-based id here too is
+            # what actually dedupes a posting found via both paths, not
+            # just within this one.
+            "job_id": _stable_job_id("Dice", title, organization, location),
+            "title": title,
+            "organization": organization,
             "location": location,
             "pay_min": pay_min,
             "pay_max": pay_max,
