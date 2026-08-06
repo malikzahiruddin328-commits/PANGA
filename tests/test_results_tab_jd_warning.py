@@ -1,9 +1,13 @@
 """Real bug found live 2026-08-06 (Zahir): jobs from sources with no
 captured JD text (ZipRecruiter, Indeed, industry boards) were being scored
 and drafted as if genuinely tailored against the posting, with no
-indication anything was missing. These tests drive the actual Results tab
-(via Streamlit's own AppTest, not a browser) to confirm the warning
-renders exactly when there's no real posting text, and never when there is.
+indication anything was missing. Zahir's explicit product direction: the
+fix is an active paste-the-JD-yourself prompt framed as Panga respecting
+sites' anti-bot protections (not an apology for a "missing" feature), not
+just a passive warning. These tests drive the actual Results tab (via
+Streamlit's own AppTest, not a browser - more reliable here for nested
+expanders) to confirm the prompt renders exactly when there's no real
+posting text, and never when there is.
 """
 
 import pytest
@@ -38,23 +42,83 @@ def results_app(isolated_data, monkeypatch):
     return AppTest.from_file(APP_PATH)
 
 
-def test_no_jd_warning_shown_when_posting_has_no_captured_text(results_app):
+def test_paste_jd_prompt_shown_when_posting_has_no_captured_text(results_app):
     at = results_app
     at.session_state["active_tab"] = "results"
     at.session_state["selected_idx_Indeed"] = 0
     at.run(timeout=30)
 
     assert not at.exception
-    warnings = [w.value for w in at.warning]
-    assert any("No job description available" in w for w in warnings)
+    infos = [i.value for i in at.info]
+    assert any("Panga respects that" in i for i in infos)
+    assert any("bypass" in i for i in infos)
+    # Framed as a deliberate design choice, never as something broken/missing.
+    assert not any("unavailable" in i.lower() or "missing" in i.lower() for i in infos)
+
+    paste_boxes = [t for t in at.text_area if t.key == "jd_paste_Indeed_nojd1"]
+    assert len(paste_boxes) == 1
+    save_buttons = [b for b in at.button if b.key == "jd_paste_save_Indeed_nojd1"]
+    assert len(save_buttons) == 1
 
 
-def test_no_warning_shown_when_posting_has_real_jd_text(results_app):
+def test_no_paste_jd_prompt_shown_when_posting_has_real_jd_text(results_app):
     at = results_app
     at.session_state["active_tab"] = "results"
     at.session_state["selected_idx_Dice"] = 0
     at.run(timeout=30)
 
     assert not at.exception
-    warnings = [w.value for w in at.warning]
-    assert not any("No job description available" in w for w in warnings)
+    assert len(at.info) == 0
+    assert not any(t.key == "jd_paste_Dice_withjd1" for t in at.text_area)
+
+
+def test_clicking_save_without_pasting_shows_a_toast_and_does_not_crash(results_app):
+    at = results_app
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Indeed"] = 0
+    at.run(timeout=30)
+
+    save_button = next(b for b in at.button if b.key == "jd_paste_save_Indeed_nojd1")
+    save_button.click().run(timeout=30)
+
+    assert not at.exception
+    # Still no description saved - the empty-paste guard did its job.
+    from search.job_store import load_jobs
+    job = next(j for j in load_jobs() if j["job_id"] == "nojd1")
+    assert not job.get("description")
+
+
+def test_pasting_jd_and_saving_stores_description_and_rescoring(results_app, monkeypatch):
+    import tailoring.drafting as drafting
+
+    def _fake_generate_documents(job, profile, doc_keys, on_progress=None):
+        assert job["description"] == "Requirements: Kubernetes, Terraform."
+        return {"resume": {
+            "text": "PROFESSIONAL EXPERIENCE\nEngineer.\n\nSKILLS\nKubernetes, Terraform",
+            "suggested_strategy_tag": "",
+            "ats_score": 88,
+            "ats_rationale": "Matched 2/2 keywords.",
+            "ats_next_actions": [],
+            "clarifying_questions": [],
+        }}
+
+    monkeypatch.setattr(drafting, "generate_documents", _fake_generate_documents)
+    monkeypatch.setattr("tailoring.dossier.sync_workspace_documents", lambda *a, **k: None)
+
+    at = results_app
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Indeed"] = 0
+    at.run(timeout=30)
+
+    paste_box = next(t for t in at.text_area if t.key == "jd_paste_Indeed_nojd1")
+    paste_box.set_value("Requirements: Kubernetes, Terraform.")
+    save_button = next(b for b in at.button if b.key == "jd_paste_save_Indeed_nojd1")
+    save_button.click().run(timeout=30)
+
+    assert not at.exception
+    from search.job_store import load_jobs
+    from tailoring.applications import get_application
+    job = next(j for j in load_jobs() if j["job_id"] == "nojd1")
+    assert job["description"] == "Requirements: Kubernetes, Terraform."
+    app_record = get_application("Indeed", "nojd1")
+    assert app_record["resume_ats_score"] == 88
