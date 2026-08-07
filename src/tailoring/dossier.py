@@ -285,7 +285,17 @@ def write_dossier(source: str, job_id: str) -> Path | None:
     if application.get("strategy_tag"):
         lines.append(f"- **Strategy tag:** {application['strategy_tag']}")
     if application.get("skip_reason"):
-        lines.append(f"- **Skip reason:** {application['skip_reason']}")
+        # The inline "Pass" dialog's "Something else" category stores
+        # category+typed-detail "\n"-joined in one skip_reason string (see
+        # ui/app.py's _pass_reason_dialog) - rendered as a nested bullet
+        # here so it reads as two distinct lines instead of markdown's
+        # lazy-continuation folding it into one run-on line. Every other
+        # category (and the older single-string "Why not interested?" box)
+        # has no embedded newline, so this is a no-op for those.
+        reason_parts = application["skip_reason"].split("\n", 1)
+        lines.append(f"- **Skip reason:** {reason_parts[0]}")
+        if len(reason_parts) == 2:
+            lines.append(f"  - {reason_parts[1]}")
     if application.get("created_at"):
         lines.append(f"- **Application started:** {application['created_at']}")
     if application.get("status_updated_at"):
