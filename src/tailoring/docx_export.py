@@ -118,6 +118,7 @@ def text_to_docx_bytes(text: str, author: str | None = None, body_size_pt: float
     lines = text.split("\n")
     seen_name = False
     in_contact_block = False
+    prev_para = None
     for raw_line in lines:
         line = raw_line.strip()
         if not line:
@@ -140,6 +141,7 @@ def text_to_docx_bytes(text: str, author: str | None = None, body_size_pt: float
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             seen_name = True
             in_contact_block = True
+            prev_para = p
             continue
 
         if in_contact_block and not _looks_like_header(line) and not line.startswith("- "):
@@ -154,11 +156,12 @@ def text_to_docx_bytes(text: str, author: str | None = None, body_size_pt: float
             # this into real hyperlink objects later.
             p = doc.add_paragraph(line)
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            prev_para = p
             continue
         in_contact_block = False
 
         if line.startswith("- "):
-            doc.add_paragraph(line[2:], style="List Bullet")
+            prev_para = doc.add_paragraph(line[2:], style="List Bullet")
             continue
 
         if _looks_like_header(line):
@@ -178,6 +181,7 @@ def text_to_docx_bytes(text: str, author: str | None = None, body_size_pt: float
             run.font.name = BODY_FONT
             run.font.size = body_size
             run.font.color.rgb = NAME_ACCENT_COLOR
+            prev_para = p
             continue
 
         date_match = _DATE_RANGE_RE.search(line) if len(line) < 120 else None
@@ -194,14 +198,33 @@ def text_to_docx_bytes(text: str, author: str | None = None, body_size_pt: float
             # the drafted text used an en-dash or "to" (Mirror/Zahir,
             # 2026-08-06): a few older ATS parsers mis-tokenize en-dashes.
             date_part = f"{date_match.group('start')} - {date_match.group('end')}"
+            if not prefix and prev_para is not None and prev_para.style.name == "Normal" \
+                    and not list(prev_para.paragraph_format.tab_stops):
+                # Real gap found live 2026-08-06 (verifying the VP-tier
+                # title fix against an actual generation): some drafts put
+                # the date range on its OWN line, right after the title/
+                # company line, instead of sharing it. An empty prefix
+                # here used to render as its own near-blank paragraph (a
+                # lone unbolded title line, then a date floating flush
+                # right on the next line with nothing visibly tying it to
+                # that title) instead of "one line, date flush right" -
+                # merge onto the immediately-preceding title/company
+                # paragraph instead of creating a new one.
+                for run in prev_para.runs:
+                    run.bold = True
+                prev_para.paragraph_format.tab_stops.add_tab_stop(_right_tab_position(doc), WD_TAB_ALIGNMENT.RIGHT)
+                prev_para.add_run("\t").bold = True
+                prev_para.add_run(date_part).bold = True
+                continue
             p = doc.add_paragraph()
             p.paragraph_format.tab_stops.add_tab_stop(_right_tab_position(doc), WD_TAB_ALIGNMENT.RIGHT)
             p.add_run(prefix).bold = True
             p.add_run("\t").bold = True
             p.add_run(date_part).bold = True
+            prev_para = p
             continue
 
-        doc.add_paragraph(line)
+        prev_para = doc.add_paragraph(line)
 
     buf = io.BytesIO()
     doc.save(buf)

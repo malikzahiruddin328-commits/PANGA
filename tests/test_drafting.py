@@ -19,8 +19,15 @@ def test_resume_spec_conditionally_keeps_or_drops_rank_prefixes_by_target_senior
     for spec in (RESUME_SPEC, RESUME_SPEC_USAJOBS):
         assert "rank-prefix" in spec
         assert "not inventing or embellishing" in spec
-        assert "VP-level or higher, KEEP" in spec
-        assert "below VP-level, DROP" in spec
+        assert "VP-level or higher, print the title in FULL" in spec
+        assert "below VP-level, print ONLY the working title" in spec
+        # The instruction must name the exact real title strings, not just
+        # describe the pattern abstractly (real gap found live 2026-08-06:
+        # the model dropped the parenthetical but kept "Vice President,"
+        # on the other title for a below-VP posting) - spelling out both
+        # forms explicitly closes that ambiguity.
+        assert "'Vice President, Head of Applications'" in spec
+        assert "'Head of IT (CIO-equivalent)'" in spec
 
 
 def test_resume_spec_folds_target_role_alignment_into_summary_not_its_own_header():

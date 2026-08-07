@@ -147,6 +147,37 @@ def test_to_date_separator_normalized_to_plain_hyphen():
     assert role_para.runs[-1].text == "September 2018 - January 2026"
 
 
+def test_date_range_on_its_own_line_merges_onto_the_preceding_title_line():
+    # Real bug found live 2026-08-06, verifying the VP-tier title fix
+    # against an actual generation: some drafts put the date range on its
+    # OWN line, right after the title/company line, instead of sharing it
+    # ("Head of IT\nJanuary 2024 - January 2026\n"). Before this fix, the
+    # empty prefix rendered as its own near-blank paragraph - a lone
+    # unbolded "Head of IT" line, then a date floating flush-right on the
+    # next line with nothing visibly tying it to that title.
+    text = "Jane Doe\njane@example.com\n\nPROFESSIONAL EXPERIENCE\nHead of IT\nJanuary 2024 - January 2026\n- Did a thing.\n"
+    doc = _load(text_to_docx_bytes(text))
+    role_para = next(p for p in doc.paragraphs if "Head of IT" in p.text)
+    assert [r.text for r in role_para.runs] == ["Head of IT", "\t", "January 2024 - January 2026"]
+    assert all(r.bold for r in role_para.runs)
+    assert len(list(role_para.paragraph_format.tab_stops)) == 1
+    # Only one paragraph for this role's title+date, not two.
+    assert sum(1 for p in doc.paragraphs if "Head of IT" in p.text or "January 2024" in p.text) == 1
+
+
+def test_date_range_on_its_own_line_after_a_bullet_does_not_merge_into_it():
+    # A lone date-range line straight after a bullet (not a title/company
+    # line) shouldn't merge into that bullet's "List Bullet" paragraph -
+    # only a plain "Normal"-style preceding paragraph is a safe merge
+    # target.
+    text = "Jane Doe\njane@example.com\n\nPROFESSIONAL EXPERIENCE\n- Did a thing.\nJanuary 2024 - January 2026\n"
+    doc = _load(text_to_docx_bytes(text))
+    bullet_para = next(p for p in doc.paragraphs if p.text == "Did a thing.")
+    assert bullet_para.style.name == "List Bullet"
+    date_para = next(p for p in doc.paragraphs if "January 2024" in p.text)
+    assert date_para is not bullet_para
+
+
 def test_all_caps_name_is_rendered_in_title_case():
     # Real bug found 2026-08-06 (Mirror/Zahir): a drafted resume sometimes
     # echoes the candidate's name in whatever casing the source resume
