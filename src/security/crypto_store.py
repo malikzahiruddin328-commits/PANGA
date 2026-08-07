@@ -32,7 +32,7 @@ import keyring
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-_SERVICE_NAME = "Panga"
+_SERVICE_NAME = os.environ.get("PANGA_KEYRING_SERVICE", "Panga")
 _KEY_USERNAME = "data-encryption-key"
 _NONCE_LEN = 12
 _MAGIC = b"PANGAENC1"  # lets callers (e.g. the one-time migration script) tell

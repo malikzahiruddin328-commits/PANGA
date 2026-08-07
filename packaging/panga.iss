@@ -17,7 +17,7 @@
 ; instead of doing its own file replacement - coordinate before merge (see
 ; docs/native-packaging-scope.md's "out of scope" section).
 
-#define MyAppId "{29D8F805-F3A8-455D-AC29-482DDED84C50}"
+#define MyAppId "{{29D8F805-F3A8-455D-AC29-482DDED84C50}"
 #define MyAppName "Panga"
 #define MyAppVersion "0.1.0"
 #define MyAppPublisher "Panga"
@@ -27,6 +27,20 @@
 ; /D on the ISCC command line to override - see the build doc.
 #ifndef BuildDistDir
   #define BuildDistDir "..\build_dist\Panga"
+#endif
+; Task Scheduler name prefix, for a test build on a machine that already has
+; a real production Panga install (see docs/native-packaging-phase2-build.md,
+; "Testing on a machine with a real install"). Defaults match the real
+; product - override via /DTaskPrefix=... on the ISCC command line for an
+; isolated test compile, e.g.:
+;   ISCC /DTaskPrefix=PangaTest- packaging\panga.iss
+; Note this only isolates the Task Scheduler names - it can't reach the
+; keyring service name baked into the already-built PyInstaller bundle (see
+; src/security/crypto_store.py's PANGA_KEYRING_SERVICE env var instead;
+; that must be set in the environment of whatever process launches the test
+; build's Panga.exe/unins000.exe, not here).
+#ifndef TaskPrefix
+  #define TaskPrefix "Panga-"
 #endif
 
 [Setup]
@@ -83,7 +97,7 @@ Source: "install_scheduled_tasks_packaged.ps1"; DestDir: "{app}\scripts"; Flags:
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{group}\Register background tasks"; Filename: "powershell.exe"; \
-    Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\install_scheduled_tasks_packaged.ps1"""; \
+    Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\install_scheduled_tasks_packaged.ps1"" -TaskPrefix ""{#TaskPrefix}"""; \
     WorkingDir: "{app}"; \
     Comment: "Run once after setting up .env and Gmail credentials - see docs\native-packaging-task-scheduler.md in the source repo"
 Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
@@ -109,7 +123,7 @@ begin
   begin
     Exec(ExpandConstant('{app}\{#MyAppExeName}'), '--uninstall-helper', '', SW_SHOW, ewWaitUntilTerminated, ResultCode);
     Exec('powershell.exe',
-      '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\scripts\uninstall_scheduled_tasks.ps1') + '"',
+      '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\scripts\uninstall_scheduled_tasks.ps1') + '" -TaskPrefix "{#TaskPrefix}"',
       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;
 end;

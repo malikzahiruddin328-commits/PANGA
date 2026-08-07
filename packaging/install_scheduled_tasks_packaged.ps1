@@ -16,6 +16,10 @@
 # full setup steps). No admin rights needed for per-user scheduled tasks.
 # Safe to re-run - each task is registered with -Force.
 
+param(
+    [string]$TaskPrefix = "Panga-"
+)
+
 $ErrorActionPreference = "Stop"
 
 $AppDir = Split-Path -Parent $PSScriptRoot
@@ -35,7 +39,7 @@ function Register-PangaTask {
 
 # panga-daily-job-search -> once daily, 7:26am
 $dailyTrigger = New-ScheduledTaskTrigger -Daily -At 7:26am
-Register-PangaTask -Name "Panga-DailyJobSearch" -TaskArg "run-search" -Triggers @($dailyTrigger)
+Register-PangaTask -Name "${TaskPrefix}DailyJobSearch" -TaskArg "run-search" -Triggers @($dailyTrigger)
 
 # panga-gmail-cta-scan -> 4x/day, 8:07am/12:07pm/4:07pm/8:07pm
 $scanTriggers = @(
@@ -44,16 +48,16 @@ $scanTriggers = @(
     New-ScheduledTaskTrigger -Daily -At 4:07pm
     New-ScheduledTaskTrigger -Daily -At 8:07pm
 )
-Register-PangaTask -Name "Panga-GmailCtaScan" -TaskArg "gmail-scan" -Triggers $scanTriggers
+Register-PangaTask -Name "${TaskPrefix}GmailCtaScan" -TaskArg "gmail-scan" -Triggers $scanTriggers
 
 # panga-cta-fulfillment -> every 10 minutes. Task Scheduler rejects
 # [TimeSpan]::MaxValue as a repetition duration, so this uses 10 years as a
 # practical stand-in, same as the original script - re-run this (safe,
 # uses -Force) to extend it before that expires.
 $fulfillmentTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 10) -RepetitionDuration (New-TimeSpan -Days 3650)
-Register-PangaTask -Name "Panga-CtaFulfillment" -TaskArg "cta-fulfillment" -Triggers @($fulfillmentTrigger)
+Register-PangaTask -Name "${TaskPrefix}CtaFulfillment" -TaskArg "cta-fulfillment" -Triggers @($fulfillmentTrigger)
 
 Write-Host ""
 Write-Host "All 3 tasks registered. View/manage them with:"
-Write-Host "  Get-ScheduledTask -TaskName 'Panga-*'"
-Write-Host "  Start-ScheduledTask -TaskName 'Panga-DailyJobSearch'   # run one on demand"
+Write-Host "  Get-ScheduledTask -TaskName '${TaskPrefix}*'"
+Write-Host "  Start-ScheduledTask -TaskName '${TaskPrefix}DailyJobSearch'   # run one on demand"

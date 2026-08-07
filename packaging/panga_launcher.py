@@ -226,8 +226,7 @@ def _uninstall_ask_data_retention() -> bool:
         ),
         justify="left",
         padx=20,
-        pady=(20, 12),
-    ).pack()
+    ).pack(pady=(20, 12))
 
     button_row = tk.Frame(root)
     button_row.pack(pady=(0, 20), padx=20)

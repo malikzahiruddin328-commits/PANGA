@@ -15,6 +15,7 @@
 # packaging/requirements-desktop.txt installed - see
 # docs/native-packaging-phase2-build.md)
 
+import os
 import sys
 from pathlib import Path
 
@@ -23,6 +24,25 @@ from PyInstaller.utils.hooks import collect_all
 block_cipher = None
 
 REPO_ROOT = Path(SPECPATH).resolve().parent  # noqa: F821 - SPECPATH is injected by PyInstaller
+
+
+def _find_bhangi_src(repo_root):
+    """Same sibling-checkout search as src/ui/app.py's _find_bhangi_src -
+    kept in sync deliberately (see that function's docstring for why this
+    walk exists). Needed at build time too: Bhangi's own modules have to be
+    on the Analysis pathex for `from bhangi.ui import ...` to resolve into
+    the frozen bundle, since a real standalone install has no sibling
+    Bhangi checkout on disk to find at runtime the way a dev worktree does."""
+    override = os.environ.get("BHANGI_PATH")
+    if override:
+        candidate = Path(override) / "src"
+        if candidate.is_dir():
+            return candidate
+    for ancestor in (repo_root, *repo_root.parents):
+        candidate = ancestor.parent / "Bhangi" / "src"
+        if candidate.is_dir():
+            return candidate
+    return None
 
 # Streamlit and pywebview both need their non-code data files (Streamlit's
 # frontend static build; pywebview's EdgeChromium/WebView2 loader DLL and
@@ -57,10 +77,49 @@ hiddenimports += [
     "gmail_cta_scan",
     "cta_fulfillment",
 ]
+# job_alert_scan (feature/job-alert-scan, merging to master separately -
+# flagged by the hub 2026-08-06) isn't in this worktree yet. Conditional so
+# this spec doesn't break today's build but picks it up automatically once
+# scripts/job_alert_scan.py lands here via a merge from master - same
+# importlib.import_module() blind spot as the 3 above, see
+# packaging/panga_launcher.py's cmd_task()/_TASKS dict.
+if (REPO_ROOT / "scripts" / "job_alert_scan.py").exists():
+    hiddenimports += ["job_alert_scan"]
+
+# cmd_serve() reaches ui/app.py by file path (Streamlit's bootstrap.run()
+# needs an actual script path, not an import), so nothing in
+# panga_launcher.py ever `import`s it - Analysis's static entry-point walk
+# never discovers it or anything it imports (tailoring/, search/,
+# prospector/, linkedin/, security/, gmail_client, profile/, licensing/,
+# bhangi.ui - see src/ui/app.py's own import list). Confirmed empirically:
+# building without this line produced a frozen exe that returned HTTP 200
+# from --serve (Streamlit's own server came up fine) but the page itself
+# was Streamlit's "Script execution error" boundary, not the real app -
+# a 200 status alone doesn't prove app.py loaded. hiddenimports here makes
+# Analysis trace the whole graph so it's actually bundled, but app.py also
+# needs to exist as a literal file (see datas below) since bootstrap.run()
+# opens it directly rather than importing it.
+hiddenimports += ["ui.app"]
+
+bhangi_src = _find_bhangi_src(REPO_ROOT)
+bhangi_pathex = [str(bhangi_src)] if bhangi_src else []
+if bhangi_src:
+    hiddenimports += ["bhangi.ui"]
+# else: leave bhangi.ui out of hiddenimports - Analysis would fail
+# immediately on an unresolvable import. The resulting bundle's Support tab
+# won't work (matches today's dev-mode behavior when no sibling Bhangi
+# checkout exists), but the rest of the app still builds and runs.
+
+# The literal ui/app.py source file, at the exact path _bundle_dir()/"ui"/
+# "app.py" resolves to when frozen (_bundle_dir() returns sys._MEIPASS,
+# i.e. _internal/ - see panga_launcher.py) - hiddenimports above puts a
+# compiled copy in the PYZ archive for `import` purposes, but
+# bootstrap.run() needs a real file on disk to open and exec.
+datas += [(str(REPO_ROOT / "src" / "ui" / "app.py"), "ui")]
 
 a = Analysis(
     [str(REPO_ROOT / "packaging" / "panga_launcher.py")],
-    pathex=[str(REPO_ROOT / "src"), str(REPO_ROOT / "scripts")],
+    pathex=[str(REPO_ROOT / "src"), str(REPO_ROOT / "scripts")] + bhangi_pathex,
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
