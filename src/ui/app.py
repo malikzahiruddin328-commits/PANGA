@@ -956,7 +956,17 @@ def _pass_reason_dialog(source: str, job_id: str, label: str) -> None:
     confirm_col, cancel_col = st.columns(2)
     with confirm_col:
         if st.button("Confirm pass", type="primary", key="pass_reason_confirm"):
-            skip_reason = free_text.strip() if reason_category == "Something else" and free_text.strip() else reason_category
+            # Store BOTH the category and the typed detail, not one or the
+            # other (Zahir's original ask, weeks ago - never actually built:
+            # caught live-testing again, 2026-08-07). "\n"-joined so
+            # skip_reason.split("\n", 1) cleanly separates "which bucket"
+            # from "what he actually said" for future data-profiling, while
+            # every other category (no free text collected) still stores as
+            # a single plain string, unchanged.
+            if reason_category == "Something else" and free_text.strip():
+                skip_reason = f"{reason_category}\n{free_text.strip()}"
+            else:
+                skip_reason = reason_category
             upsert_application(source, job_id, status="not interested", skip_reason=skip_reason)
             st.session_state.pop("pass_dialog_pending", None)
             st.toast("Marked not interested.", icon=":material/check_circle:")

@@ -219,7 +219,10 @@ def _decode_body(payload: dict) -> str:
 def _thread_summary(service, thread_id: str) -> dict:
     """One row's worth of what the old MCP search_threads tool returned:
     subject/sender/date/snippet of the thread's LATEST message, plus its
-    message_id (used as replyToMessageId when a draft is later created)."""
+    message_id (used as replyToMessageId when a draft is later created)
+    and its label_ids (used by inbox_accounts.py to filter out already-
+    reviewed threads client-side - see search_threads' docstring below for
+    why the query's own -label: term can't be trusted to do this)."""
     thread = service.users().threads().get(
         userId="me", id=thread_id, format="metadata", metadataHeaders=["Subject", "From", "Date"],
     ).execute()
@@ -240,14 +243,36 @@ def _thread_summary(service, thread_id: str) -> dict:
         # only subject+sender to go on. The message's own snippet is what
         # actually has real content.
         "snippet": latest.get("snippet", ""),
+        # The LATEST message's own labelIds, not any earlier message's -
+        # see search_threads' docstring for why this is the field that
+        # actually needs checking.
+        "label_ids": latest.get("labelIds", []),
     }
 
 
 def search_threads(query: str, max_results: int = 50) -> list[dict]:
     """Mirrors the connector's search_threads tool: returns thread summaries
-    (subject/sender/date/snippet/message_id) for threads matching `query`
-    (Gmail search syntax, e.g. "-label:Panga/Reviewed -in:spam -in:trash "
-    "newer_than:2d in:inbox"), newest first, up to max_results."""
+    (subject/sender/date/snippet/message_id/label_ids) for threads matching
+    `query` (Gmail search syntax, e.g. "-in:spam -in:trash newer_than:2d
+    in:inbox"), newest first, up to max_results.
+
+    Deliberately excludes a "-label:X" term from the queries inbox_accounts.py
+    builds (real bug found 2026-08-07 via the scheduled CTA scan's own run
+    report): Gmail's threads.modify labels a thread's messages as they exist
+    at that moment, but "-label:X" in a search query matches at THREAD
+    granularity - a thread stays excluded only once EVERY message in it
+    carries the label. A thread that was labeled Panga/Reviewed, then later
+    got a genuinely new reply (which arrives unlabeled), still has an
+    unlabeled message in it - so "-label:Panga/Reviewed" kept matching that
+    whole thread again, on every run, even though the "reviewed" run had
+    already processed everything that existed at the time. Concretely: every
+    gmail_cta_scan.py run was re-classifying (real LLM calls) the same ~80
+    already-processed threads for nothing, 3x/day, compounding daily.
+    inbox_accounts.py now checks label_ids on the LATEST message client-side
+    instead - which is also the semantically correct check (a thread with a
+    genuinely new unreviewed message SHOULD resurface, since there's new
+    content to review; this fix gets that right as a side effect, not just
+    the wasted-token case)."""
     service = get_service()
     try:
         response = service.users().threads().list(userId="me", q=query, maxResults=max_results).execute()

@@ -35,6 +35,25 @@ module docstring for why (avoids introducing any new concurrency on top
 of the shared stores' existing file locking). One account's failure (a
 revoked OAuth token, an unreachable IMAP server) is logged and skipped,
 not fatal to the rest of the run - see run()'s per-account try/except.
+
+Candidate-job join (2026-08-07): real gap flagged by this script's own
+scheduled run report and relayed back by General - applications.json
+records only carry source/job_id/status (see applications.py's
+docstring), no title/organization, so handing them straight to
+match_cta_application()/match_application_confirmation() as "candidate
+jobs" gave the LLM nothing but an id and a status to compare an email's
+actual content against; it could never have matched anything for real.
+_candidates_with_job_details() below joins each candidate application
+against search.job_store.load_jobs() (by source+job_id) to attach the
+title/organization/location the match calls actually need. The old
+docs/email-monitoring-task.md SKILL.md this script replaced never
+documented this join either - not fixed there since that file is a
+historical reference for a retired MCP-based design, not something that
+still executes; this script (and this docstring) is the live behavior
+now. jobs_by_key is built once per run() call, not once per email -
+search.job_store.load_jobs() is a 1600+-record store, and this script
+can check several emails per run (see CLAUDE.md's "avoid O(n^2) scans
+over growing stores").
 """
 
 import sys
@@ -53,6 +72,7 @@ if str(SRC) not in sys.path:
 
 from inbox_accounts import configured_accounts  # noqa: E402
 from notifications import send_notification  # noqa: E402
+from search.job_store import load_jobs  # noqa: E402
 from tailoring.applications import load_applications, suggest_status  # noqa: E402
 from tailoring.cta_emails import add_cta_email  # noqa: E402
 from tailoring.cta_reasoning import classify_thread, match_application_confirmation, match_cta_application  # noqa: E402
@@ -84,9 +104,36 @@ def _log(message: str) -> None:
     print(message, flush=True)
 
 
-def scan_account(account) -> tuple[list[dict], int]:
+def _candidates_with_job_details(applications: list[dict], jobs_by_key: dict) -> list[dict]:
+    """Joins each application record against its job record (by
+    source+job_id) so the match calls have title/organization/location to
+    actually compare an email against - see this file's module docstring
+    for why this join exists. An application with no corresponding job
+    record (shouldn't happen in practice, but not guaranteed) is skipped
+    rather than passed through with blank fields - a candidate with no
+    title/organization is exactly the "nothing to compare against" case
+    this fix removes, so silently including one would reintroduce it."""
+    candidates = []
+    for app in applications:
+        job = jobs_by_key.get((app.get("source"), app.get("job_id")))
+        if not job:
+            continue
+        candidates.append({
+            "source": app["source"],
+            "job_id": app["job_id"],
+            "status": app.get("status"),
+            "title": job.get("title", ""),
+            "organization": job.get("organization", ""),
+            "location": job.get("location", ""),
+        })
+    return candidates
+
+
+def scan_account(account, jobs_by_key: dict) -> tuple[list[dict], int]:
     """Runs the classify/store/match loop for one configured account.
-    Returns (new_cta_items, new_match_count)."""
+    jobs_by_key is a {(source, job_id): job_record} index, built once per
+    run() call and passed down - see this file's module docstring for why
+    it isn't rebuilt per-message. Returns (new_cta_items, new_match_count)."""
     messages = account.list_recent_unreviewed()
     _log(f"  [{account.provider}:{account.account}] {len(messages)} new message(s) to classify")
 
@@ -131,7 +178,8 @@ def scan_account(account) -> tuple[list[dict], int]:
 
             target_status = _CTA_STATUS_BY_CATEGORY.get(category)
             if target_status:
-                candidates = [a for a in load_applications() if a.get("status") not in _TERMINAL_APPLICATION_STATUSES]
+                open_applications = [a for a in load_applications() if a.get("status") not in _TERMINAL_APPLICATION_STATUSES]
+                candidates = _candidates_with_job_details(open_applications, jobs_by_key)
                 if candidates:
                     try:
                         body = account.get_body(msg.ref)
@@ -151,11 +199,12 @@ def scan_account(account) -> tuple[list[dict], int]:
             except Exception as exc:  # noqa: BLE001
                 _log(f"    couldn't mark reviewed for {msg.subject!r}: {exc}")
             under_review = [a for a in load_applications() if a.get("status") == "under review"]
-            if not under_review:
+            candidates = _candidates_with_job_details(under_review, jobs_by_key)
+            if not candidates:
                 continue
             try:
                 body = account.get_body(msg.ref)
-                match = match_application_confirmation(thread_summary, body, under_review)
+                match = match_application_confirmation(thread_summary, body, candidates)
             except Exception as exc:  # noqa: BLE001
                 _log(f"    application match failed for {msg.subject!r}: {exc}")
                 continue
@@ -172,11 +221,15 @@ def run() -> None:
         _log("No email accounts configured - nothing to scan.")
         return
 
+    # Built once for the whole run, not once per email - see this file's
+    # module docstring on the candidate-job join.
+    jobs_by_key = {(j.get("source"), j.get("job_id")): j for j in load_jobs()}
+
     all_new_cta_items: list[dict] = []
     total_new_match_count = 0
     for account in accounts:
         try:
-            new_cta_items, new_match_count = scan_account(account)
+            new_cta_items, new_match_count = scan_account(account, jobs_by_key)
         except Exception as exc:  # noqa: BLE001 - one account's failure (expired OAuth
             # token, unreachable IMAP server) must not stop the others from scanning
             _log(f"  [{account.provider}:{account.account}] scan failed: {exc}")

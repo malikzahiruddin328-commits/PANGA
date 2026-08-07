@@ -1,12 +1,54 @@
 from tailoring.drafting import (
+    ATS_KEYWORDS_SYSTEM_PROMPT,
     RESUME_SPEC,
     RESUME_SPEC_USAJOBS,
+    _drop_years_experience_keywords,
     _merge_keyword_gap_questions,
     _questions_worth_asking,
     _strip_rank_prefixes,
     _suggested_answer_for_keyword_gap,
     save_gap_answers,
 )
+
+
+def test_ats_keywords_prompt_excludes_years_of_experience_title_lists_and_soft_skills():
+    # Real gap Zahir hit live 2026-08-07: the keyword extractor was pulling
+    # years-of-experience thresholds ("8+ years"), alternate-title lists
+    # ("IT director, solutions architect, technology consultant"), and
+    # generic soft-skill phrases ("executive presence", "c-suite
+    # stakeholders") out as if they were discrete checkable skills - a
+    # candidate with 25+ years of exactly this experience got asked "do
+    # you have real, genuine experience with it?" for things that were
+    # never legitimate gaps, just the wrong category of thing extracted.
+    assert "Years-of-experience thresholds" in ATS_KEYWORDS_SYSTEM_PROMPT
+    assert "Alternate-title lists" in ATS_KEYWORDS_SYSTEM_PROMPT
+    assert "Generic soft-skill" in ATS_KEYWORDS_SYSTEM_PROMPT
+    assert "8+ years" in ATS_KEYWORDS_SYSTEM_PROMPT
+    assert "executive presence" in ATS_KEYWORDS_SYSTEM_PROMPT
+
+
+def test_drop_years_experience_keywords_filters_whole_phrase_variants():
+    # Deterministic backstop, not left to prompt compliance alone - same
+    # lesson as the rank-prefix/keyword-synonym fixes this week. Must
+    # catch the exact real strings a real posting produced: "10+ years IT
+    # leadership", "5 years executive technology".
+    keywords = [
+        "8+ years", "10+ years IT leadership", "5 years executive technology",
+        "3 years experience", "Python", "AWS",
+    ]
+    assert _drop_years_experience_keywords(keywords) == ["Python", "AWS"]
+
+
+def test_drop_years_experience_keywords_leaves_unrelated_terms_alone():
+    keywords = ["SQL", "Project Management", "PMP certification"]
+    assert _drop_years_experience_keywords(keywords) == keywords
+
+
+def test_drop_years_experience_keywords_does_not_eat_a_real_skill_containing_a_number():
+    # Must not overcorrect into stripping any keyword that merely contains
+    # a digit - only ones that START with a number-of-years pattern.
+    keywords = ["3D modeling", "Office 365", "24/7 on-call rotation"]
+    assert _drop_years_experience_keywords(keywords) == keywords
 
 
 def test_resume_spec_conditionally_keeps_or_drops_seniority_parenthetical():

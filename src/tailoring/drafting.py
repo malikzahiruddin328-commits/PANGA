@@ -317,7 +317,31 @@ Rules:
 - preferred_keywords: terms from a "preferred"/"desired"/"nice-to-have"/"bonus" section, or that read as a plus rather than mandatory.
 - If the posting doesn't clearly separate required vs preferred, use your best judgment on which items read as mandatory vs a plus - don't force a 50/50 split.
 - Keep each term short (1-4 words) and in the posting's own wording - e.g. "SQL", "AWS", "Project Management", "Agile", "PMP certification" - not full sentences or restated requirements.
-- If the posting text is boilerplate/empty/has no real requirements in it at all, return empty lists for both - do not pad with generic guesses."""
+- If the posting text is boilerplate/empty/has no real requirements in it at all, return empty lists for both - do not pad with generic guesses.
+
+Do NOT extract these three categories - a real gap caught live 2026-08-07: a candidate with 25+ years of exactly this kind of experience was asked "do you have real, genuine experience with it?" for things that were never checkable skill gaps in the first place, just the extractor pulling the wrong category of thing out of the posting entirely:
+- Years-of-experience thresholds. This is a numeric tenure requirement, not a checkable skill/tool/fact - e.g. do NOT extract "8+ years", "10+ years IT leadership", "5 years executive technology" as a keyword (the ATS score's own structural checks already cover tenure elsewhere; this extractor is for discrete skills/tools/certifications only).
+- Alternate-title lists. When a posting lists acceptable prior job titles (e.g. "IT director, solutions architect, technology consultant, or similar role"), that's the posting describing what kind of role the candidate should have held - not separate skills each needing individual proof. Do NOT extract "IT director", "solutions architect", or "technology consultant" as individual keywords from a title-list phrase like this.
+- Generic soft-skill/leadership phrases with no single checkable term. e.g. do NOT extract "executive presence", "presentation", "c-suite stakeholders", "strong communication skills", "executive technology strategies" - these are vague qualities almost any senior resume already demonstrates narratively; there's no literal fact to add for them."""
+
+
+# Deterministic backstop for the years-of-experience category above - a
+# regex is easy to catch here and shouldn't depend on the prompt being
+# followed perfectly every time (same lesson as the rank-prefix and
+# keyword-synonym fixes earlier this week: prompt-only guidance for this
+# extraction pipeline has already proven unreliable on its own more than
+# once). Matches when the WHOLE extracted keyword starts with a
+# number-of-years pattern, e.g. "8+ years", "10+ years IT leadership",
+# "5 years executive technology" - the tenure threshold is the entire
+# point of the string, not a discrete skill/tool/certification worth a
+# literal keyword-match check. The other two over-extraction categories
+# (alternate-title lists, generic soft-skill phrases) have no reliable
+# regex signature, so those rely on the tightened prompt above instead.
+_YEARS_EXPERIENCE_KEYWORD_RE = re.compile(r"^\d+\+?\s*years?\b", re.IGNORECASE)
+
+
+def _drop_years_experience_keywords(keywords: list[str]) -> list[str]:
+    return [k for k in keywords if not _YEARS_EXPERIENCE_KEYWORD_RE.match(k.strip())]
 
 
 def _ats_keywords_schema() -> dict:
@@ -377,8 +401,8 @@ def _extract_ats_keywords(client: "anthropic.Anthropic", job: dict, model: str |
     except (DraftingNotConfigured, DraftingFailed):
         return [], []
 
-    required = data.get("required_keywords") or []
-    preferred = data.get("preferred_keywords") or []
+    required = _drop_years_experience_keywords(data.get("required_keywords") or [])
+    preferred = _drop_years_experience_keywords(data.get("preferred_keywords") or [])
 
     from search.job_store import update_job_ats_keywords
 
