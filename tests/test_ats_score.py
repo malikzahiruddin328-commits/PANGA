@@ -124,3 +124,73 @@ def test_next_actions_flag_missing_structural_elements():
     result = score_resume_ats(POSTING, resume_no_headers_no_contact)
     joined = " ".join(result["ats_next_actions"]).lower()
     assert "header" in joined or "contact" in joined
+
+
+def test_bachelors_degree_requirement_matches_bsc_on_resume():
+    # Real bug Zahir hit live 2026-08-07: posting requires "bachelor's
+    # degree", his actual resume says "Brunel University, BSc" - pure
+    # literal matching marked this missing_required_keywords even though
+    # it's plainly present, and that false-missing flowed straight into a
+    # real, user-facing "do you have a bachelor's degree?" question.
+    result = score_resume_against_keywords(
+        ["bachelor's degree"], [], "EDUCATION\nBachelor of Science, Information Systems\nBrunel University London, BSc\n",
+    )
+    assert result["missing_required_keywords"] == []
+
+
+def test_information_technology_requirement_matches_it_abbreviation():
+    result = score_resume_against_keywords(
+        ["information technology"], [], "PROFESSIONAL EXPERIENCE\nHead of IT\nJanuary 2024 - Present\n",
+    )
+    assert result["missing_required_keywords"] == []
+
+
+def test_computer_science_requirement_matches_cs_abbreviation():
+    result = score_resume_against_keywords(
+        ["computer science"], [], "EDUCATION\nBSc, CS, Brunel University\n",
+    )
+    assert result["missing_required_keywords"] == []
+
+
+def test_masters_degree_requirement_matches_mba():
+    result = score_resume_against_keywords(
+        ["master's degree"], [], "EDUCATION\nMBA, Wharton\n",
+    )
+    assert result["missing_required_keywords"] == []
+
+
+def test_doctorate_requirement_matches_phd():
+    result = score_resume_against_keywords(
+        ["doctorate"], [], "EDUCATION\nPhD, Computer Science\n",
+    )
+    assert result["missing_required_keywords"] == []
+
+
+def test_equivalence_is_symmetric_resume_uses_full_form_posting_uses_abbreviation():
+    # A posting that asks for "BSc" should also count a resume that spells
+    # out "Bachelor of Science" - same equivalence class, either direction.
+    result = score_resume_against_keywords(
+        ["bsc"], [], "EDUCATION\nBachelor of Science, Information Systems\n",
+    )
+    assert result["missing_required_keywords"] == []
+
+
+def test_alias_matching_does_not_match_unrelated_terms():
+    # "cs" must not falsely match "customer service" or similar unrelated
+    # text just because the alias group exists.
+    result = score_resume_against_keywords(
+        ["computer science"], [], "PROFESSIONAL EXPERIENCE\nCustomer Service Representative\n",
+    )
+    assert result["missing_required_keywords"] == ["computer science"]
+
+
+def test_extract_keywords_fallback_path_also_benefits_from_equivalence():
+    # General's explicit ask: score_resume_ats()'s no-AI extract_keywords()
+    # fallback funnels into the same score_resume_against_keywords() /
+    # _phrase_in_text() call, so it must get the same fix, not just the
+    # AI-extracted-keyword-list path.
+    posting = "Minimum Qualifications: Bachelor's degree required. Experience with Information Technology systems."
+    resume = "EDUCATION\nBSc, Brunel University\n\nPROFESSIONAL EXPERIENCE\nHead of IT\n"
+    result = score_resume_ats(posting, resume)
+    assert "bachelor's degree" not in result["missing_required_keywords"]
+    assert "information technology" not in result["missing_required_keywords"]
