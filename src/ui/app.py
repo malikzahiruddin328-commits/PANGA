@@ -21,12 +21,16 @@ visible no matter which tab is open.
 """
 
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from debug_log import setup_debug_logging
+setup_debug_logging()
 
 
 def _find_bhangi_src(project_root: Path) -> Path | None:
@@ -63,8 +67,12 @@ import yaml
 
 from search.usajobs import search_jobs, USAJobsNotConfigured
 from search.job_store import load_jobs
+from search.job_sources import load_job_sources, save_job_sources
+from search.job_alert_senders import load_job_alert_senders, save_job_alert_senders
+from search.aggregators import ADZUNA_COUNTRIES, is_configured as adzuna_is_configured
+from search.source_activity import all_tracked_sources, is_source_stale
 from ranking.prioritize import weight_for, dedupe_across_sources
-from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion, set_strategy_tag, needs_edit_review, record_document_edit_review
+from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion, set_strategy_tag, needs_edit_review, record_document_edit_review, get_applications_with_open_clarifying_questions
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
 from tailoring.interview_prep import load_interview_prep, record_round_outcome, build_prep_context, generate_prep, start_round, save_round
 from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
@@ -87,11 +95,29 @@ from linkedin.connections import parse_connections_csv, looks_like_recruiter, cr
 from linkedin.connections_store import load_connections_snapshot, save_connections
 from security.crypto_store import has_recovery_code, generate_recovery_code
 import gmail_client
+import imap_client
+import microsoft_client
+import google_calendar_client
+from email_providers import detect_imap_settings
+from fulfillment import get_last_synced_at, get_pending_count, run_full_fulfillment
 from feedback.ui_feedback import get_open_feedback, mark_resolved
 from ui.feedback_widget import render_feedback_widget
 from profile.ingest import load_manifest_result, remove_document, ingest_uploaded_document, resume_text as ingested_resume_text
 from profile.storage import load_profile, update_profile_field
-from bhangi.ui import render_support_page
+try:
+    # Bhangi is a separate, standalone cross-project tool (see
+    # _find_bhangi_src above) - not something this app ships or installs
+    # itself, so a checkout that doesn't have a sibling Bhangi project (any
+    # friend-testing package, for instance - see run_app_friend_test.bat)
+    # previously hard-crashed the WHOLE app on this single import. Missing
+    # Bhangi should only mean "no Support tab", never "no app at all".
+    from bhangi.ui import render_support_page
+    from bhangi.issues import create_issue as bhangi_create_issue
+    from bhangi.build_info import detect_build as bhangi_detect_build
+except ImportError:
+    render_support_page = None
+    bhangi_create_issue = None
+    bhangi_detect_build = None
 from ui.license_gate import render_indicator_and_get_block, render_block_screen
 from licensing.client import release_device, create_portal_session, LicenseNetworkError, LicenseServiceError
 
@@ -141,6 +167,74 @@ CONFIG_PATH = PROJECT_ROOT / ".streamlit" / "config.toml"
 
 st.set_page_config(page_title="Panga - Job Search", page_icon=":material/work:", layout="wide")
 
+# Every st.button(..., icon=...) in this app pairs the icon with a real,
+# non-empty text label (tab nav, "Generate my target roles...", "Open
+# folder", etc.) - the icon is always decorative reinforcement, never the
+# button's only content. But st.button's icon= parameter renders as a bare
+# <span data-testid="stIconMaterial">notifications_active</span> with no
+# aria-hidden/aria-label at all, and the <button> itself ships an explicit
+# but EMPTY aria-label="" (confirmed by inspecting the real DOM). Verified
+# directly against Chrome's own accessibility tree (not just guessed from
+# the ARIA spec text) that an empty aria-label doesn't fall through to the
+# button's visible text the way a *missing* aria-label would - Chrome
+# treats the attribute's mere presence as authoritative and computes an
+# empty accessible name. First pass here only added aria-hidden to the
+# icon span and left that empty aria-label alone - re-checked the
+# accessibility tree afterward (this file's "verify against real data"
+# habit, not just "looks right in code") and found every tab button had
+# gone from a garbled name ("notifications_activeCall to action (7)",
+# Mirror's original finding) to NO name at all, which is worse. Fixing
+# both in the same pass: hide the redundant icon from assistive tech AND
+# set a real aria-label on the button from its own visible text, so the
+# empty one Streamlit ships never gets a chance to win.
+#
+# Diverges from Mirror's literal suggestion (copy task_alt's role="img" +
+# aria-label pattern) on purpose: task_alt is a *standalone* icon with no
+# adjacent text, where labeling the icon itself is the right fix. These
+# icons duplicate a visible label right next to them - labeling the icon
+# too would double-announce ("notifications_active icon, Call to action,
+# 7 items"). Labeling the button directly (from its own text) gets to
+# "Call to action, 7 items" with nothing redundant. Flagged back to
+# Mirror/hub for review since it departs from the literal ask.
+#
+# Can't pass either attribute through the icon= parameter (Python-level
+# API, no such option) - patches the DOM after the fact instead, same
+# technique already used elsewhere in this file for the scroll-into-view
+# anchor. A MutationObserver (not a one-shot query) because Streamlit
+# re-renders these buttons on every tab switch/interaction; the guard flag
+# makes re-running this script block on every rerun a no-op after the
+# first real pass.
+st.html(
+    """
+    <script>
+    (function () {
+        function fixDecorativeIconButtons(root) {
+            root.querySelectorAll('[data-testid="stIconMaterial"]').forEach(function (icon) {
+                var btn = icon.closest('button');
+                var labelEl = btn && btn.querySelector('[data-testid="stMarkdownContainer"]');
+                if (!labelEl) return;
+                icon.setAttribute('aria-hidden', 'true');
+                var labelText = labelEl.textContent.trim();
+                if (labelText) btn.setAttribute('aria-label', labelText);
+            });
+        }
+        fixDecorativeIconButtons(document);
+        if (window.__pangaIconA11yObserver) return;
+        var observer = new MutationObserver(function (mutations) {
+            mutations.forEach(function (m) {
+                m.addedNodes.forEach(function (n) {
+                    if (n.nodeType === 1) fixDecorativeIconButtons(n);
+                });
+            });
+        });
+        observer.observe(document.body, {childList: true, subtree: true});
+        window.__pangaIconA11yObserver = observer;
+    })();
+    </script>
+    """,
+    unsafe_allow_javascript=True,
+)
+
 
 def load_settings() -> dict:
     return yaml.safe_load(SETTINGS_PATH.read_text(encoding="utf-8"))
@@ -157,6 +251,202 @@ def application_status(job: dict) -> str | None:
 
 def job_label(job: dict) -> str:
     return f"{job.get('title')} - {job.get('organization')}"
+
+
+# Shared with the Results tab's own filtering pipeline below, so a status
+# string typo can't make the two silently disagree about which jobs count
+# as hidden-by-default.
+NOT_INTERESTED_STATUSES = ("not interested", "not-interested")  # handle both forms - see applications.py note
+CLOSED_STATUSES = ("closed by employer",)
+APPLIED_STATUSES = ("applied",)
+
+
+def compute_results_ranked(
+    jobs: list[dict], target_roles: list[dict], min_score: int,
+    show_not_interested: bool, show_closed: bool, show_applied: bool,
+) -> list[dict]:
+    """The same rank/filter/dedup pipeline the Results tab's own "N job(s)"
+    heading computes (score threshold, the three hide-by-default statuses,
+    cross-source dedup) - pulled out so the Results tab's nav-bar badge can
+    show that same number instead of the raw unfiltered job-store total
+    (Zahir's explicit ask 2026-08-06: the badge should reflect what he'll
+    actually action, not everything ever scanned). The badge is rendered
+    before the tab itself runs, so it calls this with whatever the filter
+    widgets were last set to (via their session_state keys, defaulting to
+    each widget's own default if the tab's never been visited yet) - the
+    page below calls it again with that run's live widget values once
+    they've actually rendered. One real consequence: if you change a
+    filter while ON the Results tab, the badge can lag one rerun behind the
+    page's own heading until the next interaction - a fresh call each rerun
+    would need the widgets to render before the nav bar does, which they
+    can't. Doesn't compute the intermediate hidden-by-each-filter counts
+    the page's own checkbox labels show - those still live inline below,
+    since they need the running total at each stage, not just the end
+    result."""
+    def sort_key(job):
+        has_score = "fit_score" in job
+        return (has_score, job.get("fit_score", -1), weight_for(job.get("title"), target_roles))
+
+    ranked = sorted(jobs, key=sort_key, reverse=True)
+    ranked = [j for j in ranked if "fit_score" in j and j["fit_score"] >= min_score]
+    if not show_not_interested:
+        ranked = [j for j in ranked if application_status(j) not in NOT_INTERESTED_STATUSES]
+    if not show_closed:
+        ranked = [j for j in ranked if application_status(j) not in CLOSED_STATUSES]
+    if not show_applied:
+        ranked = [j for j in ranked if application_status(j) not in APPLIED_STATUSES]
+    return dedupe_across_sources(ranked)
+
+
+# The real Gmail scan (panga-gmail-cta-scan) runs 4x/day - 8am, 12pm, 4pm,
+# 8pm local - see docs/email-monitoring-task.md. Flagging staleness at
+# double that interval (8 hours) means one slightly-late run never
+# false-positives, but a genuinely missed cycle always does.
+CTA_SCAN_INTERVAL_HOURS = 4
+CTA_SCAN_STALE_AFTER_HOURS = CTA_SCAN_INTERVAL_HOURS * 2
+
+
+def _format_last_synced(iso_timestamp: str | None) -> tuple[str, bool]:
+    """Human-readable "Last synced ..." line for the Call to Action tab's
+    status card, plus whether it's stale enough to warrant a warning.
+    `iso_timestamp` is fulfillment.get_last_synced_at()'s return value -
+    None if fulfillment has never completed a run.
+
+    Returns (text, is_stale). Without this, "All caught up" (positive/
+    green) and a last-synced time well past the expected scan cadence look
+    equally healthy - nothing distinguishes "genuinely caught up" from
+    "caught up as of a stale scan, so something new could be sitting
+    unprocessed right now and we just don't know yet" (Zahir's live-testing
+    finding, 2026-08-06, production instance - a real "Last synced 19 hours
+    ago" read as fine when it very much wasn't)."""
+    if not iso_timestamp:
+        return "Never synced yet", True
+    try:
+        synced_at = datetime.fromisoformat(iso_timestamp)
+    except ValueError:
+        return "Last synced: unknown", True
+    now = datetime.now(timezone.utc) if synced_at.tzinfo else datetime.now()
+    elapsed_seconds = (now - synced_at).total_seconds()
+    minutes = max(0, int(elapsed_seconds // 60))
+    is_stale = elapsed_seconds / 3600 > CTA_SCAN_STALE_AFTER_HOURS
+    if minutes < 1:
+        return "Last synced just now", is_stale
+    if minutes < 60:
+        return f"Last synced {minutes} minute{'s' if minutes != 1 else ''} ago", is_stale
+    hours = minutes // 60
+    if hours < 24:
+        return f"Last synced {hours} hour{'s' if hours != 1 else ''} ago", is_stale
+    days = hours // 24
+    return f"Last synced {days} day{'s' if days != 1 else ''} ago", is_stale
+
+
+_PROGRESS_CHAR_RE = re.compile(r"([\d,]+) characters")
+
+# Rough expected output length per direct-API call, used only to make a
+# progress bar move smoothly with the real character count instead of
+# sitting frozen for the entire streamed call - not a promise about final
+# length. Every direct-API call in this app reports the same "thinking..."
+# / "writing... (N characters so far)" substatus (llm_client.py's
+# call_structured, Zahir's explicit ask 2026-07-31: "no spinner anywhere
+# should be opaque when the underlying call can report real progress
+# instead"), so one lookup table + one fraction function covers all of
+# them - drafting, scoring, diagnosis, prep, LinkedIn analysis. Resume
+# drafting runs well past everything else here once RESUME_SPEC's real
+# output length is accounted for, so it gets its own higher target.
+_EXPECTED_RESPONSE_CHARS = {
+    "resume": 13_000,
+    "cover_letter": 2_500,
+    "exec_bio": 2_000,
+    "leadership_summary": 2_000,
+    "apply_answers": 3_000,
+    "job_score": 1_500,
+    "prospector_score": 1_500,
+    "diagnosis": 1_200,
+    "learn": 1_200,
+    "prep": 3_000,
+    "linkedin_enhance": 3_000,
+}
+_RESPONSE_CHARS_DEFAULT = 4_000
+_PROGRESS_CAP = 0.92  # never shows 100% until the call actually finishes
+
+
+def progress_fraction(response_key: str, substatus: str | None) -> float:
+    """How far through a direct-API call the current substatus represents,
+    0-1. "thinking..." (no character count yet) shows a small sliver so the
+    bar doesn't sit dead still while Claude reasons before writing anything;
+    "writing... (N characters so far)" scales against a rough expected
+    length for that call, capped below 100% so the visible jump to "Done"
+    always means the response is actually ready, never an estimate that
+    happened to land early."""
+    if not substatus:
+        return 0.0
+    match = _PROGRESS_CHAR_RE.search(substatus)
+    if not match:
+        return 0.05  # "thinking..." or any other pre-writing substatus
+    char_count = int(match.group(1).replace(",", ""))
+    expected = _EXPECTED_RESPONSE_CHARS.get(response_key, _RESPONSE_CHARS_DEFAULT)
+    return min(char_count / expected, _PROGRESS_CAP)
+
+
+_DRAFT_DONE_GREEN = {"light": "#1a7f37", "dark": "#3fb950"}  # config.toml's own greenColor per mode
+
+
+def progress_shimmer_css(container_key: str) -> str:
+    """A <style> block that reskins the st.progress bar inside
+    st.container(key=container_key) with a moving shimmer highlight while
+    it's running, then a solid green fill once it hits 100% - the
+    "shimmer sweep" look Zahir picked from the style comparison (2026-08-03)
+    over three animated alternatives (barber-pole stripes, pulse glow, comet
+    trail).
+
+    Targets the real DOM Streamlit renders for st.progress, confirmed by
+    direct inspection rather than guessed (inspecting a throwaway probe bar
+    at localhost:8504): the visible fill isn't a width-based div, it's a
+    full-width div translateX()'d left and clipped by its parent's
+    overflow:hidden, so a ::after sweep positioned against the fill's own
+    box is naturally masked to only the visible (filled) portion - no need
+    to recompute the sweep's bounds as progress changes. The done-state
+    color swap keys off the real aria-valuenow="100" the ProgressBar sets,
+    so it needs no separate "done" HTML injection - the same static CSS
+    handles both states.
+
+    Reads st.context.theme.type (not a prefers-color-scheme media query)
+    for the done color, since this app defines both [theme.light] and
+    [theme.dark] in config.toml - Zahir can switch modes from Streamlit's
+    own settings menu independent of his OS preference, and only the
+    server-side theme context reflects that choice correctly."""
+    green = _DRAFT_DONE_GREEN.get(st.context.theme.type, _DRAFT_DONE_GREEN["light"])
+    key_sel = f".st-key-{container_key}"
+    return f"""<style>
+{key_sel} [data-testid="stProgressBarTrack"] > div {{
+    position: relative;
+    overflow: hidden;
+}}
+{key_sel} [data-testid="stProgressBarTrack"] > div::after {{
+    content: "";
+    position: absolute;
+    top: 0; bottom: 0; left: -40%;
+    width: 40%;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.55), transparent);
+    animation: panga-progress-shimmer 1.35s ease-in-out infinite;
+}}
+{key_sel} [role="progressbar"][aria-valuenow="100"] [data-testid="stProgressBarTrack"] > div {{
+    background: {green};
+}}
+{key_sel} [role="progressbar"][aria-valuenow="100"] [data-testid="stProgressBarTrack"] > div::after {{
+    content: none;
+    animation: none;
+}}
+@keyframes panga-progress-shimmer {{
+    0% {{ left: -40%; }}
+    100% {{ left: 110%; }}
+}}
+@media (prefers-reduced-motion: reduce) {{
+    {key_sel} [data-testid="stProgressBarTrack"] > div::after {{
+        animation: none;
+    }}
+}}
+</style>"""
 
 
 def format_pay(value) -> str | None:
@@ -231,16 +521,19 @@ def render_outreach_section(key_prefix: str, target_account_name: str | None = N
                 update_outreach_status(o["outreach_id"], new_o_status)
                 st.rerun()
         with oc2:
-            if o["channel"] == "email" and o.get("contact_email") and not o.get("gmail_draft_id") and not o.get("draft_requested"):
+            if o["channel"] == "email" and o.get("contact_email") and not (o.get("draft_id") or o.get("gmail_draft_id")) and not o.get("draft_requested"):
                 if st.button("Request draft", key=f"{key_prefix}_reqdraft_{o['outreach_id']}"):
                     request_draft(o["outreach_id"])
-                    st.toast("Flagged - the background fulfillment task will create a real Gmail draft shortly.", icon=":material/check_circle:")
+                    st.toast("Flagged - will create a real draft on the next sync (2x/day, or click \"Send and receive\" on Call to Action).", icon=":material/check_circle:")
                     st.rerun()
             elif o.get("draft_requested"):
                 st.markdown("Draft requested, not yet created")
         with oc3:
-            if o.get("gmail_draft_link"):
-                st.link_button("Open draft", o["gmail_draft_link"], key=f"{key_prefix}_opendraft_{o['outreach_id']}")
+            draft_link = o.get("draft_link") or o.get("gmail_draft_link")
+            if draft_link:
+                st.link_button("Open draft", draft_link, key=f"{key_prefix}_opendraft_{o['outreach_id']}")
+            elif o.get("draft_id") or o.get("gmail_draft_id"):
+                st.button("Draft created - check Drafts folder", key=f"{key_prefix}_opendraft_{o['outreach_id']}", disabled=True)
         new_o_tag = st.text_input(
             "Strategy tag (optional)", value=o.get("strategy_tag") or "",
             key=f"{key_prefix}_otag_{o['outreach_id']}", label_visibility="collapsed",
@@ -269,18 +562,454 @@ def render_outreach_section(key_prefix: str, target_account_name: str | None = N
                 st.warning("Contact name is required.")
 
 
+def regenerate_resume_and_persist(job: dict, on_progress, success_message: str) -> dict | None:
+    """Regenerates just the resume for one job and persists the fresh text/
+    score/rationale/next_actions/clarifying_questions/strategy_tag, then
+    syncs the workspace .docx - the exact sequence both the clarifying-
+    questions regenerate flow and the paste-a-JD regenerate flow end in, so
+    it's shared rather than duplicated between them. Shows the toast itself
+    on success (success_message gets `.format(score=...)` applied); on
+    failure shows the error via st.error and returns None - the caller is
+    still responsible for creating/clearing its own progress bar, since
+    that UI differs slightly between callers."""
+    try:
+        regen = generate_documents(job, load_profile(), ["resume"], on_progress=on_progress)
+    except (DraftingNotConfigured, DraftingFailed) as exc:
+        st.error(str(exc))
+        return None
+    new_resume = regen["resume"]
+    upsert_application(
+        job["source"], job["job_id"], status="under review",
+        resume_text=new_resume["text"],
+        resume_ats_score=new_resume["ats_score"],
+        resume_ats_rationale=new_resume["ats_rationale"],
+        resume_ats_next_actions=new_resume["ats_next_actions"],
+        resume_clarifying_questions=new_resume["clarifying_questions"],
+        suggested_strategy_tag=new_resume["suggested_strategy_tag"],
+    )
+    sync_workspace_documents(
+        job["source"], job["job_id"], ["resume"],
+        {"resume": new_resume["text"]}, load_profile(), job,
+    )
+    # Same one-shot auto-expand signal the initial "Generate documents"
+    # success path sets (Zahir, 2026-08-06) - a regenerate triggered from
+    # here (answering a gap question, updating the JD text) must surface
+    # its new score/rationale/questions immediately too, not just the
+    # first-ever draft.
+    st.session_state[f"just_drafted_resume_{job['source']}_{job['job_id']}"] = True
+    st.toast(success_message.format(score=new_resume["ats_score"]), icon=":material/check_circle:")
+    return new_resume
+
+
+def _job_has_captured_jd_text(job: dict) -> bool:
+    return bool((job.get("qualification_summary") or job.get("description") or "").strip())
+
+
+def _regenerate_with_progress(job: dict, key_suffix: str, working_message: str, success_message: str) -> None:
+    """Shared progress-bar-then-regenerate sequence for both the paste-a-JD
+    flow and the view/update-an-existing-JD flow below - both end in the
+    exact same "show a shimmering progress bar while
+    regenerate_resume_and_persist() runs, then either clear it on failure
+    or mark it done and rerun" sequence, so it's factored out rather than
+    duplicated a third time."""
+    regen_bar_key = f"jd_regen_progress_bar_{key_suffix}"
+    with st.container(key=regen_bar_key):
+        regen_bar = st.progress(0, text=working_message)
+    st.html(progress_shimmer_css(regen_bar_key))
+
+    def _update_regen_progress(i, total, doc_key2, substatus=None):
+        label = "Rescoring resume"
+        label += f" — {substatus}" if substatus else "..."
+        within_doc = progress_fraction(doc_key2, substatus)
+        regen_bar.progress(((i - 1) + within_doc) / total, text=label)
+
+    new_resume = regenerate_resume_and_persist(job, _update_regen_progress, success_message)
+    if new_resume is None:
+        regen_bar.empty()
+    else:
+        regen_bar.progress(1.0, text=":material/check_circle: Done.")
+        st.rerun()
+
+
+def render_jd_view_or_update_box(job: dict, key_prefix: str) -> str | None:
+    """Collapsed-by-default view of a job's currently-stored JD text,
+    editable in place - Zahir's ask 2026-08-06: the paste box was write-
+    only (paste, save, rescore, and the pasted text was never visible
+    again). Shown whenever a job already has real JD text - the opposite
+    branch from the no-JD paste prompts, so the two never fight each
+    other (a job is always in exactly one state at a time: needs a paste,
+    or already has text to view/update).
+
+    Collapsed by default per Zahir's explicit ask, so a job that's fine as-
+    is doesn't clutter the row/score-card with an open text box. Keyed on
+    a hash of the current text (not just key_prefix alone) - the same
+    stale-widget-value pattern CLAUDE.md's HCI standard already calls out
+    elsewhere in this file (strategy-tag/clarifying-question boxes):
+    Streamlit ignores a new `value=` once a `key` already has session-
+    state, so if the stored text ever changes some other way while this
+    key stays constant, the box would keep silently showing the old text.
+
+    Returns the new text if the user clicked "Update job description" with
+    genuinely changed, non-blank text - None otherwise (including "clicked
+    but nothing changed", which shows an info toast instead of pretending
+    to save). The caller decides what happens next (persist only vs.
+    persist + regenerate a draft), since that differs between the
+    proactive (before-drafting) and post-hoc (already-drafted) call sites."""
+    current_text = job.get("description") or job.get("qualification_summary") or ""
+    text_key = f"jd_view_{key_prefix}_{abs(hash(current_text)) % 10_000_000}"
+    with st.expander("View / update job description", expanded=False):
+        updated_text = st.text_area("Job description", value=current_text, key=text_key, height=150)
+        if st.button("Update job description", key=f"jd_view_save_{key_prefix}"):
+            stripped = updated_text.strip()
+            if not stripped:
+                st.toast("The job description can't be cleared here - paste replacement text instead.", icon=":material/warning:")
+            elif stripped == current_text.strip():
+                st.toast("No changes to save.", icon=":material/info:")
+            else:
+                return stripped
+    return None
+
+
+def render_paste_jd_notice() -> None:
+    """The shared "why there's no JD text" framing - Zahir's explicit
+    product direction 2026-08-06: this must never read as a limitation to
+    apologize for. Some job sites intentionally block automated fetching to
+    protect themselves and their users from scraping/bots - Panga
+    respecting that instead of trying to bypass it is a deliberate,
+    security-conscious design choice, not a gap. Shared by both the
+    proactive (before any document is drafted) and post-hoc (an already-
+    drafted resume's score card) paste prompts below, so the framing can't
+    drift between the two."""
+    st.info(
+        "We don't have this posting's full description yet - some job "
+        "sites intentionally block automated access to protect themselves "
+        "and their users from scraping, and Panga respects that rather "
+        "than trying to bypass it. Paste the job description below and "
+        "we'll tailor against it directly.",
+        icon=":material/shield:",
+    )
+
+
+def render_paste_jd_prompt_before_drafting(job: dict) -> None:
+    """Proactive paste-JD prompt - Zahir's follow-up ask 2026-08-06: the
+    post-hoc version below only ever appeared after a resume had already
+    been drafted blind against no real JD text, buried inside that
+    drafted resume's own expander. The actual ask is for this to be
+    available BEFORE any document gets generated at all, right at the
+    job-row level next to the doc-type checkboxes/Generate button, so the
+    very first document Panga drafts for this job - resume, cover letter,
+    exec bio, leadership summary, or the Apply Assist packet, not just the
+    resume - is already tailored against the real JD rather than drafted
+    blind and fixed up after the fact.
+
+    Saving here does NOT trigger a regenerate the way the post-hoc version
+    does - nothing has been drafted yet to regenerate. It just persists
+    the text via search.job_store.update_job_description() (clears the
+    stale empty ats_required_keywords/ats_preferred_keywords cache too),
+    so whatever gets drafted next through the normal "Generate documents"
+    button reads it naturally through the same generate_documents() call
+    every draft already goes through - no new downstream code path.
+
+    This is additive, not a replacement: the post-hoc render_paste_jd_prompt()
+    stays in place too, so someone who already has a blind-drafted resume
+    can still paste a JD there and get everything correctly redrafted."""
+    render_paste_jd_notice()
+    job_key = f"{job.get('source')}_{job.get('job_id')}"
+    pasted_jd = st.text_area(
+        "Paste the job description", key=f"jd_paste_pre_{job_key}", height=120,
+        placeholder="Paste the full job posting text here...",
+        label_visibility="collapsed",
+    )
+    if st.button("Save job description", key=f"jd_paste_pre_save_{job_key}"):
+        if not pasted_jd.strip():
+            st.toast("Paste the job description text first.", icon=":material/warning:")
+        else:
+            from search.job_store import update_job_description
+
+            update_job_description(job["source"], job["job_id"], pasted_jd.strip())
+            job["description"] = pasted_jd.strip()
+            st.toast(
+                "Saved - whatever you generate next will be tailored against it.",
+                icon=":material/check_circle:",
+            )
+            st.rerun()
+
+
+def render_paste_jd_prompt(job: dict) -> None:
+    """Post-hoc active fallback for a job with no captured JD text
+    (ZipRecruiter, Indeed, the industry job boards - confirmed live
+    2026-08-06 that these sources genuinely have no real posting text
+    available, either because the site blocks automated access or no
+    detail-page fetch exists yet). Lives inside an already-drafted resume's
+    own score card - kept as a fallback for resumes drafted blind before
+    render_paste_jd_prompt_before_drafting() existed, or for anyone who
+    skips the proactive prompt and drafts anyway. See that function's
+    docstring for the proactive version, which is now the primary path.
+
+    Saving goes through the exact same read path every other job already
+    uses - search.job_store.update_job_description() sets job["description"]
+    (which tailoring.drafting._extract_ats_keywords() already reads) and
+    clears any stale empty ats_required_keywords/ats_preferred_keywords
+    cache, so the regenerate below re-extracts for real instead of reusing
+    the old "nothing found" result. Unlike the proactive version, this one
+    DOES immediately regenerate the resume - a draft already exists here
+    and needs to catch up, whereas the proactive version has nothing yet
+    to regenerate."""
+    render_paste_jd_notice()
+    job_key = f"{job.get('source')}_{job.get('job_id')}"
+    pasted_jd = st.text_area(
+        "Paste the job description", key=f"jd_paste_{job_key}", height=120,
+        placeholder="Paste the full job posting text here...",
+        label_visibility="collapsed",
+    )
+    if st.button("Save & rescore", key=f"jd_paste_save_{job_key}"):
+        if not pasted_jd.strip():
+            st.toast("Paste the job description text first.", icon=":material/warning:")
+        else:
+            from search.job_store import update_job_description
+
+            update_job_description(job["source"], job["job_id"], pasted_jd.strip())
+            job["description"] = pasted_jd.strip()
+            _regenerate_with_progress(
+                job, job_key, "Rescoring against the pasted description...",
+                "Resume rescored against the pasted description - new ATS score {score}/100.",
+            )
+
+
+def render_gap_questions_section(job: dict, app_record: dict) -> None:
+    """The clarifying-questions answer-and-regenerate flow for one job's
+    resume - the Profile Gaps tab's per-job unit. Moved off the Results tab
+    2026-08-04 (Zahir: too much clutter mixed into per-job review) -
+    resume_ats_score/rationale/next_actions stay inline on Results (just
+    informative, no clutter issue), only this interactive part moved here.
+
+    Preserves the 2026-07-31 fix intact: each text_area is keyed by the
+    question's own content + suggested_answer, not its position - keying by
+    position let a later regeneration round's box at the same index
+    silently keep a stale answer under a completely different question."""
+    clarifying_questions = app_record.get("resume_clarifying_questions") or []
+    if not clarifying_questions:
+        return
+
+    job_key = f"{job.get('source')}_{job.get('job_id')}"
+    current_score = app_record.get("resume_ats_score")
+    prev_score_key = f"prev_ats_score_{job_key}"
+
+    st.markdown(
+        "**Answer these to raise the score further - only used if you "
+        "confirm they're true, nothing is ever invented:**"
+    )
+    st.markdown(
+        "Some boxes are pre-filled with a proposed guess (worded "
+        "as a guess, e.g. \"Roughly 8-10 engineers?\") - edit it "
+        "to whatever's actually true, or clear it if it's wrong. "
+        "Nothing pre-filled is saved as-is."
+    )
+    answer_entries = []
+    for q in clarifying_questions:
+        # See the docstring above - question-content keying, not position.
+        q_key = f"gapans_{job_key}_{abs(hash(q['question'] + '|' + (q.get('suggested_answer') or ''))) % 10_000_000}"
+        is_disqualifier = q.get("type") == "disqualifier_check"
+        if is_disqualifier:
+            st.markdown(
+                ":material/flag: This answer applies to every "
+                "future job match, not just this one - not a "
+                "guess, so the box starts empty."
+            )
+        answer_value = st.text_area(
+            q["question"], value=q.get("suggested_answer") or "",
+            key=q_key, height=68,
+            placeholder="Type your answer..." if is_disqualifier else None,
+        )
+        answer_entries.append({
+            "skill": q["skill"],
+            "type": q.get("type", "skill_gap"),
+            "answer": answer_value,
+            "question": q["question"],
+        })
+    if st.button("Save answers & regenerate resume", key=f"gapsave_{job_key}"):
+        answered = [e for e in answer_entries if e["answer"] and e["answer"].strip()]
+        if not answered:
+            st.toast("Answer at least one question first.", icon=":material/warning:")
+        else:
+            st.session_state[prev_score_key] = current_score
+            save_gap_answers(job, answered)
+            regen_bar_key = f"regen_progress_bar_{job_key}"
+            with st.container(key=regen_bar_key):
+                regen_bar = st.progress(0, text="Regenerating resume with your answers...")
+            st.html(progress_shimmer_css(regen_bar_key))
+
+            def _update_regen_progress(i, total, doc_key2, substatus=None):
+                label = "Regenerating resume"
+                label += f" — {substatus}" if substatus else "..."
+                within_doc = progress_fraction(doc_key2, substatus)
+                regen_bar.progress(((i - 1) + within_doc) / total, text=label)
+
+            new_resume = regenerate_resume_and_persist(
+                job, _update_regen_progress, "Resume regenerated - new ATS score {score}/100.",
+            )
+            if new_resume is None:
+                regen_bar.empty()
+            else:
+                regen_bar.progress(1.0, text=":material/check_circle: Done.")
+                st.rerun()
+
+
+def render_answered_gap_questions() -> None:
+    """Retrievable/editable history of every confirmed gap answer - Zahir's
+    ask 2026-08-06: once a question is genuinely answered, it correctly
+    drops out of the "open" list forever (both the AI's own dedup and
+    _merge_keyword_gap_questions's profile-history check stop re-asking it)
+    - but that meant there was no way to go back and see or edit what was
+    actually answered. Same "retrievable, editable" principle already built
+    for the JD-paste box, applied here.
+
+    Profile-wide, not per-job (gap_interview_answers lives on the master
+    profile - a confirmed fact applies to every future job's scoring, not
+    just the one that first surfaced it) - a single top-level section here,
+    unlike the per-job "open questions" list above it. Collapsed by default
+    (same as the JD view/update box) so a candidate with nothing to review
+    isn't shown a wall of settled history.
+
+    Editing calls profile.interview.save_answer() again, which now updates
+    the existing entry in place (2026-08-06 fix - it used to silently
+    append a duplicate for the same skill instead of reflecting the
+    current, latest answer)."""
+    profile = load_profile()
+    answers = profile.get("gap_interview_answers", [])
+    if not answers:
+        return
+
+    with st.expander(f"Previously answered ({len(answers)})", expanded=False):
+        for entry in answers:
+            skill = entry.get("skill", "")
+            question_text = entry.get("question") or f"Confirm: {skill}"
+            is_disqualifier = entry.get("is_disqualifier", False)
+            entry_key = abs(hash(f"{skill}|{entry.get('date_captured', '')}")) % 10_000_000
+
+            if is_disqualifier:
+                st.markdown(":material/flag: Applies to every future job match, not just one.")
+            st.markdown(f"Confirmed {entry.get('date_captured', 'date unknown')} - {entry.get('role_context', '')}")
+            new_answer = st.text_area(
+                question_text, value=entry.get("answer", ""),
+                key=f"answered_edit_{entry_key}", height=68,
+            )
+            if st.button("Update answer", key=f"answered_save_{entry_key}"):
+                stripped = new_answer.strip()
+                if not stripped:
+                    st.toast("Can't clear an answer here - edit it to replacement text instead.", icon=":material/warning:")
+                elif stripped == (entry.get("answer") or "").strip():
+                    st.toast("No changes to save.", icon=":material/info:")
+                else:
+                    from datetime import date
+
+                    from profile.interview import save_answer
+
+                    save_answer(
+                        skill=skill, role_context=entry.get("role_context", ""), answer=stripped,
+                        date_captured=date.today().isoformat(), question=question_text,
+                        is_disqualifier=is_disqualifier,
+                    )
+                    st.toast("Answer updated.", icon=":material/check_circle:")
+                    st.rerun()
+            st.divider()
+
+
 def go_to_prep(target: dict) -> None:
     """Jumps to the Interview Prep tab with enough context to hand off to
     Claude Code - the tab itself doesn't generate anything, it just shows
     what to ask for. target is either {"kind": "job", "source", "job_id",
     "job_label"} (from Results, where the job is known for certain) or
-    {"kind": "email", "thread_id", "subject", "sender", "gmail_link"} (from
+    {"kind": "email", "thread_id", "subject", "sender", "web_link"} (from
     Call to Action, where the email might not be linked to a tracked
     application yet - Claude resolves that ambiguity in conversation, same
     as the existing suggest_status matching does)."""
     st.session_state["active_tab"] = "prep"
     st.session_state["prep_target"] = target
     st.rerun()
+
+
+# Structured reasons for the inline "Pass" action below (Zahir's explicit
+# ask, relayed via hub 2026-08-06): categories, not open-ended prose, since
+# the plan is to look for patterns across them later. Deliberately reuses
+# applications.py's existing skip_reason field/storage rather than adding a
+# parallel one - the category (or free text for "Something else") becomes
+# the skip_reason string exactly like the existing full-detail-panel "Why
+# not interested?" box already does, so get_unreviewed_skip_reasons() and
+# the rest of that review loop keep working unchanged on both paths.
+PASS_REASON_CATEGORIES = [
+    "Wrong seniority level",
+    "Not my industry/domain",
+    "Comp too low",
+    "Location doesn't work",
+    "Something else",
+]
+
+
+@st.dialog("Why pass on this job?")
+def _pass_reason_dialog(source: str, job_id: str, label: str) -> None:
+    st.markdown(f"**{label}**")
+    reason_category = st.radio("Reason", PASS_REASON_CATEGORIES, key="pass_reason_category")
+    free_text = ""
+    if reason_category == "Something else":
+        free_text = st.text_area("What's the reason?", key="pass_reason_free_text")
+    confirm_col, cancel_col = st.columns(2)
+    with confirm_col:
+        if st.button("Confirm pass", type="primary", key="pass_reason_confirm"):
+            skip_reason = free_text.strip() if reason_category == "Something else" and free_text.strip() else reason_category
+            upsert_application(source, job_id, status="not interested", skip_reason=skip_reason)
+            st.session_state.pop("pass_dialog_pending", None)
+            st.toast("Marked not interested.", icon=":material/check_circle:")
+            st.rerun()
+    with cancel_col:
+        if st.button("Cancel", key="pass_reason_cancel"):
+            st.session_state.pop("pass_dialog_pending", None)
+            st.rerun()
+
+
+@st.dialog("Disconnect this account?")
+def _confirm_imap_disconnect(acct: str) -> None:
+    # Used to delete credentials immediately on click, no undo, no
+    # confirmation at all (Mirror's fine-needle audit, 2026-08-06).
+    st.markdown(
+        f"Disconnect **{acct}**? This deletes its stored credentials "
+        "immediately - there's no undo. You'd need to reconnect and "
+        "re-enter them from scratch to use this account again."
+    )
+    confirm_col, cancel_col = st.columns(2)
+    with confirm_col:
+        if st.button("Disconnect", type="primary", key="imap_disconnect_confirm"):
+            imap_client.remove_account(acct)
+            st.session_state.pop("imap_disconnect_pending", None)
+            st.toast(f"Disconnected {acct}.", icon=":material/check_circle:")
+            st.rerun()
+    with cancel_col:
+        if st.button("Cancel", key="imap_disconnect_cancel"):
+            st.session_state.pop("imap_disconnect_pending", None)
+            st.rerun()
+
+
+@st.dialog("Replace your recovery code?")
+def _confirm_recovery_code_regen() -> None:
+    # Used to invalidate the existing code immediately on click, before
+    # the "it stops working" warning above had actually been read as a
+    # real consequence about to happen, not just background text (Mirror's
+    # fine-needle audit, 2026-08-06).
+    st.markdown(
+        "Generating a new recovery code immediately replaces the current "
+        "one - the old code stops working right away, even if you haven't "
+        "saved the new one anywhere yet."
+    )
+    confirm_col, cancel_col = st.columns(2)
+    with confirm_col:
+        if st.button("Generate new code", type="primary", key="recovery_code_regen_confirm"):
+            st.session_state["new_recovery_code"] = generate_recovery_code()
+            st.session_state.pop("recovery_code_regen_pending", None)
+            st.rerun()
+    with cancel_col:
+        if st.button("Cancel", key="recovery_code_regen_cancel"):
+            st.session_state.pop("recovery_code_regen_pending", None)
+            st.rerun()
 
 
 title_col, license_col = st.columns([5, 1])
@@ -298,8 +1027,29 @@ all_cta = get_active_cta_emails()
 prep_records = load_interview_prep()
 
 cta_count = len(all_cta)
-results_count = len(jobs)
+# Was len(jobs) - the raw, unfiltered job-store total (1225), not what the
+# tab actually shows once its own score-threshold and hide-by-default
+# filters run (46) - every other tab badge here is an actionable count
+# ("Call to action (7)" = emails needing a reply, "Profile gaps (16)" =
+# open questions), so Results should follow suit rather than being the one
+# outlier showing "everything ever scanned" (Zahir's explicit ask,
+# 2026-08-06). Reads the filter widgets' own session_state keys rather
+# than recomputing them here, since they're real widgets defined further
+# below - falls back to each widget's own default (matching what a
+# first-ever visit to the tab would show) if it hasn't been visited yet
+# this session.
+results_settings = load_settings()
+results_target_roles = results_settings.get("target_roles", [])
+results_count = len(compute_results_ranked(
+    jobs, results_target_roles,
+    min_score=st.session_state.get("results_min_score", 70),
+    show_not_interested=st.session_state.get("results_show_not_interested", False),
+    show_closed=st.session_state.get("results_show_closed", False),
+    show_applied=st.session_state.get("results_show_applied", False),
+))
+results_total_scanned = len(jobs)
 prep_in_progress_count = sum(1 for r in prep_records for round_ in r["rounds"] if round_["status"] == "in_progress")
+gaps_count = len(get_applications_with_open_clarifying_questions())
 
 st.session_state.setdefault("active_tab", "cta")
 
@@ -335,11 +1085,20 @@ SIGNAL_TYPE_LABELS = {
     "funding_event": "Funding/IPO filing",
     "regulatory_filing": "Regulatory filing (deprecated signal - see note above)",
 }
+# Known channels the "Add a job manually" fallback can attribute a posting
+# to - kept in sync with the sources industry_boards.py/company_sites.py
+# actually search, plus LinkedIn (default, since it's the one channel with
+# no automated search at all) and "Other" for anything not listed.
+MANUAL_JOB_SOURCE_OPTIONS = [
+    "linkedin", "Rigzone", "IChemE Job Board", "Planet Pharma", "BioSpace",
+    "Beacon Hill Life Sciences", "Atrium", "GForce Life Sciences", "Other",
+]
 TAB_ICONS = {
     "cta": ":material/notifications_active:",
     "results": ":material/work:",
     "prospector": ":material/travel_explore:",
     "prep": ":material/school:",
+    "gaps": ":material/quiz:",
     "linkedin": ":material/badge:",
     "support": ":material/support_agent:",
     "settings": ":material/settings:",
@@ -349,6 +1108,7 @@ TABS = [
     ("results", f"Results ({results_count})"),
     ("prospector", "Prospector"),
     ("prep", f"Interview prep ({prep_in_progress_count})" if prep_in_progress_count else "Interview prep"),
+    ("gaps", f"Profile gaps ({gaps_count})" if gaps_count else "Profile gaps"),
     ("linkedin", "LinkedIn"),
     ("support", "Support"),
     ("settings", "Settings"),
@@ -368,19 +1128,34 @@ if active_tab == "settings":
 
     st.header("Your documents")
     st.markdown(
-        "One shared place to manage everything Panga reads from - your "
-        "resume and other background documents, your LinkedIn profile "
-        "export, and your LinkedIn connections export."
+        "Upload your resume and other background documents here, plus your "
+        "LinkedIn profile export and LinkedIn connections export."
     )
 
     st.subheader("Resume & other source documents")
     st.markdown(
-        "\"Resume\" feeds the gap-probing interview directly. \"Context\" is "
-        "background material like an executive bio or leadership summary. "
-        "\"Reference\" is an example of a previously-tailored application - "
-        "used as a style example, not copied verbatim."
+        "\"Resume\" feeds the gap-probing interview and your target-role "
+        "suggestions - it does **not** feed what gets drafted into tailored "
+        "documents or how postings are scored against you. Those pull from "
+        "your master profile (built from a one-time structuring pass over "
+        "your resume, not automatically kept in sync) - re-uploading a "
+        "resume here won't change drafted documents until that profile is "
+        "updated too. \"Context\" is background material like an executive "
+        "bio or leadership summary. \"Reference\" is an example of a "
+        "previously-tailored application - used as a style example, not "
+        "copied verbatim."
     )
     manifest_entries = load_manifest_result()
+    resume_entries = [e for e in manifest_entries if e["category"] == "resume"]
+    if len(resume_entries) > 1:
+        st.warning(
+            f"{len(resume_entries)} documents are tagged \"resume\" "
+            f"({', '.join(e['source_file'] for e in resume_entries)}). Their "
+            "text is being blended together for the gap interview and "
+            "target-role suggestions, which can mix outdated and current "
+            "content. Keep only your current resume tagged \"resume\" - "
+            "remove the others below, or re-tag them as \"context\"."
+        )
     if manifest_entries:
         manifest_df = pd.DataFrame([{
             "File": e["source_file"],
@@ -479,9 +1254,9 @@ if active_tab == "settings":
                 )
                 st.rerun()
     if not has_resume:
-        st.caption("Upload a resume above first.")
+        st.markdown("Upload a resume above first.")
     elif not industries_text.strip():
-        st.caption("Add at least one target industry/vertical above first.")
+        st.markdown("Add at least one target industry/vertical above first.")
 
     st.subheader("Target roles")
     gen_counter = st.session_state.get("target_roles_gen_counter", 0)
@@ -498,6 +1273,207 @@ if active_tab == "settings":
         key=f"roles_editor_{gen_counter}",
     )
 
+    st.subheader("Job-board sources")
+    st.markdown(
+        "Company career sites Panga searches directly, in addition to "
+        "USAJOBS and the built-in industry boards - add or remove "
+        "companies here, no code change needed. Covers companies whose "
+        "careers site runs on Workday, SmartRecruiters, Greenhouse, or "
+        "Lever; find a company's own tenant/ID from its careers URL (see "
+        "the field hints below)."
+    )
+    # Source-level activity hint (2026-08-07) - a source producing zero new
+    # jobs for several real runs in a row (Rigzone's own volume drop was
+    # the live example that motivated this) probably isn't worth keeping,
+    # but that's a call for a person to make, not something auto-removed -
+    # this just surfaces the real data instead of needing another manual
+    # recon pass to notice.
+    stale_sources = [s for s in all_tracked_sources() if is_source_stale(s)]
+    if stale_sources:
+        st.warning(
+            "These sources haven't added a new job in several recent runs "
+            "- worth checking whether they're still active, or removing "
+            f"them: {', '.join(stale_sources)}."
+        )
+    with st.expander("Manage companies", expanded=False):
+        job_sources_data = load_job_sources()
+
+        st.markdown("**Workday** - tenant/site/wd_number come from the company's own myworkdayjobs.com URL, e.g. \"eisai.wd5.myworkdayjobs.com/eisai\" -> tenant \"eisai\", site \"eisai\", WD # 5.")
+        workday_rows = st.data_editor(
+            [
+                {"company_name": c["company_name"], "tenant": c["tenant"], "site": c["site"], "wd_number": c["wd_number"], "limit": c["limit"]}
+                for c in job_sources_data["workday"]
+            ],
+            num_rows="dynamic",
+            column_config={
+                "company_name": st.column_config.TextColumn("Company", required=True),
+                "tenant": st.column_config.TextColumn("Tenant", required=True),
+                "site": st.column_config.TextColumn("Site", required=True),
+                "wd_number": st.column_config.NumberColumn("WD #", required=True, min_value=1),
+                "limit": st.column_config.NumberColumn("Max results", required=True, min_value=1, max_value=100),
+            },
+            key="job_sources_workday_editor",
+        )
+
+        st.markdown("**SmartRecruiters** - company ID is the identifier in the company's careers.smartrecruiters.com/{id} URL, e.g. \"abbvie\".")
+        smartrecruiters_rows = st.data_editor(
+            [
+                {"company_name": c["company_name"], "company_id": c["company_id"], "limit": c["limit"]}
+                for c in job_sources_data["smartrecruiters"]
+            ],
+            num_rows="dynamic",
+            column_config={
+                "company_name": st.column_config.TextColumn("Company", required=True),
+                "company_id": st.column_config.TextColumn("Company ID", required=True),
+                "limit": st.column_config.NumberColumn("Max results", required=True, min_value=1, max_value=100),
+            },
+            key="job_sources_smartrecruiters_editor",
+        )
+
+        st.markdown("**Greenhouse** - board token is the identifier in the company's boards.greenhouse.io/{token} URL, e.g. \"stripe\".")
+        greenhouse_rows = st.data_editor(
+            [
+                {"company_name": c["company_name"], "board_token": c["board_token"], "limit": c["limit"]}
+                for c in job_sources_data["greenhouse"]
+            ],
+            num_rows="dynamic",
+            column_config={
+                "company_name": st.column_config.TextColumn("Company", required=True),
+                "board_token": st.column_config.TextColumn("Board token", required=True),
+                "limit": st.column_config.NumberColumn("Max results", required=True, min_value=1, max_value=100),
+            },
+            key="job_sources_greenhouse_editor",
+        )
+
+        st.markdown("**Lever** - company slug is the identifier in the company's jobs.lever.co/{slug} URL, e.g. \"palantir\".")
+        lever_rows = st.data_editor(
+            [
+                {"company_name": c["company_name"], "company_slug": c["company_slug"], "limit": c["limit"]}
+                for c in job_sources_data["lever"]
+            ],
+            num_rows="dynamic",
+            column_config={
+                "company_name": st.column_config.TextColumn("Company", required=True),
+                "company_slug": st.column_config.TextColumn("Company slug", required=True),
+                "limit": st.column_config.NumberColumn("Max results", required=True, min_value=1, max_value=100),
+            },
+            key="job_sources_lever_editor",
+        )
+
+        if st.button("Save job-board sources"):
+            # Advanced per-company filters (e.g. IQVIA's US-only facet) aren't
+            # exposed in this table - carry them over by company_name so
+            # editing/re-saving the list above doesn't silently drop them.
+            existing_facets = {c["company_name"]: c.get("applied_facets") for c in job_sources_data["workday"]}
+            new_workday = []
+            for row in workday_rows:
+                entry = {
+                    "company_name": row["company_name"], "tenant": row["tenant"], "site": row["site"],
+                    "wd_number": int(row["wd_number"]), "limit": int(row["limit"]),
+                }
+                facets = existing_facets.get(row["company_name"])
+                if facets:
+                    entry["applied_facets"] = facets
+                new_workday.append(entry)
+            new_smartrecruiters = [
+                {"company_name": row["company_name"], "company_id": row["company_id"], "limit": int(row["limit"])}
+                for row in smartrecruiters_rows
+            ]
+            new_greenhouse = [
+                {"company_name": row["company_name"], "board_token": row["board_token"], "limit": int(row["limit"])}
+                for row in greenhouse_rows
+            ]
+            new_lever = [
+                {"company_name": row["company_name"], "company_slug": row["company_slug"], "limit": int(row["limit"])}
+                for row in lever_rows
+            ]
+            try:
+                save_job_sources({
+                    "workday": new_workday, "smartrecruiters": new_smartrecruiters,
+                    "greenhouse": new_greenhouse, "lever": new_lever,
+                })
+            except Exception as exc:
+                st.error(f"Failed to save job-board sources: {exc}")
+            else:
+                st.toast("Saved job-board sources.", icon=":material/check_circle:")
+                st.rerun()
+
+    st.subheader("Job-alert email senders")
+    st.markdown(
+        "Senders/domains Panga scans for job-listing digest emails "
+        "(LinkedIn, Lensa, etc.), once a day - a listing found from an "
+        "address below gets added automatically, the same way manually "
+        "pasting one does. Nothing outside this list gets scanned, so add "
+        "a sender here (no code change needed) rather than expecting it "
+        "to be picked up automatically."
+    )
+    with st.expander("Manage job-alert senders", expanded=False):
+        job_alert_senders_data = load_job_alert_senders()
+        job_alert_rows = st.data_editor(
+            [{"sender": e["sender"], "source": e.get("source", "")} for e in job_alert_senders_data],
+            num_rows="dynamic",
+            column_config={
+                "sender": st.column_config.TextColumn(
+                    "Sender domain or address", required=True,
+                    help='e.g. "jobalerts-noreply@linkedin.com" or "lensa.com" - matched against the From header.',
+                ),
+                "source": st.column_config.TextColumn(
+                    "Source tag", required=True,
+                    help='What to label listings from this sender with, e.g. "linkedin" or "lensa" - groups with the rest of Panga\'s per-channel data.',
+                ),
+            },
+            key="job_alert_senders_editor",
+        )
+        if st.button("Save job-alert senders"):
+            try:
+                save_job_alert_senders([
+                    {"sender": row["sender"].strip(), "source": row["source"].strip()}
+                    for row in job_alert_rows
+                    if row.get("sender", "").strip()
+                ])
+            except Exception as exc:
+                st.error(f"Failed to save job-alert senders: {exc}")
+            else:
+                st.toast("Saved job-alert senders.", icon=":material/check_circle:")
+                st.rerun()
+
+    if bhangi_create_issue is not None:
+        # Same "no Bhangi checkout -> feature quietly absent, not an error"
+        # rule as the Support tab above - this is a convenience on top of
+        # Bhangi, not something worth alarming a friend-testing build about.
+        with st.expander("Request a new job-board source", expanded=False):
+            st.markdown(
+                "Know a job board or company career site that isn't listed "
+                "above? Describe it here instead of adding it to your own "
+                "code - this files a ticket the same way the Support tab "
+                "does, so it's tracked and doesn't get lost."
+            )
+            request_board_name = st.text_input("Job board or company name", key="request_source_name")
+            request_board_url = st.text_input("Careers page / job board URL", key="request_source_url")
+            request_board_notes = st.text_area(
+                "Anything else worth knowing? (optional)",
+                placeholder="e.g. which roles you'd expect to find there, or why it's worth adding",
+                key="request_source_notes",
+            )
+            if st.button("Submit request", disabled=not request_board_name.strip() or not request_board_url.strip()):
+                description_parts = [f"URL: {request_board_url.strip()}"]
+                if request_board_notes.strip():
+                    description_parts.append(f"Notes: {request_board_notes.strip()}")
+                description_parts.append("Requested from Settings > Job-board sources > Request a new job-board source.")
+                try:
+                    build = bhangi_detect_build(PROJECT_ROOT) if bhangi_detect_build is not None else None
+                    bhangi_create_issue(
+                        BHANGI_PROJECT, f"New job source request: {request_board_name.strip()}",
+                        "\n".join(description_parts), build=build,
+                    )
+                except Exception as exc:
+                    st.error(f"Failed to submit request: {exc}")
+                else:
+                    for key in ("request_source_name", "request_source_url", "request_source_notes"):
+                        del st.session_state[key]
+                    st.toast("Request submitted - thanks, this has been queued for review.", icon=":material/check_circle:")
+                    st.rerun()
+
     st.subheader("USAJOBS job series")
     st.markdown("See \"Occupations and job series\" on usajobs.gov for codes. This runs alongside keyword search (not instead of it) - government classification is inconsistent, so restricting to one series alone would miss real matches filed under a different code. The compatibility score, not this filter, is what actually screens for relevance.")
     job_series_text = st.text_area(
@@ -505,10 +1481,21 @@ if active_tab == "settings":
         value="\n".join(settings.get("usajobs_job_series", [])),
     )
 
+    st.subheader("Adzuna search countries")
+    if adzuna_is_configured():
+        st.markdown("Which countries to search via the Adzuna aggregator, in addition to USAJOBS/company sites/industry boards. Adzuna's free tier has a daily call limit shared across every role x country combination below, so keep this to countries you're actually job-hunting in.")
+    else:
+        st.markdown("Not set up yet - free registration at [developer.adzuna.com](https://developer.adzuna.com/), then add ADZUNA_APP_ID/ADZUNA_APP_KEY to your .env file. The countries picked below take effect once that's done.")
+    aggregator_countries = st.multiselect(
+        "Countries", sorted(ADZUNA_COUNTRIES), default=settings.get("aggregator_countries", []),
+        format_func=lambda c: c.upper(),
+    )
+
     if st.button("Save settings"):
         settings["target_roles"] = roles_df
         settings["industries"] = [line.strip() for line in industries_text.splitlines() if line.strip()]
         settings["usajobs_job_series"] = [line.strip() for line in job_series_text.splitlines() if line.strip()]
+        settings["aggregator_countries"] = aggregator_countries
         try:
             save_settings(settings)
             update_profile_field("seniority", seniority_text.strip())
@@ -664,6 +1651,159 @@ if active_tab == "settings":
                     st.success(f"Connected - found {len(labels)} Gmail label(s). The Gmail scan/fulfillment scripts are ready to use.")
 
     st.divider()
+    st.header("Other email accounts")
+    st.markdown(
+        "Not using Gmail? Connect Outlook, Hotmail, Yahoo, or any other "
+        "personal email provider below - same idea as Gmail above (Panga "
+        "reads/labels/drafts using each provider's own official access, "
+        "never sends anything without you)."
+    )
+
+    other_provider = st.selectbox("Provider", ["Outlook", "Hotmail", "Yahoo", "Other"], key="other_email_provider")
+
+    if other_provider in ("Outlook", "Hotmail"):
+        st.markdown(
+            f"{other_provider} and Outlook are the same Microsoft account "
+            "system under the hood, so this one setup covers both."
+        )
+        if microsoft_client.is_configured():
+            st.success("Microsoft app registration found - see \"Test connection\" below.")
+        else:
+            st.info("Not set up yet - follow the steps below in order.")
+
+        with st.container(border=True):
+            st.markdown("**Step 1 - Register an app in Azure**")
+            st.markdown(
+                "Choose **\"Personal Microsoft accounts only\"** for supported "
+                "account types. Under \"Redirect URI\", add a platform of "
+                "type **\"Mobile and desktop applications\"** with URI "
+                "`http://localhost`."
+            )
+            st.link_button("Open: Azure App registrations", "https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade")
+
+        with st.container(border=True):
+            st.markdown("**Step 2 - Save the Application (client) ID**")
+            ms_client_id = st.text_input("Application (client) ID", key="ms_client_id_input")
+            if st.button("Save", type="primary", disabled=not ms_client_id, key="ms_client_id_save"):
+                microsoft_client.save_client_id(ms_client_id)
+                st.toast("Microsoft app registration saved.", icon=":material/check_circle:")
+                st.rerun()
+
+        with st.container(border=True):
+            st.markdown("**Step 3 - Test the connection**")
+            st.markdown("Opens a browser window to sign in and approve access - one time only, cached after that.")
+            if st.button("Test Microsoft connection", type="primary", disabled=not microsoft_client.is_configured(), key="ms_test_connection"):
+                with st.spinner("Connecting - a browser window may open, approve access there..."):
+                    try:
+                        labels = microsoft_client.list_labels()
+                    except microsoft_client.MicrosoftNotConfigured as exc:
+                        st.error(str(exc))
+                    except Exception as exc:
+                        st.error(f"Couldn't connect: {exc}")
+                    else:
+                        st.success(f"Connected - found {len(labels)} categor{'y' if len(labels) == 1 else 'ies'} defined. Ready to use.")
+
+    else:  # Yahoo / Other - generic IMAP, multi-account
+        connected = imap_client.list_configured_accounts()
+        if connected:
+            st.success(f"Already connected: {', '.join(connected)}")
+            for acct in connected:
+                # Used to delete credentials immediately on click, no undo,
+                # no confirmation at all (Mirror's fine-needle audit,
+                # 2026-08-06). Same st.dialog confirm-step pattern as
+                # Generate recovery code below.
+                if st.button(f"Disconnect {acct}", key=f"imap_disconnect_{acct}"):
+                    st.session_state["imap_disconnect_pending"] = acct
+
+        pending_disconnect = st.session_state.get("imap_disconnect_pending")
+        if pending_disconnect:
+            _confirm_imap_disconnect(pending_disconnect)
+
+        st.markdown("**Connect another account**" if connected else "**Connect an account**")
+        imap_email = st.text_input(
+            "Email address",
+            key="imap_new_email",
+            placeholder="you@yahoo.com" if other_provider == "Yahoo" else "you@yourprovider.com",
+        )
+
+        if imap_email and st.button("Look up mail server settings", key="imap_detect_btn"):
+            with st.spinner("Looking up your provider's mail server..."):
+                st.session_state["imap_detected_for"] = imap_email
+                st.session_state["imap_detected_settings"] = detect_imap_settings(imap_email)
+
+        detect_attempted_for_current = st.session_state.get("imap_detected_for") == imap_email
+        detected = st.session_state.get("imap_detected_settings") if detect_attempted_for_current else None
+
+        if imap_email and detect_attempted_for_current and detected is None:
+            st.error("That doesn't look like a valid email address.")
+        elif detected is not None:
+            if detected.source == "guess":
+                st.warning(
+                    "Couldn't confirm these automatically - double-check them "
+                    "with your email provider if the connection test below fails."
+                )
+            # Keyed by email so switching to a different address shows that
+            # address's own detected values instead of a stale locked-in
+            # value from whatever was typed first (see CLAUDE.md's widget-
+            # key-staleness note).
+            host = st.text_input("IMAP server", value=detected.host, key=f"imap_host_{imap_email}")
+            port = st.number_input("Port", value=detected.port, key=f"imap_port_{imap_email}")
+            app_password = st.text_input(
+                "App password",
+                type="password",
+                key=f"imap_password_{imap_email}",
+                help="Most providers require a generated \"app password\" here, not your regular login "
+                     "password, once 2-factor authentication is on - check your provider's account "
+                     "security settings for \"App passwords\".",
+            )
+            if st.button("Save & test connection", type="primary", disabled=not app_password, key="imap_save_test"):
+                with st.spinner("Connecting..."):
+                    imap_client.save_credentials(imap_email, app_password, host, int(port))
+                    try:
+                        imap_client.search_messages(imap_email, criteria="ALL", max_results=1)
+                    except (imap_client.ImapConnectionError, imap_client.ImapNotConfigured) as exc:
+                        st.error(f"Saved, but the connection test failed: {exc}")
+                    else:
+                        # Was st.success() immediately followed by
+                        # st.rerun() - the message rendered for a fraction
+                        # of a second before the rerun wiped the page, so
+                        # it was never actually seen (the exact app-wide
+                        # anti-pattern this project's standing rule already
+                        # eliminated everywhere else - Mirror's fine-needle
+                        # audit caught this one remaining straggler,
+                        # 2026-08-06). st.toast() survives a rerun.
+                        st.toast(f"Connected - {imap_email} is ready to use.", icon=":material/check_circle:")
+                        st.rerun()
+
+    st.divider()
+    st.header("Calendar")
+    st.markdown(
+        "Connect Google Calendar so interview-request replies can offer a "
+        "few real, believable open times instead of just asking the "
+        "recruiter to propose their own. Read-only, free/busy times only - "
+        "Panga never reads what's actually on your calendar, and never "
+        "creates or changes events."
+    )
+    if google_calendar_client.is_configured():
+        st.success("Google Calendar access found - see \"Test connection\" below.")
+        if google_calendar_client.using_gmail_credentials():
+            st.markdown("Using the same Google sign-in already set up for Gmail above.")
+    else:
+        st.info("Not set up yet - set up Gmail above first (Calendar can reuse that same sign-in), or add a separate Google Cloud OAuth client for Calendar only.")
+
+    if st.button("Test Google Calendar connection", type="primary", disabled=not google_calendar_client.is_configured(), key="calendar_test_connection"):
+        with st.spinner("Connecting to Google Calendar - a browser window may open, approve access there..."):
+            try:
+                from datetime import datetime as _dt, timedelta as _td
+                busy = google_calendar_client.get_busy_intervals(_dt.now(), _dt.now() + _td(days=1))
+            except google_calendar_client.GoogleCalendarNotConfigured as exc:
+                st.error(str(exc))
+            except Exception as exc:
+                st.error(f"Couldn't connect: {exc}")
+            else:
+                st.success(f"Connected - found {len(busy)} busy block(s) in the next 24 hours. Ready to use.")
+
+    st.divider()
     st.header("Data recovery")
     st.markdown(
         "Your resume, job history, and applications are encrypted on this "
@@ -675,13 +1815,27 @@ if active_tab == "settings":
         "the original key."
     )
 
-    if has_recovery_code():
+    recovery_code_exists = has_recovery_code()
+    if recovery_code_exists:
         st.markdown("A recovery code already exists for this data. Generating a new one below replaces it - the old code stops working.")
     else:
         st.markdown("No recovery code has been generated yet - your data has no recovery path if this Windows account is lost.")
 
-    if st.button("Generate recovery code"):
-        st.session_state["new_recovery_code"] = generate_recovery_code()
+    # Used to invalidate the old code immediately on click, before the
+    # user had actually seen the "it stops working" warning above land as
+    # a real consequence, not just background text (Mirror's fine-needle
+    # audit, 2026-08-06). Only gated behind a confirm step when there's an
+    # existing code to lose - generating the first-ever code isn't
+    # destructive, nothing to confirm away.
+    if recovery_code_exists:
+        if st.button("Generate recovery code"):
+            st.session_state["recovery_code_regen_pending"] = True
+    else:
+        if st.button("Generate recovery code"):
+            st.session_state["new_recovery_code"] = generate_recovery_code()
+
+    if st.session_state.get("recovery_code_regen_pending"):
+        _confirm_recovery_code_regen()
 
     if st.session_state.get("new_recovery_code"):
         st.warning(
@@ -774,17 +1928,86 @@ elif active_tab == "cta":
     st.header("Call to action")
     st.markdown("Emails the Gmail scan flagged as needing a reply or a decision.")
 
+    with st.container(border=True):
+        sync_pending = get_pending_count()
+        sync_icon, sync_headline = (":material/task_alt:", "All caught up") if sync_pending == 0 else (
+            ":material/sync:", f"{sync_pending} update{'s' if sync_pending != 1 else ''} to send",
+        )
+        last_synced_text, sync_is_stale = _format_last_synced(get_last_synced_at())
+        # Compact single-line status (Zahir's live-testing feedback,
+        # 2026-08-06, found on the production instance): icon, headline,
+        # and last-synced text used to be a big H2-sized icon in its own
+        # column (most of the "dead whitespace on the left") next to two
+        # stacked lines - folded into one markdown line instead, same
+        # "fold it into one string" approach the CTA stat strip already
+        # uses just below this card. The button no longer forces
+        # width="stretch" (was disproportionately wide for "Send and
+        # receive" next to the small, content-sized "Reload view" button
+        # right below it - now both size to their own label).
+        if sync_is_stale:
+            status_line = f"{sync_icon} **{sync_headline}** · :orange[:material/warning: {last_synced_text} - a new scan may be overdue]"
+        else:
+            status_line = f"{sync_icon} **{sync_headline}** · {last_synced_text}"
+        sync_cols = st.columns([5, 2], vertical_alignment="center")
+        with sync_cols[0]:
+            st.markdown(status_line)
+        with sync_cols[1]:
+            if st.button("Send and receive", type="primary", key="manual_sync_button"):
+                with st.spinner("Syncing - archiving, drafting replies, checking sent drafts..."):
+                    sync_summary = run_full_fulfillment()
+                parts = []
+                if sync_summary["archived"]:
+                    parts.append(f"{sync_summary['archived']} archived")
+                if sync_summary["cta_drafts"]:
+                    parts.append(f"{sync_summary['cta_drafts']} repl{'ies' if sync_summary['cta_drafts'] != 1 else 'y'} drafted")
+                if sync_summary["outreach_drafts"]:
+                    parts.append(f"{sync_summary['outreach_drafts']} outreach draft{'s' if sync_summary['outreach_drafts'] != 1 else ''} created")
+                summary_text = ", ".join(parts) if parts else "nothing was pending"
+                if sync_summary["failures"]:
+                    st.toast(f"Synced with {sync_summary['failures']} failure(s) - {summary_text}. Try again shortly.", icon=":material/warning:")
+                else:
+                    st.toast(f"Synced: {summary_text}.", icon=":material/check_circle:")
+                st.rerun()
+
     r1, r2 = st.columns([1, 5])
     with r1:
-        if st.button("Refresh"):
+        # Was labeled "Refresh", which read as "go check Gmail again" -
+        # it's actually just st.rerun(), no Gmail call at all (Mirror's
+        # first UI/UX review pass, 2026-08-06). "Send and receive" above is
+        # the one that does real syncing; this button's real, honest
+        # purpose is re-reading the on-disk CTA/application stores without
+        # a Gmail round-trip - useful right after a scheduled task updates
+        # them in the background, or after an action taken elsewhere in
+        # the app. Kept, just renamed to say what it actually does.
+        if st.button("Reload view", help="Re-reads the current data without contacting Gmail - use \"Send and receive\" above for a real sync."):
             st.rerun()
 
     counts = {cat: sum(1 for e in all_cta if e.get("category") == cat) for cat in CATEGORY_ORDER}
-    stat_cols = st.columns(len(CATEGORY_ORDER))
-    for col, cat in zip(stat_cols, CATEGORY_ORDER):
-        with col:
-            st.badge(CATEGORY_LABELS[cat], color=CATEGORY_COLORS[cat])
-            st.metric("Count", counts[cat], label_visibility="collapsed")
+    # Compact single-line stat strip (Zahir's live-testing feedback,
+    # 2026-08-06): 5x st.columns()+st.metric() each claimed a full
+    # 1/5-width column for a single digit - mostly empty space, since
+    # st.columns() always spans the full container width regardless of how
+    # little its content needs, so there's no column-ratio fix for that.
+    # Reuses the real st.badge() widget (theme-correct light/dark, same
+    # semantic colors already used elsewhere on this tab) with label+count
+    # folded into one string, then a scoped CSS rule (same
+    # .st-key-{container} pattern as progress_shimmer_css) reflows the
+    # normally block-stacked badges into one wrapping horizontal row.
+    stat_strip_key = "cta_stat_strip"
+    st.html(f"""<style>
+.st-key-{stat_strip_key}[data-testid="stVerticalBlock"] {{
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    align-items: center;
+}}
+.st-key-{stat_strip_key} [data-testid="stElementContainer"] {{
+    width: auto;
+}}
+</style>""")
+    with st.container(key=stat_strip_key):
+        for cat in CATEGORY_ORDER:
+            st.badge(f"{CATEGORY_LABELS[cat]} **{counts[cat]}**", color=CATEGORY_COLORS[cat])
 
     f1, f2 = st.columns([1, 2])
     with f1:
@@ -816,18 +2039,31 @@ elif active_tab == "cta":
             if email.get("snippet"):
                 st.markdown(email["snippet"])
 
+            # "web_link" is the current field name; "gmail_link" is read as a
+            # fallback for records written before multi-provider support
+            # (Outlook/IMAP have no reliable webmail deep link, so this can
+            # legitimately be None - see tailoring/cta_emails.py).
+            open_link = email.get("web_link") or email.get("gmail_link")
+            open_label = {"gmail": "Open in Gmail", "microsoft": "Open in Outlook"}.get(email.get("provider", "gmail"), "Open inbox")
+
             actions = st.columns(4 if cat == "interview_request" else 3)
             with actions[0]:
-                st.link_button("Open in Gmail", email["gmail_link"], key=f"open_cta_{email['thread_id']}")
+                if open_link:
+                    st.link_button(open_label, open_link, key=f"open_cta_{email['thread_id']}")
+                else:
+                    st.button(f"Check {email.get('account', 'your inbox')}", key=f"open_cta_{email['thread_id']}", disabled=True)
             with actions[1]:
                 if email.get("draft_created"):
-                    st.link_button("Open draft", email["draft_link"], key=f"draft_link_{email['thread_id']}")
+                    if email.get("draft_link"):
+                        st.link_button("Open draft", email["draft_link"], key=f"draft_link_{email['thread_id']}")
+                    else:
+                        st.button("Draft created - check Drafts folder", key=f"draft_link_{email['thread_id']}", disabled=True)
                 elif email.get("draft_requested"):
                     st.button("Draft requested...", key=f"draft_pending_{email['thread_id']}", disabled=True)
                 else:
                     if st.button("Draft reply", key=f"draft_cta_{email['thread_id']}"):
                         request_draft(email["thread_id"])
-                        st.toast("Draft requested - will be created in Gmail on the next scan run.", icon=":material/check_circle:")
+                        st.toast("Draft requested - will be created on the next scan run.", icon=":material/check_circle:")
                         st.rerun()
             with actions[2]:
                 if st.button("Dismiss", key=f"dismiss_cta_{email['thread_id']}"):
@@ -835,13 +2071,26 @@ elif active_tab == "cta":
                     st.rerun()
             if cat == "interview_request":
                 with actions[3]:
-                    if st.button("Prep for this interview", key=f"prep_cta_{email['thread_id']}"):
+                    # Mirror's first UI/UX review pass (2026-08-06) flagged
+                    # these 4 buttons as same-weight with no hierarchy - not
+                    # fixed by consolidating them (checked against CLAUDE.md's
+                    # "is this really one decision?" test: Open in Gmail,
+                    # Draft reply, Dismiss, and Prep for this interview are 4
+                    # genuinely independent actions a candidate takes at
+                    # different times for different reasons, not steps of one
+                    # decision). What was missing is visual weight - this is
+                    # the one action specific to interview_request and the
+                    # highest-value next step, so it gets type="primary" like
+                    # "Send and receive" above does for the same reason (the
+                    # one action in its row worth drawing the eye to); the
+                    # other 3 stay default/secondary.
+                    if st.button("Prep for this interview", key=f"prep_cta_{email['thread_id']}", type="primary"):
                         go_to_prep({
                             "kind": "email",
                             "thread_id": email["thread_id"],
                             "subject": email.get("subject"),
                             "sender": email.get("sender"),
-                            "gmail_link": email["gmail_link"],
+                            "web_link": open_link,
                         })
             st.divider()
 
@@ -850,7 +2099,7 @@ elif active_tab == "results":
 
     settings = load_settings()
 
-    col1, col2 = st.columns([1, 3])
+    col1, col_manual, col2 = st.columns([1.3, 1.4, 2.3])
     with col1:
         if st.button("Run now (USAJOBS)", type="primary"):
             # Real "i of N" progress instead of an opaque spinner (Zahir's
@@ -865,7 +2114,9 @@ elif active_tab == "results":
                 steps = [("role", r["name"]) for r in target_roles] + [("series", c) for c in job_series]
                 total_new = 0
                 if steps:
-                    search_bar = st.progress(0, text=f"Searching 1 of {len(steps)}: {steps[0][1]}...")
+                    with st.container(key="search_progress_bar"):
+                        search_bar = st.progress(0, text=f"Searching 1 of {len(steps)}: {steps[0][1]}...")
+                    st.html(progress_shimmer_css("search_progress_bar"))
                     for i, (kind, value) in enumerate(steps, start=1):
                         search_bar.progress((i - 1) / len(steps), text=f"Searching {i} of {len(steps)}: {value}...")
                         if kind == "role":
@@ -873,23 +2124,54 @@ elif active_tab == "results":
                         else:
                             results = search_jobs(job_category_code=value, results_per_page=100)
                         total_new += save_jobs(results)
-                    search_bar.progress(1.0, text="Done.")
+                    search_bar.progress(1.0, text=":material/check_circle: Done.")
                 st.success(f"Found {total_new} new job(s).")
             except USAJobsNotConfigured as e:
                 st.error(str(e))
+    with col_manual:
+        # Zahir couldn't find "Add a job manually" - it was a plain
+        # collapsed st.expander sitting below this row, easy to miss as
+        # inert prose (Mirror confirmed live on production, 2026-08-07).
+        # Approved direction (Zahir picked from 3 mockups): a dedicated,
+        # equal-weight button right next to "Run now (USAJOBS)" - same
+        # type="primary" as that button, since both are top-level ways to
+        # get a job into the Results tab, not a secondary/buried action.
+        # Clicking it force-opens the expander below once (see the
+        # one-shot pattern comment just above that expander for why).
+        if st.button("Add a job manually", icon=":material/add:", type="primary"):
+            st.session_state["manual_job_reveal_pending"] = True
+            st.rerun()
     with col2:
         st.markdown("This button only covers USAJOBS.gov directly. ZipRecruiter, Dice, and Indeed are searched automatically once a day by the scheduled task instead (they're MCP connector tools, not reachable from this button).")
 
-    with st.expander("Add a job manually (e.g. from LinkedIn)"):
+    # Same one-shot force-expand pattern already proven working elsewhere
+    # in this file (Interview Prep's just_generated_prep_* flag): pop the
+    # pending flag right before the widget so it force-expands exactly
+    # once. Tried a key="manual_job_expander" + expanded=session_state.get(...)
+    # version first (which AppTest confirmed as logically correct) but it
+    # did not actually open the expander when live-verified in the real
+    # browser - a real discrepancy between AppTest's simulated widget
+    # reconciliation and the live frontend for this specific key+expanded
+    # combination, not just a wait-time/click-delivery issue (confirmed via
+    # the native <details>.open DOM property after several isolated
+    # retries). This pattern needs no key at all - the expander's own
+    # header click still toggles it normally afterward since Streamlit's
+    # frontend preserves that toggle client-side across unrelated reruns
+    # even for un-keyed expanders (same as Interview Prep's).
+    manual_job_reveal = st.session_state.pop("manual_job_reveal_pending", False)
+    with st.expander(
+        "Add a job manually (e.g. from LinkedIn or a site Panga can't search automatically)",
+        expanded=manual_job_reveal,
+    ):
         st.markdown(
-            "LinkedIn has no public search API and blocks scraping, so this "
-            "is the one channel that works by pasting the posting yourself "
-            "instead of an automated search. The description is saved now "
-            "rather than fetched live later like other channels, since "
-            "LinkedIn URLs often can't be reliably refetched (login wall/"
-            "bot-check)."
+            "For channels with no public search API and no working scraper "
+            "(LinkedIn, or a job board that turned out blocked/JS-rendered), "
+            "this is the way to get a posting into Panga - paste it yourself "
+            "instead of waiting on an automated search. The description is "
+            "saved now rather than fetched live later, since these URLs "
+            "often can't be reliably refetched (login wall/bot-check)."
         )
-        manual_job_fields = ["manual_job_title", "manual_job_org", "manual_job_location", "manual_job_url", "manual_job_description"]
+        manual_job_fields = ["manual_job_title", "manual_job_org", "manual_job_location", "manual_job_url", "manual_job_description", "manual_job_source_other"]
         # Same pattern as the feedback widget's clear-after-save: a widget's
         # own session_state key can only be reset BEFORE that widget is
         # instantiated in a given run, so the save handler below only sets
@@ -902,15 +2184,23 @@ elif active_tab == "results":
         manual_org = st.text_input("Organization", key="manual_job_org")
         manual_location = st.text_input("Location", key="manual_job_location")
         manual_url = st.text_input("Posting URL", key="manual_job_url")
-        manual_source = st.text_input("Source", value="linkedin", key="manual_job_source")
+        manual_source_choice = st.selectbox(
+            "Channel this came from", MANUAL_JOB_SOURCE_OPTIONS, key="manual_job_source",
+            help="Pick the site the posting is from, so it groups with the rest of Panga's per-channel data instead of showing up unlabeled.",
+        )
+        manual_source_other = (
+            st.text_input("Channel name", key="manual_job_source_other")
+            if manual_source_choice == "Other" else None
+        )
         manual_description = st.text_area(
             "Paste the job description text", key="manual_job_description", height=200,
         )
+        manual_source = (manual_source_other or "Other") if manual_source_choice == "Other" else manual_source_choice
         if st.button("Save job", type="primary", disabled=not (manual_title and manual_org and manual_url)):
             from search.job_store import add_manual_job, update_job_score
             job = add_manual_job(
                 title=manual_title, organization=manual_org, location=manual_location,
-                description=manual_description, posting_url=manual_url, source=manual_source or "linkedin",
+                description=manual_description, posting_url=manual_url, source=manual_source,
             )
             # A job with no fit_score is hidden by the Results tab regardless
             # of the slider (see the min_score filter above) - without this,
@@ -921,10 +2211,12 @@ elif active_tab == "results":
                 # explicit ask 2026-07-31, "same needs to be here and all
                 # other spinner places") - same thinking/writing
                 # character-count mechanism as document drafting.
-                score_bar = st.progress(0, text="Scoring compatibility...")
+                with st.container(key="job_score_progress_bar"):
+                    score_bar = st.progress(0, text="Scoring compatibility...")
+                st.html(progress_shimmer_css("job_score_progress_bar"))
 
                 def _update_score_progress(substatus):
-                    score_bar.progress(0.5, text=f"Scoring compatibility - {substatus}")
+                    score_bar.progress(progress_fraction("job_score", substatus), text=f"Scoring compatibility - {substatus}")
 
                 try:
                     scored = score_job(job, load_profile(), on_progress=_update_score_progress)
@@ -932,7 +2224,7 @@ elif active_tab == "results":
                     score_bar.empty()
                     st.toast(f"Saved, but scoring failed: {exc}", icon=":material/warning:")
                 else:
-                    score_bar.progress(1.0, text="Done.")
+                    score_bar.progress(1.0, text=":material/check_circle: Done.")
                     update_job_score(job["source"], job["job_id"], scored["fit_score"], scored["fit_rationale"])
                     st.toast(
                         f"Saved \"{job['title']}\" at {job['organization']} - scored {scored['fit_score']}/100.",
@@ -957,10 +2249,15 @@ elif active_tab == "results":
 
     unscored_count = sum(1 for j in jobs if "fit_score" not in j)
     scored_count = len(jobs) - unscored_count
+    # Explicit, stable keys (rather than the auto-generated ones these had
+    # before) so compute_results_ranked() can read each filter's current
+    # value from st.session_state for the nav-bar badge above, before this
+    # widget has rendered on a given run.
     min_score = st.slider(
         "Minimum compatibility score",
         0, 100, 70,
         help="Hides low-fit results (e.g. unrelated roles pulled in by broad keyword matches).",
+        key="results_min_score",
     )
     # Unscored jobs are hidden by default, NOT always shown - showing
     # unscored jobs regardless of the slider defeated the purpose of scoring
@@ -970,11 +2267,41 @@ elif active_tab == "results":
     # jobs from "Run now" won't show here until one of those has run.
     ranked = [j for j in ranked if "fit_score" in j and j["fit_score"] >= min_score]
 
-    NOT_INTERESTED = ("not interested", "not-interested")  # handle both forms - see applications.py note
-    not_interested_count = sum(1 for j in ranked if application_status(j) in NOT_INTERESTED)
-    show_not_interested = st.checkbox(f"Show {not_interested_count} job(s) marked 'not interested' (hidden by default, nothing is deleted)")
+    not_interested_count = sum(1 for j in ranked if application_status(j) in NOT_INTERESTED_STATUSES)
+    show_not_interested = st.checkbox(
+        f"Show {not_interested_count} job(s) marked 'not interested' (hidden by default, nothing is deleted)",
+        key="results_show_not_interested",
+    )
     if not show_not_interested:
-        ranked = [j for j in ranked if application_status(j) not in NOT_INTERESTED]
+        ranked = [j for j in ranked if application_status(j) not in NOT_INTERESTED_STATUSES]
+
+    # Separate from "not interested" (Zahir's own preference) - this is the
+    # posting itself having closed on the source site (LinkedIn showing "No
+    # longer accepting applications"), which he's now hit twice (2026-08-04)
+    # scrolling stale results. Same hide-but-never-delete pattern as above -
+    # a distinct status/count rather than folding into NOT_INTERESTED so the
+    # two different reasons ("I don't want it" vs. "it's gone") stay visible
+    # as different information, not conflated into one bucket.
+    closed_count = sum(1 for j in ranked if application_status(j) in CLOSED_STATUSES)
+    show_closed = st.checkbox(
+        f"Show {closed_count} job(s) marked 'closed by employer' (hidden by default, nothing is deleted)",
+        key="results_show_closed",
+    )
+    if not show_closed:
+        ranked = [j for j in ranked if application_status(j) not in CLOSED_STATUSES]
+
+    # Same hide-but-never-delete pattern again (2026-08-05 request): once a
+    # job is marked "applied" there's nothing left to do on it here, so by
+    # default Results should only show jobs still needing a decision -
+    # already-applied jobs stay tracked (CTA/status still update normally)
+    # but no longer crowd out the ones that actually need attention.
+    applied_count = sum(1 for j in ranked if application_status(j) in APPLIED_STATUSES)
+    show_applied = st.checkbox(
+        f"Show {applied_count} job(s) marked 'applied' (hidden by default, nothing is deleted)",
+        key="results_show_applied",
+    )
+    if not show_applied:
+        ranked = [j for j in ranked if application_status(j) not in APPLIED_STATUSES]
 
     # Cross-source dedup (2026-07-30): if a company has a direct-site channel
     # (Eisai/AbbVie/IQVIA via company_sites.py) and the same real opening also
@@ -987,6 +2314,17 @@ elif active_tab == "results":
         st.markdown(f"{unscored_count} job(s) found but not yet compatibility-scored - hidden until the next scoring pass (daily scheduled task, or ask Claude to score them now).")
 
     st.subheader(f"{len(ranked)} job(s)")
+    # Zahir's explicit ask alongside the badge fix above: don't lose the
+    # 1225 total scanned entirely just because the badge/heading now leads
+    # with the actionable 46 - keep that transparency, right where both
+    # numbers are simultaneously known and can't drift out of sync with
+    # each other (this line always reflects the real, live ranked list,
+    # unlike the badge above the tabs, which can lag one rerun behind while
+    # actively changing a filter - see compute_results_ranked()'s
+    # docstring). st.markdown, not st.caption - this project's standing
+    # readability rule (Mirror's fine-needle audit caught this exact call
+    # as one of the still-remaining violations, 2026-08-06).
+    st.markdown(f"{len(jobs)} job(s) scanned, {len(ranked)} match your profile and current filters.")
 
     # Grouped by channel (source) per Zahir's request 2026-07-29 - each
     # channel (USAJOBS, Dice, ZipRecruiter, etc.) gets its own section.
@@ -1029,7 +2367,27 @@ elif active_tab == "results":
         if cross_source_merged:
             dup_notes.append(f"{cross_source_merged} job-board posting(s) matched to this direct listing")
         dup_note = f", {'; '.join(dup_notes)}" if dup_notes else ""
-        with st.expander(f"{channel} ({len(deduped)}{dup_note})", expanded=True):
+        # Investigated a reported inconsistency (2026-08-06, relayed via
+        # hub): USAJOBS seen expanded on page load while Indeed was
+        # correctly collapsed. Could not reproduce with a genuinely fresh
+        # session - a brand-new browser tab against a brand-new server
+        # process shows every channel (USAJOBS included) starting
+        # collapsed, matching the flat expanded=False every channel gets
+        # here (no per-channel branching exists in this loop - all sources,
+        # job boards and direct-company-sites alike, go through this same
+        # code). No expander-related key ever gets written to
+        # st.session_state elsewhere in this file either. Best explanation:
+        # without an explicit key, an expander's open/closed state lives
+        # only in the frontend's React tree, never synced to Python - once
+        # a channel is opened by hand in an already-connected browser tab,
+        # that tab keeps remembering it across reruns even though the
+        # underlying script always initializes to collapsed; a real hard
+        # reload resets it. Added an explicit, stable key below anyway -
+        # not a fix for a bug that didn't reproduce in the code, but it
+        # makes each expander's identity explicit rather than relying on
+        # Streamlit's implicit auto-generated one, which is better practice
+        # regardless and removes one hypothetical variable if this recurs.
+        with st.expander(f"{channel} ({len(deduped)}{dup_note})", expanded=False, key=f"channel_expander_{channel}"):
             table_rows = []
             for job in deduped:
                 pay_min, pay_max = format_pay(job.get("pay_min")), format_pay(job.get("pay_max"))
@@ -1040,7 +2398,9 @@ elif active_tab == "results":
                     "Pay": pay,
                     "Score": job.get("fit_score"),
                     "Status": application_status(job) or "-",
+                    "JD": "✓" if _job_has_captured_jd_text(job) else "–",
                     "Posting": job.get("posting_url"),
+                    "Pass": "Pass",  # ButtonColumn's label comes from the cell value itself - same word every row on purpose
                 })
             df = pd.DataFrame(table_rows)
 
@@ -1065,6 +2425,31 @@ elif active_tab == "results":
                     st.session_state[selected_idx_key] = click["row"]
                     st.session_state[scroll_pending_key] = True
 
+            # Inline "Pass" (Zahir's explicit ask, relayed via hub
+            # 2026-08-06): marking a job "not interested" used to mean
+            # activating the row, scrolling to its full detail panel, and
+            # finding "Mark status" among three side-by-side fields - too
+            # many steps for what should be a quick, one-click pass. This
+            # button is reachable straight from the table, same ButtonColumn
+            # mechanism as the existing Role click-to-activate above. The
+            # callback only records WHICH job was clicked (same
+            # default-arg-closure pattern as _activate_row, needed because
+            # `deduped` is rebound each loop iteration) - the actual dialog
+            # is opened once, after the channel loop ends, never from inside
+            # a callback or from inside this loop, since Streamlit only
+            # allows one dialog function call per script run.
+            pass_click_key = f"passclick_{channel}"
+
+            def _trigger_pass(pass_click_key=pass_click_key, channel_deduped=deduped):
+                click = st.session_state.get(pass_click_key)
+                if click:
+                    clicked_job = channel_deduped[click["row"]]
+                    st.session_state["pass_dialog_pending"] = {
+                        "source": clicked_job.get("source"),
+                        "job_id": clicked_job.get("job_id"),
+                        "label": job_label(clicked_job),
+                    }
+
             st.dataframe(
                 df,
                 hide_index=True,
@@ -1074,6 +2459,15 @@ elif active_tab == "results":
                     "Role": st.column_config.ButtonColumn(
                         "Role", type="tertiary", alignment="left",
                         on_click=_activate_row, key=role_click_key,
+                    ),
+                    "JD": st.column_config.TextColumn(
+                        "JD", alignment="left", width="small",
+                        help="Whether Panga has this posting's job description text to score and tailor against.",
+                    ),
+                    "Pass": st.column_config.ButtonColumn(
+                        "Pass", type="tertiary", alignment="left", width="small",
+                        help="Mark not interested, with a structured reason for later pattern analysis - doesn't affect what's shown to you.",
+                        on_click=_trigger_pass, key=pass_click_key,
                     ),
                 }),
                 key=f"table_{channel}",
@@ -1127,6 +2521,32 @@ elif active_tab == "results":
                 requested = app_record.get("documents_requested") or []
                 status = app_record.get("status")
 
+                # Only shown before a resume exists for this job (same
+                # "resume_ats_score is not None" condition the post-hoc
+                # score-card box below uses to appear) - Zahir hit this
+                # live 2026-08-06: once a resume's already drafted, this
+                # proactive box and the post-hoc one showed the exact same
+                # content twice on the same screen. The proactive box's
+                # whole purpose (prompt/view before anything's drafted) is
+                # moot once a draft exists - the post-hoc one takes over
+                # from there, same as it already did before this box existed.
+                if app_record.get("resume_ats_score") is None:
+                    if _job_has_captured_jd_text(job):
+                        pre_job_key = f"pre_{job.get('source')}_{job.get('job_id')}"
+                        updated_text = render_jd_view_or_update_box(job, pre_job_key)
+                        if updated_text is not None:
+                            from search.job_store import update_job_description
+
+                            update_job_description(job["source"], job["job_id"], updated_text)
+                            job["description"] = updated_text
+                            st.toast(
+                                "Updated - whatever you generate next will be tailored against it.",
+                                icon=":material/check_circle:",
+                            )
+                            st.rerun()
+                    else:
+                        render_paste_jd_prompt_before_drafting(job)
+
                 st.markdown("**Documents for this application**")
                 doc_types = [
                     ("resume", "Resume"),
@@ -1168,12 +2588,15 @@ elif active_tab == "results":
                         st.rerun()
                     else:
                         doc_labels = dict(doc_types)
-                        progress_bar = st.progress(0, text=f"Drafting 1 of {len(selected)}: {doc_labels[selected[0]]}...")
+                        with st.container(key="draft_progress_bar"):
+                            progress_bar = st.progress(0, text=f"Drafting 1 of {len(selected)}: {doc_labels[selected[0]]}...")
+                        st.html(progress_shimmer_css("draft_progress_bar"))
 
                         def _update_progress(i, total, doc_key, substatus=None):
                             label = f"Drafting {i} of {total}: {doc_labels[doc_key]}"
                             label += f" — {substatus}" if substatus else "..."
-                            progress_bar.progress((i - 1) / total, text=label)
+                            within_doc = progress_fraction(doc_key, substatus)
+                            progress_bar.progress(((i - 1) + within_doc) / total, text=label)
 
                         try:
                             drafted = generate_documents(job, load_profile(), selected, on_progress=_update_progress)
@@ -1181,7 +2604,7 @@ elif active_tab == "results":
                             progress_bar.empty()
                             st.error(str(exc))
                         else:
-                            progress_bar.progress(1.0, text="Done.")
+                            progress_bar.progress(1.0, text=":material/check_circle: Done.")
                             resume_draft = drafted.get("resume")
                             resume_is_scored = isinstance(resume_draft, dict)
                             upsert_application(
@@ -1199,6 +2622,15 @@ elif active_tab == "results":
                                 apply_answers=drafted.get("apply_answers"),
                             )
                             sync_workspace_documents(job["source"], job["job_id"], selected, drafted, load_profile(), job)
+                            if "resume" in selected and resume_is_scored:
+                                # Zahir's explicit ask 2026-08-06: the score,
+                                # "why this score" breakdown, and any outstanding
+                                # gap questions must be part of what he sees the
+                                # moment he generates - not something he has to
+                                # notice or go click open afterward. One-shot -
+                                # popped the next time this expander renders, so
+                                # it doesn't stay force-expanded forever.
+                                st.session_state[f"just_drafted_resume_{job['source']}_{job['job_id']}"] = True
                             st.toast("Documents drafted. Review and download them below, then use them for the actual application.", icon=":material/check_circle:")
                             st.rerun()
 
@@ -1226,9 +2658,35 @@ elif active_tab == "results":
                                     st.code(value, language=None, wrap_lines=True)
                         continue
                     if drafted_text:
-                        with st.expander(f"{doc_label} (drafted)"):
+                        auto_expand = False
+                        if doc_key == "resume":
+                            # Zahir's explicit ask 2026-08-06: right after
+                            # generating (or regenerating - answering a gap
+                            # question, updating the JD text), the score,
+                            # "why this score" breakdown, and any outstanding
+                            # questions must be part of what he sees
+                            # immediately - not behind a click he has to
+                            # remember to make. One-shot: popped here so it
+                            # doesn't stay force-expanded on later, unrelated
+                            # visits to this same job.
+                            auto_expand = st.session_state.pop(f"just_drafted_resume_{job.get('source')}_{job.get('job_id')}", False)
+                        with st.expander(f"{doc_label} (drafted)", expanded=auto_expand):
                             if doc_key == "resume" and app_record.get("resume_ats_score") is not None:
                                 with st.container(border=True):
+                                    if _job_has_captured_jd_text(job):
+                                        job_key = f"{job.get('source')}_{job.get('job_id')}"
+                                        updated_text = render_jd_view_or_update_box(job, job_key)
+                                        if updated_text is not None:
+                                            from search.job_store import update_job_description
+
+                                            update_job_description(job["source"], job["job_id"], updated_text)
+                                            job["description"] = updated_text
+                                            _regenerate_with_progress(
+                                                job, f"update_{job_key}", "Rescoring against the updated description...",
+                                                "Resume rescored against the updated description - new ATS score {score}/100.",
+                                            )
+                                    else:
+                                        render_paste_jd_prompt(job)
                                     current_score = app_record["resume_ats_score"]
                                     prev_score_key = f"prev_ats_score_{job.get('source')}_{job.get('job_id')}"
                                     # Set right before a regenerate call below, popped (shown once,
@@ -1248,96 +2706,16 @@ elif active_tab == "results":
                                         st.markdown("**How to raise it:**")
                                         for action in next_actions:
                                             st.markdown(f"- {action}")
-                                    clarifying_questions = app_record.get("resume_clarifying_questions") or []
-                                    if clarifying_questions:
-                                        st.markdown(
-                                            "**Answer these to raise the score further - only used if you "
-                                            "confirm they're true, nothing is ever invented:**"
-                                        )
-                                        st.markdown(
-                                            "Some boxes are pre-filled with a proposed guess (worded "
-                                            "as a guess, e.g. \"Roughly 8-10 engineers?\") - edit it "
-                                            "to whatever's actually true, or clear it if it's wrong. "
-                                            "Nothing pre-filled is saved as-is."
-                                        )
-                                        job_key = f"{job.get('source')}_{job.get('job_id')}"
-                                        answer_entries = []
-                                        for q in clarifying_questions:
-                                            # Keyed by the question's own content, not its position
-                                            # (qi) - a real bug found 2026-07-31: each regeneration
-                                            # round produces a differently-worded, differently-
-                                            # ordered set of questions, but Streamlit persists a
-                                            # text_area's value across reruns by its key. Keying by
-                                            # position meant a NEW round's box at the same position
-                                            # silently kept the PREVIOUS round's leftover answer text
-                                            # for a completely different question, which then got
-                                            # saved under the new (wrong) skill label - confirmed in
-                                            # gap_interview_answers with several mismatched entries.
-                                            # Also folded in the suggested_answer text (2026-07-31,
-                                            # same bug class caught on the strategy-tag box): the SAME
-                                            # question can recur across rounds with a DIFFERENT
-                                            # suggested answer, and a key on question text alone would
-                                            # silently keep showing the earlier round's stale suggestion.
-                                            q_key = f"gapans_{job_key}_{abs(hash(q['question'] + '|' + (q.get('suggested_answer') or ''))) % 10_000_000}"
-                                            is_disqualifier = q.get("type") == "disqualifier_check"
-                                            if is_disqualifier:
-                                                st.caption(
-                                                    ":material/flag: This answer applies to every "
-                                                    "future job match, not just this one - not a "
-                                                    "guess, so the box starts empty."
-                                                )
-                                            answer_value = st.text_area(
-                                                q["question"], value=q.get("suggested_answer") or "",
-                                                key=q_key, height=68,
-                                                placeholder="Type your answer..." if is_disqualifier else None,
-                                            )
-                                            answer_entries.append({
-                                                "skill": q["skill"],
-                                                "type": q.get("type", "skill_gap"),
-                                                "answer": answer_value,
-                                            })
-                                        if st.button("Save answers & regenerate resume", key=f"gapsave_{job_key}"):
-                                            answered = [e for e in answer_entries if e["answer"] and e["answer"].strip()]
-                                            if not answered:
-                                                st.toast("Answer at least one question first.", icon=":material/warning:")
-                                            else:
-                                                st.session_state[prev_score_key] = current_score
-                                                save_gap_answers(job, answered)
-                                                regen_bar = st.progress(0, text="Regenerating resume with your answers...")
-
-                                                def _update_regen_progress(i, total, doc_key2, substatus=None):
-                                                    label = "Regenerating resume"
-                                                    label += f" — {substatus}" if substatus else "..."
-                                                    regen_bar.progress((i - 1) / total, text=label)
-
-                                                try:
-                                                    regen = generate_documents(
-                                                        job, load_profile(), ["resume"], on_progress=_update_regen_progress,
-                                                    )
-                                                except (DraftingNotConfigured, DraftingFailed) as exc:
-                                                    regen_bar.empty()
-                                                    st.error(str(exc))
-                                                else:
-                                                    regen_bar.progress(1.0, text="Done.")
-                                                    new_resume = regen["resume"]
-                                                    upsert_application(
-                                                        job["source"], job["job_id"], status="under review",
-                                                        resume_text=new_resume["text"],
-                                                        resume_ats_score=new_resume["ats_score"],
-                                                        resume_ats_rationale=new_resume["ats_rationale"],
-                                                        resume_ats_next_actions=new_resume["ats_next_actions"],
-                                                        resume_clarifying_questions=new_resume["clarifying_questions"],
-                                                        suggested_strategy_tag=new_resume["suggested_strategy_tag"],
-                                                    )
-                                                    sync_workspace_documents(
-                                                        job["source"], job["job_id"], ["resume"],
-                                                        {"resume": new_resume["text"]}, load_profile(), job,
-                                                    )
-                                                    st.toast(
-                                                        f"Resume regenerated - new ATS score {new_resume['ats_score']}/100.",
-                                                        icon=":material/check_circle:",
-                                                    )
-                                                    st.rerun()
+                                    # Inline here, not just a pointer to the Profile Gaps tab
+                                    # (Zahir's correction 2026-08-06, live-testing: expanding a
+                                    # specific job's score card is a clear signal of focus on
+                                    # THIS job - he wants to answer right there, not context-
+                                    # switch to a separate tab). Profile Gaps still exists for
+                                    # scanning across every job at once; this is additive, not a
+                                    # replacement - same shared render_gap_questions_section(),
+                                    # same "Save answers & regenerate resume" behavior, just
+                                    # rendered in both places now.
+                                    render_gap_questions_section(job, app_record)
                             if doc_key == "resume" and app_record.get("resume_ats_score") is not None:
                                 st.markdown(f"**Resume text (ATS score: {app_record['resume_ats_score']}/100):**")
                             st.code(drafted_text, language=None, wrap_lines=True)
@@ -1363,14 +2741,26 @@ elif active_tab == "results":
                     st.markdown("**Your application folder (edit the Word files directly here):**")
                     st.code(str(workspace_folder), language=None)
                     st.markdown(
-                        "Open this folder in File Explorer and edit the .docx files directly in Word "
-                        "if you want to change anything (each file is named "
-                        "Name_DocType_Role_Company.docx, same convention as before), then click "
-                        "\"Check my edited documents\" below - you'll need to do this before marking "
-                        "the job \"applied\"."
+                        "Edit the .docx files directly in Word if you want to change anything "
+                        "(each file is named Name_DocType_Role_Company.docx, same convention as "
+                        "before), then click \"Check my edited documents\" below - you'll need to "
+                        "do this before marking the job \"applied\"."
                     )
-                    if st.button("Check my edited documents", key=f"checkedits_{job_key}"):
-                        st.session_state[f"editreport_{job_key}"] = check_for_edits(job["source"], job["job_id"])
+                    folder_row = st.container(horizontal=True)
+                    with folder_row:
+                        if st.button("Open folder", key=f"openfolder_{job_key}", icon=":material/folder_open:"):
+                            if workspace_folder.is_dir():
+                                # Local, single-user desktop app (Streamlit and the browser
+                                # both run on Zahir's own machine) - os.startfile() just does
+                                # what double-clicking the folder in Explorer would do. No
+                                # shell involved and workspace_folder is a computed Path from
+                                # job data, never a user-typed string, so there's nothing here
+                                # for shell-injection-style concerns to attach to.
+                                os.startfile(workspace_folder)  # noqa: S606 - Windows-only app, see comment above
+                            else:
+                                st.toast("Folder not created yet - generate a document first.", icon=":material/warning:")
+                        if st.button("Check my edited documents", key=f"checkedits_{job_key}"):
+                            st.session_state[f"editreport_{job_key}"] = check_for_edits(job["source"], job["job_id"])
 
                     # edit_report/what_changed are computed here (if a check
                     # has been run) but RENDERED further below, folded into
@@ -1458,8 +2848,9 @@ elif active_tab == "results":
                 with status_col:
                     new_status = st.selectbox(
                         "Mark status",
-                        ["-", "applied", "interview scheduled", "offer", "rejected", "not interested", "save for later"],
+                        ["-", "applied", "interview scheduled", "offer", "rejected", "not interested", "save for later", "closed by employer"],
                         key=f"status_{job.get('source')}_{job.get('job_id')}",
+                        help="\"closed by employer\" is for a posting that's stopped accepting applications on the source site (e.g. LinkedIn showing \"No longer accepting applications\") - separate from \"not interested\", which is your own choice.",
                     )
                     skip_reason = None
                     if new_status == "not interested":
@@ -1487,6 +2878,14 @@ elif active_tab == "results":
                         st.rerun()
                 st.divider()
                 render_outreach_section(f"job_{job.get('source')}_{job.get('job_id')}", job_source=job.get("source"), job_id=job.get("job_id"))
+
+    # Opened once, after every channel's table has had a chance to set it
+    # (Streamlit allows only one dialog function call per script run) -
+    # never call _pass_reason_dialog from inside the per-channel loop or
+    # from a callback.
+    pending_pass = st.session_state.get("pass_dialog_pending")
+    if pending_pass:
+        _pass_reason_dialog(pending_pass["source"], pending_pass["job_id"], pending_pass["label"])
 
 elif active_tab == "prospector":
     render_feedback_widget("prospector")
@@ -1536,10 +2935,12 @@ elif active_tab == "prospector":
         # Real streaming progress instead of a spinner (Zahir's explicit
         # ask 2026-07-31) - same thinking/writing character-count
         # mechanism as document drafting.
-        score_compute_bar = st.progress(0, text="Reasoning over your real data...")
+        with st.container(key="prospector_score_progress_bar"):
+            score_compute_bar = st.progress(0, text="Reasoning over your real data...")
+        st.html(progress_shimmer_css("prospector_score_progress_bar"))
 
         def _update_score_compute_progress(substatus):
-            score_compute_bar.progress(0.5, text=f"Reasoning over your real data - {substatus}")
+            score_compute_bar.progress(progress_fraction("prospector_score", substatus), text=f"Reasoning over your real data - {substatus}")
 
         try:
             result = compute_prospector_score(score_input, on_progress=_update_score_compute_progress)
@@ -1547,7 +2948,7 @@ elif active_tab == "prospector":
             score_compute_bar.empty()
             st.error(str(exc))
         else:
-            score_compute_bar.progress(1.0, text="Done.")
+            score_compute_bar.progress(1.0, text=":material/check_circle: Done.")
             save_prospector_score(
                 result["score"], result["rationale"], result["next_actions"],
                 score_input["data_points"], datetime.now(timezone.utc).isoformat(),
@@ -1616,14 +3017,16 @@ elif active_tab == "prospector":
                 # explicit ask 2026-07-31) - one company per real search
                 # call, so this is a genuine count, not a simulated one.
                 total = len(missing_website)
-                lookup_bar = st.progress(0, text=f"Looking up website 1 of {total}: {missing_website[0]['company_name']}...")
+                with st.container(key="lookup_progress_bar"):
+                    lookup_bar = st.progress(0, text=f"Looking up website 1 of {total}: {missing_website[0]['company_name']}...")
+                st.html(progress_shimmer_css("lookup_progress_bar"))
                 run_cost = 0.0
                 for i, acc in enumerate(missing_website, start=1):
                     lookup_bar.progress((i - 1) / total, text=f"Looking up website {i} of {total}: {acc['company_name']}...")
                     found, cost = lookup_company_website(acc["company_name"])
                     set_website(acc["company_name"], found or "")
                     run_cost += cost
-                lookup_bar.progress(1.0, text="Done.")
+                lookup_bar.progress(1.0, text=":material/check_circle: Done.")
                 save_website_lookup_cost(run_cost, total)
                 st.rerun()
 
@@ -1787,10 +3190,12 @@ elif active_tab == "prospector":
         if diagnosis_input["rejected_count"] == 0 and diagnosis_input["not_interested_with_reason_count"] == 0:
             st.info("Nothing to diagnose yet - no rejections tracked and no not-interested reasons given so far.")
         else:
-            diag_bar = st.progress(0, text="Looking for patterns in your rejections...")
+            with st.container(key="diag_progress_bar"):
+                diag_bar = st.progress(0, text="Looking for patterns in your rejections...")
+            st.html(progress_shimmer_css("diag_progress_bar"))
 
             def _update_diag_progress(substatus):
-                diag_bar.progress(0.5, text=f"Looking for patterns in your rejections - {substatus}")
+                diag_bar.progress(progress_fraction("diagnosis", substatus), text=f"Looking for patterns in your rejections - {substatus}")
 
             try:
                 result = diagnose(diagnosis_input, on_progress=_update_diag_progress)
@@ -1798,7 +3203,7 @@ elif active_tab == "prospector":
                 diag_bar.empty()
                 st.error(str(exc))
             else:
-                diag_bar.progress(1.0, text="Done.")
+                diag_bar.progress(1.0, text=":material/check_circle: Done.")
                 st.session_state["diagnosis_result"] = result
                 st.rerun()
 
@@ -1824,10 +3229,12 @@ elif active_tab == "prospector":
         if total_inputs == 0:
             st.info("Nothing to analyze yet - come back once there's more history across scoring, target accounts, outreach, or interviews.")
         else:
-            learn_bar = st.progress(0, text="Reasoning over your real data...")
+            with st.container(key="learn_progress_bar"):
+                learn_bar = st.progress(0, text="Reasoning over your real data...")
+            st.html(progress_shimmer_css("learn_progress_bar"))
 
             def _update_learn_progress(substatus):
-                learn_bar.progress(0.5, text=f"Reasoning over your real data - {substatus}")
+                learn_bar.progress(progress_fraction("learn", substatus), text=f"Reasoning over your real data - {substatus}")
 
             try:
                 result = analyze_learn_engine(learn_input, on_progress=_update_learn_progress)
@@ -1835,7 +3242,7 @@ elif active_tab == "prospector":
                 learn_bar.empty()
                 st.error(str(exc))
             else:
-                learn_bar.progress(1.0, text="Done.")
+                learn_bar.progress(1.0, text=":material/check_circle: Done.")
                 for gap in learn_input["known_gaps"]:
                     result.setdefault("known_gaps", []).append(gap)
                 st.session_state["learn_engine_result"] = result
@@ -1854,7 +3261,8 @@ elif active_tab == "prep":
                 st.markdown(f"**Ready to prep: {prep_target['job_label']}**")
             else:
                 st.markdown(f"**Ready to prep: \"{prep_target['subject']}\"** from {prep_target['sender']}")
-                st.markdown(f"[Open in Gmail]({prep_target['gmail_link']})")
+                if prep_target.get("web_link") or prep_target.get("gmail_link"):
+                    st.markdown(f"[Open in inbox]({prep_target.get('web_link') or prep_target.get('gmail_link')})")
                 job_options = {job_label(j): j for j in jobs}
                 chosen_label = st.selectbox(
                     "Which application is this interview for?", ["-- select --"] + list(job_options.keys()),
@@ -1882,10 +3290,16 @@ elif active_tab == "prep":
             with gen_col:
                 if st.button("Generate prep", type="primary", key="generate_prep_btn", disabled=(target_job is None)):
                     start_round(target_job["source"], target_job["job_id"], round_label, interviewers=interviewers or None)
-                    prep_bar = st.progress(0, text="Researching the company and interviewer(s)...")
+                    with st.container(key="prep_progress_bar"):
+                        prep_bar = st.progress(0, text="Researching the company and interviewer(s)...")
+                    st.html(progress_shimmer_css("prep_progress_bar"))
 
                     def _update_prep_progress(substatus):
-                        prep_bar.progress(0.6, text=f"Drafting prep content - {substatus}")
+                        # generate_prep only wires on_progress into its second call
+                        # (structuring the research into prep content) - the research
+                        # phase itself reports no substatus, so the bar just holds
+                        # at its "Researching..." starting text until this fires.
+                        prep_bar.progress(progress_fraction("prep", substatus), text=f"Drafting prep content - {substatus}")
 
                     try:
                         result = generate_prep(target_job, load_profile(), interviewers, on_progress=_update_prep_progress)
@@ -1893,7 +3307,7 @@ elif active_tab == "prep":
                         prep_bar.empty()
                         st.error(str(exc))
                     else:
-                        prep_bar.progress(1.0, text="Done.")
+                        prep_bar.progress(1.0, text=":material/check_circle: Done.")
                         save_round(
                             target_job["source"], target_job["job_id"], round_label,
                             interviewers=result["interviewers"] or interviewers,
@@ -1903,6 +3317,18 @@ elif active_tab == "prep":
                             status="ready",
                         )
                         st.session_state["prep_target"] = None
+                        # Was collapsing immediately - status flipping to
+                        # "ready" made the expander's own expanded=(status
+                        # == "in_progress") go False the instant the content
+                        # that was just generated became available, so
+                        # seeing it needed a scroll-down and a re-click
+                        # (Mirror's fine-needle audit, 2026-08-06). Same
+                        # one-shot force-expand session_state pattern as the
+                        # Results tab's just-drafted-resume flag above -
+                        # popped (consumed) the moment this round's
+                        # expander renders, so it doesn't stay
+                        # force-expanded on later, unrelated visits.
+                        st.session_state[f"just_generated_prep_{target_job['source']}_{target_job['job_id']}_{round_label}"] = True
                         st.toast("Interview prep ready.", icon=":material/check_circle:")
                         st.rerun()
             with clear_col:
@@ -1920,7 +3346,10 @@ elif active_tab == "prep":
 
         for round_ in record["rounds"]:
             status_note = "in progress" if round_["status"] == "in_progress" else round_["status"]
-            with st.expander(f"{round_['round_label']} - {status_note}", expanded=(round_["status"] == "in_progress")):
+            just_generated = st.session_state.pop(
+                f"just_generated_prep_{record['source']}_{record['job_id']}_{round_['round_label']}", False,
+            )
+            with st.expander(f"{round_['round_label']} - {status_note}", expanded=(round_["status"] == "in_progress" or just_generated)):
                 logistics = " - ".join(v for v in [round_.get("date"), round_.get("format")] if v)
                 if logistics:
                     st.markdown(logistics)
@@ -1971,15 +3400,43 @@ elif active_tab == "prep":
                     st.toast("Saved.", icon=":material/check_circle:")
                     st.rerun()
 
+elif active_tab == "gaps":
+    render_feedback_widget("gaps")
+
+    st.header("Profile gaps")
+    st.markdown(
+        "Real facts your resumes are currently missing that would raise "
+        "their ATS score, consolidated across every job in one place - "
+        "answer here instead of hunting through each job's Results entry. "
+        "A job drops off this list once its questions are answered and its "
+        "resume regenerated."
+    )
+
+    gap_apps = get_applications_with_open_clarifying_questions()
+    if not gap_apps:
+        st.markdown("Nothing open right now.")
+    else:
+        jobs_by_key = {(j.get("source"), j.get("job_id")): j for j in jobs}
+        for app_record in gap_apps:
+            job = jobs_by_key.get((app_record.get("source"), app_record.get("job_id")))
+            if job is None:
+                continue
+            n = len(app_record.get("resume_clarifying_questions") or [])
+            score = app_record.get("resume_ats_score")
+            score_label = f" - ATS score {score}/100" if score is not None else ""
+            with st.expander(f"{job.get('title', 'Untitled role')} @ {job.get('organization', 'Unknown organization')}{score_label} ({n} open)"):
+                render_gap_questions_section(job, app_record)
+
+    render_answered_gap_questions()
+
 elif active_tab == "linkedin":
     render_feedback_widget("linkedin")
 
     st.header("LinkedIn profile enhancement")
     st.markdown(
         "Uploads for your LinkedIn profile and connections live in Settings "
-        "now, alongside your resume and other source documents - one shared "
-        "place to manage everything Panga reads from. This tab shows the "
-        "analysis and suggestions once you've uploaded there and run the "
+        "now, alongside your resume and other source documents. This tab "
+        "shows the analysis and suggestions once you've uploaded there and run the "
         "analysis below - it compares your export against your master "
         "profile and target-role skills, and drafts suggested rewrites. "
         "Suggestions below are yours to copy and paste into LinkedIn's own "
@@ -1995,10 +3452,12 @@ elif active_tab == "linkedin":
         st.markdown(f"Last saved: {linkedin_data['last_saved']} (from {', '.join(linkedin_data.get('source_files', []))})")
 
         if st.button("Analyze profile", type="primary", disabled=not linkedin_data.get("raw_text")):
-            enhance_bar = st.progress(0, text="Analyzing your LinkedIn profile...")
+            with st.container(key="enhance_progress_bar"):
+                enhance_bar = st.progress(0, text="Analyzing your LinkedIn profile...")
+            st.html(progress_shimmer_css("enhance_progress_bar"))
 
             def _update_enhance_progress(substatus):
-                enhance_bar.progress(0.5, text=f"Analyzing your LinkedIn profile - {substatus}")
+                enhance_bar.progress(progress_fraction("linkedin_enhance", substatus), text=f"Analyzing your LinkedIn profile - {substatus}")
 
             try:
                 context = build_enhancement_context()
@@ -2007,7 +3466,7 @@ elif active_tab == "linkedin":
                 enhance_bar.empty()
                 st.error(str(exc))
             else:
-                enhance_bar.progress(1.0, text="Done.")
+                enhance_bar.progress(1.0, text=":material/check_circle: Done.")
                 save_analysis(
                     result["suggestions"], result["profile_strength_score"], result["profile_strength_rationale"],
                     datetime.now(timezone.utc).isoformat(),
@@ -2086,12 +3545,15 @@ elif active_tab == "linkedin":
 
 elif active_tab == "support":
     render_feedback_widget("support")
-    render_support_page(
-        BHANGI_PROJECT,
-        intro=(
-            "Ran into something broken? Describe it below and attach a "
-            "screenshot and/or a log file if you have one - this gets queued "
-            "for review, same as everything else Panga tracks."
-        ),
-        project_root=PROJECT_ROOT,
-    )
+    if render_support_page is None:
+        st.info("The Support tab isn't available in this build.")
+    else:
+        render_support_page(
+            BHANGI_PROJECT,
+            intro=(
+                "Ran into something broken? Describe it below and attach a "
+                "screenshot and/or a log file if you have one - this gets queued "
+                "for review, same as everything else Panga tracks."
+            ),
+            project_root=PROJECT_ROOT,
+        )

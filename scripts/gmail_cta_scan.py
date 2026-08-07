@@ -1,17 +1,40 @@
 """Standalone replacement for the panga-gmail-cta-scan Claude scheduled
-task (native-packaging branch, 2026-07-31) - ported step-for-step from
-C:\\Users\\User\\.claude\\scheduled-tasks\\panga-gmail-cta-scan\\SKILL.md
-(see docs/email-monitoring-task.md), using gmail_client.py (official Gmail
-API) in place of the MCP connector and tailoring.cta_reasoning (direct
-Anthropic API) in place of live Claude Code reasoning for classification
-and application matching.
+task (native-packaging branch, 2026-07-31; extended 2026-08-04 to scan
+every configured inbox account, not just Gmail) - ported step-for-step
+from C:\\Users\\User\\.claude\\scheduled-tasks\\panga-gmail-cta-scan\\SKILL.md
+(see docs/email-monitoring-task.md), using inbox_accounts.py's per-provider
+adapters (gmail_client.py/microsoft_client.py/imap_client.py - no MCP
+anywhere, see that module's docstring) in place of the MCP connector, and
+tailoring.cta_reasoning (direct Anthropic API) in place of live Claude
+Code reasoning for classification and application matching. Kept this
+filename despite no longer being Gmail-only - Windows Task Scheduler
+references it by path (see docs/native-packaging-task-scheduler.md), and
+renaming would silently break an already-registered task until someone
+re-runs the install script.
 
 Safety property preserved from the original: this script only ever reads
-and labels Gmail, and only ever *suggests* an application status change
+and labels inboxes, and only ever *suggests* an application status change
 (suggest_status - Zahir still confirms it himself in the Streamlit app). It
 never sends, replies to, or drafts a reply to anything - that only happens
 in cta_fulfillment.py, and only in response to Zahir clicking "Draft reply"
 himself.
+
+Status matching (2026-08-06): a classified rejection/interview_request/
+offer email is also matched against every non-terminal application and,
+if confidently matched, suggests the corresponding status
+(_CTA_STATUS_BY_CATEGORY below) - closing a real gap Mirror's PRD-vs-code
+audit found (the PRD had marked this Done since 2026-07-30, but the
+call_to_action bucket only ever stored the email, never called
+suggest_status; the only real matching that existed was the older
+"applied" match on confirmation emails below). assessment_request/
+recruiter_question are deliberately excluded - neither has a
+corresponding status value in applications.py's lifecycle.
+
+Sequential across accounts, not concurrent - see inbox_accounts.py's
+module docstring for why (avoids introducing any new concurrency on top
+of the shared stores' existing file locking). One account's failure (a
+revoked OAuth token, an unreachable IMAP server) is logged and skipped,
+not fatal to the rest of the run - see run()'s per-account try/except.
 """
 
 import sys
@@ -28,41 +51,56 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-import gmail_client  # noqa: E402
+from inbox_accounts import configured_accounts  # noqa: E402
 from notifications import send_notification  # noqa: E402
 from tailoring.applications import load_applications, suggest_status  # noqa: E402
 from tailoring.cta_emails import add_cta_email  # noqa: E402
-from tailoring.cta_reasoning import classify_thread, match_application_confirmation  # noqa: E402
+from tailoring.cta_reasoning import classify_thread, match_application_confirmation, match_cta_application  # noqa: E402
 
-SEARCH_QUERY = "-label:Panga/Reviewed -in:spam -in:trash newer_than:2d in:inbox"
+# Which cta_category values represent a real application-status
+# transition, and what status to suggest for each - only these 3 of the 5
+# categories (see tailoring/cta_reasoning.py's classify_thread docstring
+# for the full set) have a corresponding value in applications.py's
+# status lifecycle. assessment_request and recruiter_question are
+# deliberately excluded: neither one is a status change (an assessment
+# ask is still mid-"applied", and a recruiter question often isn't tied
+# to an existing application at all), so matching one against the
+# applications list would either misrepresent the real stage or just
+# waste an API call on emails with nothing to match.
+_CTA_STATUS_BY_CATEGORY = {
+    "rejection": "rejected",
+    "interview_request": "interview scheduled",
+    "offer": "offer",
+}
+
+# Applications already in one of these are excluded from CTA matching -
+# a rejection/interview/offer email about an application that's already
+# closed out has nothing left to update (see applications.py's status
+# lifecycle docstring for the full set of values).
+_TERMINAL_APPLICATION_STATUSES = {"rejected", "not interested", "save for later", "closed by employer"}
 
 
 def _log(message: str) -> None:
     print(message, flush=True)
 
 
-def _full_body(thread_id: str) -> str:
-    thread = gmail_client.get_thread(thread_id)
-    return "\n\n".join(m["body"] for m in thread["messages"] if m["body"])
-
-
-def run() -> None:
-    reviewed_label_id = gmail_client.ensure_label("Panga/Reviewed")
-    cta_label_id = gmail_client.ensure_label("Panga/Call-to-Action")
-
-    threads = gmail_client.search_threads(SEARCH_QUERY)
-    _log(f"Found {len(threads)} new thread(s) to classify")
+def scan_account(account) -> tuple[list[dict], int]:
+    """Runs the classify/store/match loop for one configured account.
+    Returns (new_cta_items, new_match_count)."""
+    messages = account.list_recent_unreviewed()
+    _log(f"  [{account.provider}:{account.account}] {len(messages)} new message(s) to classify")
 
     new_cta_items = []
     new_match_count = 0
 
-    for thread in threads:
+    for msg in messages:
+        thread_summary = {"subject": msg.subject, "sender": msg.sender, "date": msg.date, "snippet": msg.snippet}
         try:
-            result = classify_thread(thread)
+            result = classify_thread(thread_summary)
             if not result["confident"]:
-                result = classify_thread(thread, full_body=_full_body(thread["thread_id"]))
-        except Exception as exc:  # noqa: BLE001 - one thread's failure shouldn't stop the rest
-            _log(f"  classification failed for {thread['subject']!r}: {exc}")
+                result = classify_thread(thread_summary, full_body=account.get_body(msg.ref))
+        except Exception as exc:  # noqa: BLE001 - one message's failure shouldn't stop the rest
+            _log(f"    classification failed for {msg.subject!r}: {exc}")
             continue
 
         bucket = result["bucket"]
@@ -70,34 +108,83 @@ def run() -> None:
             continue
 
         if bucket == "passive":
-            gmail_client.label_thread(thread["thread_id"], [reviewed_label_id])
+            try:
+                account.mark_reviewed(msg.ref)
+            except Exception as exc:  # noqa: BLE001 - best-effort marking (e.g. an IMAP
+                # server that rejects custom keyword flags)
+                _log(f"    couldn't mark reviewed for {msg.subject!r}: {exc}")
             continue
 
         if bucket == "call_to_action":
-            gmail_client.label_thread(thread["thread_id"], [reviewed_label_id, cta_label_id])
+            try:
+                account.mark_cta(msg.ref)
+            except Exception as exc:  # noqa: BLE001
+                _log(f"    couldn't mark CTA for {msg.subject!r}: {exc}")
+            category = result["cta_category"]
             add_cta_email(
-                thread["thread_id"], thread["subject"], thread["sender"], thread["snippet"], thread["date"],
-                result["cta_category"], message_id=thread.get("message_id"),
+                msg.ref, msg.subject, msg.sender, msg.snippet, msg.date,
+                category, message_id=msg.message_id,
+                provider=account.provider, account=account.account,
+                web_link=account.web_link(msg.ref),
             )
-            new_cta_items.append({**thread, "category": result["cta_category"]})
+            new_cta_items.append({"subject": msg.subject, "sender": msg.sender, "category": category})
+
+            target_status = _CTA_STATUS_BY_CATEGORY.get(category)
+            if target_status:
+                candidates = [a for a in load_applications() if a.get("status") not in _TERMINAL_APPLICATION_STATUSES]
+                if candidates:
+                    try:
+                        body = account.get_body(msg.ref)
+                        match = match_cta_application(category, thread_summary, body, candidates)
+                    except Exception as exc:  # noqa: BLE001 - a failed match shouldn't drop the
+                        # CTA email itself, which is already stored above
+                        _log(f"    CTA application match failed for {msg.subject!r}: {exc}")
+                    else:
+                        if match["matched"]:
+                            suggest_status(match["source"], match["job_id"], target_status, match["reason"])
+                            new_match_count += 1
             continue
 
         if bucket == "application_confirmation":
-            gmail_client.label_thread(thread["thread_id"], [reviewed_label_id])
+            try:
+                account.mark_reviewed(msg.ref)
+            except Exception as exc:  # noqa: BLE001
+                _log(f"    couldn't mark reviewed for {msg.subject!r}: {exc}")
             under_review = [a for a in load_applications() if a.get("status") == "under review"]
             if not under_review:
                 continue
             try:
-                body = _full_body(thread["thread_id"])
-                match = match_application_confirmation(thread, body, under_review)
+                body = account.get_body(msg.ref)
+                match = match_application_confirmation(thread_summary, body, under_review)
             except Exception as exc:  # noqa: BLE001
-                _log(f"  application match failed for {thread['subject']!r}: {exc}")
+                _log(f"    application match failed for {msg.subject!r}: {exc}")
                 continue
             if match["matched"]:
                 suggest_status(match["source"], match["job_id"], "applied", match["reason"])
                 new_match_count += 1
 
-    _notify(new_cta_items, new_match_count)
+    return new_cta_items, new_match_count
+
+
+def run() -> None:
+    accounts = configured_accounts()
+    if not accounts:
+        _log("No email accounts configured - nothing to scan.")
+        return
+
+    all_new_cta_items: list[dict] = []
+    total_new_match_count = 0
+    for account in accounts:
+        try:
+            new_cta_items, new_match_count = scan_account(account)
+        except Exception as exc:  # noqa: BLE001 - one account's failure (expired OAuth
+            # token, unreachable IMAP server) must not stop the others from scanning
+            _log(f"  [{account.provider}:{account.account}] scan failed: {exc}")
+            continue
+        all_new_cta_items.extend(new_cta_items)
+        total_new_match_count += new_match_count
+
+    _notify(all_new_cta_items, total_new_match_count)
     _log("Done.")
 
 
@@ -113,7 +200,7 @@ def _notify(new_cta_items: list[dict], new_match_count: int) -> None:
         parts.append(f"{new_match_count} application match{'es' if new_match_count != 1 else ''} ready to confirm")
     if not parts:
         return
-    send_notification("Panga - Gmail scan", ". Also: ".join(parts)[:200])
+    send_notification("Panga - Inbox scan", ". Also: ".join(parts)[:200])
 
 
 if __name__ == "__main__":

@@ -58,3 +58,52 @@ def test_update_job_address_caches_empty_string_as_a_real_value(isolated_data):
     # entirely ("never searched"). Both must be preserved distinctly.
     assert "organization_address" in job
     assert job["organization_address"] == ""
+
+
+def test_update_job_ats_keywords_sets_both_lists_on_matching_job(isolated_data):
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}])
+    job_store.update_job_ats_keywords("Dice", "1", ["python", "sql"], ["aws"])
+    job = job_store.load_jobs()[0]
+    assert job["ats_required_keywords"] == ["python", "sql"]
+    assert job["ats_preferred_keywords"] == ["aws"]
+
+
+def test_update_job_ats_keywords_caches_empty_lists_as_a_real_value(isolated_data):
+    # Empty lists mean "extracted, genuinely no such keywords" - distinct
+    # from the keys being absent entirely ("never extracted").
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}])
+    job_store.update_job_ats_keywords("Dice", "1", [], [])
+    job = job_store.load_jobs()[0]
+    assert job["ats_required_keywords"] == []
+    assert job["ats_preferred_keywords"] == []
+
+
+def test_update_job_description_sets_description(isolated_data):
+    job_store.save_jobs([{"source": "Eisai", "job_id": "1", "title": "Director"}])
+    job_store.update_job_description("Eisai", "1", "Real JD text.")
+    job = job_store.load_jobs()[0]
+    assert job["description"] == "Real JD text."
+
+
+def test_update_job_description_clears_stale_empty_ats_keyword_cache(isolated_data):
+    # Real bug this guards against: if a job was cached with empty keyword
+    # lists BEFORE it had any real JD text, drafting.py's
+    # _extract_ats_keywords() would treat that empty cache as "already
+    # tried, genuinely nothing there" forever - even after real text is
+    # backfilled - since it only re-attempts when the keys are absent, not
+    # merely empty. Backfilling description must reset that cache so the
+    # next regenerate re-extracts for real.
+    job_store.save_jobs([{"source": "Eisai", "job_id": "1", "title": "Director"}])
+    job_store.update_job_ats_keywords("Eisai", "1", [], [])
+    job_store.update_job_description("Eisai", "1", "Real JD text.")
+    job = job_store.load_jobs()[0]
+    assert job["description"] == "Real JD text."
+    assert "ats_required_keywords" not in job
+    assert "ats_preferred_keywords" not in job
+
+
+def test_update_job_description_no_op_when_job_not_found(isolated_data):
+    job_store.save_jobs([{"source": "Eisai", "job_id": "1", "title": "Director"}])
+    job_store.update_job_description("Eisai", "does-not-exist", "text")
+    job = job_store.load_jobs()[0]
+    assert "description" not in job

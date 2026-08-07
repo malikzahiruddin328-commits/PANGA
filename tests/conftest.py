@@ -30,6 +30,11 @@ def isolated_data(tmp_path, monkeypatch):
     import prospector.target_accounts as target_accounts
     import tailoring.dossier as dossier
     import tailoring.interview_prep as interview_prep
+    import tailoring.cta_emails as cta_emails
+    import prospector.outreach as outreach
+    import fulfillment
+    import profile.storage as profile_storage
+    import profile.ingest as profile_ingest
 
     monkeypatch.setattr(job_store, "JOBS_PATH", tmp_path / "jobs.json")
     monkeypatch.setattr(applications, "APPLICATIONS_PATH", tmp_path / "applications.json")
@@ -37,4 +42,23 @@ def isolated_data(tmp_path, monkeypatch):
     monkeypatch.setattr(target_accounts, "WEBSITE_LOOKUP_COST_PATH", tmp_path / "website_lookup_cost.json")
     monkeypatch.setattr(dossier, "DOSSIER_DIR", tmp_path / "dossiers")
     monkeypatch.setattr(interview_prep, "INTERVIEW_PREP_PATH", tmp_path / "interview_prep.json")
+    monkeypatch.setattr(cta_emails, "CTA_EMAILS_PATH", tmp_path / "cta_emails.json")
+    monkeypatch.setattr(outreach, "OUTREACH_PATH", tmp_path / "outreach.json")
+    monkeypatch.setattr(fulfillment, "SYNC_STATUS_PATH", tmp_path / "fulfillment_status.json")
+    # Real gap found 2026-08-06: profile/storage.py's MASTER_PROFILE_PATH was
+    # never added here despite being exactly the kind of store this fixture
+    # exists to isolate - one test file (test_dossier_edit_detection.py) had
+    # been patching it ad hoc in its own fixture instead. Covered centrally
+    # now so every test gets the same safety by construction, not by each
+    # test file remembering to do it itself.
+    monkeypatch.setattr(profile_storage, "MASTER_PROFILE_PATH", tmp_path / "master_profile.json")
+    # Same class of gap as MASTER_PROFILE_PATH above - profile/ingest.py's
+    # manifest/raw-text store was never isolated either, so any test that
+    # uploads/removes a document would silently touch the real data/profile
+    # folder. PROJECT_ROOT must move too: ingest_uploaded_document() computes
+    # each entry's "extracted_to" via out_path.relative_to(PROJECT_ROOT), which
+    # raises ValueError if OUTPUT_DIR isn't actually under PROJECT_ROOT.
+    monkeypatch.setattr(profile_ingest, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(profile_ingest, "OUTPUT_DIR", tmp_path / "profile_raw")
+    monkeypatch.setattr(profile_ingest, "MANIFEST_RESULT_PATH", tmp_path / "profile_raw" / "manifest_result.json")
     return tmp_path

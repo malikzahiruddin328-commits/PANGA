@@ -1,3 +1,16 @@
+# baseFontSize is registered by Streamlit (config.py's _create_theme_options)
+# with categories=["theme"] only, unlike baseRadius/showWidgetBorder/
+# linkUnderline below (which also carry CustomThemeCategories.SIDEBAR, the
+# thing that makes an option settable per light/dark mode). That means
+# theme.light.baseFontSize/theme.dark.baseFontSize were never valid config
+# keys - found live 2026-08-04 via a friend tester's console log ("not a
+# valid config option... it may have been removed"), non-fatal (Streamlit
+# just warns and ignores it) but alarming red text for a non-technical
+# tester to see on first launch. Both modes used the same value (15) anyway,
+# so this is a behavior-preserving move, not a real config change.
+[theme]
+baseFontSize = 15
+
 [theme.light]
 primaryColor = "#993C1D"
 backgroundColor = "#ffffff"
@@ -8,9 +21,24 @@ linkColor = "#993C1D"
 greenColor = "#1a7f37"
 redColor = "#cf222e"
 yellowColor = "#bf8700"
+# grayColor was never set, so st.badge(color="gray") (used for the
+# "Recruiter question"/"Rejection" category badges and their urgency
+# labels) fell back to Streamlit's own built-in default: text at 60%
+# opacity over a 10% tint, rgba(49,51,63,*) - measured live at ~3.5:1
+# against its own badge background, failing WCAG 1.4.3's 4.5:1 minimum
+# for normal text (Mirror's first UI/UX review pass, 2026-08-06). Every
+# OTHER semantic color here (green/red/yellow) gets a solid, non-transparent
+# derived text color from Streamlit and passes comfortably - gray is the
+# one color Streamlit doesn't auto-derive a real text color for, it just
+# dims via opacity. Setting explicit grayBackgroundColor/grayTextColor
+# (warm-toned to match this palette rather than a cool default gray)
+# fixes it the same way the other colors are already fixed: a real solid
+# text color, not a transparency trick. Verified: ~6.4:1.
+grayColor = "#8A8478"
+grayBackgroundColor = "#EDEBE7"
+grayTextColor = "#57534A"
 font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
 headingFont = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@600;700&display=swap"
-baseFontSize = 15
 baseRadius = "8px"
 showWidgetBorder = true
 linkUnderline = false
@@ -25,9 +53,16 @@ linkColor = "#F0997B"
 greenColor = "#3fb950"
 redColor = "#f85149"
 yellowColor = "#d29922"
+# Same fix as [theme.light]'s grayColor block above - dark mode's default
+# gray badge happened to measure compliant already (~6.3:1, checked before
+# assuming it needed the same fix), but setting it explicitly here anyway
+# so both modes use the same deliberate warm-gray pairing instead of one
+# themed and one falling back to Streamlit's default.
+grayColor = "#8A8478"
+grayBackgroundColor = "#3A362E"
+grayTextColor = "#D8D3C8"
 font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
 headingFont = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@600;700&display=swap"
-baseFontSize = 15
 baseRadius = "8px"
 showWidgetBorder = true
 linkUnderline = false

@@ -54,7 +54,15 @@ def add_outreach(
 ) -> str:
     """Creates an outreach record with status "planned". Requires either
     (job_source AND job_id) or target_account_name - outreach must be
-    anchored to one or the other. Returns the new outreach_id."""
+    anchored to one or the other. Returns the new outreach_id.
+
+    `provider`/`account` aren't caller-supplied here (unlike
+    tailoring.cta_emails.add_cta_email) - an outreach record isn't tied to
+    a specific inbox until a draft is actually created; mark_draft_created
+    stamps those fields at that point, from whichever configured account
+    src/fulfillment.py picked to send from (currently Gmail if configured,
+    falling back through inbox_accounts.configured_accounts() otherwise -
+    see that module)."""
     if not ((job_source and job_id) or target_account_name):
         raise ValueError("outreach needs either a (job_source, job_id) pair or a target_account_name")
 
@@ -77,8 +85,10 @@ def add_outreach(
         "created_at": now,
         "status_updated_at": now,
         "draft_requested": False,
-        "gmail_draft_id": None,
-        "gmail_draft_link": None,
+        "provider": None,
+        "account": None,
+        "draft_id": None,
+        "draft_link": None,
     })
     _save_all(records)
     return outreach_id
@@ -107,9 +117,11 @@ def set_strategy_tag(outreach_id: str, strategy_tag: str) -> None:
 
 
 def request_draft(outreach_id: str) -> None:
-    """Flags an email-channel outreach record for the panga-cta-fulfillment
-    scheduled task to compose and create a real Gmail draft on its next
-    run - same "prepare but don't submit" rule as CTA replies."""
+    """Flags an email-channel outreach record for the fulfillment logic
+    (src/fulfillment.py - called by either the 2x/day scheduled task or
+    the dashboard's synchronous "Send and receive" button) to compose and
+    create a real draft on its next run - same "prepare but don't submit"
+    rule as CTA replies."""
     records = load_outreach()
     r = _find(records, outreach_id)
     if r:
@@ -118,16 +130,26 @@ def request_draft(outreach_id: str) -> None:
 
 
 def get_pending_draft_requests() -> list[dict]:
-    return [r for r in load_outreach() if r.get("draft_requested") and not r.get("gmail_draft_id")]
+    return [r for r in load_outreach() if r.get("draft_requested") and not (r.get("draft_id") or r.get("gmail_draft_id"))]
 
 
-def mark_draft_created(outreach_id: str, draft_id: str) -> None:
+def mark_draft_created(outreach_id: str, draft_id: str, provider: str = "gmail", account: str = "gmail", draft_link: str | None = None) -> None:
+    """`provider`/`account` record which configured account the draft was
+    actually created in (see inbox_accounts.py) - default to Gmail for
+    backward compatibility with call sites predating multi-provider
+    support. `draft_link` defaults to Gmail's own compose-deep-link format
+    only when the record's provider is Gmail and no link was given (same
+    rule as tailoring.cta_emails.mark_draft_created)."""
     records = load_outreach()
     r = _find(records, outreach_id)
     if r:
         r["draft_requested"] = False
-        r["gmail_draft_id"] = draft_id
-        r["gmail_draft_link"] = f"https://mail.google.com/mail/u/0/#drafts?compose={draft_id}"
+        r["provider"] = provider
+        r["account"] = account
+        r["draft_id"] = draft_id
+        if draft_link is None and provider == "gmail":
+            draft_link = f"https://mail.google.com/mail/u/0/#drafts?compose={draft_id}"
+        r["draft_link"] = draft_link
         if r["status"] == "planned":
             r["status_updated_at"] = datetime.now(timezone.utc).isoformat()
             r["status"] = "drafted"
@@ -135,11 +157,12 @@ def mark_draft_created(outreach_id: str, draft_id: str) -> None:
 
 
 def get_awaiting_draft_send() -> list[dict]:
-    """Outreach records with a draft sitting in Gmail, still marked
-    "drafted" (not yet confirmed sent) - the fulfillment task checks each
-    gmail_draft_id against Gmail's live drafts list, same reconciliation
-    pattern as cta_emails.get_awaiting_draft_send()."""
-    return [r for r in load_outreach() if r.get("gmail_draft_id") and r["status"] == "drafted"]
+    """Outreach records with a draft sitting in some inbox's Drafts
+    folder, still marked "drafted" (not yet confirmed sent) - the
+    fulfillment logic checks each draft_id against that account's live
+    drafts list, same reconciliation pattern as
+    cta_emails.get_awaiting_draft_send()."""
+    return [r for r in load_outreach() if (r.get("draft_id") or r.get("gmail_draft_id")) and r["status"] == "drafted"]
 
 
 def mark_draft_sent(outreach_id: str) -> None:

@@ -27,12 +27,62 @@ import os
 from pathlib import Path
 
 import requests
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(PROJECT_ROOT / ".env")
 
 API_URL = "https://api.fda.gov/drug/drugsfda.json"
+
+
+def _html_to_text(html: str | None) -> str | None:
+    if not html:
+        return None
+    return BeautifulSoup(html, "html.parser").get_text("\n", strip=True) or None
+
+
+def _fetch_workday_job_description(tenant: str, site: str, wd_number: int, external_path: str) -> str | None:
+    """Real posting text for one Workday requisition - the list-search
+    response search_workday_jobs() calls only has title/location/pay, no
+    description at all (live-confirmed 2026-08-06 while auditing why ATS
+    keyword extraction was coming back empty for every non-USAJOBS job -
+    see tailoring/ats_score.py). Same CXS per-requisition detail endpoint
+    check_workday_posting_open() below already calls successfully for
+    freshness-checking - reusing an endpoint already proven reachable, not
+    a new live-fetch risk. Returns None on any failure (network error,
+    unexpected shape) rather than raising - one job's description fetch
+    failing must not break the whole search."""
+    url = f"https://{tenant}.wd{wd_number}.myworkdayjobs.com/wday/cxs/{tenant}/{site}{external_path}"
+    try:
+        response = requests.get(url, timeout=20)
+        response.raise_for_status()
+        return _html_to_text(response.json().get("jobPostingInfo", {}).get("jobDescription"))
+    except Exception:
+        return None
+
+
+def _fetch_smartrecruiters_job_description(company_id: str, posting_id: str) -> str | None:
+    """Real posting text for one SmartRecruiters posting - same reasoning
+    as _fetch_workday_job_description() above, one platform over. The
+    detail endpoint's jobAd.sections separates jobDescription from
+    qualifications (live-confirmed 2026-08-06) - qualifications is
+    concatenated in since it's exactly the required/preferred-skills text
+    tailoring/ats_score.py's keyword extraction looks for. Returns None on
+    any failure, same fail-soft reasoning as the Workday version."""
+    url = f"https://api.smartrecruiters.com/v1/companies/{company_id}/postings/{posting_id}"
+    try:
+        response = requests.get(url, timeout=20)
+        response.raise_for_status()
+        sections = response.json().get("jobAd", {}).get("sections", {})
+        parts = [
+            _html_to_text((sections.get(key) or {}).get("text"))
+            for key in ("jobDescription", "qualifications")
+        ]
+        text = "\n\n".join(p for p in parts if p)
+        return text or None
+    except Exception:
+        return None
 
 
 def _params(limit: int, skip: int, search: str | None) -> dict:
@@ -89,15 +139,17 @@ def search_workday_jobs(company_name: str, tenant: str, site: str, wd_number: in
     base_url = f"https://{tenant}.wd{wd_number}.myworkdayjobs.com/{site}"
     jobs = []
     for posting in data.get("jobPostings", []):
-        posting_url = base_url + (posting.get("externalPath") or "")
+        external_path = posting.get("externalPath")
+        posting_url = base_url + (external_path or "")
         jobs.append({
             "source": company_name,
-            "job_id": posting.get("externalPath"),
+            "job_id": external_path,
             "title": posting.get("title"),
             "organization": company_name,
             "location": posting.get("locationsText"),
             "pay_min": None,
             "pay_max": None,
+            "description": _fetch_workday_job_description(tenant, site, wd_number, external_path),
             "posting_url": posting_url,
             "apply_url": posting_url,
         })
@@ -128,19 +180,137 @@ def search_smartrecruiters_jobs(company_name: str, company_id: str, keyword: str
             elif field.get("fieldLabel") == "Salary Max":
                 pay_max = field.get("valueLabel")
 
-        posting_url = f"https://jobs.smartrecruiters.com/{company_name}/{posting.get('id')}"
+        posting_id = posting.get("id")
+        posting_url = f"https://jobs.smartrecruiters.com/{company_name}/{posting_id}"
         jobs.append({
             "source": company_name,
-            "job_id": posting.get("id"),
+            "job_id": posting_id,
             "title": posting.get("name"),
             "organization": company_name,
             "location": location_text,
             "pay_min": pay_min,
             "pay_max": pay_max,
+            "description": _fetch_smartrecruiters_job_description(company_id, posting_id),
             "posting_url": posting_url,
             "apply_url": posting_url,
         })
     return jobs
+
+
+def check_smartrecruiters_posting_open(company_id: str, posting_id: str) -> bool:
+    """Freshness check (added 2026-08-05): SmartRecruiters' public API also
+    exposes a single-posting detail endpoint, same base as
+    search_smartrecruiters_jobs() above - a filled/withdrawn posting either
+    404s or comes back with status != "PUBLISHED"."""
+    url = f"https://api.smartrecruiters.com/v1/companies/{company_id}/postings/{posting_id}"
+    response = requests.get(url, timeout=20)
+    if response.status_code == 404:
+        return False
+    response.raise_for_status()
+    return response.json().get("status") == "PUBLISHED"
+
+
+def check_workday_posting_open(tenant: str, site: str, wd_number: int, external_path: str) -> bool:
+    """Freshness check (added 2026-08-05): same Workday CXS JSON API as
+    search_workday_jobs() above, just the per-requisition detail path instead
+    of the list-search path - a closed requisition 404s here rather than
+    returning a job body."""
+    url = f"https://{tenant}.wd{wd_number}.myworkdayjobs.com/wday/cxs/{tenant}/{site}{external_path}"
+    response = requests.get(url, timeout=20)
+    if response.status_code == 404:
+        return False
+    response.raise_for_status()
+    return bool(response.json().get("jobPostingInfo"))
+
+
+def search_greenhouse_jobs(company_name: str, board_token: str, limit: int = 50) -> list[dict]:
+    """board_token is the identifier in the company's own
+    boards.greenhouse.io/{board_token} careers URL, e.g. "stripe". Public
+    job board API, no auth required - meant for syndication, same
+    intended-use basis as search_smartrecruiters_jobs() above.
+
+    No server-side keyword search on this endpoint (unlike Workday/
+    SmartRecruiters) - it always returns the company's whole open-jobs
+    list. Deliberately NOT called per-role in a loop the way Workday/
+    SmartRecruiters are (see run_search.py's search_ats_boards()) -
+    fetching the same full board once per target role would be wasted
+    requests for zero extra data, same reasoning as the industry-board
+    fetchers in industry_boards.py. Compatibility scoring, not this
+    function, is what actually filters for relevance."""
+    url = f"https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs"
+    response = requests.get(url, timeout=20)
+    response.raise_for_status()
+    data = response.json()
+
+    jobs = []
+    for posting in data.get("jobs", [])[:limit]:
+        posting_url = posting.get("absolute_url")
+        jobs.append({
+            "source": company_name,
+            "job_id": str(posting.get("id")),
+            "title": posting.get("title"),
+            "organization": company_name,
+            "location": (posting.get("location") or {}).get("name"),
+            "pay_min": None,
+            "pay_max": None,
+            "posting_url": posting_url,
+            "apply_url": posting_url,
+        })
+    return jobs
+
+
+def search_lever_jobs(company_name: str, company_slug: str, limit: int = 50) -> list[dict]:
+    """company_slug is the identifier in the company's own
+    jobs.lever.co/{company_slug} careers URL, e.g. "netflix". Public
+    postings API, no auth required. Same "no server-side keyword search,
+    fetch once per company not per role" reasoning as
+    search_greenhouse_jobs() above - see run_search.py's
+    search_ats_boards()."""
+    url = f"https://api.lever.co/v0/postings/{company_slug}"
+    response = requests.get(url, params={"mode": "json"}, timeout=20)
+    response.raise_for_status()
+    data = response.json()
+
+    jobs = []
+    for posting in data[:limit]:
+        posting_url = posting.get("hostedUrl")
+        location = (posting.get("categories") or {}).get("location")
+        jobs.append({
+            "source": company_name,
+            "job_id": str(posting.get("id")),
+            "title": posting.get("text"),
+            "organization": company_name,
+            "location": location,
+            "pay_min": None,
+            "pay_max": None,
+            "posting_url": posting_url,
+            "apply_url": posting.get("applyUrl") or posting_url,
+        })
+    return jobs
+
+
+def check_greenhouse_posting_open(board_token: str, job_id: str) -> bool:
+    """Freshness check: Greenhouse's single-job endpoint - a filled/closed
+    requisition 404s here rather than returning a job body (confirmed
+    2026-08-05, same shape as check_workday_posting_open())."""
+    url = f"https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs/{job_id}"
+    response = requests.get(url, timeout=20)
+    if response.status_code == 404:
+        return False
+    response.raise_for_status()
+    return True
+
+
+def check_lever_posting_open(company_slug: str, posting_id: str) -> bool:
+    """Freshness check: Lever's single-posting endpoint - a filled/closed
+    posting 404s here (confirmed 2026-08-05, same shape as
+    check_smartrecruiters_posting_open())."""
+    url = f"https://api.lever.co/v0/postings/{company_slug}/{posting_id}"
+    response = requests.get(url, params={"mode": "json"}, timeout=20)
+    if response.status_code == 404:
+        return False
+    response.raise_for_status()
+    return True
 
 
 if __name__ == "__main__":

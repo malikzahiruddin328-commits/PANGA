@@ -128,13 +128,65 @@ def match_application_confirmation(thread_summary: dict, full_body: str, candida
     )
 
 
+_CTA_MATCH_SYSTEM_PROMPT = """You are matching a job-search email (a rejection, interview request, or offer) to a specific job record from Zahir Uddin's job-search tool "Panga", so his application status can be updated automatically. Only report a match if you are genuinely confident - if the email doesn't give enough detail to distinguish between multiple candidate jobs (e.g. two identically-titled postings at different companies, or the email is generic/ambiguous about which role it's about), do not guess; report matched=false instead. A wrong match is worse than no match - it would silently mark the wrong application as rejected/interviewing/offered."""
+
+# Same shape as _MATCH_SCHEMA above, kept as its own object rather than
+# shared so each prompt's schema description text stays accurate to what
+# it's actually describing (a "confirmation" email there, any of
+# rejection/interview_request/offer here).
+_CTA_MATCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "matched": {"type": "boolean"},
+        "source": {"type": "string", "description": "The matched job's source field. Empty string if matched=false."},
+        "job_id": {"type": "string", "description": "The matched job's job_id field. Empty string if matched=false."},
+        "reason": {"type": "string", "description": "One sentence: what the email said, or why no confident match exists."},
+    },
+    "required": ["matched", "source", "job_id", "reason"],
+    "additionalProperties": False,
+}
+
+
+def match_cta_application(category: str, thread_summary: dict, full_body: str, candidate_jobs: list[dict]) -> dict:
+    """Matches a rejection/interview_request/offer email to a specific
+    application - same "confident match or explicitly no match" pattern
+    as match_application_confirmation above, extended to the CTA
+    categories that actually represent a status transition (see
+    scripts/gmail_cta_scan.py's _CTA_STATUS_BY_CATEGORY for why
+    assessment_request/recruiter_question are deliberately excluded - a
+    question or an assessment ask isn't a status change, and there's no
+    corresponding value in applications.py's status lifecycle for either).
+    `candidate_jobs` is every application not already in a terminal status
+    (rejected/not interested/save for later/closed by employer) - the
+    caller is responsible for that filtering, this function only matches
+    within whatever list it's handed. Returns {"matched": bool, "source":
+    str, "job_id": str, "reason": str}."""
+    client = get_client()
+    content = (
+        f"CATEGORY: {category}\n"
+        f"Subject: {thread_summary.get('subject', '')}\n"
+        f"From: {thread_summary.get('sender', '')}\nBody:\n{full_body}\n\n"
+        "CANDIDATE APPLICATIONS (not yet in a final/closed status):\n" + json.dumps(candidate_jobs, indent=2, default=str)
+    )
+    return call_structured(
+        client,
+        system=_CTA_MATCH_SYSTEM_PROMPT,
+        user_content=content,
+        schema=_CTA_MATCH_SCHEMA,
+        max_tokens=500,
+        effort="medium",
+        thinking=False,
+        refusal_message="Claude declined to match this email. Treating as no match for safety.",
+    )
+
+
 _DRAFT_REPLY_SYSTEM_PROMPT = f"""You are composing a short, professional email reply on Zahir Uddin's behalf, for his job-search tool "Panga". This becomes a Gmail DRAFT only - it is never sent automatically, Zahir reviews and sends it himself, so err toward a reasonable draft rather than declining.
 
 {_TARGETING_CONTEXT}
 
 Write 2-4 sentences tailored to the category and the actual subject/snippet content:
 - offer: express genuine interest/thanks, ask about next steps (start date, comp details if not covered, etc).
-- interview_request: confirm enthusiasm and general availability, ask them to propose times (don't invent a specific date/time you don't have).
+- interview_request: confirm enthusiasm. If "Available times" are given below, propose exactly those (don't invent others, and don't offer every one of your open hours - a shortlist reads as a normal, in-demand schedule, not as "I'm free whenever," which is the whole point of only being given a curated few). If no available times are given, ask them to propose times instead (don't invent a specific date/time you don't have).
 - assessment_request: acknowledge receipt, confirm you'll complete it, ask about the deadline if unclear.
 - recruiter_question: answer helpfully based on Zahir's background above if the question is answerable from that; otherwise keep it brief and ask a clarifying question back.
 - rejection: brief, gracious thank-you, express interest in being considered for future roles.
@@ -149,12 +201,21 @@ _DRAFT_REPLY_SCHEMA = {
 }
 
 
-def draft_cta_reply(category: str, subject: str, snippet: str) -> str:
+def draft_cta_reply(category: str, subject: str, snippet: str, available_slots: list[str] | None = None) -> str:
     """category is one of "rejection", "interview_request",
     "assessment_request", "offer", "recruiter_question" (cta_emails.py's
-    stored category field). Returns the composed reply body text."""
+    stored category field). `available_slots` is an optional list of
+    human-readable time strings (e.g. "Tuesday, Aug 5, 2:00-2:30 PM") - the
+    caller is responsible for producing these (see
+    google_calendar_client.curate_believable_slots() for the Google
+    Calendar path) and for this being real availability, not invented;
+    this function just decides whether to use them. Only meaningful for
+    category="interview_request" - ignored for every other category, same
+    as the caller passing None. Returns the composed reply body text."""
     client = get_client()
     content = f"Category: {category}\nSubject: {subject}\nSnippet: {snippet}"
+    if available_slots:
+        content += "\nAvailable times:\n" + "\n".join(f"- {slot}" for slot in available_slots)
     data = call_structured(
         client,
         system=_DRAFT_REPLY_SYSTEM_PROMPT,

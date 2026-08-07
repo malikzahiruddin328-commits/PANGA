@@ -15,6 +15,7 @@ happens out-of-process via scripts/license_daily_checkin.py instead.
 """
 
 import math
+import os
 
 import streamlit as st
 
@@ -31,7 +32,18 @@ def render_indicator_and_get_block() -> dict | None:
     """Renders the small top-right indicator for the non-blocking states
     (verified / grace) in whatever column the caller is already inside.
     Returns None if the app should proceed normally, or the check-in
-    result dict if the caller should render a full-screen block and stop."""
+    result dict if the caller should render a full-screen block and stop.
+
+    PANGA_TEST_MODE=1 (set by the friend-testing package's launcher only -
+    never in a real distributed build) skips the real license check
+    entirely, so testers who aren't paying customers can run the app
+    without needing a Stripe subscription. Shows an obvious yellow badge
+    instead of the real indicator so nobody mistakes a test run for a
+    verified license."""
+    if os.environ.get("PANGA_TEST_MODE") == "1":
+        st.markdown(":orange[⚠ TEST MODE — license check skipped]")
+        return None
+
     if not client.is_configured():
         return {"state": "not_configured"}
 
@@ -73,7 +85,23 @@ def render_block_screen(result: dict) -> None:
         )
         return
 
-    if state in ("locked", "never_verified"):
+    if state == "never_verified":
+        # A first-ever check-in (fresh signup) that hit a transient hiccup
+        # (e.g. a cold-start timeout during device activation) - NOT the
+        # same situation as "locked" below (3 real days offline). Reusing
+        # that copy here would tell a customer who signed up seconds ago
+        # that they've been offline for days, which is just wrong.
+        st.error(
+            "We couldn't verify your license just now. Check your internet "
+            "connection and try again.",
+            icon=":material/wifi_off:",
+        )
+        if st.button("Try again", key="license_refresh_never_verified"):
+            _run_check_in()
+            st.rerun()
+        return
+
+    if state == "locked":
         st.error(
             "We haven't been able to verify your license in 3 days — "
             "connect to the internet and reopen Panga.\n\n"
@@ -87,13 +115,23 @@ def render_block_screen(result: dict) -> None:
         return
 
     if state in ("expired_trial", "expired_subscription"):
-        expires_at = result.get("expires_at", "")
+        expires_at = result.get("expires_at")
         noun = "trial" if state == "expired_trial" else "subscription"
+        ended_clause = f" on {expires_at}" if expires_at else ""
         st.error(
-            f"Your {noun} ended on {expires_at}. Renew to keep using Panga.",
+            f"Your {noun} ended{ended_clause}. Renew to keep using Panga.",
             icon=":material/lock:",
         )
-        st.link_button("Renew now", "https://panga.example.com/renew")
+        if st.button("Renew now", key="license_renew_now"):
+            try:
+                checkout = client.create_checkout_session(
+                    success_url="http://localhost:8501", cancel_url="http://localhost:8501",
+                )
+                st.link_button("Continue to checkout", checkout["checkout_url"])
+            except client.LicenseNetworkError:
+                st.error("Couldn't reach the billing service — check your internet connection and try again.")
+            except client.LicenseServiceError as e:
+                st.error(f"Couldn't start checkout: {e}")
         return
 
     if state == "device_conflict":
@@ -123,12 +161,28 @@ def _render_email_signin() -> None:
     st.markdown("Enter your email to continue.")
     email = st.text_input("Email", key="license_signin_email", label_visibility="collapsed")
     if st.button("Continue", key="license_signin_start") and email:
+        # Reveal the code box regardless of whether THIS click actually sent
+        # a fresh email - a rate-limit/throttle failure here doesn't mean no
+        # code exists, it means no NEW one was sent. An earlier code (same
+        # hour, same address) may still be sitting in the customer's inbox
+        # and still valid, so there must always be somewhere to type it
+        # rather than leaving them stuck with only an error and no input box.
+        st.session_state["license_signin_pending_email"] = email
         try:
             client.request_login_code(email)
-            st.session_state["license_signin_pending_email"] = email
-            st.rerun()
         except client.LicenseServiceError as e:
-            st.error(f"Couldn't send a login code: {e}")
+            # Was st.warning() immediately followed by the unconditional
+            # st.rerun() below - rendered for a fraction of a second before
+            # the rerun wiped it, never actually seen (this project's
+            # standing anti-pattern, this instance found by a new
+            # regression test added alongside Mirror's fine-needle audit,
+            # 2026-08-06 - not one Mirror itself listed). st.toast()
+            # survives a rerun.
+            st.toast(
+                f"Couldn't send a new code right now ({e}) - if you already have one from a recent email, you can still enter it below.",
+                icon=":material/warning:",
+            )
+        st.rerun()
 
     pending_email = st.session_state.get("license_signin_pending_email")
     if pending_email:
@@ -163,7 +217,7 @@ def _render_anthropic_connect_placeholder() -> None:
         st.button("Connect an account I already have", key="anthropic_connect_existing", disabled=True)
     with c2:
         st.button("I don't have one — set one up", key="anthropic_connect_new", disabled=True)
-    st.caption("Coming soon — waiting on native-packaging's direct-API support.")
+    st.markdown("Coming soon — waiting on native-packaging's direct-API support.")
     if st.button("Skip for now", key="anthropic_connect_skip"):
         _run_check_in()
         st.rerun()

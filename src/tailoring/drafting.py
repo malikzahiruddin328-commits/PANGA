@@ -13,6 +13,7 @@ console.anthropic.com - this module never creates or manages the key itself.
 """
 
 import json
+import re
 
 import anthropic
 
@@ -25,8 +26,9 @@ from llm_client import (
     get_client as _client,
     is_configured,
 )
+from tailoring.ats_score import score_resume_against_keywords, score_resume_ats
 
-RESUME_SPEC = (
+_RESUME_SPEC_COMMON = (
     "Tailored resume text for this specific job, written to be ATS-perfect - "
     "it must parse cleanly in an Applicant Tracking System, not just read "
     "well to a human. Plain text only - no markdown (no **, no #, no "
@@ -41,13 +43,32 @@ RESUME_SPEC = (
     "ATS systems match on literal keyword overlap, not paraphrases. Spell "
     "out acronyms at first use with the acronym in parentheses so both "
     "keyword matching and human readers catch it (e.g. 'Master Data "
-    "Management (MDM)'). If this posting is a US federal government job "
-    "(USAJOBS or similar), follow federal resume conventions: full "
-    "chronological work history with month/year date ranges, hours worked "
-    "per week, and specific, quantifiable accomplishments for each role - "
-    "federal resumes are longer and more detailed than private-sector ones, "
-    "there is no one-page limit. Otherwise (private-sector, retained-search, "
-    "or direct-company postings), the WHOLE document must fit on roughly 2 "
+    "Management (MDM)'). Some roles in the master profile carry a "
+    "parenthetical seniority-equivalence note after the title (e.g. 'Head "
+    "of IT (CIO-equivalent)'). First judge THIS job posting's own "
+    "seniority level (also reflected in the target_seniority_at_least_vp "
+    "field below - keep the two consistent). If the posting itself is "
+    "VP-level or higher, print the parenthetical in FULL exactly as stored "
+    "(e.g. 'Head of IT (CIO-equivalent)') - it supports the case that the "
+    "candidate has already operated at that level. If the posting is "
+    "below VP-level, drop the parenthetical and print just the working "
+    "title (e.g. 'Head of IT', NOT 'Head of IT (CIO-equivalent)') - for a "
+    "role below that level, keeping the higher-rank qualifier on the "
+    "printed title reads as applying beneath your level. Either way, "
+    "dropping or keeping this parenthetical is not inventing or "
+    "embellishing - it is the same underlying role, employer, dates, and "
+    "bullet content either way, exactly as given. Separately, some roles "
+    "also carry a leading rank-prefix ahead of the working title (e.g. "
+    "the master profile's title field literally reads 'Vice President, "
+    "Head of Applications') - write that title in FULL, prefix included, "
+    "regardless of this posting's seniority; the app strips that prefix "
+    "automatically for a below-VP posting based on the "
+    "target_seniority_at_least_vp field, so don't try to handle it "
+    "yourself in the text. "
+)
+
+_RESUME_SPEC_TWO_PAGE_RULES = (
+    "The WHOLE document must fit on roughly 2 "
     "pages - target a total of about 900-1100 words of body text (excluding "
     "headers/contact/dates), and treat these as hard caps, not suggestions: "
     "- Give full bullet-point detail to ONLY the 3 most recent roles: 5-6 "
@@ -63,15 +84,64 @@ RESUME_SPEC = (
     "many years ago it was. "
     "- Keep the Core Skills / Technical Skills section to a tight, "
     "scannable list of terms - not full sentences. "
-    "Include a 'TARGET ROLE ALIGNMENT' section directly after the "
-    "professional summary - at most 5 bullets, each mapping a specific "
-    "requirement or theme from THIS job posting to the strongest genuine "
-    "matching experience in the profile, in the posting's own language "
-    "where accurate. Use plain '- ' dashes for bullet points, one blank "
-    "line between sections. If applying these caps would still run "
+    "Do NOT give the job-to-experience alignment content its own separate "
+    "'TARGET ROLE ALIGNMENT' section or any other standalone bold-caps "
+    "header for it (real problem hit 2026-08-06: a job-application "
+    "portal's own auto-parser expects the first employer entry right after "
+    "the summary, saw a header-styled section there instead, and parsed "
+    "its content straight into the Company field of Work Experience 1 - "
+    "it is not a standard ATS-recognized resume section, so it must not be "
+    "styled to look like one). Instead, fold this content directly into "
+    "the PROFESSIONAL SUMMARY as its closing part - either woven into the "
+    "summary's prose or as a short run of at most 5 plain '- ' bullets "
+    "immediately under the summary paragraph (still inside that same "
+    "section, no new header), each mapping a specific requirement or theme "
+    "from THIS job posting to the strongest genuine matching experience in "
+    "the profile, in the posting's own language where accurate. Use plain "
+    "'- ' dashes for any bullet points, one blank line between sections. "
+    "If applying these caps would still run "
     "noticeably over 2 pages, trim bullet wording and cut the least "
     "job-relevant bullets first - length wins over completeness here."
 )
+
+# USAJOBS itself hard-rejects any uploaded resume PDF over 2 pages at
+# submission time (confirmed directly, 2026-08-03 - Zahir hit the real
+# upload error on a federal-format draft that ran over). Federal resume
+# convention (full chronological detail, hours/week, no page limit) is
+# real practice for federal HR reviewers, but it's moot if USAJOBS won't
+# accept the file - the platform's own hard limit wins. So USAJOBS
+# postings now get the SAME 2-page hard cap as private-sector ones,
+# just with federal-flavored content (hours/week per role, exact
+# month/year dates) folded into that condensed structure wherever it
+# still fits, instead of the old "no page limit" exception.
+RESUME_SPEC_USAJOBS = (
+    _RESUME_SPEC_COMMON
+    + "This is a USAJOBS posting - USAJOBS itself rejects any uploaded "
+    "resume PDF over 2 pages, so the federal 'no page limit' convention "
+    "does not apply here; treat this exactly like the private-sector "
+    "length rules below, with one federal-flavored addition: where space "
+    "allows, note hours worked per week for the most recent 1-2 roles "
+    "only (skip it entirely if it would push a bullet over length). "
+    + _RESUME_SPEC_TWO_PAGE_RULES
+)
+
+RESUME_SPEC = (
+    _RESUME_SPEC_COMMON
+    + "If this posting is a US federal government job other than USAJOBS "
+    "itself (an agency's own careers site, for instance) and that site "
+    "states no page limit, follow full federal resume conventions: full "
+    "chronological work history with month/year date ranges, hours worked "
+    "per week, and specific, quantifiable accomplishments for each role. "
+    "Otherwise (private-sector, retained-search, direct-company, or "
+    "USAJOBS postings), the following hard caps apply: "
+    + _RESUME_SPEC_TWO_PAGE_RULES
+)
+
+
+def _resume_spec_for_job(job: dict) -> str:
+    if (job or {}).get("source") == "USAJOBS":
+        return RESUME_SPEC_USAJOBS
+    return RESUME_SPEC
 
 DOC_SPECS = {
     "resume": RESUME_SPEC,
@@ -118,11 +188,12 @@ Ground rules:
 - Tailor every document specifically to this job posting and organization - reference the actual role, organization name, and what the posting emphasizes. Do not write generic, could-apply-to-any-job text.
 - Return ONLY the documents requested via the structured output schema. No extra commentary.
 
-Writing voice - this must read as a real senior executive's own writing, not AI output:
+Writing voice - under no circumstances may this read as AI-written. It must read as a real senior executive's own writing, full stop:
 - British English prose conventions - phrasing, idiom, and a measured, understated register - but American spellings throughout (e.g. "color" not "colour", "organize" not "organise", "center" not "centre"), since this is for US employers.
 - Vary sentence length and structure line to line; never fall into a uniform rhythm.
 - Do not use these overused AI-writing tells: corporate buzzwords (leverage, spearhead, synergy, robust, cutting-edge, seamless, dynamic, passionate, game-changer); repetitive three-item lists; formulaic openers ("In today's fast-paced environment...", "I am thrilled to apply..."); "not just X, but Y" constructions; excessive em dashes; and stacking multiple adjectives before a noun.
-- Every claim should sound like something this specific person would actually say about his own work - concrete, specific, a little understated rather than oversold."""
+- Every claim should sound like something this specific person would actually say about his own work - concrete, specific, a little understated rather than oversold.
+- Before returning the text, silently re-read it as if you were an AI-detection reviewer looking for generated-text patterns (uniform bullet cadence, hollow superlatives, generic transition phrases). If anything reads as machine-generated, rewrite that line in plainer, more specific, human terms before returning it."""
 
 
 SCORE_SYSTEM_PROMPT = """You are scoring how well one job posting fits this specific candidate, for their personal job-search tool. Read the candidate's master profile below and reason genuinely about fit - never a keyword count.
@@ -238,6 +309,86 @@ def generate_target_roles(resume_text: str, industries: list[str], seniority: st
     return data
 
 
+ATS_KEYWORDS_SYSTEM_PROMPT = """You are extracting the literal keywords/skills/tools/certifications a job posting itself asks for, for a deterministic ATS keyword-match scorer downstream - you are NOT scoring or judging fit, just pulling out real terms that are actually present in the posting's text.
+
+Rules:
+- Only extract terms that genuinely appear in the posting (as words/phrases or unmistakable synonyms of them, e.g. "Excel" for "Microsoft Excel") - never invent a skill the posting doesn't mention.
+- required_keywords: terms from a "required"/"minimum qualifications"/"must-have" section, or stated as mandatory even without an explicit section header.
+- preferred_keywords: terms from a "preferred"/"desired"/"nice-to-have"/"bonus" section, or that read as a plus rather than mandatory.
+- If the posting doesn't clearly separate required vs preferred, use your best judgment on which items read as mandatory vs a plus - don't force a 50/50 split.
+- Keep each term short (1-4 words) and in the posting's own wording - e.g. "SQL", "AWS", "Project Management", "Agile", "PMP certification" - not full sentences or restated requirements.
+- If the posting text is boilerplate/empty/has no real requirements in it at all, return empty lists for both - do not pad with generic guesses."""
+
+
+def _ats_keywords_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "required_keywords": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Short (1-4 word) required/must-have terms taken directly from the posting's own wording. Empty list if none are genuinely stated.",
+            },
+            "preferred_keywords": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Short (1-4 word) preferred/nice-to-have terms taken directly from the posting's own wording. Empty list if none are genuinely stated.",
+            },
+        },
+        "required": ["required_keywords", "preferred_keywords"],
+        "additionalProperties": False,
+    }
+
+
+def _extract_ats_keywords(client: "anthropic.Anthropic", job: dict, model: str | None = None) -> tuple[list[str], list[str]]:
+    """One real-NLP-judgment AI call that pulls the literal required/
+    preferred keyword list out of this job's own posting text (title +
+    qualification_summary/description, whichever this job record has - see
+    search/job_store.py). This is the piece regex heuristics can't do well
+    (real language understanding of what's mandatory vs a nice-to-have in
+    messy scraped prose) - everything downstream (the actual score) stays
+    deterministic counting against this list, done by
+    ats_score.score_resume_against_keywords(), not another AI guess.
+
+    Cached on the job record (search.job_store.update_job_ats_keywords) so
+    the same posting always scores against the same keyword list rather
+    than re-extracting (and potentially drifting) on every regenerate -
+    same caching shape as _lookup_company_address's organization_address.
+    Returns ([], []) without caching on any drafting failure, so a
+    transient API error doesn't permanently freeze a job at "no keywords
+    found" - the caller falls back to the local heuristic for that one
+    draft and the next regenerate gets another real attempt."""
+    posting_text = "\n".join(filter(None, [
+        job.get("title"), job.get("qualification_summary"), job.get("description"),
+    ]))
+    if not posting_text.strip():
+        return [], []
+    try:
+        data = call_structured(
+            client,
+            system=ATS_KEYWORDS_SYSTEM_PROMPT,
+            user_content=f"JOB POSTING:\n{posting_text}",
+            schema=_ats_keywords_schema(),
+            max_tokens=1500,
+            model=model,
+            effort="medium",
+            refusal_message="Claude declined to extract ATS keywords.",
+        )
+    except (DraftingNotConfigured, DraftingFailed):
+        return [], []
+
+    required = data.get("required_keywords") or []
+    preferred = data.get("preferred_keywords") or []
+
+    from search.job_store import update_job_ats_keywords
+
+    job["ats_required_keywords"] = required
+    job["ats_preferred_keywords"] = preferred
+    if job.get("source") and job.get("job_id"):
+        update_job_ats_keywords(job["source"], job["job_id"], required, preferred)
+    return required, preferred
+
+
 def _score_schema() -> dict:
     return {
         "type": "object",
@@ -294,18 +445,40 @@ def _schema(doc_keys: list[str]) -> dict:
     }
 
 
-def _resume_schema() -> dict:
+def _resume_schema(job: dict | None = None) -> dict:
     # The resume gets a richer schema than the other doc types: alongside
-    # the text itself, Claude self-assesses how well that exact text would
-    # score in a real ATS keyword/structure match against this posting -
-    # same "score + why + how to raise it" shape as Prospector Score and
-    # LinkedIn's profile-strength score elsewhere in this app, computed in
-    # the same pass so the assessment is grounded in the text actually
-    # produced, not a separate guess.
+    # the text itself, it carries clarifying_questions for real facts that
+    # would close a gap. ats_score/ats_rationale/ats_next_actions are
+    # deliberately NOT part of this schema - they used to be a free-text
+    # Claude self-assessment made in the same call that wrote the resume,
+    # which is an independent, memoryless AI guess every time (no memory of
+    # the previous score or what changed), and produced a score that never
+    # moved no matter what was edited. tailoring.ats_score.score_resume_ats()
+    # computes those three fields deterministically after this call returns,
+    # from real keyword-overlap arithmetic against the drafted text - see
+    # generate_documents() below.
     return {
         "type": "object",
         "properties": {
-            "text": {"type": "string", "description": RESUME_SPEC},
+            "text": {"type": "string", "description": _resume_spec_for_job(job)},
+            "target_seniority_at_least_vp": {
+                "type": "boolean",
+                "description": (
+                    "True if THIS specific job posting is itself at the VP "
+                    "level or higher (VP, SVP, EVP, President, C-suite/"
+                    "Chief-*-Officer titles); False for anything below that "
+                    "(Director, Head of, Senior Manager, individual-"
+                    "contributor roles, etc.). Real gap found 2026-08-06: "
+                    "asking the model to also strip a leading rank-prefix "
+                    "like 'Vice President,' from a past title in the text "
+                    "itself was unreliable - it kept the prefix on a "
+                    "below-VP posting in testing even with explicit "
+                    "instructions. This field lets the app do that "
+                    "stripping deterministically instead - keep it "
+                    "consistent with how you actually wrote the text (the "
+                    "parenthetical seniority-equivalence notes above)."
+                ),
+            },
             "suggested_strategy_tag": {
                 "type": "string",
                 "description": (
@@ -318,30 +491,6 @@ def _resume_schema() -> dict:
                     "state it directly, no hedging needed. Prefills the "
                     "app's own 'strategy tag' field; the candidate can "
                     "edit or clear it."
-                ),
-            },
-            "ats_score": {
-                "type": "integer",
-                "description": (
-                    "0-100 estimate of how well THIS resume text would score when "
-                    "parsed by a typical Applicant Tracking System and matched "
-                    "against this specific job posting - keyword/skill overlap "
-                    "with the posting's stated requirements, standard parseable "
-                    "structure, title alignment. Be honest, not generous."
-                ),
-            },
-            "ats_rationale": {
-                "type": "string",
-                "description": "1-3 sentences: what matched well, what's weak or missing.",
-            },
-            "ats_next_actions": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": (
-                    "2-5 concrete, specific actions that would raise the score - "
-                    "e.g. a specific keyword/skill from the posting to add IF the "
-                    "candidate's real profile supports it, or honestly note that a "
-                    "gap can't be closed without real experience they don't have."
                 ),
             },
             "clarifying_questions": {
@@ -421,7 +570,7 @@ def _resume_schema() -> dict:
                 ),
             },
         },
-        "required": ["text", "suggested_strategy_tag", "ats_score", "ats_rationale", "ats_next_actions", "clarifying_questions"],
+        "required": ["text", "target_seniority_at_least_vp", "suggested_strategy_tag", "clarifying_questions"],
         "additionalProperties": False,
     }
 
@@ -459,6 +608,145 @@ def _apply_answers_schema() -> dict:
     }
 
 
+def _suggested_answer_for_keyword_gap(term: str, profile: dict | None) -> str:
+    """A genuine, honest starting guess for a missing-required-keyword
+    question - Zahir's explicit correction 2026-08-06: an empty box was the
+    wrong call even here. He'd rather see *something* to react to and edit
+    than compose an answer from scratch, same "accept or edit" bar as every
+    other suggested_answer in this app - it just has to stay honestly
+    hedged, never asserted as fact, same as those.
+
+    Cheap, deterministic, no AI call: if the term (or a close variant)
+    appears anywhere in the candidate's full profile - not just the resume
+    text this specific draft produced, which the deterministic scorer
+    already confirmed doesn't mention it - that's a genuine, real signal
+    worth surfacing (the profile may cover experience this particular
+    tailored resume didn't happen to include). If it doesn't appear
+    anywhere at all, there is truly no real basis to guess yes or no, so
+    the honest starting text says exactly that rather than inventing
+    confidence - still real text to edit, not a blank box."""
+    profile_text_lower = json.dumps(profile or {}, default=str).lower()
+    if term.lower() in profile_text_lower:
+        return (
+            f"Your profile may already mention \"{term}\" - can you confirm "
+            "and briefly describe your real experience with it?"
+        )
+    return "Unknown - please describe your real experience (if any) with this."
+
+
+def _merge_keyword_gap_questions(
+    clarifying_questions: list[dict], missing_required_keywords: list[str],
+    previously_answered_skills: list[str] | None = None,
+    profile: dict | None = None,
+) -> list[dict]:
+    """Folds missing-required-keyword gaps into the same clarifying_questions
+    structure Profile Gaps already uses, instead of leaving them as inert
+    "How to raise it" bullet text with no way to answer or act on it (real
+    gap Zahir hit live 2026-08-06: ats_next_actions and clarifying_questions
+    were built as two disconnected systems - one a static list, the other
+    the real interactive, savable, drafts-feeding mechanism - and "add
+    Databricks" belonged in the second one, not sitting inert in the first).
+
+    Each missing required keyword becomes a real skill_gap question -
+    answerable, persisted via save_gap_answers() into the master profile's
+    gap_interview_answers exactly like every other skill_gap question, and
+    actually read back into the next regenerate. suggested_answer comes from
+    _suggested_answer_for_keyword_gap() - a real, honestly-hedged starting
+    guess (Zahir, 2026-08-06: even "unknown, please fill in" beats a blank
+    box - something to react to and edit, not compose from scratch).
+
+    Deduped two ways:
+    - Against the AI-generated clarifying_questions passed in (by substring
+      match against each existing question's own "skill" label, case-
+      insensitive, either direction) - the AI may have already asked about
+      the same skill in its own words this same round.
+    - Against previously_answered_skills (pass profile["gap_interview_answers"]'s
+      skill labels) - without this, a keyword the candidate already said
+      "no, I don't have that" to would keep coming back as a "new" question
+      on every single regenerate forever, since the deterministic keyword
+      match has no memory of its own and the resume text will never
+      naturally gain a skill the candidate confirmed they don't have. This
+      is the same profile/interview.py._already_answered() precedent this
+      module's own gap-detection already follows - a real answer (even a
+      "no") means don't ask again, not just a real yes."""
+    already_asked_lower = [(q.get("skill") or "").lower() for q in clarifying_questions if q.get("skill")]
+    already_asked_lower += [s.lower() for s in (previously_answered_skills or []) if s]
+    merged = list(clarifying_questions)
+    for term in missing_required_keywords:
+        term_lower = term.lower()
+        if any(term_lower in skill or skill in term_lower for skill in already_asked_lower):
+            continue
+        merged.append({
+            "type": "skill_gap",
+            "skill": term,
+            "question": (
+                f"The posting requires \"{term}\" - do you have real, genuine "
+                "experience with it? If so, briefly describe it so it can be "
+                "added to your resume."
+            ),
+            "suggested_answer": _suggested_answer_for_keyword_gap(term, profile),
+        })
+    return merged
+
+
+def _questions_worth_asking(clarifying_questions: list[dict], ats_score: int) -> list[dict]:
+    """Drops clarifying_questions once ats_score is already maxed at 100 -
+    those questions come from the same drafting call as the resume text,
+    before the deterministic ats_score even exists (see
+    tailoring.ats_score.score_resume_against_keywords()/score_resume_ats()),
+    so the model drafting them has no way to know the real score can't go
+    any higher. A "fact that would raise the score" is meaningless once
+    there's nothing left to raise (Zahir, 2026-08-04: was still seeing
+    these on maxed-score jobs - confusing, pointless)."""
+    if ats_score >= 100:
+        return []
+    return clarifying_questions
+
+
+# Matches a rank-prefix leading a past title line, e.g. "Vice President, "
+# or "SVP, " ahead of "Head of Applications" - a pattern, not a literal
+# string tied to this one profile's exact wording (real gap found live
+# 2026-08-06: relying on the model to drop this itself was unreliable even
+# with explicit instructions naming the exact string - it kept the prefix
+# on a below-VP posting twice in a row). Anchored to the start of a line
+# (title lines are always alone on their own line in this app's resume
+# format) so it can't accidentally eat a mid-sentence "President, " inside
+# real bullet prose.
+_RANK_PREFIX_RE = re.compile(
+    r"^(\s*)(?:Executive\s+Vice\s+President|Senior\s+Vice\s+President|"
+    r"Vice\s+President|EVP|SVP|VP|President)\s*,\s*",
+    re.IGNORECASE,
+)
+# Matches a trailing seniority-equivalence parenthetical on a title line,
+# e.g. "(CIO-equivalent)" or "(Chief Information Officer equivalent)" -
+# narrow on purpose (requires the word "equivalent" inside the
+# parenthesis) so it can't accidentally eat an unrelated parenthetical
+# elsewhere in the text. Live-verified 2026-08-07: unlike the rank-prefix
+# above, the model DID reliably drop this on its own in earlier runs - but
+# a later run of the exact same below-VP posting kept it anyway, so this
+# needs the same deterministic backstop, not just better prompt wording a
+# second time.
+_SENIORITY_PARENTHETICAL_RE = re.compile(r"\s*\([^)]*\bequivalent\b[^)]*\)", re.IGNORECASE)
+
+
+def _strip_rank_prefixes(resume_text: str) -> str:
+    """Deterministic safety net for a below-VP target posting: strips a
+    leading rank-prefix from any line that starts with one, and any
+    trailing seniority-equivalence parenthetical anywhere in the text -
+    same pattern as docx_export.py's all-caps-name normalizer. The model
+    still makes the genuinely contextual judgment call (is this posting
+    VP-level or not, via target_seniority_at_least_vp), but once that call
+    is made, removing a known qualifier pattern is mechanical and
+    shouldn't depend on the model reliably doing it in the text every
+    single time - real gap found live 2026-08-06/07: both forms were
+    caught NOT being dropped on a below-VP posting in separate live runs,
+    despite explicit prompt instructions for each."""
+    lines = resume_text.split("\n")
+    lines = [_RANK_PREFIX_RE.sub(r"\1", line) for line in lines]
+    lines = [_SENIORITY_PARENTHETICAL_RE.sub("", line) for line in lines]
+    return "\n".join(lines)
+
+
 def _draft_one(
     client: "anthropic.Anthropic",
     shared_context: list[dict],
@@ -467,17 +755,19 @@ def _draft_one(
     on_progress=None,
     doc_index: int = 1,
     doc_total: int = 1,
+    job: dict | None = None,
+    profile: dict | None = None,
 ):
     if doc_key == "resume":
-        schema = _resume_schema()
+        schema = _resume_schema(job)
     elif doc_key == "apply_answers":
         schema = _apply_answers_schema()
     else:
         schema = _schema([doc_key])
-    # The resume schema carries the text itself plus ats_score/rationale/
-    # next_actions/clarifying_questions, and federal-format resumes alone
-    # can run 3000+ tokens - give it real headroom rather than truncating
-    # (hit for real during testing at 6000 with a federal-length resume).
+    # The resume schema carries the text itself plus suggested_strategy_tag/
+    # clarifying_questions, and federal-format resumes alone can run 3000+
+    # tokens - give it real headroom rather than truncating (hit for real
+    # during testing at 6000 with a federal-length resume).
     max_tokens = 20000 if doc_key == "resume" else 6000
 
     def _progress(substatus):
@@ -500,13 +790,43 @@ def _draft_one(
     )
 
     if doc_key == "resume":
+        resume_text = data.get("text", "")
+        if not data.get("target_seniority_at_least_vp", True):
+            # Deterministic safety net, not left to prompt compliance alone
+            # (see _strip_rank_prefixes docstring) - only for a below-VP
+            # posting; defaults to True (no stripping) if the field is
+            # somehow missing, so an absent judgment fails toward leaving
+            # the text untouched rather than silently mangling a title.
+            resume_text = _strip_rank_prefixes(resume_text)
+        job = job or {}
+        required_kw = job.get("ats_required_keywords")
+        preferred_kw = job.get("ats_preferred_keywords")
+        if required_kw is not None and preferred_kw is not None:
+            # AI-extracted keyword list already cached on the job record
+            # (generate_documents() ensures this before calling _draft_one) -
+            # the real-NLP-judgment path, see _extract_ats_keywords().
+            ats = score_resume_against_keywords(required_kw, preferred_kw, resume_text)
+        else:
+            # Extraction was never attempted/failed for this job (e.g. no
+            # posting text, or a transient API error) - fall back to the
+            # dependency-free regex heuristic rather than leaving the
+            # resume unscored.
+            posting_text = "\n".join(filter(None, [
+                job.get("title"), job.get("qualification_summary"), job.get("description"),
+            ]))
+            ats = score_resume_ats(posting_text, resume_text)
+        previously_answered_skills = [a.get("skill") for a in (profile or {}).get("gap_interview_answers", [])]
+        merged_questions = _merge_keyword_gap_questions(
+            data.get("clarifying_questions", []), ats.get("missing_required_keywords", []),
+            previously_answered_skills, profile,
+        )
         return {
-            "text": data.get("text", ""),
+            "text": resume_text,
             "suggested_strategy_tag": data.get("suggested_strategy_tag", ""),
-            "ats_score": data.get("ats_score"),
-            "ats_rationale": data.get("ats_rationale", ""),
-            "ats_next_actions": data.get("ats_next_actions", []),
-            "clarifying_questions": data.get("clarifying_questions", []),
+            "ats_score": ats["ats_score"],
+            "ats_rationale": ats["ats_rationale"],
+            "ats_next_actions": ats["ats_next_actions"],
+            "clarifying_questions": _questions_worth_asking(merged_questions, ats["ats_score"]),
         }
     if doc_key == "apply_answers":
         return data.get("apply_answers", [])
@@ -564,11 +884,18 @@ def generate_documents(
     "suggested_strategy_tag": str, "ats_score": int, "ats_rationale": str,
     "ats_next_actions": [...], "clarifying_questions": [{"skill": ...,
     "question": ..., "suggested_answer": ...}]} instead of a
-    plain string, since the resume is ATS-scored against this posting as
-    part of the same drafting pass - clarifying_questions are gaps Claude
-    couldn't close honestly without more real facts (never invented; ask,
-    don't fabricate - see profile/interview.py's save_answer(), the same
-    mechanism this feeds back into via the Results tab). "apply_answers"
+    plain string. ats_score/ats_rationale/ats_next_actions are computed
+    deterministically by tailoring.ats_score.score_resume_ats() from real
+    keyword-overlap arithmetic between the posting's own text (title +
+    qualification_summary/description, whichever this job record has - see
+    search/job_store.py) and the resume text Claude just wrote, right after
+    this call returns - not asked of the same API call that drafted the
+    text, which used to be an independent AI guess every time with no real
+    comparison happening and a score that never moved no matter what
+    changed. clarifying_questions are gaps Claude couldn't close honestly
+    without more real facts (never invented; ask, don't fabricate - see
+    profile/interview.py's save_answer(), the same mechanism this feeds
+    back into via the Results tab). "apply_answers"
     maps to a list of {"label": ..., "value": ...} dicts (a ready-to-paste
     packet for common ATS form fields) rather than a single string. Raises
     DraftingNotConfigured if no API key is set, DraftingFailed on
@@ -595,6 +922,9 @@ def generate_documents(
         job["organization_address"] = address
         update_job_address(job.get("source"), job.get("job_id"), address)
 
+    if "resume" in doc_keys and job.get("ats_required_keywords") is None:
+        _extract_ats_keywords(client, job, model)
+
     shared_context = [{
         "type": "text",
         "text": (
@@ -609,7 +939,7 @@ def generate_documents(
     for i, doc_key in enumerate(doc_keys, start=1):
         if on_progress:
             on_progress(i, total, doc_key)
-        results[doc_key] = _draft_one(client, shared_context, doc_key, model, on_progress, i, total)
+        results[doc_key] = _draft_one(client, shared_context, doc_key, model, on_progress, i, total, job=job, profile=profile)
     return results
 
 
@@ -621,7 +951,10 @@ def save_gap_answers(job: dict, answered_questions: list[dict]) -> None:
     available to every future job's drafting, not just this one.
     answered_questions is the subset of clarifying_questions the candidate
     actually typed a real answer for (blank ones already filtered out by the
-    caller), each a {"skill":, "type":, "answer":} dict - "type" ==
+    caller), each a {"skill":, "type":, "answer":, "question":} dict -
+    "question" is optional (older callers may omit it) and is stored so the
+    Profile Gaps tab's "previously answered" view can show what was
+    actually asked, not just the short skill label. "type" ==
     "disqualifier_check" is saved with is_disqualifier=True so
     SCORE_SYSTEM_PROMPT applies it to every future job, not just this one;
     anything else (including missing/old-shape entries) saves as an ordinary
@@ -639,5 +972,5 @@ def save_gap_answers(job: dict, answered_questions: list[dict]) -> None:
             continue
         save_answer(
             skill=q["skill"], role_context=role_context, answer=answer, date_captured=today,
-            is_disqualifier=(q.get("type") == "disqualifier_check"),
+            question=q.get("question", ""), is_disqualifier=(q.get("type") == "disqualifier_check"),
         )

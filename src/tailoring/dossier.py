@@ -30,6 +30,7 @@ data/ folder itself, same as everything else here.
 
 import difflib
 import hashlib
+import io
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -62,6 +63,15 @@ _LEGACY_WORKSPACE_FILENAMES = {
     "leadership_summary_text": "leadership_summary.docx",
 }
 
+# Hard ceiling Zahir needs (2026-08-05): some destinations he pastes/copies
+# these files into truncate or mangle names past this length - a real
+# posting title alone ("Senior Director of IT Enterprise Applications") can
+# already run 46 characters, so Title was dropped from the filename
+# entirely below (still preserved in the parent dossier folder name via
+# _slug() - nothing is lost, just not duplicated).
+_MAX_WORKSPACE_FILENAME_LEN = 50
+_WORKSPACE_FILENAME_SUFFIX_LEN = 6
+
 DOC_KEY_TO_FIELD = {
     "resume": "resume_text",
     "cover_letter": "cover_letter_text",
@@ -70,10 +80,19 @@ DOC_KEY_TO_FIELD = {
 }
 
 
+def _job_hash(source: str, job_id: str, length: int = 8) -> str:
+    """Stable per-job identifier, independent of what job_id itself looks
+    like (some sources store a full posting URL as job_id - see
+    search/industry_boards.py) - used both for the dossier folder's own
+    slug below and as the workspace filename's uniqueness suffix, so two
+    different jobs never collide even when Name+DocType+Organization are
+    otherwise identical (e.g. two different roles at the same company)."""
+    return hashlib.sha1(f"{source}:{job_id}".encode()).hexdigest()[:length]
+
+
 def _slug(source: str, job_id: str, organization: str | None, title: str | None) -> str:
     base = re.sub(r"[^a-z0-9]+", "-", f"{organization or ''}-{title or ''}".lower()).strip("-")[:60]
-    short_hash = hashlib.sha1(f"{source}:{job_id}".encode()).hexdigest()[:8]
-    return f"{base or 'job'}-{short_hash}"
+    return f"{base or 'job'}-{_job_hash(source, job_id)}"
 
 
 def dossier_dir(source: str, job_id: str, organization: str | None = None, title: str | None = None) -> Path:
@@ -88,16 +107,101 @@ def _sanitize_filename_part(value: str) -> str:
     return re.sub(r'[<>:"/\\|?*]', "", value).strip().replace(" ", "_")
 
 
-def _workspace_filename(field: str, candidate_name: str | None, job: dict) -> str:
-    """Descriptive filename for a workspace document - Zahir's explicit ask
-    2026-07-31: files inside the per-application folder should follow the
-    same {Name}_{DocType}_{Title}_{Organization}.docx convention the old
-    per-document download button used, so a file is self-explanatory even
-    pulled out of its folder (e.g. attached to an email)."""
+def _legacy_descriptive_workspace_filename(field: str, candidate_name: str | None, job: dict) -> str:
+    """The {Name}_{DocType}_{Title}_{Organization}.docx format used
+    2026-07-31 through 2026-08-05, before the 50-char ceiling below existed
+    - kept only so _migrate_descriptive_filename() can find and rename a
+    folder's existing files under this now-superseded format. A real
+    posting title alone ("Senior Director of IT Enterprise Applications")
+    could already run this past 100+ characters, which is what the new
+    format below fixes."""
     doc_label = DOC_LABELS.get(field, field)
     parts = [candidate_name, doc_label, job.get("title"), job.get("organization")]
     safe_parts = [_sanitize_filename_part(p) for p in parts if p]
     return "_".join(safe_parts)[:150] + ".docx"
+
+
+def _legacy_hash_suffixed_workspace_filename(field: str, candidate_name: str | None, job: dict) -> str:
+    """The {Name}_{DocType}_{Organization}_{hash}.docx format used briefly
+    on 2026-08-05 (commit 51120a7), before Zahir asked for the trailing hex
+    suffix to be removed entirely - kept only so
+    _migrate_hash_suffixed_filename() can find and rename a folder's
+    existing files under this now-superseded format."""
+    doc_label = _sanitize_filename_part(DOC_LABELS.get(field, field))
+    name = _sanitize_filename_part(candidate_name or "")
+    org = _sanitize_filename_part(job.get("organization") or "")
+    suffix = _job_hash(job.get("source"), job.get("job_id"), _WORKSPACE_FILENAME_SUFFIX_LEN)
+
+    ext = ".docx"
+    fixed_len = len(ext) + len("_" + suffix) + len("_") * 2
+    budget = max(0, _MAX_WORKSPACE_FILENAME_LEN - fixed_len - len(doc_label))
+    if len(name) + len(org) > budget:
+        if len(name) <= budget // 2 or len(name) <= budget - len(org):
+            name_budget = min(len(name), budget)
+            org_budget = budget - name_budget
+        elif len(org) <= budget // 2:
+            org_budget = min(len(org), budget)
+            name_budget = budget - org_budget
+        else:
+            name_budget = budget // 2
+            org_budget = budget - name_budget
+        name = name[:name_budget]
+        org = org[:org_budget]
+
+    parts = [p for p in [name, doc_label, org] if p]
+    return "_".join(parts) + f"_{suffix}" + ext
+
+
+def _workspace_filename(field: str, candidate_name: str | None, job: dict) -> str:
+    """Filename for a workspace document: {Name}_{DocType}_{Organization}.docx,
+    capped at _MAX_WORKSPACE_FILENAME_LEN total so it survives being pulled
+    out of its folder into a destination with its own length limit (email,
+    some cloud drives) - Title is dropped entirely (still preserved in the
+    parent dossier folder name via _slug(), so nothing is lost, just not
+    duplicated in the filename too). DocType is never truncated (it's what
+    distinguishes Resume from CoverLetter); Name/Organization share
+    whatever's left, and only the one that's actually long gives up length
+    - if one is short, it keeps its full length and the long one absorbs
+    the whole cut, rather than both being clipped by a flat amount.
+
+    No disambiguating suffix (Zahir, 2026-08-05: didn't want a trailing hex
+    string on the filename - see _legacy_hash_suffixed_workspace_filename()
+    for the brief format this replaces). Within the app itself this can
+    never actually collide: every job already gets its own physically
+    separate dossier folder (_slug() below folds in a per-job hash), so two
+    different jobs' documents are never written into the same directory in
+    the first place - sync_workspace_documents()'s existing edit-detection/
+    backup logic is what governs a filename recurring WITHIN one job's own
+    folder (a normal regenerate), not a cross-job collision. The only way
+    two different jobs could ever produce the identical
+    Name_DocType_Organization.docx is if Zahir manually gathers files out of
+    two different per-job folders into one flat destination himself
+    (Downloads, an email) - accepted as a real but narrow and low-likelihood
+    tradeoff (requires applying to 2+ different roles at the literal same
+    company) rather than adding cross-folder collision-scanning complexity
+    (an O(applications) scan on every document write) to guard against it."""
+    doc_label = _sanitize_filename_part(DOC_LABELS.get(field, field))
+    name = _sanitize_filename_part(candidate_name or "")
+    org = _sanitize_filename_part(job.get("organization") or "")
+
+    ext = ".docx"
+    fixed_len = len(ext) + len("_") * 2  # 2 separators assuming name+org both present
+    budget = max(0, _MAX_WORKSPACE_FILENAME_LEN - fixed_len - len(doc_label))
+    if len(name) + len(org) > budget:
+        if len(name) <= budget // 2 or len(name) <= budget - len(org):
+            name_budget = min(len(name), budget)
+            org_budget = budget - name_budget
+        elif len(org) <= budget // 2:
+            org_budget = min(len(org), budget)
+            name_budget = budget - org_budget
+        else:
+            name_budget = budget // 2
+            org_budget = budget - name_budget
+        name = name[:name_budget]
+        org = org[:org_budget]
+
+    parts = [p for p in [name, doc_label, org] if p]
+    return "_".join(parts) + ext
 
 
 def _migrate_legacy_filename(folder: Path, field: str, new_filename: str) -> None:
@@ -113,6 +217,36 @@ def _migrate_legacy_filename(folder: Path, field: str, new_filename: str) -> Non
     new_path = folder / new_filename
     if legacy_path.exists() and not new_path.exists():
         legacy_path.rename(new_path)
+
+
+def _migrate_descriptive_filename(folder: Path, field: str, new_filename: str, candidate_name: str | None, job: dict) -> None:
+    """One-time rename for a workspace folder created under the 2026-07-31
+    through 2026-08-05 {Name}_{DocType}_{Title}_{Organization}.docx format,
+    before the 50-char ceiling existed: if that longer descriptive name is
+    still on disk and the new short name isn't, renames it in place - same
+    reasoning as _migrate_legacy_filename() one step further down the same
+    chain, so Zahir's real edits under the older format aren't orphaned
+    when the naming convention changes again."""
+    old_name = _legacy_descriptive_workspace_filename(field, candidate_name, job)
+    old_path = folder / old_name
+    new_path = folder / new_filename
+    if old_name != new_filename and old_path.exists() and not new_path.exists():
+        old_path.rename(new_path)
+
+
+def _migrate_hash_suffixed_filename(folder: Path, field: str, new_filename: str, candidate_name: str | None, job: dict) -> None:
+    """One-time rename for a workspace folder created under the brief
+    2026-08-05 {Name}_{DocType}_{Organization}_{hash}.docx format (commit
+    51120a7), before Zahir asked for the trailing hex suffix to be dropped:
+    if that hash-suffixed name is still on disk and the new suffix-free
+    name isn't, renames it in place - same one-more-link-in-the-chain
+    reasoning as _migrate_descriptive_filename(), so real edits made in the
+    brief window that format existed aren't orphaned."""
+    old_name = _legacy_hash_suffixed_workspace_filename(field, candidate_name, job)
+    old_path = folder / old_name
+    new_path = folder / new_filename
+    if old_name != new_filename and old_path.exists() and not new_path.exists():
+        old_path.rename(new_path)
 
 
 def _format_pay(job: dict) -> str | None:
@@ -216,12 +350,7 @@ def write_dossier(source: str, job_id: str) -> Path | None:
     return path
 
 
-def _extract_docx_text(path: Path) -> str:
-    # Deliberately not reused from profile/ingest.py's extract_text() -
-    # same reasoning as linkedin/ingest.py's separate _extract_pdf_text():
-    # the logic is small and the packages serve different concerns, so a
-    # cross-package dependency isn't worth it for ~10 lines.
-    doc = Document(str(path))
+def _extract_docx_text_from_document(doc: Document) -> str:
     parts = [p.text for p in doc.paragraphs if p.text.strip()]
     for table in doc.tables:
         for row in table.rows:
@@ -229,6 +358,55 @@ def _extract_docx_text(path: Path) -> str:
                 if cell.text.strip():
                     parts.append(cell.text)
     return "\n".join(parts)
+
+
+def _extract_docx_text(path: Path) -> str:
+    # Deliberately not reused from profile/ingest.py's extract_text() -
+    # same reasoning as linkedin/ingest.py's separate _extract_pdf_text():
+    # the logic is small and the packages serve different concerns, so a
+    # cross-package dependency isn't worth it for ~10 lines.
+    return _extract_docx_text_from_document(Document(str(path)))
+
+
+def _render_doc_key_to_bytes(doc_key: str, text: str, candidate_name: str | None, job: dict) -> bytes:
+    """The same doc_key -> renderer/params dispatch sync_workspace_documents()
+    uses to write a fresh .docx, factored out so edit-detection can render
+    the SAME stored text through the SAME pipeline before comparing it
+    against what's on disk - see _baseline_docx_text()'s docstring for why
+    this matters."""
+    if doc_key == "cover_letter":
+        return cover_letter_to_docx_bytes(
+            text, company_name=job.get("organization"),
+            company_address=job.get("organization_address"), author=candidate_name,
+        )
+    if doc_key == "resume" and job.get("source") == "USAJOBS":
+        word_count = len(text.split())
+        body_size_pt = 9.0 if word_count > 1100 else 10.0
+        return text_to_docx_bytes(text, author=candidate_name, body_size_pt=body_size_pt)
+    return text_to_docx_bytes(text, author=candidate_name)
+
+
+def _baseline_docx_text(doc_key: str, text: str, candidate_name: str | None, job: dict) -> str:
+    """What _extract_docx_text() would return for `text` if it had just been
+    (re)rendered and never touched since - the correct thing to diff a
+    workspace file against, NOT the raw stored text itself.
+
+    Real bug fixed 2026-08-04 (Zahir hit this live: a cover letter he never
+    touched was reported as "4 lines added, 6 removed"): the renderers
+    inject content that never existed in the raw drafted text at all
+    (cover_letter_to_docx_bytes always adds today's date, the company name,
+    and an address line before the body) and also transform it on the way
+    in (blank lines dropped, "- " bullet markers stripped in favor of the
+    "List Bullet" paragraph style). Comparing raw stored text against
+    text extracted back out of the rendered file meant EVERY document with
+    a bullet, or EVERY cover letter at all, showed a spurious diff on every
+    check - not just here in check_for_edits(), but also in
+    sync_workspace_documents()'s own edit-detection, which was silently
+    creating an unnecessary ".edited-<timestamp>.docx" backup on every
+    single regenerate, edited or not."""
+    return _extract_docx_text_from_document(
+        Document(io.BytesIO(_render_doc_key_to_bytes(doc_key, text, candidate_name, job)))
+    )
 
 
 def sync_workspace_documents(
@@ -277,6 +455,8 @@ def sync_workspace_documents(
 
         filename = _workspace_filename(field, candidate_name, job)
         _migrate_legacy_filename(folder, field, filename)
+        _migrate_descriptive_filename(folder, field, filename, candidate_name, job)
+        _migrate_hash_suffixed_filename(folder, field, filename, candidate_name, job)
         file_path = folder / filename
         if file_path.exists():
             previous_stored_text = application.get(field)
@@ -284,20 +464,18 @@ def sync_workspace_documents(
                 current_on_disk_text = _extract_docx_text(file_path)
             except Exception:
                 current_on_disk_text = None
-            if current_on_disk_text is not None and current_on_disk_text.strip() != (previous_stored_text or "").strip():
+            # Compare against a freshly-rendered baseline of the PREVIOUS
+            # stored text, not the raw text itself - see _baseline_docx_text()
+            # for why a raw-text comparison here was a real bug (every
+            # regenerate looked like an edit, even when the file was never
+            # touched, spamming spurious .edited-*.docx backups).
+            baseline_text = _baseline_docx_text(doc_key, previous_stored_text or "", candidate_name, job)
+            if current_on_disk_text is not None and current_on_disk_text.strip() != baseline_text.strip():
                 stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%S")
                 backup_name = f"{file_path.stem}.edited-{stamp}{file_path.suffix}"
                 file_path.rename(folder / backup_name)
 
-        if doc_key == "cover_letter":
-            doc_bytes = cover_letter_to_docx_bytes(
-                new_text,
-                company_name=job.get("organization"),
-                company_address=job.get("organization_address"),
-                author=candidate_name,
-            )
-        else:
-            doc_bytes = text_to_docx_bytes(new_text, author=candidate_name)
+        doc_bytes = _render_doc_key_to_bytes(doc_key, new_text, candidate_name, job)
         file_path.write_bytes(doc_bytes)
 
 
@@ -329,6 +507,8 @@ def check_for_edits(source: str, job_id: str) -> dict:
             continue
         filename = _workspace_filename(field, candidate_name, job)
         _migrate_legacy_filename(folder, field, filename)
+        _migrate_descriptive_filename(folder, field, filename, candidate_name, job)
+        _migrate_hash_suffixed_filename(folder, field, filename, candidate_name, job)
         file_path = folder / filename
         if not file_path.exists():
             # A document drafted before this workspace feature existed (or
@@ -342,11 +522,17 @@ def check_for_edits(source: str, job_id: str) -> dict:
         except Exception as exc:
             results[doc_key] = {"changed": False, "diff": [], "error": f"Couldn't read {filename}: {exc}"}
             continue
-        if current_text.strip() == stored_text.strip():
+        # Diff against a freshly-rendered baseline of stored_text, not
+        # stored_text itself - see _baseline_docx_text() for why comparing
+        # raw drafted text against text extracted back out of a rendered
+        # .docx was a real bug (every cover letter, and every document with
+        # a bullet, showed a spurious diff on every check).
+        baseline_text = _baseline_docx_text(doc_key, stored_text, candidate_name, job)
+        if current_text.strip() == baseline_text.strip():
             results[doc_key] = {"changed": False, "diff": []}
         else:
             diff = list(difflib.unified_diff(
-                stored_text.splitlines(), current_text.splitlines(),
+                baseline_text.splitlines(), current_text.splitlines(),
                 fromfile="original draft", tofile="your edited version", lineterm="",
             ))
             results[doc_key] = {"changed": True, "diff": diff}

@@ -58,7 +58,18 @@ inline - same rule Bhangi follows for its own scope
 10. **Clean up** the now-merged worktree and branch
     (`git worktree remove`, `git branch -d`) once `master` has the work -
     a merged worktree just sitting there is one more thing to keep track
-    of for no benefit.
+    of for no benefit. **Re-check the branch's tip immediately before
+    removing anything** (`git log --oneline <branch> -1`) - the owning
+    session can land a new commit (e.g. its own proactive self-review)
+    in the gap between your merge and your cleanup, and a `git worktree
+    remove --force` doesn't warn you about that the way `git branch -d`
+    does. If `git branch -d` refuses ("not fully merged"), treat that as
+    a hard stop-and-recheck signal, not something to force past - re-run
+    the merge for whatever new commit(s) showed up, then clean up again.
+    Discovered live 2026-08-06: a worktree was force-removed mid-cleanup
+    right as a 9th commit landed on it: no data was lost (removing a
+    worktree doesn't delete commits), but only `git branch -d`'s refusal
+    caught the gap - don't rely on that safety net being the only check.
 
 ## What it explicitly does not do
 

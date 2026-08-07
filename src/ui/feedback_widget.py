@@ -29,7 +29,7 @@ def render_feedback_widget(section_key: str) -> None:
         st.session_state[text_key] = ""
 
     with st.expander("Leave feedback on this screen", icon=":material/mic:"):
-        st.caption(
+        st.markdown(
             "Record a quick voice note about what should change here, or just "
             "type it - no need to open Claude Code first. Voice notes are "
             "transcribed automatically (needs internet); check the text below "

@@ -101,3 +101,30 @@ def test_suggested_strategy_tag_stored_separately_from_real_tag(isolated_data):
     app = applications.get_application("Dice", "1")
     assert app["strategy_tag"] == "his-own-tag"
     assert app["strategy_tag_suggestion"] == "a-new-suggestion"
+
+
+def test_get_applications_with_open_clarifying_questions_filters_to_non_empty(isolated_data):
+    applications.upsert_application(
+        "Dice", "1", status="under review",
+        resume_clarifying_questions=[{"skill": "SQL", "type": "skill_gap", "question": "?", "suggested_answer": ""}],
+    )
+    applications.upsert_application("Dice", "2", status="under review", resume_clarifying_questions=[])
+    applications.upsert_application("Dice", "3", status="under review")
+
+    open_apps = applications.get_applications_with_open_clarifying_questions()
+    job_ids = {a["job_id"] for a in open_apps}
+    assert job_ids == {"1"}
+
+
+def test_get_applications_with_open_clarifying_questions_drops_off_after_regenerate_clears_them(isolated_data):
+    applications.upsert_application(
+        "Dice", "1", status="under review",
+        resume_clarifying_questions=[{"skill": "SQL", "type": "skill_gap", "question": "?", "suggested_answer": ""}],
+    )
+    assert len(applications.get_applications_with_open_clarifying_questions()) == 1
+
+    # A regenerate that maxes the score (or otherwise closes every gap)
+    # persists an empty list - the job must disappear from this list, not
+    # linger with stale questions.
+    applications.upsert_application("Dice", "1", status="under review", resume_clarifying_questions=[])
+    assert applications.get_applications_with_open_clarifying_questions() == []
