@@ -107,3 +107,22 @@ def test_update_job_description_no_op_when_job_not_found(isolated_data):
     job_store.update_job_description("Eisai", "does-not-exist", "text")
     job = job_store.load_jobs()[0]
     assert "description" not in job
+
+
+def test_flag_employer_attribution_uncertain_sets_fields(isolated_data):
+    job_store.save_jobs([{"source": "Indeed", "job_id": "1", "title": "Director", "organization": "Suncoast Credit Union"}])
+    job_store.flag_employer_attribution_uncertain("Indeed", "1", likely_organization="Celldex")
+    job = job_store.load_jobs()[0]
+    assert job["employer_attribution_uncertain"] is True
+    assert job["likely_organization"] == "Celldex"
+    # organization itself is left alone - flagged, not auto-corrected, so
+    # Zahir judges for himself same as everywhere else in this app.
+    assert job["organization"] == "Suncoast Credit Union"
+
+
+def test_flag_employer_attribution_uncertain_without_a_guess(isolated_data):
+    job_store.save_jobs([{"source": "Indeed", "job_id": "1", "title": "Director"}])
+    job_store.flag_employer_attribution_uncertain("Indeed", "1")
+    job = job_store.load_jobs()[0]
+    assert job["employer_attribution_uncertain"] is True
+    assert job["likely_organization"] is None

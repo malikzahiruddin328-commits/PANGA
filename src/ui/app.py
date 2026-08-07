@@ -2392,9 +2392,12 @@ elif active_tab == "results":
             for job in deduped:
                 pay_min, pay_max = format_pay(job.get("pay_min")), format_pay(job.get("pay_max"))
                 pay = f"${pay_min or '?'}-${pay_max or '?'}" if (pay_min or pay_max) else (job.get("salary_text") or "")
+                organization_cell = job.get("organization")
+                if job.get("employer_attribution_uncertain") and organization_cell:
+                    organization_cell = f"⚠️ {organization_cell}"
                 table_rows.append({
                     "Role": job.get("title"),
-                    "Organization": job.get("organization"),
+                    "Organization": organization_cell,
                     "Pay": pay,
                     "Score": job.get("fit_score"),
                     "Status": application_status(job) or "-",
@@ -2508,6 +2511,17 @@ elif active_tab == "results":
                     st.html(f'<div id="{anchor_id}"></div>')
 
                 st.markdown(f"{job.get('location') or 'Location not listed'}")
+                if job.get("employer_attribution_uncertain"):
+                    # Real bug found 2026-08-07: an Indeed posting for a
+                    # life-sciences IT role was attributed to "Suncoast
+                    # Credit Union" - the JD body clearly named a different
+                    # real company throughout. Confirmed an Indeed-side data
+                    # issue, not a Panga parsing bug - flagged, not auto-
+                    # corrected, since a guessed replacement could itself be
+                    # wrong (see job_store.flag_employer_attribution_uncertain).
+                    likely = job.get("likely_organization")
+                    note = f"the posting text suggests **{likely}**" if likely else "the posting text suggests a different employer"
+                    st.warning(f"⚠️ Employer name may be wrong - {note}, not \"{job.get('organization')}\" as listed. Worth checking the original posting before applying.")
                 if "fit_score" in job:
                     st.markdown(job.get("fit_rationale") or "")
                 else:

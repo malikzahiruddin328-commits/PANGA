@@ -149,6 +149,29 @@ def update_job_description(source: str, job_id: str, description: str) -> None:
         write_json(JOBS_PATH, jobs)
 
 
+def flag_employer_attribution_uncertain(source: str, job_id: str, likely_organization: str | None = None) -> None:
+    """Marks a job's `organization` field as possibly wrong (2026-08-07,
+    real bug found in production data: an Indeed posting for a life-
+    sciences IT role was attributed to "Suncoast Credit Union" - the JD
+    body clearly said "About Celldex..." throughout, a real biopharma
+    company with nothing to do with the stated employer. Confirmed via
+    Indeed's own get_job_details tool, not a Panga-side parsing bug - the
+    field is wrong at the source). likely_organization is the name the JD
+    text itself suggests, if one was found, for display alongside the
+    caution - None means "flagged as suspect, but no better guess found."
+    Surfaced in the Results tab as a caution note, not auto-corrected -
+    same "let Zahir judge for himself" principle as fit_score, since a
+    heuristic guess at the real employer could itself be wrong."""
+    with locked("jobs"):
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("source") == source and job.get("job_id") == job_id:
+                job["employer_attribution_uncertain"] = True
+                job["likely_organization"] = likely_organization
+                break
+        write_json(JOBS_PATH, jobs)
+
+
 def update_job_score(source: str, job_id: str, fit_score: int, fit_rationale: str) -> None:
     """fit_score is 0-100: how well this job matches the master profile,
     per PRD §3 "Fit + Tailoring". Computed by Claude reasoning over the job

@@ -206,7 +206,13 @@ def test_normalize_indeed_jobs_has_no_description_field():
     # Indeed's markdown search response genuinely contains no JD text
     # either (live-confirmed 2026-08-06), and its posting_url domain is
     # separately confirmed WAF-blocked for a live fetch (freshness_check.py)
-    # - this source is structurally JD-less, not a code gap.
+    # - this parser has no way to get JD text, still true and still correct
+    # here. NOT the same as "Indeed is JD-less" though: the scheduled
+    # task's own SKILL.md (2026-08-07) now calls Indeed's separate
+    # get_job_details MCP tool for newly-saved jobs and writes the result
+    # via job_store.update_job_description() directly - a different code
+    # path outside this module, since it needs a live MCP call this pure
+    # text-normalization function can't make.
     raw_text = (
         "**Job Title:** Chief Information Officer\n"
         "**Company:** Acme Corp\n"
