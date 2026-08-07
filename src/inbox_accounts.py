@@ -62,7 +62,25 @@ HANDLED_LABEL = "Panga/Handled"
 IMAP_REVIEWED_KEYWORD = "PangaReviewed"
 IMAP_CTA_KEYWORD = "PangaCTA"
 
+# Job-alert-digest tracking (2026-08-07, scripts/job_alert_scan.py) is
+# DELIBERATELY separate from REVIEWED_LABEL/IMAP_REVIEWED_KEYWORD above,
+# not reused: gmail_cta_scan.py already classifies bulk job-alert digests
+# as "passive" and marks them reviewed via the shared label - if
+# job_alert_scan.py's own "unscanned" check used that same marker, the
+# CTA scan (which runs first, several times a day) would starve it of
+# every message before it ever got a look, since both would be racing to
+# be the first one to see "reviewed=false". A dedicated marker means
+# either script can process the same message without interfering with
+# the other's own tracking.
+JOB_ALERT_LABEL = "Panga/JobAlertReviewed"
+IMAP_JOB_ALERT_KEYWORD = "PangaJobAlertReviewed"
+
 _LOOKBACK_DAYS = 2  # matches gmail_cta_scan.py's original "newer_than:2d"
+_JOB_ALERT_LOOKBACK_DAYS = 2  # job_alert_scan.py runs 1x/day (not 4x/day
+# like the CTA scan) - a small overlap beyond exactly 24h means a message
+# that arrived right at yesterday's scan boundary still gets one more
+# chance to be picked up, at negligible extra cost given how few messages
+# match a configured sender allowlist to begin with.
 _MAX_IMAP_ACCOUNTS = 25  # sanity bound on account discovery - a runaway
                           # credentials directory must not turn "loop over
                           # every configured account" into an unbounded loop.
@@ -104,6 +122,7 @@ class GmailAccount:
         self._reviewed_id = None
         self._cta_id = None
         self._handled_id = None
+        self._job_alert_id = None
 
     def _label_ids(self) -> tuple[str, str, str]:
         if self._reviewed_id is None:
@@ -111,6 +130,11 @@ class GmailAccount:
             self._cta_id = gmail_client.ensure_label(CTA_LABEL)
             self._handled_id = gmail_client.ensure_label(HANDLED_LABEL)
         return self._reviewed_id, self._cta_id, self._handled_id
+
+    def _job_alert_label_id(self) -> str:
+        if self._job_alert_id is None:
+            self._job_alert_id = gmail_client.ensure_label(JOB_ALERT_LABEL)
+        return self._job_alert_id
 
     def list_recent_unreviewed(self) -> list[InboxMessage]:
         query = f"-label:{REVIEWED_LABEL} -in:spam -in:trash newer_than:{_LOOKBACK_DAYS}d in:inbox"
@@ -148,6 +172,27 @@ class GmailAccount:
     def list_current_draft_ids(self) -> list[str]:
         return gmail_client.list_drafts()
 
+    def list_job_alert_candidates(self, senders: list[str]) -> list[InboxMessage]:
+        """senders is job_alert_senders.load_job_alert_senders()'s configured
+        list of domains/addresses - Gmail's from: query operator matches a
+        bare domain against the From header fine, so no client-side
+        sender filtering is needed here (unlike Microsoft/IMAP below,
+        whose fetch primitives have no equivalent server-side sender
+        filter to build on)."""
+        if not senders:
+            return []
+        from_clause = " OR ".join(f"from:{s}" for s in senders)
+        query = f"({from_clause}) -label:{JOB_ALERT_LABEL} -in:spam -in:trash newer_than:{_JOB_ALERT_LOOKBACK_DAYS}d in:inbox"
+        threads = gmail_client.search_threads(query)
+        return [
+            InboxMessage(self.provider, self.account, t["thread_id"], t.get("message_id"),
+                         t["subject"], t["sender"], t["date"], t["snippet"])
+            for t in threads
+        ]
+
+    def mark_job_alert_reviewed(self, ref: str) -> None:
+        gmail_client.label_thread(ref, [self._job_alert_label_id()])
+
 
 class MicrosoftAccount:
     provider = "microsoft"
@@ -155,6 +200,12 @@ class MicrosoftAccount:
 
     def __init__(self):
         self._reviewed_registered = False
+        self._job_alert_registered = False
+
+    def _ensure_job_alert_category(self) -> None:
+        if not self._job_alert_registered:
+            microsoft_client.ensure_label(JOB_ALERT_LABEL)
+            self._job_alert_registered = True
 
     def _ensure_categories(self) -> None:
         # Registering as a masterCategory isn't required for label_thread
@@ -199,6 +250,29 @@ class MicrosoftAccount:
 
     def list_current_draft_ids(self) -> list[str]:
         return microsoft_client.list_drafts()
+
+    def list_job_alert_candidates(self, senders: list[str]) -> list[InboxMessage]:
+        """Graph has no server-side "from one of these senders" filter
+        composable with list_recent's existing $filter the way Gmail's
+        from: query operator does - so this re-fetches the same bounded
+        recent window list_recent_unreviewed() already fetches and filters
+        client-side, same "bounded window, not O(n) over the mailbox"
+        justification as that method's own docstring above."""
+        if not senders:
+            return []
+        recent = microsoft_client.list_recent(_JOB_ALERT_LOOKBACK_DAYS)
+        lowered = [s.lower() for s in senders]
+        return [
+            InboxMessage(self.provider, self.account, m["message_id"], m["message_id"],
+                         m["subject"], m["sender"], m["date"], m["snippet"])
+            for m in recent
+            if JOB_ALERT_LABEL not in (m.get("categories") or [])
+            and any(s in (m.get("sender") or "").lower() for s in lowered)
+        ]
+
+    def mark_job_alert_reviewed(self, ref: str) -> None:
+        self._ensure_job_alert_category()
+        microsoft_client.label_thread(ref, [JOB_ALERT_LABEL])
 
 
 class IMAPAccount:
@@ -245,6 +319,22 @@ class IMAPAccount:
 
     def list_current_draft_ids(self) -> list[str]:
         return imap_client.list_drafts(self._email)
+
+    def list_job_alert_candidates(self, senders: list[str]) -> list[InboxMessage]:
+        if not senders:
+            return []
+        recent = imap_client.search_recent(self._email, since_days=_JOB_ALERT_LOOKBACK_DAYS)
+        lowered = [s.lower() for s in senders]
+        return [
+            InboxMessage(self.provider, self.account, m.uid, m.message_id_header,
+                         m.subject, m.sender, m.date, m.snippet)
+            for m in recent
+            if IMAP_JOB_ALERT_KEYWORD not in m.flags
+            and any(s in (m.sender or "").lower() for s in lowered)
+        ]
+
+    def mark_job_alert_reviewed(self, ref: str) -> None:
+        imap_client.add_keyword(self._email, ref, IMAP_JOB_ALERT_KEYWORD)
 
 
 def configured_accounts() -> list:

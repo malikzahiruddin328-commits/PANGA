@@ -13,6 +13,7 @@ console.anthropic.com - this module never creates or manages the key itself.
 """
 
 import json
+import re
 
 import anthropic
 
@@ -42,19 +43,28 @@ _RESUME_SPEC_COMMON = (
     "ATS systems match on literal keyword overlap, not paraphrases. Spell "
     "out acronyms at first use with the acronym in parentheses so both "
     "keyword matching and human readers catch it (e.g. 'Master Data "
-    "Management (MDM)'). Some roles in the master profile carry a leading "
-    "rank-prefix (e.g. 'Vice President, Head of Applications') or a "
-    "parenthetical seniority-equivalence note (e.g. 'Head of IT "
-    "(CIO-equivalent)'). First judge THIS job posting's own seniority "
-    "level. If the posting itself is VP-level or higher, KEEP those "
-    "prefixes/parentheticals on the relevant past titles - they support "
-    "the case that the candidate has already operated at that level. If "
-    "the posting is below VP-level, DROP them and print just the working "
-    "title (e.g. 'Head of Applications', 'Head of IT') - for a role below "
-    "that level, keeping the higher-rank qualifier on the printed title "
-    "reads as applying beneath your level. Either way, dropping or keeping "
-    "this qualifier is not inventing or embellishing; keep the employer, "
-    "dates, and bullet content for that role exactly as given. "
+    "Management (MDM)'). Some roles in the master profile carry a "
+    "parenthetical seniority-equivalence note after the title (e.g. 'Head "
+    "of IT (CIO-equivalent)'). First judge THIS job posting's own "
+    "seniority level (also reflected in the target_seniority_at_least_vp "
+    "field below - keep the two consistent). If the posting itself is "
+    "VP-level or higher, print the parenthetical in FULL exactly as stored "
+    "(e.g. 'Head of IT (CIO-equivalent)') - it supports the case that the "
+    "candidate has already operated at that level. If the posting is "
+    "below VP-level, drop the parenthetical and print just the working "
+    "title (e.g. 'Head of IT', NOT 'Head of IT (CIO-equivalent)') - for a "
+    "role below that level, keeping the higher-rank qualifier on the "
+    "printed title reads as applying beneath your level. Either way, "
+    "dropping or keeping this parenthetical is not inventing or "
+    "embellishing - it is the same underlying role, employer, dates, and "
+    "bullet content either way, exactly as given. Separately, some roles "
+    "also carry a leading rank-prefix ahead of the working title (e.g. "
+    "the master profile's title field literally reads 'Vice President, "
+    "Head of Applications') - write that title in FULL, prefix included, "
+    "regardless of this posting's seniority; the app strips that prefix "
+    "automatically for a below-VP posting based on the "
+    "target_seniority_at_least_vp field, so don't try to handle it "
+    "yourself in the text. "
 )
 
 _RESUME_SPEC_TWO_PAGE_RULES = (
@@ -451,6 +461,24 @@ def _resume_schema(job: dict | None = None) -> dict:
         "type": "object",
         "properties": {
             "text": {"type": "string", "description": _resume_spec_for_job(job)},
+            "target_seniority_at_least_vp": {
+                "type": "boolean",
+                "description": (
+                    "True if THIS specific job posting is itself at the VP "
+                    "level or higher (VP, SVP, EVP, President, C-suite/"
+                    "Chief-*-Officer titles); False for anything below that "
+                    "(Director, Head of, Senior Manager, individual-"
+                    "contributor roles, etc.). Real gap found 2026-08-06: "
+                    "asking the model to also strip a leading rank-prefix "
+                    "like 'Vice President,' from a past title in the text "
+                    "itself was unreliable - it kept the prefix on a "
+                    "below-VP posting in testing even with explicit "
+                    "instructions. This field lets the app do that "
+                    "stripping deterministically instead - keep it "
+                    "consistent with how you actually wrote the text (the "
+                    "parenthetical seniority-equivalence notes above)."
+                ),
+            },
             "suggested_strategy_tag": {
                 "type": "string",
                 "description": (
@@ -542,7 +570,7 @@ def _resume_schema(job: dict | None = None) -> dict:
                 ),
             },
         },
-        "required": ["text", "suggested_strategy_tag", "clarifying_questions"],
+        "required": ["text", "target_seniority_at_least_vp", "suggested_strategy_tag", "clarifying_questions"],
         "additionalProperties": False,
     }
 
@@ -675,6 +703,50 @@ def _questions_worth_asking(clarifying_questions: list[dict], ats_score: int) ->
     return clarifying_questions
 
 
+# Matches a rank-prefix leading a past title line, e.g. "Vice President, "
+# or "SVP, " ahead of "Head of Applications" - a pattern, not a literal
+# string tied to this one profile's exact wording (real gap found live
+# 2026-08-06: relying on the model to drop this itself was unreliable even
+# with explicit instructions naming the exact string - it kept the prefix
+# on a below-VP posting twice in a row). Anchored to the start of a line
+# (title lines are always alone on their own line in this app's resume
+# format) so it can't accidentally eat a mid-sentence "President, " inside
+# real bullet prose.
+_RANK_PREFIX_RE = re.compile(
+    r"^(\s*)(?:Executive\s+Vice\s+President|Senior\s+Vice\s+President|"
+    r"Vice\s+President|EVP|SVP|VP|President)\s*,\s*",
+    re.IGNORECASE,
+)
+# Matches a trailing seniority-equivalence parenthetical on a title line,
+# e.g. "(CIO-equivalent)" or "(Chief Information Officer equivalent)" -
+# narrow on purpose (requires the word "equivalent" inside the
+# parenthesis) so it can't accidentally eat an unrelated parenthetical
+# elsewhere in the text. Live-verified 2026-08-07: unlike the rank-prefix
+# above, the model DID reliably drop this on its own in earlier runs - but
+# a later run of the exact same below-VP posting kept it anyway, so this
+# needs the same deterministic backstop, not just better prompt wording a
+# second time.
+_SENIORITY_PARENTHETICAL_RE = re.compile(r"\s*\([^)]*\bequivalent\b[^)]*\)", re.IGNORECASE)
+
+
+def _strip_rank_prefixes(resume_text: str) -> str:
+    """Deterministic safety net for a below-VP target posting: strips a
+    leading rank-prefix from any line that starts with one, and any
+    trailing seniority-equivalence parenthetical anywhere in the text -
+    same pattern as docx_export.py's all-caps-name normalizer. The model
+    still makes the genuinely contextual judgment call (is this posting
+    VP-level or not, via target_seniority_at_least_vp), but once that call
+    is made, removing a known qualifier pattern is mechanical and
+    shouldn't depend on the model reliably doing it in the text every
+    single time - real gap found live 2026-08-06/07: both forms were
+    caught NOT being dropped on a below-VP posting in separate live runs,
+    despite explicit prompt instructions for each."""
+    lines = resume_text.split("\n")
+    lines = [_RANK_PREFIX_RE.sub(r"\1", line) for line in lines]
+    lines = [_SENIORITY_PARENTHETICAL_RE.sub("", line) for line in lines]
+    return "\n".join(lines)
+
+
 def _draft_one(
     client: "anthropic.Anthropic",
     shared_context: list[dict],
@@ -719,6 +791,13 @@ def _draft_one(
 
     if doc_key == "resume":
         resume_text = data.get("text", "")
+        if not data.get("target_seniority_at_least_vp", True):
+            # Deterministic safety net, not left to prompt compliance alone
+            # (see _strip_rank_prefixes docstring) - only for a below-VP
+            # posting; defaults to True (no stripping) if the field is
+            # somehow missing, so an absent judgment fails toward leaving
+            # the text untouched rather than silently mangling a title.
+            resume_text = _strip_rank_prefixes(resume_text)
         job = job or {}
         required_kw = job.get("ats_required_keywords")
         preferred_kw = job.get("ats_preferred_keywords")

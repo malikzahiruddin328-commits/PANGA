@@ -122,17 +122,27 @@ it could just as easily have taken out another session's live check. This
 is the same "route judgment calls through the hub" principle applied to
 shared infrastructure, not just decisions.)
 
-## Processing LinkedIn job-alert emails into job records
+## Processing job-alert emails into job records
 
-There is no automated script for this yet - it's currently done by a
-Claude Code session manually reading Zahir's LinkedIn email digests and
-adding postings via `add_manual_job()`. **Add every listing found, never
-skip one because it looks like the wrong industry/vertical** (Zahir's
-explicit instruction, 2026-08-06) - industry/vertical relevance is the
-scoring pipeline's job (`fit_score`, shown to Zahir so he can judge for
-himself), not a reason to silently never add a record in the first place.
-A dropped-at-intake job never even reaches him to evaluate; a low-scored
-one still does.
+Automated as of 2026-08-07 (`scripts/job_alert_scan.py`, registered as
+the `Panga-JobAlertScan` scheduled task, 1x/day) - no live session reads
+Zahir's inbox for this anymore. It scans only the senders/domains
+configured in Settings ("Job-alert email senders", user-managed, see
+`src/search/job_alert_senders.py`) - a defined allowlist, not a "looks
+like a job listing" heuristic, per Zahir's explicit ask. Extraction
+(`src/tailoring/job_alert_reasoning.py`) pulls every distinct posting out
+of a digest email (a single email often bundles several) and saves each
+via the same `add_manual_job()` the old manual process used, so dedup and
+source tagging are unchanged. **Add every listing found, never skip one
+because it looks like the wrong industry/vertical** (Zahir's explicit
+instruction, 2026-08-06) - industry/vertical relevance is the scoring
+pipeline's job (`fit_score`, shown to Zahir so he can judge for himself),
+not a reason to silently never add a record in the first place. A
+dropped-at-intake job never even reaches him to evaluate; a low-scored
+one still does. A listing extracted with a blank organization/description
+isn't backfilled or guessed at - it saves as-is and picks up the existing
+paste-JD-manually UX (`ui/app.py`'s `render_paste_jd_prompt_before_drafting`)
+the same way any other thin job record does.
 
 ## Merging a finished worktree branch into master
 
