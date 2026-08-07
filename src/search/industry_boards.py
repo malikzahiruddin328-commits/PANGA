@@ -254,7 +254,7 @@ def fetch_gforce_jobs(limit: int = 25) -> list[dict]:
     return jobs
 
 
-def fetch_rigzone_jobs(limit: int = 25, location: str = "United Kingdom") -> list[dict]:
+def fetch_rigzone_jobs(limit: int = 25, location: str = "United States") -> list[dict]:
     """Global oil & gas board, not UK-specific - confirmed 2026-08-04 that
     the site's own location field (?sl=<text>) filters server-side (143 UK
     jobs vs. "thousands" unfiltered), so this passes it instead of scraping
@@ -263,7 +263,15 @@ def fetch_rigzone_jobs(limit: int = 25, location: str = "United Kingdom") -> lis
     first) sort - no pagination, same reasoning as Planet Pharma/Beacon
     Hill. Listings are HTML with the employer name and location as two text
     nodes inside one <address> tag separated by a <br/>, not separate
-    elements - parsed positionally rather than by selector."""
+    elements - parsed positionally rather than by selector.
+
+    Default fixed 2026-08-07 (was "United Kingdom") - the daily run
+    (scripts/run_search.py) never overrode this, so this had been quietly
+    searching UK postings only, not US, against the project's US-only
+    merit bar. Fixed regardless of Rigzone currently being disabled in the
+    daily run (see run_search.py's _INDUSTRY_BOARD_FETCHERS comment) - the
+    function should be correct whenever it's re-enabled, not just when
+    someone remembers to also fix this."""
     response = requests.get(
         "https://www.rigzone.com/oil/jobs/search/", params={"sl": location}, headers=HEADERS, timeout=20,
     )
