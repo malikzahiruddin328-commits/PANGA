@@ -3,31 +3,90 @@ from tailoring.drafting import (
     RESUME_SPEC_USAJOBS,
     _merge_keyword_gap_questions,
     _questions_worth_asking,
+    _strip_rank_prefixes,
     _suggested_answer_for_keyword_gap,
     save_gap_answers,
 )
 
 
-def test_resume_spec_conditionally_keeps_or_drops_rank_prefixes_by_target_seniority():
-    # Real complaint 2026-08-06 (Zahir, via Mirror): titles carrying a rank
-    # prefix ("Vice President, Head of Applications") or a seniority
-    # parenthetical ("Head of IT (CIO-equivalent)") make a role below that
-    # level look like he's applying beneath himself - but for a VP+ target
-    # role, those same qualifiers support the case he's already operated
-    # at that level, so this has to be a per-job judgment call (confirmed
-    # with Zahir 2026-08-06), not a blanket strip-always rule.
+def test_resume_spec_conditionally_keeps_or_drops_seniority_parenthetical():
+    # Real complaint 2026-08-06 (Zahir, via Mirror): a seniority
+    # parenthetical ("Head of IT (CIO-equivalent)") on a role below that
+    # level looks like applying beneath himself - but for a VP+ target
+    # role, the same qualifier supports the case he's already operated at
+    # that level, so this is a per-job judgment call (confirmed with Zahir
+    # 2026-08-06), not a blanket strip-always rule. The prompt still asks
+    # for this (it worked in two live tests before failing a third), but
+    # _strip_rank_prefixes now backstops it deterministically too - see
+    # test_strip_rank_prefixes_also_removes_seniority_parentheticals below.
     for spec in (RESUME_SPEC, RESUME_SPEC_USAJOBS):
-        assert "rank-prefix" in spec
         assert "not inventing or embellishing" in spec
-        assert "VP-level or higher, print the title in FULL" in spec
-        assert "below VP-level, print ONLY the working title" in spec
-        # The instruction must name the exact real title strings, not just
-        # describe the pattern abstractly (real gap found live 2026-08-06:
-        # the model dropped the parenthetical but kept "Vice President,"
-        # on the other title for a below-VP posting) - spelling out both
-        # forms explicitly closes that ambiguity.
-        assert "'Vice President, Head of Applications'" in spec
+        assert "VP-level or higher, print the parenthetical in FULL" in spec
+        assert "below VP-level, drop the parenthetical" in spec
         assert "'Head of IT (CIO-equivalent)'" in spec
+
+
+def test_resume_spec_defers_rank_prefix_stripping_to_the_app():
+    # Real gap found live 2026-08-06: asking the model to also drop a
+    # leading rank-prefix ("Vice President, Head of Applications" ->
+    # "Head of Applications") in the text itself was unreliable even with
+    # an explicit instruction naming the exact string - it kept the prefix
+    # on a below-VP posting twice in a row. Moved to a deterministic
+    # code-level strip (_strip_rank_prefixes) gated on the model's own
+    # target_seniority_at_least_vp judgment instead - the prompt just
+    # needs to say "write it in full, the app handles stripping."
+    for spec in (RESUME_SPEC, RESUME_SPEC_USAJOBS):
+        assert "target_seniority_at_least_vp" in spec
+        assert "the app strips that prefix automatically" in spec
+
+
+def test_strip_rank_prefixes_removes_leading_rank_titles():
+    text = (
+        "Zahir Uddin\n\nPROFESSIONAL EXPERIENCE\n"
+        "Vice President, Head of Applications\nMarch 2020 - December 2023\n"
+        "- Did a thing mentioning the President, who approved the budget.\n"
+    )
+    result = _strip_rank_prefixes(text)
+    assert "Head of Applications" in result
+    assert "Vice President, Head of Applications" not in result
+    # Only strips at the start of a line - must not eat a mid-sentence
+    # "President," inside real bullet prose.
+    assert "the President, who approved the budget" in result
+
+
+def test_strip_rank_prefixes_handles_svp_evp_and_plain_president():
+    for prefix, rest in [
+        ("SVP, ", "Global Sales"),
+        ("EVP, ", "Operations"),
+        ("President, ", "North America"),
+        ("Senior Vice President, ", "Engineering"),
+        ("Executive Vice President, ", "Product"),
+    ]:
+        result = _strip_rank_prefixes(f"{prefix}{rest}\nJanuary 2020 - Present\n")
+        assert result.startswith(rest), (prefix, result)
+
+
+def test_strip_rank_prefixes_leaves_plain_titles_untouched():
+    text = "Head of IT\nJanuary 2024 - January 2026\n"
+    assert _strip_rank_prefixes(text) == text
+
+
+def test_strip_rank_prefixes_also_removes_seniority_parentheticals():
+    # Real gap found live 2026-08-07: the model reliably dropped this
+    # parenthetical for a below-VP posting in two earlier live tests, then
+    # kept it anyway on a later run of the exact same posting - the same
+    # "prompt says X, model inconsistently does X" failure mode as the
+    # rank-prefix, so it gets the same deterministic backstop.
+    text = "Head of IT (CIO-equivalent)\nJanuary 2024 - January 2026\n- Did a thing.\n"
+    result = _strip_rank_prefixes(text)
+    assert "Head of IT" in result
+    assert "(CIO-equivalent)" not in result
+
+
+def test_strip_rank_prefixes_only_strips_parentheticals_containing_equivalent():
+    # Narrow on purpose - must not eat an unrelated parenthetical.
+    text = "Head of IT (Paramus, NJ)\nJanuary 2024 - January 2026\n"
+    assert _strip_rank_prefixes(text) == text
 
 
 def test_resume_spec_folds_target_role_alignment_into_summary_not_its_own_header():
