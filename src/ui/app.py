@@ -2054,7 +2054,7 @@ elif active_tab == "results":
 
     settings = load_settings()
 
-    col1, col2 = st.columns([1, 3])
+    col1, col_manual, col2 = st.columns([1.3, 1.4, 2.3])
     with col1:
         if st.button("Run now (USAJOBS)", type="primary"):
             # Real "i of N" progress instead of an opaque spinner (Zahir's
@@ -2083,10 +2083,41 @@ elif active_tab == "results":
                 st.success(f"Found {total_new} new job(s).")
             except USAJobsNotConfigured as e:
                 st.error(str(e))
+    with col_manual:
+        # Zahir couldn't find "Add a job manually" - it was a plain
+        # collapsed st.expander sitting below this row, easy to miss as
+        # inert prose (Mirror confirmed live on production, 2026-08-07).
+        # Approved direction (Zahir picked from 3 mockups): a dedicated,
+        # equal-weight button right next to "Run now (USAJOBS)" - same
+        # type="primary" as that button, since both are top-level ways to
+        # get a job into the Results tab, not a secondary/buried action.
+        # Clicking it force-opens the expander below once (see the
+        # one-shot pattern comment just above that expander for why).
+        if st.button("Add a job manually", icon=":material/add:", type="primary"):
+            st.session_state["manual_job_reveal_pending"] = True
+            st.rerun()
     with col2:
         st.markdown("This button only covers USAJOBS.gov directly. ZipRecruiter, Dice, and Indeed are searched automatically once a day by the scheduled task instead (they're MCP connector tools, not reachable from this button).")
 
-    with st.expander("Add a job manually (e.g. from LinkedIn or a site Panga can't search automatically)"):
+    # Same one-shot force-expand pattern already proven working elsewhere
+    # in this file (Interview Prep's just_generated_prep_* flag): pop the
+    # pending flag right before the widget so it force-expands exactly
+    # once. Tried a key="manual_job_expander" + expanded=session_state.get(...)
+    # version first (which AppTest confirmed as logically correct) but it
+    # did not actually open the expander when live-verified in the real
+    # browser - a real discrepancy between AppTest's simulated widget
+    # reconciliation and the live frontend for this specific key+expanded
+    # combination, not just a wait-time/click-delivery issue (confirmed via
+    # the native <details>.open DOM property after several isolated
+    # retries). This pattern needs no key at all - the expander's own
+    # header click still toggles it normally afterward since Streamlit's
+    # frontend preserves that toggle client-side across unrelated reruns
+    # even for un-keyed expanders (same as Interview Prep's).
+    manual_job_reveal = st.session_state.pop("manual_job_reveal_pending", False)
+    with st.expander(
+        "Add a job manually (e.g. from LinkedIn or a site Panga can't search automatically)",
+        expanded=manual_job_reveal,
+    ):
         st.markdown(
             "For channels with no public search API and no working scraper "
             "(LinkedIn, or a job board that turned out blocked/JS-rendered), "
