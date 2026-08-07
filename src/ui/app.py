@@ -1928,49 +1928,61 @@ elif active_tab == "cta":
     st.header("Call to action")
     st.markdown("Emails the Gmail scan flagged as needing a reply or a decision.")
 
-    with st.container(border=True):
-        sync_pending = get_pending_count()
-        sync_icon, sync_headline = (":material/task_alt:", "All caught up") if sync_pending == 0 else (
-            ":material/sync:", f"{sync_pending} update{'s' if sync_pending != 1 else ''} to send",
-        )
-        last_synced_text, sync_is_stale = _format_last_synced(get_last_synced_at())
-        # Compact single-line status (Zahir's live-testing feedback,
-        # 2026-08-06, found on the production instance): icon, headline,
-        # and last-synced text used to be a big H2-sized icon in its own
-        # column (most of the "dead whitespace on the left") next to two
-        # stacked lines - folded into one markdown line instead, same
-        # "fold it into one string" approach the CTA stat strip already
-        # uses just below this card. The button no longer forces
-        # width="stretch" (was disproportionately wide for "Send and
-        # receive" next to the small, content-sized "Reload view" button
-        # right below it - now both size to their own label).
-        if sync_is_stale:
-            status_line = f"{sync_icon} **{sync_headline}** · :orange[:material/warning: {last_synced_text} - a new scan may be overdue]"
-        else:
-            status_line = f"{sync_icon} **{sync_headline}** · {last_synced_text}"
-        sync_cols = st.columns([5, 2], vertical_alignment="center")
-        with sync_cols[0]:
-            st.markdown(status_line)
-        with sync_cols[1]:
-            if st.button("Send and receive", type="primary", key="manual_sync_button"):
-                with st.spinner("Syncing - archiving, drafting replies, checking sent drafts..."):
-                    sync_summary = run_full_fulfillment()
-                parts = []
-                if sync_summary["archived"]:
-                    parts.append(f"{sync_summary['archived']} archived")
-                if sync_summary["cta_drafts"]:
-                    parts.append(f"{sync_summary['cta_drafts']} repl{'ies' if sync_summary['cta_drafts'] != 1 else 'y'} drafted")
-                if sync_summary["outreach_drafts"]:
-                    parts.append(f"{sync_summary['outreach_drafts']} outreach draft{'s' if sync_summary['outreach_drafts'] != 1 else ''} created")
-                summary_text = ", ".join(parts) if parts else "nothing was pending"
-                if sync_summary["failures"]:
-                    st.toast(f"Synced with {sync_summary['failures']} failure(s) - {summary_text}. Try again shortly.", icon=":material/warning:")
-                else:
-                    st.toast(f"Synced: {summary_text}.", icon=":material/check_circle:")
-                st.rerun()
+    sync_pending = get_pending_count()
+    sync_icon, sync_headline = (":material/task_alt:", "All caught up") if sync_pending == 0 else (
+        ":material/sync:", f"{sync_pending} update{'s' if sync_pending != 1 else ''} to send",
+    )
+    last_synced_text, sync_is_stale = _format_last_synced(get_last_synced_at())
+    if sync_is_stale:
+        status_line = f"{sync_icon} **{sync_headline}** · :orange[:material/warning: {last_synced_text} - a new scan may be overdue]"
+    else:
+        status_line = f"{sync_icon} **{sync_headline}** · {last_synced_text}"
+    counts = {cat: sum(1 for e in all_cta if e.get("category") == cat) for cat in CATEGORY_ORDER}
 
-    r1, r2 = st.columns([1, 5])
-    with r1:
+    # Single-line header row (Zahir's live-testing feedback, 2026-08-07 -
+    # "the send receive and the offer, interview ... rejection should all
+    # be in the same line else it looks NASTY"): status text, both buttons,
+    # and all 5 category badges used to be 3 separate stacked
+    # rows/containers (this status card, a standalone Reload-view row, and
+    # a separate stat-strip container below) - merged into one flex row.
+    # Same .st-key-{container} scoped-CSS-reflow pattern as
+    # progress_shimmer_css, just applied to every child in this one
+    # container instead of per-section. flex-wrap keeps it from
+    # overflowing horizontally on a narrower window - it wraps to more
+    # lines instead, verified down to mobile width.
+    header_key = "cta_header_row"
+    st.html(f"""<style>
+.st-key-{header_key}[data-testid="stVerticalBlock"] {{
+    display: flex !important;
+    flex-direction: row !important;
+    flex-wrap: wrap !important;
+    gap: 0.6rem;
+    align-items: center;
+    width: 100% !important;
+}}
+.st-key-{header_key} [data-testid="stElementContainer"] {{
+    width: fit-content !important;
+    flex: 0 0 auto !important;
+}}
+</style>""")
+    with st.container(key=header_key):
+        st.markdown(status_line)
+        if st.button("Send and receive", type="primary", key="manual_sync_button"):
+            with st.spinner("Syncing - archiving, drafting replies, checking sent drafts..."):
+                sync_summary = run_full_fulfillment()
+            parts = []
+            if sync_summary["archived"]:
+                parts.append(f"{sync_summary['archived']} archived")
+            if sync_summary["cta_drafts"]:
+                parts.append(f"{sync_summary['cta_drafts']} repl{'ies' if sync_summary['cta_drafts'] != 1 else 'y'} drafted")
+            if sync_summary["outreach_drafts"]:
+                parts.append(f"{sync_summary['outreach_drafts']} outreach draft{'s' if sync_summary['outreach_drafts'] != 1 else ''} created")
+            summary_text = ", ".join(parts) if parts else "nothing was pending"
+            if sync_summary["failures"]:
+                st.toast(f"Synced with {sync_summary['failures']} failure(s) - {summary_text}. Try again shortly.", icon=":material/warning:")
+            else:
+                st.toast(f"Synced: {summary_text}.", icon=":material/check_circle:")
+            st.rerun()
         # Was labeled "Refresh", which read as "go check Gmail again" -
         # it's actually just st.rerun(), no Gmail call at all (Mirror's
         # first UI/UX review pass, 2026-08-06). "Send and receive" above is
@@ -1981,31 +1993,6 @@ elif active_tab == "cta":
         # the app. Kept, just renamed to say what it actually does.
         if st.button("Reload view", help="Re-reads the current data without contacting Gmail - use \"Send and receive\" above for a real sync."):
             st.rerun()
-
-    counts = {cat: sum(1 for e in all_cta if e.get("category") == cat) for cat in CATEGORY_ORDER}
-    # Compact single-line stat strip (Zahir's live-testing feedback,
-    # 2026-08-06): 5x st.columns()+st.metric() each claimed a full
-    # 1/5-width column for a single digit - mostly empty space, since
-    # st.columns() always spans the full container width regardless of how
-    # little its content needs, so there's no column-ratio fix for that.
-    # Reuses the real st.badge() widget (theme-correct light/dark, same
-    # semantic colors already used elsewhere on this tab) with label+count
-    # folded into one string, then a scoped CSS rule (same
-    # .st-key-{container} pattern as progress_shimmer_css) reflows the
-    # normally block-stacked badges into one wrapping horizontal row.
-    stat_strip_key = "cta_stat_strip"
-    st.html(f"""<style>
-.st-key-{stat_strip_key}[data-testid="stVerticalBlock"] {{
-    flex-direction: row;
-    flex-wrap: wrap;
-    gap: 0.5rem;
-    align-items: center;
-}}
-.st-key-{stat_strip_key} [data-testid="stElementContainer"] {{
-    width: auto;
-}}
-</style>""")
-    with st.container(key=stat_strip_key):
         for cat in CATEGORY_ORDER:
             st.badge(f"{CATEGORY_LABELS[cat]} **{counts[cat]}**", color=CATEGORY_COLORS[cat])
 
