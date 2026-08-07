@@ -223,11 +223,35 @@ for _group in _KEYWORD_EQUIVALENCE_GROUPS:
         _KEYWORD_ALIASES[_term] = _frozen_group
 
 
-def _literal_phrase_in_text(phrase: str, text_lower: str) -> bool:
+# Short acronym-style aliases that are ALSO ordinary English words/tokens
+# when lowercased - "it" being the standout risk (one of the most common
+# words in English). Real gap found 2026-08-07 (General's review, before
+# this shipped): matching these case-insensitively against the fully-
+# lowercased resume text meant any resume containing an ordinary sentence
+# like "delivered it on time" would silently satisfy "information
+# technology" - the opposite failure mode from the bug this equivalence
+# table exists to fix, and worse, because it's silent (no gap question
+# ever gets asked, so a real gap stays hidden instead of being surfaced).
+# These are checked case-sensitively against the ORIGINAL (non-lowercased)
+# text instead - only count if the token actually appears capitalized/
+# uppercase there, the way a real acronym would. Multi-word aliases
+# ("information technology", "bachelor's degree") stay case-insensitive -
+# they're unambiguous, no common English phrase collides with them.
+_CASE_SENSITIVE_ALIASES = {"it", "cs", "bsc", "ba", "bs", "ms", "ma", "mba", "phd"}
+
+
+def _literal_phrase_in_text(phrase: str, text_lower: str, text_original: str) -> bool:
     # Periods stripped from both sides before matching so "b.sc"/"ph.d."-
     # style aliases line up with however the actual text punctuates them
     # ("BSc", "B.S.C", "PhD", "Ph.D." all normalize the same way).
     phrase = phrase.replace(".", "")
+    if phrase in _CASE_SENSITIVE_ALIASES:
+        original_depunct = text_original.replace(".", "")
+        pattern = r"\b" + re.escape(phrase) + r"\b"
+        return any(
+            m.group(0) != m.group(0).lower()
+            for m in re.finditer(pattern, original_depunct, re.IGNORECASE)
+        )
     text_lower = text_lower.replace(".", "")
     if re.match(r"^[\w\s']+$", phrase):
         pattern = r"\b" + r"\s+".join(re.escape(w) for w in phrase.split()) + r"\b"
@@ -235,9 +259,9 @@ def _literal_phrase_in_text(phrase: str, text_lower: str) -> bool:
     return phrase in text_lower
 
 
-def _phrase_in_text(phrase: str, text_lower: str) -> bool:
+def _phrase_in_text(phrase: str, text_lower: str, text_original: str) -> bool:
     for alias in _KEYWORD_ALIASES.get(phrase, (phrase,)):
-        if _literal_phrase_in_text(alias, text_lower):
+        if _literal_phrase_in_text(alias, text_lower, text_original):
             return True
     return False
 
@@ -318,8 +342,8 @@ def score_resume_against_keywords(
     preferred = [k.lower() for k in preferred_keywords]
     resume_lower = resume_text.lower()
 
-    matched_required = [k for k in required if _phrase_in_text(k, resume_lower)]
-    matched_preferred = [k for k in preferred if _phrase_in_text(k, resume_lower)]
+    matched_required = [k for k in required if _phrase_in_text(k, resume_lower, resume_text)]
+    matched_preferred = [k for k in preferred if _phrase_in_text(k, resume_lower, resume_text)]
 
     required_coverage = (len(matched_required) / len(required)) if required else None
     preferred_coverage = (len(matched_preferred) / len(preferred)) if preferred else None

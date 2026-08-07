@@ -184,6 +184,50 @@ def test_alias_matching_does_not_match_unrelated_terms():
     assert result["missing_required_keywords"] == ["computer science"]
 
 
+def test_lowercase_it_pronoun_in_prose_does_not_falsely_satisfy_information_technology():
+    # Real gap found 2026-08-07 (General's review, before this shipped):
+    # "it" is one of the most common words in English. Case-insensitive
+    # alias matching would have let ANY resume containing an ordinary
+    # sentence using the pronoun "it" silently satisfy "information
+    # technology" - hiding a real gap instead of surfacing it, the
+    # opposite (and worse, silent) failure mode from the bug this
+    # equivalence table exists to fix. A candidate with zero IT background
+    # must still show "information technology" as missing.
+    resume = (
+        "PROFESSIONAL EXPERIENCE\nSales Director - Acme - Jan 2020 - Present\n"
+        "- Delivered it on time and managed it end-to-end for every major account.\n"
+        "- Owned it from kickoff to close, presenting it to the board each quarter.\n"
+    )
+    result = score_resume_against_keywords(["information technology"], [], resume)
+    assert result["missing_required_keywords"] == ["information technology"]
+
+
+def test_lowercase_cs_style_token_in_prose_does_not_falsely_satisfy_computer_science():
+    resume = "PROFESSIONAL EXPERIENCE\nSales rep vs cs team on pricing disputes.\n"
+    result = score_resume_against_keywords(["computer science"], [], resume)
+    assert result["missing_required_keywords"] == ["computer science"]
+
+
+def test_uppercase_it_acronym_still_satisfies_information_technology():
+    # The case-sensitivity fix must not overcorrect into never matching -
+    # a real capitalized "IT" acronym should still count.
+    result = score_resume_against_keywords(
+        ["information technology"], [], "PROFESSIONAL EXPERIENCE\nHead of IT\n",
+    )
+    assert result["missing_required_keywords"] == []
+
+
+def test_multi_word_aliases_stay_case_insensitive():
+    # Multi-word aliases ("bachelor's degree", "information technology")
+    # are unambiguous - no common English phrase collides with them - so
+    # they should still match regardless of casing, unlike the short
+    # acronym aliases above.
+    result = score_resume_against_keywords(
+        ["bsc"], [], "education\nbachelor of science, information systems\n",
+    )
+    assert result["missing_required_keywords"] == []
+
+
 def test_extract_keywords_fallback_path_also_benefits_from_equivalence():
     # General's explicit ask: score_resume_ats()'s no-AI extract_keywords()
     # fallback funnels into the same score_resume_against_keywords() /
