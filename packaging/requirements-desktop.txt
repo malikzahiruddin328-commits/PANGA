@@ -1,0 +1,14 @@
+# Extra dependencies for the packaged desktop build (native-packaging
+# Phase 2), on top of the project's own requirements.txt. Kept separate
+# rather than added to requirements.txt itself: pyinstaller and the Inno
+# Setup toolchain are build-time only (never needed on an end user's
+# machine, or in the dev `streamlit run` workflow requirements.txt already
+# serves), and pywebview is desktop-build-only (the dev workflow opens a
+# regular browser tab, no window-wrapping needed there).
+#
+# Install with:
+#   pip install -r requirements.txt -r packaging/requirements-desktop.txt
+# See docs/native-packaging-phase2-build.md for the full build steps.
+
+pywebview
+pyinstaller
