@@ -217,3 +217,155 @@ def test_normalize_indeed_jobs_has_no_description_field():
     jobs = normalize_indeed_jobs(raw_text)
     assert len(jobs) == 1
     assert "description" not in jobs[0]
+
+
+# --- Built In fixtures (real markup shape, live-confirmed 2026-08-07) ---
+
+_BUILT_IN_CARD_WITH_SALARY = """
+<div data-id="job-card" id="job-card-1">
+  <div class="left-side-tile-item-2">
+    <a data-id="company-title" href="/company/acme"><span>Acme Corp</span></a>
+  </div>
+  <h2><a data-id="job-card-title" data-alias="/job/chief-information-officer/9053354" href="/job/x">Chief Information Officer</a></h2>
+  <div class="bounded-attribute-section">
+    <span class="font-barlow text-gray-04">Hybrid</span>
+    <span class="font-barlow text-gray-04">Chicago, IL, USA</span>
+    <span class="font-barlow text-gray-04">275K-310K Annually</span>
+    <span class="font-barlow text-gray-04">Expert/Leader</span>
+  </div>
+</div>
+"""
+
+# Real shape found live: salary omitted entirely (not a placeholder) when
+# Built In has no salary data for a posting - one fewer span, not blank.
+_BUILT_IN_CARD_NO_SALARY = """
+<div data-id="job-card" id="job-card-2">
+  <div class="left-side-tile-item-2">
+    <a data-id="company-title" href="/company/jpmc"><span>JPMorganChase</span></a>
+  </div>
+  <h2><a data-id="job-card-title" data-alias="/job/senior-engineer/10310265" href="/job/y">Senior Engineer</a></h2>
+  <div class="bounded-attribute-section">
+    <span class="font-barlow text-gray-04">Hybrid</span>
+    <span class="font-barlow text-gray-04">Jersey City, NJ, USA</span>
+    <span class="font-barlow text-gray-04">Senior level</span>
+  </div>
+</div>
+"""
+
+
+def _built_in_page(*cards):
+    return "<html><body>" + "".join(cards) + "</body></html>"
+
+
+def test_fetch_built_in_jobs_parses_card_with_salary(monkeypatch):
+    monkeypatch.setattr(boards.requests, "get", lambda url, params=None, headers=None, timeout=None: _FakeResponse(_built_in_page(_BUILT_IN_CARD_WITH_SALARY)))
+    jobs = boards.fetch_built_in_jobs("Chief Information Officer")
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert job["source"] == "Built In"
+    assert job["title"] == "Chief Information Officer"
+    assert job["organization"] == "Acme Corp"
+    assert job["location"] == "Chicago, IL, USA"
+    assert job["pay_min"] == "275000"
+    assert job["pay_max"] == "310000"
+    assert job["job_id"] == "/job/chief-information-officer/9053354"
+    assert job["posting_url"] == "https://builtin.com/job/chief-information-officer/9053354"
+
+
+def test_fetch_built_in_jobs_handles_missing_salary(monkeypatch):
+    # Real shape found live: a card missing salary data has one fewer span
+    # entirely, not an empty placeholder - this crashed a fixed-index-based
+    # first draft of the parser during development.
+    monkeypatch.setattr(boards.requests, "get", lambda url, params=None, headers=None, timeout=None: _FakeResponse(_built_in_page(_BUILT_IN_CARD_NO_SALARY)))
+    jobs = boards.fetch_built_in_jobs("Engineer")
+    assert jobs[0]["pay_min"] is None
+    assert jobs[0]["pay_max"] is None
+    assert jobs[0]["location"] == "Jersey City, NJ, USA"
+
+
+def test_fetch_built_in_jobs_id_stable_across_repeat_fetches(monkeypatch):
+    # data-alias is Built In's own permalink slug (live-verified stable
+    # across repeat fetches, unlike SimplyHired's href token below) - no
+    # _stable_job_id() substitution needed here.
+    monkeypatch.setattr(boards.requests, "get", lambda url, params=None, headers=None, timeout=None: _FakeResponse(_built_in_page(_BUILT_IN_CARD_WITH_SALARY)))
+    job1 = boards.fetch_built_in_jobs("CIO")[0]
+    job2 = boards.fetch_built_in_jobs("CIO")[0]
+    assert job1["job_id"] == job2["job_id"]
+
+
+def test_fetch_built_in_jobs_respects_limit(monkeypatch):
+    monkeypatch.setattr(boards.requests, "get", lambda url, params=None, headers=None, timeout=None: _FakeResponse(_built_in_page(_BUILT_IN_CARD_WITH_SALARY, _BUILT_IN_CARD_NO_SALARY)))
+    jobs = boards.fetch_built_in_jobs("CIO", limit=1)
+    assert len(jobs) == 1
+
+
+# --- SimplyHired fixtures (real markup shape, live-confirmed 2026-08-07) ---
+
+_SIMPLYHIRED_CARD = """
+<div data-testid="searchSerpJob">
+  <h2 data-testid="searchSerpJobTitle"><a href="/job/tokenAAA">IT Director</a></h2>
+  <span data-testid="companyName">Confidential</span>
+  <span data-testid="searchSerpJobLocation">Boca Raton, FL</span>
+  <span data-testid="salaryChip-0">$120,000 - $140,000 a year</span>
+  <span data-testid="searchSerpJobDateStamp">2d</span>
+</div>
+"""
+
+_SIMPLYHIRED_CARD_NO_SALARY = """
+<div data-testid="searchSerpJob">
+  <h2 data-testid="searchSerpJobTitle"><a href="/job/tokenBBB">Business Unit CIO</a></h2>
+  <span data-testid="companyName">Sysco</span>
+  <span data-testid="searchSerpJobLocation">Houston, TX</span>
+</div>
+"""
+
+
+def _simplyhired_page(*cards):
+    return "<html><body>" + "".join(cards) + "</body></html>"
+
+
+def test_fetch_simplyhired_jobs_parses_real_response_shape(monkeypatch):
+    monkeypatch.setattr(boards.requests, "get", lambda url, params=None, headers=None, timeout=None: _FakeResponse(_simplyhired_page(_SIMPLYHIRED_CARD)))
+    jobs = boards.fetch_simplyhired_jobs("Chief Information Officer")
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert job["source"] == "SimplyHired"
+    assert job["title"] == "IT Director"
+    assert job["organization"] == "Confidential"
+    assert job["location"] == "Boca Raton, FL"
+    assert job["pay_min"] == "120000"
+    assert job["pay_max"] == "140000"
+    assert job["posting_url"] == "https://www.simplyhired.com/job/tokenAAA"
+
+
+def test_fetch_simplyhired_jobs_handles_missing_salary(monkeypatch):
+    monkeypatch.setattr(boards.requests, "get", lambda url, params=None, headers=None, timeout=None: _FakeResponse(_simplyhired_page(_SIMPLYHIRED_CARD_NO_SALARY)))
+    jobs = boards.fetch_simplyhired_jobs("CIO")
+    assert jobs[0]["pay_min"] is None
+    assert jobs[0]["pay_max"] is None
+
+
+def test_fetch_simplyhired_jobs_id_is_content_based_not_the_url_token(monkeypatch):
+    # Real bug found 2026-08-07: the /job/<token> href is NOT stable across
+    # repeat fetches for the same real posting (live-tested: 7 of 8 stayed
+    # the same, 1 changed) - job_id must be content-based, same fix already
+    # applied to Indeed/ZipRecruiter/Dice's MCP path.
+    same_posting_different_token = """
+    <div data-testid="searchSerpJob">
+      <h2 data-testid="searchSerpJobTitle"><a href="/job/tokenZZZ-different">IT Director</a></h2>
+      <span data-testid="companyName">Confidential</span>
+      <span data-testid="searchSerpJobLocation">Boca Raton, FL</span>
+    </div>
+    """
+    monkeypatch.setattr(boards.requests, "get", lambda url, params=None, headers=None, timeout=None: _FakeResponse(_simplyhired_page(_SIMPLYHIRED_CARD)))
+    job1 = boards.fetch_simplyhired_jobs("IT Director")[0]
+    monkeypatch.setattr(boards.requests, "get", lambda url, params=None, headers=None, timeout=None: _FakeResponse(same_posting_different_token))
+    job2 = boards.fetch_simplyhired_jobs("IT Director")[0]
+    assert job1["job_id"] == job2["job_id"]
+    assert job1["posting_url"] != job2["posting_url"]  # links can differ, id must not
+
+
+def test_fetch_simplyhired_jobs_respects_limit(monkeypatch):
+    monkeypatch.setattr(boards.requests, "get", lambda url, params=None, headers=None, timeout=None: _FakeResponse(_simplyhired_page(_SIMPLYHIRED_CARD, _SIMPLYHIRED_CARD_NO_SALARY)))
+    jobs = boards.fetch_simplyhired_jobs("CIO", limit=1)
+    assert len(jobs) == 1

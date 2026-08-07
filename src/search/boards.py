@@ -25,6 +25,27 @@ panga-daily-job-search scheduled task as a stopgap covering ZipRecruiter/
 Dice/Indeed together) - not retired here, that's a call for whoever owns
 deciding when the stopgap itself comes off, not something to do unilaterally
 mid-investigation.
+
+BROAD-SCOPE UPDATE (2026-08-07): Zahir's ask to widen board coverage across
+the whole US job market, not just pharma - general-purpose, multi-employer
+national boards belong here alongside Dice, not in industry_boards.py
+(which is for single-vertical/single-employer niche sources). Recon'd ~10
+real candidates live before building anything (Built In and SimplyHired
+cleared all 3 merit criteria - real recent activity, reputable/established,
+US-focused; Monster/CareerBuilder/WallStreetOasis/eFinancialCareers/
+ClearedJobs/The Ladders all WAF-blocked same as ZipRecruiter/Indeed;
+HealthITJobs.com turned out to be a parked/expired domain; Idealist is
+JS-rendered). fetch_built_in_jobs()/fetch_simplyhired_jobs() below both
+search PER keyword (same as search_dice()) rather than fetching
+everything - deliberate: an unfiltered fetch of a broad multi-employer
+board could pull in thousands of totally unrelated roles (a nurse, a
+supply-chain specialist - Zahir's own example of what NOT to surface),
+unlike Greenhouse/Lever's fetch-everything pattern, which stays safe only
+because it's bounded to one company's total open roles. Searching by
+target-role keyword keeps the volume/relevance bar the same as every
+other keyword-searched source in this codebase, rather than leaning on
+fit_score alone to filter out noise it was never designed to absorb at
+this scale.
 """
 
 import hashlib
@@ -218,6 +239,121 @@ def fetch_dice_jobs(keyword: str, limit: int = 25) -> list[dict]:
             # what actually dedupes a posting found via both paths, not
             # just within this one.
             "job_id": _stable_job_id("Dice", title, organization, location),
+            "title": title,
+            "organization": organization,
+            "location": location,
+            "pay_min": pay_min,
+            "pay_max": pay_max,
+            "posting_url": posting_url,
+            "apply_url": posting_url,
+        })
+    return jobs
+
+
+def fetch_built_in_jobs(keyword: str, limit: int = 25) -> list[dict]:
+    """Direct scrape of builtin.com/jobs?search=<keyword> - confirmed real
+    server-side keyword filtering, live-verified against a "chief
+    information officer" search (25 real, recent postings - JPMorganChase,
+    Navan, etc., "Reposted Yesterday"/"N Days Ago"). Inherently US-only (a
+    US-focused careers platform - every location seen in recon was a US
+    city/state or "N Locations"), no extra country param needed.
+
+    Location and salary fields aren't behind a stable data-id like title/
+    company are - Built In's markup only tags a fixed handful of fields
+    with data-id (company-title, job-card-title), everything else is a
+    bare list of `.font-barlow.text-gray-04` spans whose first entry is
+    always work-mode (Hybrid/Remote/In-Office) and second is always
+    location, but salary/seniority-level entries are only present when
+    Built In actually has that data - a card missing salary just has one
+    fewer span, not an empty placeholder (confirmed live across 25 real
+    cards). Salary is identified by pattern-matching for a "NNNK" shape
+    rather than trusting a fixed index, since its position shifts."""
+    response = requests.get(
+        "https://builtin.com/jobs", params={"search": keyword}, headers=HEADERS, timeout=20,
+    )
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    jobs = []
+    for card in soup.select('[data-id="job-card"]')[:limit]:
+        title_link = card.select_one('a[data-id="job-card-title"]')
+        if not title_link:
+            continue
+        company_el = card.select_one('a[data-id="company-title"]')
+        attr_section = card.select_one(".bounded-attribute-section")
+        spans = attr_section.select("span.font-barlow.text-gray-04") if attr_section else []
+        location = spans[1].get_text(strip=True) if len(spans) > 1 else None
+
+        pay_min = pay_max = None
+        for span in spans:
+            text = span.get_text(strip=True)
+            nums = re.findall(r"(\d+)K", text)
+            if nums:
+                pay_min = str(int(nums[0]) * 1000)
+                pay_max = str(int(nums[1]) * 1000) if len(nums) > 1 else pay_min
+                break
+
+        job_id = title_link.get("data-alias") or title_link.get("href")
+        posting_url = f"https://builtin.com{job_id}" if job_id and job_id.startswith("/") else job_id
+        jobs.append({
+            "source": "Built In",
+            "job_id": job_id,
+            "title": title_link.get_text(strip=True),
+            "organization": company_el.get_text(strip=True) if company_el else None,
+            "location": location,
+            "pay_min": pay_min,
+            "pay_max": pay_max,
+            "posting_url": posting_url,
+            "apply_url": posting_url,
+        })
+    return jobs
+
+
+def fetch_simplyhired_jobs(keyword: str, limit: int = 25) -> list[dict]:
+    """Direct scrape of simplyhired.com/search?q=<keyword>&l=United+States -
+    confirmed real server-side keyword + location filtering, live-verified
+    against a "chief information officer" search restricted to "United
+    States" (real, relevant results - IT Director, CIO, CISO postings with
+    real salary/location/date-posted data, "2d"/"8d" recency stamps).
+
+    job_id is content-based (_stable_job_id()), NOT the /job/<token> href -
+    live-tested fetching the same search twice (same lesson as Indeed/
+    ZipRecruiter/Dice's MCP path): 7 of 8 matching postings kept the same
+    href token, but one didn't, so it's not safe to trust as a dedup key.
+    posting_url/apply_url still use the real (if occasionally reissued)
+    href, same "id is stable, link is whatever's live today" split used
+    everywhere else in this module."""
+    response = requests.get(
+        "https://www.simplyhired.com/search", params={"q": keyword, "l": "United States"}, headers=HEADERS, timeout=20,
+    )
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    jobs = []
+    for card in soup.select('[data-testid="searchSerpJob"]')[:limit]:
+        title_el = card.select_one('[data-testid="searchSerpJobTitle"]')
+        title_link = title_el.select_one("a") if title_el else None
+        if not title_link:
+            continue
+        company_el = card.select_one('[data-testid="companyName"]')
+        location_el = card.select_one('[data-testid="searchSerpJobLocation"]')
+        salary_el = card.select_one('[data-testid="salaryChip-0"]')
+
+        pay_min = pay_max = None
+        if salary_el:
+            nums = re.findall(r"[\d,]+", salary_el.get_text())
+            if nums:
+                pay_min = nums[0].replace(",", "")
+                pay_max = nums[1].replace(",", "") if len(nums) > 1 else pay_min
+
+        href = title_link.get("href")
+        posting_url = f"https://www.simplyhired.com{href}" if href and href.startswith("/") else href
+        title = title_link.get_text(strip=True)
+        organization = company_el.get_text(strip=True) if company_el else None
+        location = location_el.get_text(strip=True) if location_el else None
+        jobs.append({
+            "source": "SimplyHired",
+            "job_id": _stable_job_id("SimplyHired", title, organization, location),
             "title": title,
             "organization": organization,
             "location": location,

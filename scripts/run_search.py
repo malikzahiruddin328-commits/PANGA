@@ -11,10 +11,12 @@ connector tools) is dropped - see docs/native-packaging-scope.md's Phase 1
 spike. ZipRecruiter has no API usable outside that connector (only a
 "Publisher Partner" program built for job-aggregator sites, not a personal
 search tool) and Indeed's connector tool has no non-MCP equivalent either -
-both genuinely unavailable in a standalone build. Dice is the exception
-(investigated fresh 2026-08-06, see search/boards.py's fetch_dice_jobs()):
-its search-results page turned out to be plain server-rendered HTML, no MCP
-needed - STEP 2c below covers it directly. USAJOBS + company-site ATS APIs +
+both genuinely unavailable in a standalone build. Dice, Built In, and
+SimplyHired are the exceptions (Dice investigated 2026-08-06; Built In/
+SimplyHired added 2026-08-07 as part of the broad-scope-expansion work -
+see search/boards.py's module docstring for the recon behind all three):
+each turned out to be plain server-rendered HTML, no MCP needed - STEPs
+2c/2d/2e below cover them directly. USAJOBS + company-site ATS APIs +
 industry-board scraping + Adzuna (steps 1, 2b, 3, 4) are also unaffected,
 since none of those ever depended on MCP either.
 """
@@ -36,7 +38,7 @@ import yaml  # noqa: E402
 
 from notifications import send_notification  # noqa: E402
 from profile.storage import load_profile  # noqa: E402
-from search import aggregators, boards, company_sites, freshness_check, industry_boards, job_sources, job_store, usajobs  # noqa: E402
+from search import aggregators, boards, company_sites, freshness_check, industry_boards, job_sources, job_store, source_activity, usajobs  # noqa: E402
 from tailoring.applications import get_unreviewed_skip_reasons  # noqa: E402
 from tailoring.drafting import DraftingFailed, DraftingNotConfigured, score_job  # noqa: E402
 
@@ -55,18 +57,25 @@ def _log(message: str) -> None:
 
 def search_usajobs(target_roles: list[dict], job_series: list[str]) -> int:
     added = 0
+    attempts = errors = 0
     for role in target_roles:
+        attempts += 1
         try:
             jobs = usajobs.search_jobs(keyword=role["name"], results_per_page=50)
             added += job_store.save_jobs(jobs)
         except Exception as exc:  # noqa: BLE001 - one role's failure shouldn't stop the rest
+            errors += 1
             _log(f"  [usajobs] keyword search failed for {role['name']!r}: {exc}")
     for code in job_series:
+        attempts += 1
         try:
             jobs = usajobs.search_jobs(job_category_code=code, results_per_page=100)
             added += job_store.save_jobs(jobs)
         except Exception as exc:  # noqa: BLE001
+            errors += 1
             _log(f"  [usajobs] job-series search failed for {code!r}: {exc}")
+    if attempts:
+        source_activity.record_run_result("USAJOBS", added, had_error=errors == attempts)
     return added
 
 
@@ -85,16 +94,25 @@ def search_aggregators(target_roles: list[dict], countries: list[str]) -> int:
         return 0
 
     added = 0
+    attempts = errors = 0
     for role in target_roles:
         for country in countries:
+            attempts += 1
             try:
                 jobs = aggregators.fetch_adzuna_jobs(role["name"], country, limit=25)
                 added += job_store.save_jobs(jobs)
             except aggregators.AdzunaBudgetExceeded as exc:
                 _log(f"  [aggregators] {exc} - stopping Adzuna search for the rest of this run")
+                # Budget exhaustion isn't evidence of staleness (or of
+                # anything about Adzuna's own posting activity) - it means
+                # this run stopped early, not that no new jobs exist.
+                source_activity.record_run_result("Adzuna", added, had_error=True)
                 return added
             except Exception as exc:  # noqa: BLE001 - one (role, country) pair's failure shouldn't stop the rest
+                errors += 1
                 _log(f"  [aggregators] Adzuna search failed for {role['name']!r} / {country!r}: {exc}")
+    if attempts:
+        source_activity.record_run_result("Adzuna", added, had_error=errors == attempts)
     return added
 
 
@@ -103,12 +121,54 @@ def search_dice(target_roles: list[dict]) -> int:
     why this is safe to run unattended (server-rendered, plain `requests`
     reaches it fine, unlike ZipRecruiter/Indeed's WAF)."""
     added = 0
+    errors = 0
     for role in target_roles:
         try:
             jobs = boards.fetch_dice_jobs(role["name"], limit=25)
             added += job_store.save_jobs(jobs)
         except Exception as exc:  # noqa: BLE001 - one role's failure shouldn't stop the rest
+            errors += 1
             _log(f"  [boards] Dice search failed for {role['name']!r}: {exc}")
+    if target_roles:
+        source_activity.record_run_result("Dice", added, had_error=errors == len(target_roles))
+    return added
+
+
+def search_built_in(target_roles: list[dict]) -> int:
+    """Direct scrape, no MCP - see boards.fetch_built_in_jobs()'s docstring.
+    Searched per target-role keyword, same reasoning as search_dice(): an
+    unfiltered fetch of a broad multi-employer board could pull in
+    thousands of unrelated roles (Zahir's own example: a nurse, a supply-
+    chain specialist), unlike Greenhouse/Lever's fetch-everything pattern,
+    which only stays safe because it's bounded to one company's postings."""
+    added = 0
+    errors = 0
+    for role in target_roles:
+        try:
+            jobs = boards.fetch_built_in_jobs(role["name"], limit=25)
+            added += job_store.save_jobs(jobs)
+        except Exception as exc:  # noqa: BLE001 - one role's failure shouldn't stop the rest
+            errors += 1
+            _log(f"  [boards] Built In search failed for {role['name']!r}: {exc}")
+    if target_roles:
+        source_activity.record_run_result("Built In", added, had_error=errors == len(target_roles))
+    return added
+
+
+def search_simplyhired(target_roles: list[dict]) -> int:
+    """Direct scrape, no MCP - see boards.fetch_simplyhired_jobs()'s
+    docstring. Same per-target-role-keyword reasoning as search_built_in()."""
+    added = 0
+    errors = 0
+    for role in target_roles:
+        try:
+            jobs = boards.fetch_simplyhired_jobs(role["name"], limit=25)
+            added += job_store.save_jobs(jobs)
+        except Exception as exc:  # noqa: BLE001
+            errors += 1
+            _log(f"  [boards] SimplyHired search failed for {role['name']!r}: {exc}")
+    if target_roles:
+        source_activity.record_run_result("SimplyHired", added, had_error=errors == len(target_roles))
     return added
 
 
@@ -117,25 +177,42 @@ def search_company_sites(target_roles: list[dict]) -> int:
     Settings tab, not hardcoded here) - see search/job_sources.py."""
     sources = job_sources.load_job_sources()
     added = 0
+    # Per-company stats accumulated across the whole role loop (a company
+    # is searched once per target role) so each company's activity gets
+    # recorded exactly once per run, not once per role.
+    stats = {c["company_name"]: [0, 0, 0] for c in sources["workday"] + sources["smartrecruiters"]}  # [added, attempts, errors]
     for role in target_roles:
         for company in sources["workday"]:
+            name = company["company_name"]
+            stats[name][1] += 1
             try:
                 jobs = company_sites.search_workday_jobs(
-                    company["company_name"], company["tenant"], company["site"], company["wd_number"],
+                    name, company["tenant"], company["site"], company["wd_number"],
                     keyword=role["name"], limit=company["limit"],
                     applied_facets=company.get("applied_facets"),
                 )
-                added += job_store.save_jobs(jobs)
+                got = job_store.save_jobs(jobs)
+                added += got
+                stats[name][0] += got
             except Exception as exc:  # noqa: BLE001 - one company's failure shouldn't stop the rest
-                _log(f"  [company_sites] Workday search failed for {company['company_name']} / {role['name']!r}: {exc}")
+                stats[name][2] += 1
+                _log(f"  [company_sites] Workday search failed for {name} / {role['name']!r}: {exc}")
         for company in sources["smartrecruiters"]:
+            name = company["company_name"]
+            stats[name][1] += 1
             try:
                 jobs = company_sites.search_smartrecruiters_jobs(
-                    company["company_name"], company["company_id"], keyword=role["name"], limit=company["limit"],
+                    name, company["company_id"], keyword=role["name"], limit=company["limit"],
                 )
-                added += job_store.save_jobs(jobs)
+                got = job_store.save_jobs(jobs)
+                added += got
+                stats[name][0] += got
             except Exception as exc:  # noqa: BLE001
-                _log(f"  [company_sites] SmartRecruiters search failed for {company['company_name']} / {role['name']!r}: {exc}")
+                stats[name][2] += 1
+                _log(f"  [company_sites] SmartRecruiters search failed for {name} / {role['name']!r}: {exc}")
+    for name, (company_added, attempts, errors) in stats.items():
+        if attempts:
+            source_activity.record_run_result(name, company_added, had_error=errors == attempts)
     return added
 
 
@@ -150,21 +227,25 @@ def search_ats_boards() -> int:
     sources = job_sources.load_job_sources()
     added = 0
     for company in sources["greenhouse"]:
+        name = company["company_name"]
         try:
-            jobs = company_sites.search_greenhouse_jobs(
-                company["company_name"], company["board_token"], limit=company["limit"],
-            )
-            added += job_store.save_jobs(jobs)
+            jobs = company_sites.search_greenhouse_jobs(name, company["board_token"], limit=company["limit"])
+            got = job_store.save_jobs(jobs)
+            added += got
+            source_activity.record_run_result(name, got, had_error=False)
         except Exception as exc:  # noqa: BLE001 - one company's failure shouldn't stop the rest
-            _log(f"  [company_sites] Greenhouse search failed for {company['company_name']}: {exc}")
+            source_activity.record_run_result(name, 0, had_error=True)
+            _log(f"  [company_sites] Greenhouse search failed for {name}: {exc}")
     for company in sources["lever"]:
+        name = company["company_name"]
         try:
-            jobs = company_sites.search_lever_jobs(
-                company["company_name"], company["company_slug"], limit=company["limit"],
-            )
-            added += job_store.save_jobs(jobs)
+            jobs = company_sites.search_lever_jobs(name, company["company_slug"], limit=company["limit"])
+            got = job_store.save_jobs(jobs)
+            added += got
+            source_activity.record_run_result(name, got, had_error=False)
         except Exception as exc:  # noqa: BLE001
-            _log(f"  [company_sites] Lever search failed for {company['company_name']}: {exc}")
+            source_activity.record_run_result(name, 0, had_error=True)
+            _log(f"  [company_sites] Lever search failed for {name}: {exc}")
     return added
 
 
@@ -174,7 +255,23 @@ _INDUSTRY_BOARD_FETCHERS = [
     ("Beacon Hill", industry_boards.fetch_beacon_hill_jobs),
     ("Atrium", industry_boards.fetch_atrium_jobs),
     ("GForce", industry_boards.fetch_gforce_jobs),
-    ("Rigzone", industry_boards.fetch_rigzone_jobs),
+    # Rigzone dropped from the daily run (2026-08-07, Zahir's explicit call
+    # via General) - live-checked during the board-scope-expansion work and
+    # its own site-wide listing (no filter at all) is only ~4-6 postings
+    # right now, vs. "thousands unfiltered" at its original 2026-08-04
+    # recon. Fails merit criterion #1 (real recent activity) outright -
+    # fixing fetch_rigzone_jobs()'s location default (currently defaults to
+    # "United Kingdom", never overridden here, a separate real bug also
+    # found during this pass) wouldn't fix a source that's nearly dead
+    # right now regardless of which country it's pointed at. Function kept
+    # as-is, not deleted, so it's easy to re-enable if Rigzone's volume
+    # recovers - source_activity.py (added this same pass) will surface
+    # that automatically once enough of the OTHER sources below run
+    # consecutively without Rigzone contributing to a false "stale"
+    # judgment on itself while it's disabled (is_source_stale() only
+    # counts REAL runs, and a disabled source simply gets no new runs
+    # recorded at all rather than being force-fed zeros).
+    # ("Rigzone", industry_boards.fetch_rigzone_jobs),
     # IChemE Job Board deliberately NOT wired in here - fetch_icheme_jobs()
     # below is written and its parsing logic verified against real markup,
     # but the live site 403s Python's requests library specifically (works
@@ -189,8 +286,11 @@ def search_industry_boards() -> int:
     for name, fetch in _INDUSTRY_BOARD_FETCHERS:
         try:
             jobs = fetch(limit=25)
-            added += job_store.save_jobs(jobs)
+            got = job_store.save_jobs(jobs)
+            added += got
+            source_activity.record_run_result(name, got, had_error=False)
         except Exception as exc:  # noqa: BLE001 - one site's failure shouldn't stop the rest
+            source_activity.record_run_result(name, 0, had_error=True)
             _log(f"  [industry_boards] {name} fetch failed: {exc}")
     return added
 
@@ -255,6 +355,14 @@ def run() -> None:
 
     _log("STEP 2c - Dice (direct scrape, no MCP needed - see boards.fetch_dice_jobs())")
     added = search_dice(target_roles)
+    _log(f"  added {added} new job(s)")
+
+    _log("STEP 2d - Built In (direct scrape, no MCP needed)")
+    added = search_built_in(target_roles)
+    _log(f"  added {added} new job(s)")
+
+    _log("STEP 2e - SimplyHired (direct scrape, no MCP needed)")
+    added = search_simplyhired(target_roles)
     _log(f"  added {added} new job(s)")
 
     _log("STEP 3 - Company career sites")

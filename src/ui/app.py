@@ -70,6 +70,7 @@ from search.job_store import load_jobs
 from search.job_sources import load_job_sources, save_job_sources
 from search.job_alert_senders import load_job_alert_senders, save_job_alert_senders
 from search.aggregators import ADZUNA_COUNTRIES, is_configured as adzuna_is_configured
+from search.source_activity import all_tracked_sources, is_source_stale
 from ranking.prioritize import weight_for, dedupe_across_sources
 from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion, set_strategy_tag, needs_edit_review, record_document_edit_review, get_applications_with_open_clarifying_questions
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
@@ -297,27 +298,46 @@ def compute_results_ranked(
     return dedupe_across_sources(ranked)
 
 
-def _format_last_synced(iso_timestamp: str | None) -> str:
+# The real Gmail scan (panga-gmail-cta-scan) runs 4x/day - 8am, 12pm, 4pm,
+# 8pm local - see docs/email-monitoring-task.md. Flagging staleness at
+# double that interval (8 hours) means one slightly-late run never
+# false-positives, but a genuinely missed cycle always does.
+CTA_SCAN_INTERVAL_HOURS = 4
+CTA_SCAN_STALE_AFTER_HOURS = CTA_SCAN_INTERVAL_HOURS * 2
+
+
+def _format_last_synced(iso_timestamp: str | None) -> tuple[str, bool]:
     """Human-readable "Last synced ..." line for the Call to Action tab's
-    status card. `iso_timestamp` is fulfillment.get_last_synced_at()'s
-    return value - None if fulfillment has never completed a run."""
+    status card, plus whether it's stale enough to warrant a warning.
+    `iso_timestamp` is fulfillment.get_last_synced_at()'s return value -
+    None if fulfillment has never completed a run.
+
+    Returns (text, is_stale). Without this, "All caught up" (positive/
+    green) and a last-synced time well past the expected scan cadence look
+    equally healthy - nothing distinguishes "genuinely caught up" from
+    "caught up as of a stale scan, so something new could be sitting
+    unprocessed right now and we just don't know yet" (Zahir's live-testing
+    finding, 2026-08-06, production instance - a real "Last synced 19 hours
+    ago" read as fine when it very much wasn't)."""
     if not iso_timestamp:
-        return "Never synced yet"
+        return "Never synced yet", True
     try:
         synced_at = datetime.fromisoformat(iso_timestamp)
     except ValueError:
-        return "Last synced: unknown"
+        return "Last synced: unknown", True
     now = datetime.now(timezone.utc) if synced_at.tzinfo else datetime.now()
-    minutes = max(0, int((now - synced_at).total_seconds() // 60))
+    elapsed_seconds = (now - synced_at).total_seconds()
+    minutes = max(0, int(elapsed_seconds // 60))
+    is_stale = elapsed_seconds / 3600 > CTA_SCAN_STALE_AFTER_HOURS
     if minutes < 1:
-        return "Last synced just now"
+        return "Last synced just now", is_stale
     if minutes < 60:
-        return f"Last synced {minutes} minute{'s' if minutes != 1 else ''} ago"
+        return f"Last synced {minutes} minute{'s' if minutes != 1 else ''} ago", is_stale
     hours = minutes // 60
     if hours < 24:
-        return f"Last synced {hours} hour{'s' if hours != 1 else ''} ago"
+        return f"Last synced {hours} hour{'s' if hours != 1 else ''} ago", is_stale
     days = hours // 24
-    return f"Last synced {days} day{'s' if days != 1 else ''} ago"
+    return f"Last synced {days} day{'s' if days != 1 else ''} ago", is_stale
 
 
 _PROGRESS_CHAR_RE = re.compile(r"([\d,]+) characters")
@@ -1262,6 +1282,19 @@ if active_tab == "settings":
         "Lever; find a company's own tenant/ID from its careers URL (see "
         "the field hints below)."
     )
+    # Source-level activity hint (2026-08-07) - a source producing zero new
+    # jobs for several real runs in a row (Rigzone's own volume drop was
+    # the live example that motivated this) probably isn't worth keeping,
+    # but that's a call for a person to make, not something auto-removed -
+    # this just surfaces the real data instead of needing another manual
+    # recon pass to notice.
+    stale_sources = [s for s in all_tracked_sources() if is_source_stale(s)]
+    if stale_sources:
+        st.warning(
+            "These sources haven't added a new job in several recent runs "
+            "- worth checking whether they're still active, or removing "
+            f"them: {', '.join(stale_sources)}."
+        )
     with st.expander("Manage companies", expanded=False):
         job_sources_data = load_job_sources()
 
@@ -1900,14 +1933,26 @@ elif active_tab == "cta":
         sync_icon, sync_headline = (":material/task_alt:", "All caught up") if sync_pending == 0 else (
             ":material/sync:", f"{sync_pending} update{'s' if sync_pending != 1 else ''} to send",
         )
-        sync_cols = st.columns([1, 4, 2], vertical_alignment="center")
+        last_synced_text, sync_is_stale = _format_last_synced(get_last_synced_at())
+        # Compact single-line status (Zahir's live-testing feedback,
+        # 2026-08-06, found on the production instance): icon, headline,
+        # and last-synced text used to be a big H2-sized icon in its own
+        # column (most of the "dead whitespace on the left") next to two
+        # stacked lines - folded into one markdown line instead, same
+        # "fold it into one string" approach the CTA stat strip already
+        # uses just below this card. The button no longer forces
+        # width="stretch" (was disproportionately wide for "Send and
+        # receive" next to the small, content-sized "Reload view" button
+        # right below it - now both size to their own label).
+        if sync_is_stale:
+            status_line = f"{sync_icon} **{sync_headline}** · :orange[:material/warning: {last_synced_text} - a new scan may be overdue]"
+        else:
+            status_line = f"{sync_icon} **{sync_headline}** · {last_synced_text}"
+        sync_cols = st.columns([5, 2], vertical_alignment="center")
         with sync_cols[0]:
-            st.markdown(f"## {sync_icon}")
+            st.markdown(status_line)
         with sync_cols[1]:
-            st.markdown(f"**{sync_headline}**")
-            st.markdown(_format_last_synced(get_last_synced_at()))
-        with sync_cols[2]:
-            if st.button("Send and receive", type="primary", key="manual_sync_button", width="stretch"):
+            if st.button("Send and receive", type="primary", key="manual_sync_button"):
                 with st.spinner("Syncing - archiving, drafting replies, checking sent drafts..."):
                     sync_summary = run_full_fulfillment()
                 parts = []

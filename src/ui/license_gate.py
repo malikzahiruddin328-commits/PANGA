@@ -85,7 +85,23 @@ def render_block_screen(result: dict) -> None:
         )
         return
 
-    if state in ("locked", "never_verified"):
+    if state == "never_verified":
+        # A first-ever check-in (fresh signup) that hit a transient hiccup
+        # (e.g. a cold-start timeout during device activation) - NOT the
+        # same situation as "locked" below (3 real days offline). Reusing
+        # that copy here would tell a customer who signed up seconds ago
+        # that they've been offline for days, which is just wrong.
+        st.error(
+            "We couldn't verify your license just now. Check your internet "
+            "connection and try again.",
+            icon=":material/wifi_off:",
+        )
+        if st.button("Try again", key="license_refresh_never_verified"):
+            _run_check_in()
+            st.rerun()
+        return
+
+    if state == "locked":
         st.error(
             "We haven't been able to verify your license in 3 days — "
             "connect to the internet and reopen Panga.\n\n"

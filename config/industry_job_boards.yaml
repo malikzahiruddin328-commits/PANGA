@@ -13,7 +13,12 @@
 #                    plain requests/BeautifulSoup won't work here
 #   blocked       -> confirmed 2026-07-29: 403/429 on repeated attempts, active
 #                    bot-blocking - not a plain-requests target
-# status: candidate (researched, not yet built against) | built | rejected
+# status: candidate (researched, not yet built against) | built | rejected |
+#   disabled (was built and working, code kept as-is, deliberately not run
+#   in the daily flow right now - e.g. Rigzone 2026-08-07, current live
+#   volume too low to meet the merit bar; see its own note for the
+#   re-enable condition, and src/search/source_activity.py for the
+#   mechanism meant to catch this automatically going forward)
 #
 # Full-site reconnaissance done 2026-07-29 (19 sites checked for scrapeability
 # before writing any scraper code) - see docs/daily-job-search-task.md for the
@@ -223,9 +228,9 @@ uk_energy_job_boards:
 
   - name: Rigzone
     url: "https://www.rigzone.com/oil/jobs/search/"
-    note: "Confirmed SCRAPEABLE 2026-08-03 - real listings server-rendered in raw HTML (title/company/location, e.g. 'Warehouse & Yard Operator' - Baker Hughes, Prudhoe Bay AK), '1 - 20 of thousands of Jobs' pagination visible. Global board, not UK-specific, so would need a location/keyword filter to narrow to UK roles - not attempted, recon only. BUILT 2026-08-04 (src/search/industry_boards.py fetch_rigzone_jobs) - confirmed the site's own ?sl=<text> location field filters server-side (143 UK jobs vs. thousands unfiltered), so the scraper passes sl=\"United Kingdom\" instead of scraping everything."
+    note: "Confirmed SCRAPEABLE 2026-08-03 - real listings server-rendered in raw HTML (title/company/location, e.g. 'Warehouse & Yard Operator' - Baker Hughes, Prudhoe Bay AK), '1 - 20 of thousands of Jobs' pagination visible. Global board, not UK-specific, so would need a location/keyword filter to narrow to UK roles - not attempted, recon only. BUILT 2026-08-04 (src/search/industry_boards.py fetch_rigzone_jobs) - confirmed the site's own ?sl=<text> location field filters server-side (143 UK jobs vs. thousands unfiltered), so the scraper passes sl=\"United Kingdom\" instead of scraping everything. DISABLED 2026-08-07 (Zahir's explicit call, via General) - live-rechecked during the board-scope-expansion work and the site's own unfiltered listing is only ~4-6 postings total right now, down from the 'thousands' this recon found - fails the US-only-board merit criterion #1 (real recent activity) outright. Also fixed the location default (was defaulting to \"United Kingdom\", never overridden in the daily run - a separate real bug found the same pass) so the function is correct whenever it's re-enabled. Commented out, not deleted, in scripts/run_search.py's _INDUSTRY_BOARD_FETCHERS - see that comment for the re-enable condition."
     access_method: public_html
-    status: built
+    status: disabled
 
   - name: Oil & Gas Job Search
     url: "https://oilandgasjobsearch.com/jobs?title=uk"
