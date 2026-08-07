@@ -69,6 +69,7 @@ from search.usajobs import search_jobs, USAJobsNotConfigured
 from search.job_store import load_jobs
 from search.job_sources import load_job_sources, save_job_sources
 from search.aggregators import ADZUNA_COUNTRIES, is_configured as adzuna_is_configured
+from search.source_activity import all_tracked_sources, is_source_stale
 from ranking.prioritize import weight_for, dedupe_across_sources
 from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion, set_strategy_tag, needs_edit_review, record_document_edit_review, get_applications_with_open_clarifying_questions
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
@@ -1261,6 +1262,19 @@ if active_tab == "settings":
         "Lever; find a company's own tenant/ID from its careers URL (see "
         "the field hints below)."
     )
+    # Source-level activity hint (2026-08-07) - a source producing zero new
+    # jobs for several real runs in a row (Rigzone's own volume drop was
+    # the live example that motivated this) probably isn't worth keeping,
+    # but that's a call for a person to make, not something auto-removed -
+    # this just surfaces the real data instead of needing another manual
+    # recon pass to notice.
+    stale_sources = [s for s in all_tracked_sources() if is_source_stale(s)]
+    if stale_sources:
+        st.warning(
+            "These sources haven't added a new job in several recent runs "
+            "- worth checking whether they're still active, or removing "
+            f"them: {', '.join(stale_sources)}."
+        )
     with st.expander("Manage companies", expanded=False):
         job_sources_data = load_job_sources()
 
