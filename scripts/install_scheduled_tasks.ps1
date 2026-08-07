@@ -1,8 +1,9 @@
-# Registers Panga's 3 background jobs as native Windows Task Scheduler
-# tasks (native-packaging branch, 2026-07-31) - replaces the Claude Code
-# scheduled tasks (panga-daily-job-search, panga-gmail-cta-scan,
-# panga-cta-fulfillment), which a standalone build can't carry (no live
-# Claude Code session to run them in). Same schedule as the originals (see
+# Registers Panga's background jobs as native Windows Task Scheduler
+# tasks (native-packaging branch, 2026-07-31; Panga-JobAlertScan added
+# 2026-08-07) - replaces the Claude Code scheduled tasks
+# (panga-daily-job-search, panga-gmail-cta-scan, panga-cta-fulfillment),
+# which a standalone build can't carry (no live Claude Code session to
+# run them in). Same schedule as the originals (see
 # docs/email-monitoring-task.md, docs/daily-job-search-task.md).
 #
 # Run this once from an elevated-or-not PowerShell (no admin rights needed
@@ -36,6 +37,18 @@ function Register-PangaTask {
     Write-Host "Registered '$Name'"
 }
 
+# panga-job-alert-scan -> once daily, 7:00am - runs shortly before
+# Panga-DailyJobSearch (7:26am) so listings this scan saves (which get no
+# fit_score of their own - see job_alert_scan.py's docstring) are already
+# in the store by the time that task's score_unscored_jobs() sweep runs,
+# rather than waiting a full extra day for the sweep after it. 1x/day
+# (not 4x/day like the CTA scan) per Zahir's explicit cost-conscious call
+# (relayed via General, 2026-08-07) - a new listing isn't time-critical
+# the way a CTA reply is, so this starts at the conservative end and can
+# be retuned later if daily turns out to miss anything in practice.
+$jobAlertTrigger = New-ScheduledTaskTrigger -Daily -At 7:00am
+Register-PangaTask -Name "Panga-JobAlertScan" -ScriptRelativePath "scripts\job_alert_scan.py" -Triggers @($jobAlertTrigger)
+
 # panga-daily-job-search -> once daily, 7:26am (same time as the original)
 $dailyTrigger = New-ScheduledTaskTrigger -Daily -At 7:26am
 Register-PangaTask -Name "Panga-DailyJobSearch" -ScriptRelativePath "scripts\run_search.py" -Triggers @($dailyTrigger)
@@ -60,7 +73,7 @@ $fulfillmentTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionI
 Register-PangaTask -Name "Panga-CtaFulfillment" -ScriptRelativePath "scripts\cta_fulfillment.py" -Triggers @($fulfillmentTrigger)
 
 Write-Host ""
-Write-Host "All 3 tasks registered. View/manage them with:"
+Write-Host "All 4 tasks registered. View/manage them with:"
 Write-Host "  Get-ScheduledTask -TaskName 'Panga-*'"
 Write-Host "  Start-ScheduledTask -TaskName 'Panga-DailyJobSearch'   # run one on demand"
-Write-Host "  .\scripts\uninstall_scheduled_tasks.ps1                # remove all 3"
+Write-Host "  .\scripts\uninstall_scheduled_tasks.ps1                # remove all 4"
