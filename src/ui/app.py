@@ -2337,6 +2337,13 @@ elif active_tab == "results":
     # anchor to match against, and the risk of wrongly merging two different
     # jobs is higher than the clutter cost.
     channels = list(dict.fromkeys(j["source"] for j in ranked))  # first-appearance order, dedup'd
+    # Computed once here (not per-job below) - CLAUDE.md's "avoid O(n^2)
+    # scans" guidance - so the resume-drafted expander below can
+    # default-open for a job with genuinely outstanding questions without
+    # re-scanning every application per job row.
+    open_gap_question_keys = {
+        (a.get("source"), a.get("job_id")) for a in get_applications_with_open_clarifying_questions()
+    }
 
     def dedupe_key(job):
         # Same title+org+location+pay within a channel = almost certainly the
@@ -2372,19 +2379,22 @@ elif active_tab == "results":
         # collapsed, matching the flat expanded=False every channel gets
         # here (no per-channel branching exists in this loop - all sources,
         # job boards and direct-company-sites alike, go through this same
-        # code). No expander-related key ever gets written to
-        # st.session_state elsewhere in this file either. Best explanation:
-        # without an explicit key, an expander's open/closed state lives
-        # only in the frontend's React tree, never synced to Python - once
-        # a channel is opened by hand in an already-connected browser tab,
-        # that tab keeps remembering it across reruns even though the
-        # underlying script always initializes to collapsed; a real hard
-        # reload resets it. Added an explicit, stable key below anyway -
-        # not a fix for a bug that didn't reproduce in the code, but it
-        # makes each expander's identity explicit rather than relying on
-        # Streamlit's implicit auto-generated one, which is better practice
-        # regardless and removes one hypothetical variable if this recurs.
-        with st.expander(f"{channel} ({len(deduped)}{dup_note})", expanded=False, key=f"channel_expander_{channel}"):
+        # code).
+        #
+        # A REAL bug in the same neighborhood surfaced later (2026-08-07,
+        # Zahir live-testing: answering a clarifying-questions box inside
+        # this expander collapsed the whole section on him mid-form). Root
+        # cause confirmed by reading the actual installed st.expander's
+        # docstring rather than guessing: "When on_change is set to 'rerun'
+        # or a callable, setting a key lets you read or update the expanded
+        # state via st.session_state[key]" - i.e. key= ALONE (without
+        # on_change) does nothing for server-side persistence; Python's
+        # `expanded=` argument is authoritative on every single rerun,
+        # silently overwriting whatever the user's own click set client-side
+        # the moment any nearby content shifts enough to force a resync
+        # (which answering a question inside it does). on_change="rerun"
+        # below is what actually makes the existing key= functional.
+        with st.expander(f"{channel} ({len(deduped)}{dup_note})", expanded=False, key=f"channel_expander_{channel}", on_change="rerun"):
             table_rows = []
             for job in deduped:
                 pay_min, pay_max = format_pay(job.get("pay_min")), format_pay(job.get("pay_max"))
@@ -2655,7 +2665,7 @@ elif active_tab == "results":
                                     st.code(value, language=None, wrap_lines=True)
                         continue
                     if drafted_text:
-                        auto_expand = False
+                        resume_expander_key = None
                         if doc_key == "resume":
                             # Zahir's explicit ask 2026-08-06: right after
                             # generating (or regenerating - answering a gap
@@ -2663,11 +2673,49 @@ elif active_tab == "results":
                             # "why this score" breakdown, and any outstanding
                             # questions must be part of what he sees
                             # immediately - not behind a click he has to
-                            # remember to make. One-shot: popped here so it
-                            # doesn't stay force-expanded on later, unrelated
-                            # visits to this same job.
-                            auto_expand = st.session_state.pop(f"just_drafted_resume_{job.get('source')}_{job.get('job_id')}", False)
-                        with st.expander(f"{doc_label} (drafted)", expanded=auto_expand):
+                            # remember to make.
+                            #
+                            # Used to be a one-shot session_state.pop() flag
+                            # feeding a bare `expanded=` - correct for
+                            # "flash open right after generating", wrong for
+                            # "stay open while actively answering the
+                            # questions inside it": every rerun answering a
+                            # question causes (any text_area losing focus
+                            # reruns the script, same as clicking anywhere
+                            # else) re-evaluated `expanded=auto_expand` as
+                            # False, since the flag was already consumed on
+                            # the very first render - collapsing the whole
+                            # section out from under him mid-form (2026-08-07
+                            # live-testing report). Fixed the same way as the
+                            # channel expander above: a real key= +
+                            # on_change="rerun" makes st.session_state[key]
+                            # the actual source of truth Streamlit itself
+                            # maintains across reruns, not something this
+                            # code has to re-derive from scratch every time.
+                            #
+                            # The one-shot force-open on fresh generation
+                            # still works - explicitly written into
+                            # session_state here, which is the documented,
+                            # now-supported way to control a key+on_change
+                            # expander from Python. Also defaults open (only
+                            # the very first time this key is ever seen in a
+                            # session - the `not in st.session_state` guard
+                            # keeps this from re-forcing a later manual
+                            # collapse back open) if this job genuinely has
+                            # unanswered questions, so coming back to a job
+                            # left mid-answer doesn't require remembering to
+                            # reopen it by hand.
+                            resume_expander_key = f"resume_drafted_open_{job.get('source')}_{job.get('job_id')}"
+                            just_drafted = st.session_state.pop(f"just_drafted_resume_{job.get('source')}_{job.get('job_id')}", False)
+                            has_open_questions = (job.get("source"), job.get("job_id")) in open_gap_question_keys
+                            if just_drafted or (resume_expander_key not in st.session_state and has_open_questions):
+                                st.session_state[resume_expander_key] = True
+                        with st.expander(
+                            f"{doc_label} (drafted)",
+                            expanded=st.session_state.get(resume_expander_key, False) if resume_expander_key else False,
+                            key=resume_expander_key,
+                            on_change="rerun" if resume_expander_key else "ignore",
+                        ):
                             if doc_key == "resume" and app_record.get("resume_ats_score") is not None:
                                 with st.container(border=True):
                                     if _job_has_captured_jd_text(job):
