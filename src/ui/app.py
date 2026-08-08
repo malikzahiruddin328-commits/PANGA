@@ -340,6 +340,44 @@ def _format_last_synced(iso_timestamp: str | None) -> tuple[str, bool]:
     return f"Last synced {days} day{'s' if days != 1 else ''} ago", is_stale
 
 
+def _cta_watch_signature() -> tuple:
+    """Cheap fingerprint of "would the Call to Action tab look any
+    different right now" - covers both things that can change it without
+    a click: panga-gmail-cta-scan adding/removing entries (doesn't touch
+    last_synced_at, that's fulfillment-only) and panga-cta-fulfillment
+    updating draft status on an existing entry or completing a sync.
+    Recomputed every tick of _cta_auto_refresh_watcher below; only ever
+    compared for equality, never displayed."""
+    cta = get_active_cta_emails()
+    entries = tuple(sorted(
+        (e.get("thread_id"), e.get("draft_created"), e.get("draft_requested"), e.get("draft_link"))
+        for e in cta
+    ))
+    return (entries, get_pending_count(), get_last_synced_at())
+
+
+@st.fragment(run_every="45s")
+def _cta_auto_refresh_watcher() -> None:
+    """Replaces the old "Reload view" button (2026-08-08, Mirror's sweep +
+    Zahir mockup approval): that button's only real purpose was catching
+    background-scheduled-task updates when Zahir hadn't otherwise
+    interacted with the page - there's no caching anywhere in this data
+    path, so literally any other click already re-reads fresh disk data
+    for free. This polls the same on-disk signature on a timer instead and
+    forces a full rerun only when it actually changed, so an unattended
+    tab quietly catches up on its own. A no-op tick (nothing changed, the
+    overwhelmingly common case) touches nothing else on the page - no
+    flicker, no risk of interrupting an in-progress "Send and receive"
+    click, since that owns its own session_state flag independent of this
+    watcher's ticks."""
+    sig = _cta_watch_signature()
+    watch_key = "cta_watch_signature"
+    previous = st.session_state.get(watch_key)
+    st.session_state[watch_key] = sig
+    if previous is not None and previous != sig:
+        st.rerun()
+
+
 _PROGRESS_CHAR_RE = re.compile(r"([\d,]+) characters")
 
 # Rough expected output length per direct-API call, used only to make a
@@ -1960,7 +1998,18 @@ elif active_tab == "cta":
     # container instead of per-section. flex-wrap keeps it from
     # overflowing horizontally on a narrower window - it wraps to more
     # lines instead, verified down to mobile width.
+    #
+    # "Reload view" (the old plain st.rerun() button) is gone as of
+    # 2026-08-08 (Mirror's sweep + Zahir mockup approval) - its only real
+    # job was catching a background-scheduled-task update when Zahir
+    # hadn't otherwise interacted with the page, which
+    # _cta_auto_refresh_watcher() below now does on its own timer. Every
+    # other click already re-reads fresh disk data for free (no caching in
+    # this path), so a manual "reload" button was never actually needed
+    # for anything a click elsewhere in the app wouldn't already do.
     header_key = "cta_header_row"
+    sync_in_progress_key = "cta_sync_in_progress"
+    syncing = st.session_state.get(sync_in_progress_key, False)
     st.html(f"""<style>
 .st-key-{header_key}[data-testid="stVerticalBlock"] {{
     display: flex !important;
@@ -1974,12 +2023,40 @@ elif active_tab == "cta":
     width: fit-content !important;
     flex: 0 0 auto !important;
 }}
+.st-key-manual_sync_button [data-testid="stIconMaterial"] {{
+    animation: panga-btn-spin 1s linear infinite;
+}}
+@keyframes panga-btn-spin {{
+    from {{ transform: rotate(0deg); }}
+    to {{ transform: rotate(360deg); }}
+}}
+@media (prefers-reduced-motion: reduce) {{
+    .st-key-manual_sync_button [data-testid="stIconMaterial"] {{
+        animation: none;
+    }}
+}}
 </style>""")
     with st.container(key=header_key):
         st.markdown(status_line)
-        if st.button("Send and receive", type="primary", key="manual_sync_button"):
+        # Two-phase button (Zahir's mockup-approved ask, 2026-08-08 - the
+        # click needs its OWN visible feedback, not just the st.spinner
+        # overlay below): a single script run can't repaint a widget
+        # mid-execution, so the disabled/"Syncing..." state has to be its
+        # own rerun before the real work starts, not something toggled
+        # around the same st.button() call the click came from.
+        clicked = st.button(
+            "Syncing..." if syncing else "Send and receive",
+            type="primary", key="manual_sync_button",
+            icon=":material/progress_activity:" if syncing else None,
+            disabled=syncing,
+        )
+        if clicked and not syncing:
+            st.session_state[sync_in_progress_key] = True
+            st.rerun()
+        if syncing:
             with st.spinner("Syncing - archiving, drafting replies, checking sent drafts..."):
                 sync_summary = run_full_fulfillment()
+            st.session_state[sync_in_progress_key] = False
             parts = []
             if sync_summary["archived"]:
                 parts.append(f"{sync_summary['archived']} archived")
@@ -1993,18 +2070,9 @@ elif active_tab == "cta":
             else:
                 st.toast(f"Synced: {summary_text}.", icon=":material/check_circle:")
             st.rerun()
-        # Was labeled "Refresh", which read as "go check Gmail again" -
-        # it's actually just st.rerun(), no Gmail call at all (Mirror's
-        # first UI/UX review pass, 2026-08-06). "Send and receive" above is
-        # the one that does real syncing; this button's real, honest
-        # purpose is re-reading the on-disk CTA/application stores without
-        # a Gmail round-trip - useful right after a scheduled task updates
-        # them in the background, or after an action taken elsewhere in
-        # the app. Kept, just renamed to say what it actually does.
-        if st.button("Reload view", help="Re-reads the current data without contacting Gmail - use \"Send and receive\" above for a real sync."):
-            st.rerun()
         for cat in CATEGORY_ORDER:
             st.badge(f"{CATEGORY_LABELS[cat]} **{counts[cat]}**", color=CATEGORY_COLORS[cat])
+    _cta_auto_refresh_watcher()
 
     f1, f2 = st.columns([1, 2])
     with f1:
