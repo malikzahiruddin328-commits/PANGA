@@ -70,9 +70,27 @@ def add_manual_job(
     URLs carry the real job ID in the path (/jobs/view/<digits>/), which
     stays stable even when tracking query params differ between pastes: a
     hash of the full URL would treat those as different jobs.
+
+    A blank posting_url falls back to hashing title+organization+
+    description instead of the (empty) URL - found 2026-08-08 via a manual
+    backlog catch-up run: hashing "" always produces the same job_id, so
+    two genuinely different listings that both happened to have no URL
+    would collide and save_jobs()'s (source, job_id) dedup would silently
+    drop the second one as a "duplicate" of the first. This caller's own
+    UI form requires posting_url, and scripts/job_alert_scan.py already
+    skips any extracted listing with no posting_url before ever reaching
+    here - so this wasn't observed to actually collide in practice - but
+    a future caller with no such guard would hit it silently, so it's
+    fixed at the source rather than left as an implicit assumption only
+    today's two callers happen to uphold.
     """
     match = LINKEDIN_JOB_ID_RE.search(posting_url)
-    job_id = match.group(1) if match else hashlib.sha256(posting_url.encode()).hexdigest()[:16]
+    if match:
+        job_id = match.group(1)
+    elif posting_url:
+        job_id = hashlib.sha256(posting_url.encode()).hexdigest()[:16]
+    else:
+        job_id = hashlib.sha256(f"{title}|{organization}|{description}".encode()).hexdigest()[:16]
 
     job = {
         "source": source,

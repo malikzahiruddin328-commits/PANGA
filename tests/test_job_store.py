@@ -42,6 +42,27 @@ def test_add_manual_job_hashes_url_when_no_linkedin_id_present(isolated_data):
     assert len(job["job_id"]) == 16
 
 
+def test_add_manual_job_blank_url_falls_back_to_content_hash_not_empty_string_hash(isolated_data):
+    # Real gap found 2026-08-08: hashing "" always produces the same
+    # job_id, so two genuinely different blank-URL listings would collide
+    # and the second would be silently dropped as a "duplicate" by
+    # save_jobs()'s (source, job_id) dedup.
+    job_a = job_store.add_manual_job(title="CIO", organization="Acme Corp", location="Remote", description="d1", posting_url="", source="lensa")
+    job_b = job_store.add_manual_job(title="VP IT", organization="Beta Inc", location="NYC", description="d2", posting_url="", source="lensa")
+    assert job_a["job_id"] != job_b["job_id"]
+    assert len(job_store.load_jobs()) == 2
+
+
+def test_add_manual_job_blank_url_same_content_still_dedupes(isolated_data):
+    # Two blank-URL listings with genuinely identical title/organization/
+    # description ARE meant to collide - that's a real duplicate, not the
+    # bug above.
+    job_a = job_store.add_manual_job(title="CIO", organization="Acme Corp", location="Remote", description="d1", posting_url="", source="lensa")
+    job_b = job_store.add_manual_job(title="CIO", organization="Acme Corp", location="Remote", description="d1", posting_url="", source="lensa")
+    assert job_a["job_id"] == job_b["job_id"]
+    assert len(job_store.load_jobs()) == 1
+
+
 def test_update_job_score_sets_fields_on_matching_job(isolated_data):
     job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}])
     job_store.update_job_score("Dice", "1", 85, "Strong match")

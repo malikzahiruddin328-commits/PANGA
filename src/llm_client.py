@@ -109,6 +109,21 @@ class LLMCallFailed(Exception):
     pass
 
 
+class LLMResponseTruncated(LLMCallFailed):
+    """Raised specifically when stop_reason == "max_tokens" - a subclass of
+    LLMCallFailed (not a separate hierarchy) so every existing `except
+    LLMCallFailed` elsewhere keeps catching this the same way it always
+    did. Exists so a caller that CAN meaningfully react to truncation
+    specifically (e.g. retry the same call with a higher max_tokens) can
+    catch just this, instead of the generic LLMCallFailed a refusal or
+    invalid-JSON response also raises - those aren't fixed by a bigger
+    token budget, so conflating them would make a blind retry-on-any-
+    failure just as likely to retry something a bigger budget can't help.
+    Added 2026-08-08 for tailoring.job_alert_reasoning.extract_listings'
+    escalating-max_tokens retry - see that module for why."""
+    pass
+
+
 def _call_with_retries(make_request, primary_model: str, on_retry=None):
     """Runs make_request(model) against `primary_model`, retrying up to
     _MAX_ATTEMPTS total attempts (with exponential backoff) on transient
@@ -222,7 +237,7 @@ def call_structured(
     if response.stop_reason == "refusal":
         raise LLMCallFailed(refusal_message)
     if response.stop_reason == "max_tokens":
-        raise LLMCallFailed("The response was cut off before finishing. Try again.")
+        raise LLMResponseTruncated("The response was cut off before finishing. Try again.")
 
     text_block = next((b.text for b in response.content if b.type == "text"), None)
     if not text_block:
