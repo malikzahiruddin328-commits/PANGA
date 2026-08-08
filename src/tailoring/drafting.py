@@ -296,6 +296,7 @@ def generate_target_roles(resume_text: str, industries: list[str], seniority: st
         model=model,
         effort="high",
         refusal_message="Claude declined to propose target roles. Try again.",
+        purpose="target_roles",
     )
 
     ladder_industry = data.get("ladder_industry")
@@ -421,6 +422,7 @@ def _extract_ats_keywords(client: "anthropic.Anthropic", job: dict, model: str |
     ]))
     if not posting_text.strip():
         return [], []
+    job_key = (job["source"], job["job_id"]) if job.get("source") and job.get("job_id") else None
     try:
         data = call_structured(
             client,
@@ -431,6 +433,8 @@ def _extract_ats_keywords(client: "anthropic.Anthropic", job: dict, model: str |
             model=model,
             effort="medium",
             refusal_message="Claude declined to extract ATS keywords.",
+            purpose="ats_keyword_extraction",
+            job_key=job_key,
         )
     except (DraftingNotConfigured, DraftingFailed):
         return [], []
@@ -480,6 +484,7 @@ def score_job(job: dict, profile: dict, model: str | None = None, on_progress=No
         "JOB POSTING:\n" + json.dumps(job, indent=2, default=str) +
         "\n\nCANDIDATE'S MASTER PROFILE:\n" + json.dumps(profile, indent=2, default=str)
     )
+    job_key = (job["source"], job["job_id"]) if job.get("source") and job.get("job_id") else None
     data = call_structured(
         client,
         system=SCORE_SYSTEM_PROMPT,
@@ -490,6 +495,8 @@ def score_job(job: dict, profile: dict, model: str | None = None, on_progress=No
         effort="high",
         on_progress=on_progress,
         refusal_message="Claude declined to score this job. Try again.",
+        purpose="fit_score",
+        job_key=job_key,
     )
     return {"fit_score": data["fit_score"], "fit_rationale": data["fit_rationale"]}
 
@@ -843,6 +850,7 @@ def _draft_one(
         if on_progress:
             on_progress(doc_index, doc_total, doc_key, substatus)
 
+    job_key = (job["source"], job["job_id"]) if job and job.get("source") and job.get("job_id") else None
     data = call_structured(
         client,
         system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
@@ -856,6 +864,8 @@ def _draft_one(
             "Claude declined to draft this document. This is unusual for resume "
             "content - try again, or check the job posting text for anything unusual."
         ),
+        purpose=f"draft_{doc_key}",
+        job_key=job_key,
     )
 
     if doc_key == "resume":
@@ -903,7 +913,10 @@ def _draft_one(
     return data.get(doc_key, "")
 
 
-def _lookup_company_address(client: "anthropic.Anthropic", organization: str, location: str | None) -> str | None:
+def _lookup_company_address(
+    client: "anthropic.Anthropic", organization: str, location: str | None,
+    job_key: tuple[str, str] | None = None,
+) -> str | None:
     """Looks up an organization's real mailing/headquarters address via the
     Claude API's server-side web search tool, for the cover letter's
     recipient block - never guessed, only used if a real source turns up.
@@ -925,6 +938,8 @@ def _lookup_company_address(client: "anthropic.Anthropic", organization: str, lo
         user_content=f"Company: {organization}{location_hint}",
         max_tokens=300,
         max_uses=3,
+        purpose="company_address_lookup",
+        job_key=job_key,
     )
     if not text or text == "NOT_FOUND" or len(text) > 300:
         return None
@@ -985,10 +1000,11 @@ def generate_documents(
         return {}
 
     client = _client()
+    job_key = (job["source"], job["job_id"]) if job.get("source") and job.get("job_id") else None
     if "cover_letter" in doc_keys and "organization_address" not in job and job.get("organization"):
         from search.job_store import update_job_address
 
-        address = _lookup_company_address(client, job["organization"], job.get("location")) or ""
+        address = _lookup_company_address(client, job["organization"], job.get("location"), job_key) or ""
         job["organization_address"] = address
         update_job_address(job.get("source"), job.get("job_id"), address)
 
@@ -1011,6 +1027,76 @@ def generate_documents(
             on_progress(i, total, doc_key)
         results[doc_key] = _draft_one(client, shared_context, doc_key, model, on_progress, i, total, job=job, profile=profile)
     return results
+
+
+def check_regenerate_impact(job: dict, app_record: dict, profile: dict) -> dict:
+    """Score-first-resume-flow spec item 6: when "Generate" is clicked
+    again for a job that already has a resume, tells the caller (UI
+    refinement's confirmation popup) whether there's genuinely new
+    confirmed info to incorporate, and the real numbers to show either
+    way - never a UI-side approximation of arithmetic this module already
+    owns.
+
+    Returns {"has_new_info": bool, "new_fact_count": int,
+    "current_score": int, "estimated_new_score": int | None,
+    "cost_estimate": float | None, "last_generation_cost": float | None}.
+    estimated_new_score/cost_estimate are only meaningful when
+    has_new_info is True; last_generation_cost only when it's False.
+
+    "New" is determined by comparing each gap_interview_answers entry's
+    date_captured (a date, not a precise timestamp) against this
+    application's documents_drafted_at date - there's no existing link
+    between "which specific answers were used for this job's last draft,"
+    so this is the best available real signal without new data plumbing,
+    not perfect same-day precision. estimated_new_score reuses the exact
+    point_value already computed for this job's stored
+    resume_clarifying_questions (score_resume_against_keywords' own
+    formula, score-first-resume-flow item 2) rather than a separate guess,
+    matched to a newly-answered skill by exact case-insensitive label
+    equality - by construction, save_gap_answers() saves a question's
+    "skill" field back verbatim, so this isn't the same fragile
+    AI-vs-deterministic substring matching Mirror flagged elsewhere
+    (2026-08-08) - it's comparing a string to its own origin."""
+    from cost_log import last_cost_for_job
+
+    current_score = app_record.get("resume_ats_score") or 0
+    drafted_at = app_record.get("documents_drafted_at")
+    drafted_date = drafted_at[:10] if drafted_at else None
+
+    new_answers = [
+        a for a in profile.get("gap_interview_answers", [])
+        if a.get("date_captured") and (drafted_date is None or a["date_captured"] >= drafted_date)
+    ]
+    has_new_info = bool(new_answers)
+
+    source, job_id = job.get("source"), job.get("job_id")
+    last_cost = last_cost_for_job(source, job_id, purpose="draft_resume") if source and job_id else None
+
+    if not has_new_info:
+        return {
+            "has_new_info": False, "new_fact_count": 0, "current_score": current_score,
+            "estimated_new_score": None, "cost_estimate": None, "last_generation_cost": last_cost,
+        }
+
+    new_skills_lower = {a["skill"].lower() for a in new_answers if a.get("skill")}
+    point_values = [
+        q["point_value"] for q in (app_record.get("resume_clarifying_questions") or [])
+        if q.get("point_value") and (q.get("skill") or "").lower() in new_skills_lower
+    ]
+    estimated_new_score = min(100, round(current_score + sum(point_values)))
+
+    return {
+        "has_new_info": True,
+        "new_fact_count": len(new_answers),
+        "current_score": current_score,
+        "estimated_new_score": estimated_new_score,
+        # Best available forward-looking estimate: the real logged cost of
+        # this job's last actual resume draft, not a fresh pricing guess -
+        # a redraft's real cost depends on final resume length, which
+        # isn't knowable before the call happens.
+        "cost_estimate": last_cost,
+        "last_generation_cost": None,
+    }
 
 
 def save_gap_answers(job: dict, answered_questions: list[dict]) -> None:

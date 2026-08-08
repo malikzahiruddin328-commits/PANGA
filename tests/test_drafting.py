@@ -7,6 +7,7 @@ from tailoring.drafting import (
     _questions_worth_asking,
     _strip_rank_prefixes,
     _suggested_answer_for_keyword_gap,
+    check_regenerate_impact,
     save_gap_answers,
 )
 
@@ -346,3 +347,80 @@ def test_save_gap_answers_never_triggers_document_generation(isolated_data, monk
 
     from profile.storage import load_profile
     assert load_profile()["gap_interview_answers"][0]["skill"] == "Databricks"
+
+
+def test_check_regenerate_impact_no_new_info_returns_last_real_cost(isolated_data):
+    # score-first-resume-flow spec item 6.
+    from cost_log import log_api_cost
+
+    job = {"source": "linkedin", "job_id": "1"}
+    app_record = {"resume_ats_score": 76, "documents_drafted_at": "2026-08-08T19:00:00+00:00"}
+    profile = {"gap_interview_answers": [{"skill": "Old skill", "date_captured": "2026-08-01"}]}
+
+    log_api_cost(purpose="draft_resume", model="claude-opus-5", input_tokens=1, output_tokens=1, cost_usd=0.42, job_key=("linkedin", "1"))
+
+    result = check_regenerate_impact(job, app_record, profile)
+    assert result["has_new_info"] is False
+    assert result["new_fact_count"] == 0
+    assert result["current_score"] == 76
+    assert result["estimated_new_score"] is None
+    assert result["cost_estimate"] is None
+    assert result["last_generation_cost"] == 0.42
+
+
+def test_check_regenerate_impact_detects_new_answers_since_last_draft(isolated_data):
+    job = {"source": "linkedin", "job_id": "1"}
+    app_record = {
+        "resume_ats_score": 76,
+        "documents_drafted_at": "2026-08-08T19:00:00+00:00",
+        "resume_clarifying_questions": [
+            {"type": "skill_gap", "skill": "Clinical development", "point_value": 5.0},
+        ],
+    }
+    profile = {
+        "gap_interview_answers": [
+            {"skill": "Old skill", "date_captured": "2026-08-01"},
+            {"skill": "Clinical development", "date_captured": "2026-08-08"},
+        ],
+    }
+
+    result = check_regenerate_impact(job, app_record, profile)
+    assert result["has_new_info"] is True
+    assert result["new_fact_count"] == 1
+    assert result["current_score"] == 76
+    assert result["estimated_new_score"] == 81
+    assert result["last_generation_cost"] is None
+
+
+def test_check_regenerate_impact_estimated_score_is_capped_at_100(isolated_data):
+    job = {"source": "linkedin", "job_id": "1"}
+    app_record = {
+        "resume_ats_score": 95,
+        "documents_drafted_at": "2026-08-08T19:00:00+00:00",
+        "resume_clarifying_questions": [
+            {"type": "skill_gap", "skill": "Clinical development", "point_value": 20.0},
+        ],
+    }
+    profile = {"gap_interview_answers": [{"skill": "Clinical development", "date_captured": "2026-08-08"}]}
+
+    result = check_regenerate_impact(job, app_record, profile)
+    assert result["estimated_new_score"] == 100
+
+
+def test_check_regenerate_impact_ignores_answers_from_before_the_last_draft(isolated_data):
+    job = {"source": "linkedin", "job_id": "1"}
+    app_record = {"resume_ats_score": 76, "documents_drafted_at": "2026-08-08T19:00:00+00:00"}
+    profile = {"gap_interview_answers": [{"skill": "Old skill", "date_captured": "2026-08-01"}]}
+
+    result = check_regenerate_impact(job, app_record, profile)
+    assert result["has_new_info"] is False
+
+
+def test_check_regenerate_impact_treats_no_prior_draft_date_as_everything_new(isolated_data):
+    job = {"source": "linkedin", "job_id": "1"}
+    app_record = {"resume_ats_score": 0, "documents_drafted_at": None}
+    profile = {"gap_interview_answers": [{"skill": "Some skill", "date_captured": "2026-08-01"}]}
+
+    result = check_regenerate_impact(job, app_record, profile)
+    assert result["has_new_info"] is True
+    assert result["new_fact_count"] == 1
