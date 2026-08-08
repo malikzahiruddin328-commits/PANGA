@@ -543,7 +543,20 @@ def render_outreach_section(key_prefix: str, target_account_name: str | None = N
             set_outreach_strategy_tag(o["outreach_id"], new_o_tag)
             st.rerun()
 
-    with st.expander("Log new outreach"):
+    # Genuinely no persistence mechanism at all here before this fix (not
+    # even a bare key=) - typing into any field or changing the channel
+    # dropdown reruns the script and the box visually snapped shut mid-
+    # entry (Mirror's proactive sweep, 2026-08-08). Field values themselves
+    # survived (separately keyed), but it looked like the form collapsed/
+    # lost the in-progress entry. Same key=+on_change="rerun" fix already
+    # proven on the Results-tab channel/resume-drafted expanders - explicit
+    # expanded=st.session_state.get(...) included too (not just a bare
+    # default), confirmed necessary for a PROGRAMMATIC session_state write
+    # to actually take effect (key+on_change alone only reliably reflects
+    # a real user click on the header, not a Python-side pre-set value -
+    # found live while testing this exact fix, 2026-08-08).
+    log_outreach_key = f"{key_prefix}_log_outreach_expander"
+    with st.expander("Log new outreach", expanded=st.session_state.get(log_outreach_key, False), key=log_outreach_key, on_change="rerun"):
         oc_name = st.text_input("Contact name", key=f"{key_prefix}_new_contact_name")
         oc_title = st.text_input("Contact title (optional)", key=f"{key_prefix}_new_contact_title")
         oc_channel = st.selectbox("Channel", ["email", "linkedin", "phone", "in_person"], key=f"{key_prefix}_new_channel")
@@ -880,7 +893,19 @@ def render_answered_gap_questions() -> None:
     if not answers:
         return
 
-    with st.expander(f"Previously answered ({len(answers)})", expanded=False):
+    # Same key=+on_change="rerun" fix as the Results-tab channel/resume-
+    # drafted expanders - this one collapsed while editing a past answer
+    # (Mirror's proactive sweep, 2026-08-08). Rendered exactly once per
+    # script run (profile-wide, not per-job - see docstring above), so a
+    # static key is safe, no collision risk. Explicit
+    # expanded=st.session_state.get(...) (not just a bare False default) -
+    # confirmed necessary for a programmatic session_state write to
+    # actually take effect, not just a real click on the header.
+    with st.expander(
+        f"Previously answered ({len(answers)})",
+        expanded=st.session_state.get("previously_answered_expander", False),
+        key="previously_answered_expander", on_change="rerun",
+    ):
         for entry in answers:
             skill = entry.get("skill", "")
             question_text = entry.get("question") or f"Confirm: {skill}"
@@ -2394,7 +2419,20 @@ elif active_tab == "results":
         # the moment any nearby content shifts enough to force a resync
         # (which answering a question inside it does). on_change="rerun"
         # below is what actually makes the existing key= functional.
-        with st.expander(f"{channel} ({len(deduped)}{dup_note})", expanded=False, key=f"channel_expander_{channel}", on_change="rerun"):
+        #
+        # expanded= reads session_state explicitly (not just a bare False
+        # default) - a real click on the header is correctly reflected by
+        # key=+on_change="rerun" alone, but a PROGRAMMATIC session_state
+        # write (as opposed to a real click) needs this explicit read to
+        # actually take effect - found 2026-08-08 while building the
+        # outreach/previously-answered expander fixes and applied back
+        # here for the same robustness/testability.
+        channel_expander_key = f"channel_expander_{channel}"
+        with st.expander(
+            f"{channel} ({len(deduped)}{dup_note})",
+            expanded=st.session_state.get(channel_expander_key, False),
+            key=channel_expander_key, on_change="rerun",
+        ):
             table_rows = []
             for job in deduped:
                 pay_min, pay_max = format_pay(job.get("pay_min")), format_pay(job.get("pay_max"))
@@ -3394,7 +3432,46 @@ elif active_tab == "prep":
             just_generated = st.session_state.pop(
                 f"just_generated_prep_{record['source']}_{record['job_id']}_{round_['round_label']}", False,
             )
-            with st.expander(f"{round_['round_label']} - {status_note}", expanded=(round_["status"] == "in_progress" or just_generated)):
+            # Collapsed while recording an outcome (Mirror's proactive
+            # sweep, 2026-08-08): the plain `expanded=(status == "in_progress"
+            # or just_generated)` got re-evaluated on every rerun (any
+            # widget inside - the outcome selectbox, the notes box -
+            # losing focus reruns the script), and without key=+
+            # on_change="rerun" Python's `expanded=` argument is
+            # authoritative every time, snapping it shut mid-edit (same
+            # root cause already fixed on the Results-tab expanders).
+            #
+            # A plain key=+on_change="rerun" alone isn't quite enough here,
+            # unlike the simpler channel/resume-drafted expanders: once a
+            # key exists, Streamlit ignores the `expanded=` argument on
+            # every later render, so the one-shot just_generated force-open
+            # (test_force_expand_is_one_shot_not_sticky_on_a_later_unrelated_rerun,
+            # from the earlier 2026-08-06 fine-needle-audit work - a fresh
+            # round must NOT stay force-expanded forever just because it
+            # was recently generated) would otherwise become permanently
+            # sticky the moment the key is set, instead of reverting on the
+            # very next render like the un-keyed version correctly did. A
+            # second, delayed flag un-forces it exactly one render later -
+            # long enough for the force-open to actually render and be
+            # seen, short enough to still revert before any real "unrelated
+            # rerun" test/interaction happens - restoring the live
+            # status == "in_progress" default from that point on, same as
+            # if just_generated had never fired.
+            round_expander_key = f"prep_round_open_{record['source']}_{record['job_id']}_{round_['round_label']}"
+            pending_unforce_key = f"prep_round_unforce_pending_{record['source']}_{record['job_id']}_{round_['round_label']}"
+            if st.session_state.pop(pending_unforce_key, False):
+                st.session_state[round_expander_key] = round_["status"] == "in_progress"
+            if just_generated:
+                st.session_state[round_expander_key] = True
+                st.session_state[pending_unforce_key] = True
+            elif round_expander_key not in st.session_state:
+                st.session_state[round_expander_key] = round_["status"] == "in_progress"
+            with st.expander(
+                f"{round_['round_label']} - {status_note}",
+                expanded=st.session_state.get(round_expander_key, False),
+                key=round_expander_key,
+                on_change="rerun",
+            ):
                 logistics = " - ".join(v for v in [round_.get("date"), round_.get("format")] if v)
                 if logistics:
                     st.markdown(logistics)
@@ -3469,7 +3546,21 @@ elif active_tab == "gaps":
             n = len(app_record.get("resume_clarifying_questions") or [])
             score = app_record.get("resume_ats_score")
             score_label = f" - ATS score {score}/100" if score is not None else ""
-            with st.expander(f"{job.get('title', 'Untitled role')} @ {job.get('organization', 'Unknown organization')}{score_label} ({n} open)"):
+            # Same key=+on_change="rerun" fix as the Results-tab channel/
+            # resume-drafted expanders (Mirror's proactive sweep,
+            # 2026-08-08) - this instance was missed since it's rendered
+            # from a separate loop (Profile Gaps, not Results). Real data
+            # at the time this was found: 19 applications have open
+            # clarifying questions (some 6-9 each) - a heavily-used render
+            # path, not theoretical. expanded= reads session_state
+            # explicitly (not just a bare default) - needed for a
+            # programmatic write to take effect, not just a real click.
+            gaps_expander_key = f"profile_gaps_expander_{job.get('source')}_{job.get('job_id')}"
+            with st.expander(
+                f"{job.get('title', 'Untitled role')} @ {job.get('organization', 'Unknown organization')}{score_label} ({n} open)",
+                expanded=st.session_state.get(gaps_expander_key, False),
+                key=gaps_expander_key, on_change="rerun",
+            ):
                 render_gap_questions_section(job, app_record)
 
     render_answered_gap_questions()
