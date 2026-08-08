@@ -74,7 +74,7 @@ from search.source_activity import all_tracked_sources, is_source_stale
 from ranking.prioritize import weight_for, dedupe_across_sources
 from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion, set_strategy_tag, needs_edit_review, record_document_edit_review, get_applications_with_open_clarifying_questions
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
-from tailoring.interview_prep import load_interview_prep, record_round_outcome, build_prep_context, generate_prep, start_round, save_round
+from tailoring.interview_prep import load_interview_prep, get_interview_prep, record_round_outcome, build_prep_context, generate_prep, start_round, save_round
 from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
 from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
@@ -996,6 +996,77 @@ def _confirm_imap_disconnect(acct: str) -> None:
     with cancel_col:
         if st.button("Cancel", key="imap_disconnect_cancel"):
             st.session_state.pop("imap_disconnect_pending", None)
+            st.rerun()
+
+
+def _generate_and_save_prep_round(target_job: dict, round_label: str, interviewers: list[dict]) -> None:
+    """The actual research+draft+save for one round - shared by the direct
+    (fresh round) path and _confirm_prep_regen_dialog's Confirm button
+    (same content, gated behind a warning when it would overwrite an
+    already-"ready" round - see that dialog's docstring for why)."""
+    start_round(target_job["source"], target_job["job_id"], round_label, interviewers=interviewers or None)
+    with st.container(key="prep_progress_bar"):
+        prep_bar = st.progress(0, text="Researching the company and interviewer(s)...")
+    st.html(progress_shimmer_css("prep_progress_bar"))
+
+    def _update_prep_progress(substatus):
+        prep_bar.progress(progress_fraction("prep", substatus), text=f"Drafting prep content - {substatus}")
+
+    try:
+        result = generate_prep(target_job, load_profile(), interviewers, on_progress=_update_prep_progress)
+    except (DraftingNotConfigured, DraftingFailed) as exc:
+        prep_bar.empty()
+        st.error(str(exc))
+    else:
+        prep_bar.progress(1.0, text=":material/check_circle: Done.")
+        save_round(
+            target_job["source"], target_job["job_id"], round_label,
+            interviewers=result["interviewers"] or interviewers,
+            company_snapshot=result["company_snapshot"],
+            likely_questions=result["likely_questions"],
+            questions_to_ask=result["questions_to_ask"],
+            status="ready",
+        )
+        st.session_state["prep_target"] = None
+        st.session_state[f"just_generated_prep_{target_job['source']}_{target_job['job_id']}_{round_label}"] = True
+        st.toast("Interview prep ready.", icon=":material/check_circle:")
+        st.rerun()
+
+
+@st.dialog("Regenerate this round's prep?")
+def _confirm_prep_regen_dialog(target_job: dict, round_label: str, interviewers: list[dict]) -> None:
+    # Real risk flagged by Mirror's proactive sweep (2026-08-08), same
+    # structural shape as the resume-regenerate bug that motivated the
+    # score-first resume flow redesign: save_round() replaces
+    # interviewers/company_snapshot/likely_questions/questions_to_ask
+    # wholesale on every call, and each call is a FRESH web-search pass -
+    # not guaranteed to find at least as much as the last one. A round
+    # whose default "Round 1" label the form starts pre-filled with makes
+    # this easy to hit by accident: reopen "Prep for this interview" for
+    # a round already researched, don't change the label, click Generate
+    # again. outcome/outcome_notes (what Zahir actually wrote himself)
+    # are correctly never touched by this - this dialog is the same
+    # "don't silently overwrite what's already there" principle applied
+    # to the rest, via a warning rather than a merge (there's no
+    # meaningful way to "merge" two independent research passes the way
+    # gap answers merge into a resume - a fresh regenerate is a real,
+    # sometimes-worse-off redo, so the honest fix is asking first, not
+    # pretending to reconcile them).
+    st.markdown(
+        f"**{round_label}** already has research and questions from a "
+        "previous pass. Regenerating runs a fresh web search and replaces "
+        "all of it - interviewers, company snapshot, and questions - "
+        "which may find less than before, since it's a new search each "
+        "time, not guaranteed to repeat or improve on the last one."
+    )
+    confirm_col, cancel_col = st.columns(2)
+    with confirm_col:
+        if st.button("Regenerate anyway", type="primary", key="prep_regen_confirm"):
+            st.session_state.pop("prep_regen_confirm_pending", None)
+            _generate_and_save_prep_round(target_job, round_label, interviewers)
+    with cancel_col:
+        if st.button("Cancel", key="prep_regen_cancel"):
+            st.session_state.pop("prep_regen_confirm_pending", None)
             st.rerun()
 
 
@@ -3334,52 +3405,41 @@ elif active_tab == "prep":
             gen_col, clear_col = st.columns([1, 1])
             with gen_col:
                 if st.button("Generate prep", type="primary", key="generate_prep_btn", disabled=(target_job is None)):
-                    start_round(target_job["source"], target_job["job_id"], round_label, interviewers=interviewers or None)
-                    with st.container(key="prep_progress_bar"):
-                        prep_bar = st.progress(0, text="Researching the company and interviewer(s)...")
-                    st.html(progress_shimmer_css("prep_progress_bar"))
-
-                    def _update_prep_progress(substatus):
-                        # generate_prep only wires on_progress into its second call
-                        # (structuring the research into prep content) - the research
-                        # phase itself reports no substatus, so the bar just holds
-                        # at its "Researching..." starting text until this fires.
-                        prep_bar.progress(progress_fraction("prep", substatus), text=f"Drafting prep content - {substatus}")
-
-                    try:
-                        result = generate_prep(target_job, load_profile(), interviewers, on_progress=_update_prep_progress)
-                    except (DraftingNotConfigured, DraftingFailed) as exc:
-                        prep_bar.empty()
-                        st.error(str(exc))
-                    else:
-                        prep_bar.progress(1.0, text=":material/check_circle: Done.")
-                        save_round(
-                            target_job["source"], target_job["job_id"], round_label,
-                            interviewers=result["interviewers"] or interviewers,
-                            company_snapshot=result["company_snapshot"],
-                            likely_questions=result["likely_questions"],
-                            questions_to_ask=result["questions_to_ask"],
-                            status="ready",
-                        )
-                        st.session_state["prep_target"] = None
-                        # Was collapsing immediately - status flipping to
-                        # "ready" made the expander's own expanded=(status
-                        # == "in_progress") go False the instant the content
-                        # that was just generated became available, so
-                        # seeing it needed a scroll-down and a re-click
-                        # (Mirror's fine-needle audit, 2026-08-06). Same
-                        # one-shot force-expand session_state pattern as the
-                        # Results tab's just-drafted-resume flag above -
-                        # popped (consumed) the moment this round's
-                        # expander renders, so it doesn't stay
-                        # force-expanded on later, unrelated visits.
-                        st.session_state[f"just_generated_prep_{target_job['source']}_{target_job['job_id']}_{round_label}"] = True
-                        st.toast("Interview prep ready.", icon=":material/check_circle:")
+                    # Real risk (Mirror's proactive sweep, 2026-08-08): this
+                    # form's round_label defaults to "Round 1" every time it
+                    # opens, so re-clicking Generate for an already-
+                    # researched round is one accidental click away, and
+                    # save_round() replaces its content wholesale via a
+                    # fresh (not guaranteed as-good) web search. Gate behind
+                    # a warning only when that round already has real
+                    # content ("ready") - a genuinely fresh/in-progress
+                    # round still generates immediately, no extra click.
+                    existing_record = get_interview_prep(target_job["source"], target_job["job_id"])
+                    existing_round = next(
+                        (r for r in (existing_record["rounds"] if existing_record else []) if r["round_label"] == round_label),
+                        None,
+                    )
+                    if existing_round is not None and existing_round["status"] != "in_progress":
+                        st.session_state["prep_regen_confirm_pending"] = {
+                            "target_job": target_job, "round_label": round_label, "interviewers": interviewers,
+                        }
                         st.rerun()
+                    else:
+                        _generate_and_save_prep_round(target_job, round_label, interviewers)
             with clear_col:
                 if st.button("Clear", key="clear_prep_target"):
                     st.session_state["prep_target"] = None
                     st.rerun()
+
+    # Checked once here (same pattern as _pass_reason_dialog/
+    # regen_confirm_pending elsewhere) rather than inside the button's own
+    # if-block, so Streamlit's one-@st.dialog-call-per-run rule is
+    # respected regardless of how this section is reached.
+    prep_regen_pending = st.session_state.get("prep_regen_confirm_pending")
+    if prep_regen_pending:
+        _confirm_prep_regen_dialog(
+            prep_regen_pending["target_job"], prep_regen_pending["round_label"], prep_regen_pending["interviewers"],
+        )
 
     if not prep_records:
         st.markdown("No interview prep started yet. Use \"Prep for this interview\" on Results or Call to Action once you're past the applied stage.")
