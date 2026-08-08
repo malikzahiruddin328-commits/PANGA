@@ -27,6 +27,41 @@ def test_ats_keywords_prompt_excludes_years_of_experience_title_lists_and_soft_s
     assert "executive presence" in ATS_KEYWORDS_SYSTEM_PROMPT
 
 
+def test_ats_keywords_prompt_explains_either_or_group_extraction():
+    # score-first-resume-flow spec item 2: a JD's "Master's degree, OR
+    # Bachelor's degree plus 8+ years" must be extracted as ONE
+    # {"any_of": [...]} group, not two independent flat keywords - a
+    # candidate satisfying either alternative should never be dinged for
+    # a "missing" requirement they've genuinely met a different way.
+    assert "any_of" in ATS_KEYWORDS_SYSTEM_PROMPT
+    assert "Either/or qualification groups" in ATS_KEYWORDS_SYSTEM_PROMPT
+    assert "Master's degree, OR Bachelor's degree" in ATS_KEYWORDS_SYSTEM_PROMPT
+
+
+def test_ats_keywords_schema_supports_either_or_group_items():
+    # Anthropic's structured-output schema rejects "oneOf" (confirmed
+    # live, 2026-08-08) - "anyOf" is the supported equivalent, used here.
+    from tailoring.drafting import _ats_keywords_schema
+
+    schema = _ats_keywords_schema()
+    required_item_schema = schema["properties"]["required_keywords"]["items"]
+    assert "anyOf" in required_item_schema
+    assert "oneOf" not in required_item_schema
+    branch_types = {branch.get("type") for branch in required_item_schema["anyOf"]}
+    assert branch_types == {"string", "object"}
+
+
+def test_drop_years_experience_keywords_passes_through_group_items_unchanged():
+    # Group items ({"any_of": [...]}) must not crash the years-of-
+    # experience filter (which used to assume every item was a plain
+    # string) and must never be dropped by it - a years threshold
+    # wouldn't sensibly appear as one side of a real either/or group.
+    keywords = [{"any_of": ["Master's degree", "Bachelor's degree"]}, "8+ years", "Python"]
+    assert _drop_years_experience_keywords(keywords) == [
+        {"any_of": ["Master's degree", "Bachelor's degree"]}, "Python",
+    ]
+
+
 def test_drop_years_experience_keywords_filters_whole_phrase_variants():
     # Deterministic backstop, not left to prompt compliance alone - same
     # lesson as the rank-prefix/keyword-synonym fixes this week. Must
@@ -178,11 +213,19 @@ def test_suggested_answer_for_keyword_gap_handles_none_profile():
     assert result != ""
 
 
+def _missing(*labels):
+    # score-first-resume-flow spec item 2 (2026-08-08): missing_required_
+    # keywords is now [{"label": str, "point_value": float}, ...], not flat
+    # strings - this builds that shape for tests that don't care about the
+    # exact point_value.
+    return [{"label": label, "point_value": 5.0} for label in labels]
+
+
 def test_merge_keyword_gap_questions_adds_a_real_skill_gap_question():
     # 2026-08-06: missing required keywords used to sit as inert
     # ats_next_actions bullet text - now they become real, answerable
     # clarifying_questions, same shape/mechanism as every other one.
-    merged = _merge_keyword_gap_questions([], ["Databricks"])
+    merged = _merge_keyword_gap_questions([], _missing("Databricks"))
     assert len(merged) == 1
     q = merged[0]
     assert q["type"] == "skill_gap"
@@ -191,16 +234,19 @@ def test_merge_keyword_gap_questions_adds_a_real_skill_gap_question():
     # Zahir's correction 2026-08-06: even here, a real starting guess beats
     # a blank box - never fabricated as a fact, but something to react to.
     assert q["suggested_answer"] != ""
+    # Real, scorer-computed point value threaded through (score-first-
+    # resume-flow spec item 2/UI contract) - not re-derived by the caller.
+    assert q["point_value"] == 5.0
 
 
 def test_merge_keyword_gap_questions_adds_one_per_missing_keyword():
-    merged = _merge_keyword_gap_questions([], ["Databricks", "Kubernetes"])
+    merged = _merge_keyword_gap_questions([], _missing("Databricks", "Kubernetes"))
     assert {q["skill"] for q in merged} == {"Databricks", "Kubernetes"}
 
 
 def test_merge_keyword_gap_questions_dedupes_against_existing_question_by_skill():
     existing = [{"skill": "Databricks experience", "type": "skill_gap", "question": "?", "suggested_answer": ""}]
-    merged = _merge_keyword_gap_questions(existing, ["Databricks"])
+    merged = _merge_keyword_gap_questions(existing, _missing("Databricks"))
     # The AI already asked about this same skill in its own words - must
     # not show up twice under two different phrasings.
     assert len(merged) == 1
@@ -209,13 +255,13 @@ def test_merge_keyword_gap_questions_dedupes_against_existing_question_by_skill(
 
 def test_merge_keyword_gap_questions_dedup_is_case_insensitive():
     existing = [{"skill": "databricks", "type": "skill_gap", "question": "?", "suggested_answer": ""}]
-    merged = _merge_keyword_gap_questions(existing, ["Databricks"])
+    merged = _merge_keyword_gap_questions(existing, _missing("Databricks"))
     assert len(merged) == 1
 
 
 def test_merge_keyword_gap_questions_preserves_existing_questions():
     existing = [{"skill": "SK Life Science team size", "type": "skill_gap", "question": "?", "suggested_answer": "8-10?"}]
-    merged = _merge_keyword_gap_questions(existing, ["Databricks"])
+    merged = _merge_keyword_gap_questions(existing, _missing("Databricks"))
     assert existing[0] in merged
     assert len(merged) == 2
 
@@ -233,17 +279,17 @@ def test_merge_keyword_gap_questions_does_not_re_ask_a_previously_answered_skill
     # resume text will never gain a skill the candidate confirmed they
     # don't have. Same "a real answer means don't ask again" precedent as
     # profile/interview.py's own _already_answered().
-    merged = _merge_keyword_gap_questions([], ["Databricks"], previously_answered_skills=["Databricks"])
+    merged = _merge_keyword_gap_questions([], _missing("Databricks"), previously_answered_skills=["Databricks"])
     assert merged == []
 
 
 def test_merge_keyword_gap_questions_previously_answered_dedup_is_case_insensitive_and_partial():
-    merged = _merge_keyword_gap_questions([], ["Databricks"], previously_answered_skills=["databricks certification"])
+    merged = _merge_keyword_gap_questions([], _missing("Databricks"), previously_answered_skills=["databricks certification"])
     assert merged == []
 
 
 def test_merge_keyword_gap_questions_still_asks_about_a_different_unanswered_skill():
-    merged = _merge_keyword_gap_questions([], ["Databricks", "Terraform"], previously_answered_skills=["Databricks"])
+    merged = _merge_keyword_gap_questions([], _missing("Databricks", "Terraform"), previously_answered_skills=["Databricks"])
     assert {q["skill"] for q in merged} == {"Terraform"}
 
 
@@ -273,3 +319,30 @@ def test_save_gap_answers_tolerates_missing_question_field(isolated_data):
 
     answers = load_profile()["gap_interview_answers"]
     assert answers[0]["question"] == ""
+
+
+def test_save_gap_answers_never_triggers_document_generation(isolated_data, monkeypatch):
+    # Locks the contract the score-first-resume-flow spec's item 4 depends
+    # on (docs/score-first-resume-flow-spec.md): an answer must persist to
+    # the profile regardless of whether a resume is ever generated. This
+    # was already true (save_gap_answers only ever calls
+    # profile.interview.save_answer) - today's UI just happens to always
+    # chain a regenerate after it in the same button handler, a UI-layer
+    # coupling, not a backend one. This test makes that a guaranteed
+    # contract rather than an incidental fact, by failing loudly if
+    # save_gap_answers is ever changed to call into drafting/generation or
+    # the applications store itself.
+    import tailoring.applications as applications
+    import tailoring.drafting as drafting_module
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("save_gap_answers must never call this")
+
+    monkeypatch.setattr(drafting_module, "generate_documents", _fail)
+    monkeypatch.setattr(applications, "upsert_application", _fail)
+
+    job = {"title": "Director", "organization": "Acme"}
+    save_gap_answers(job, [{"skill": "Databricks", "type": "skill_gap", "answer": "Yes, 3 years."}])
+
+    from profile.storage import load_profile
+    assert load_profile()["gap_interview_answers"][0]["skill"] == "Databricks"

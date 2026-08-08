@@ -322,7 +322,9 @@ Rules:
 Do NOT extract these three categories - a real gap caught live 2026-08-07: a candidate with 25+ years of exactly this kind of experience was asked "do you have real, genuine experience with it?" for things that were never checkable skill gaps in the first place, just the extractor pulling the wrong category of thing out of the posting entirely:
 - Years-of-experience thresholds. This is a numeric tenure requirement, not a checkable skill/tool/fact - e.g. do NOT extract "8+ years", "10+ years IT leadership", "5 years executive technology" as a keyword (the ATS score's own structural checks already cover tenure elsewhere; this extractor is for discrete skills/tools/certifications only).
 - Alternate-title lists. When a posting lists acceptable prior job titles (e.g. "IT director, solutions architect, technology consultant, or similar role"), that's the posting describing what kind of role the candidate should have held - not separate skills each needing individual proof. Do NOT extract "IT director", "solutions architect", or "technology consultant" as individual keywords from a title-list phrase like this.
-- Generic soft-skill/leadership phrases with no single checkable term. e.g. do NOT extract "executive presence", "presentation", "c-suite stakeholders", "strong communication skills", "executive technology strategies" - these are vague qualities almost any senior resume already demonstrates narratively; there's no literal fact to add for them."""
+- Generic soft-skill/leadership phrases with no single checkable term. e.g. do NOT extract "executive presence", "presentation", "c-suite stakeholders", "strong communication skills", "executive technology strategies" - these are vague qualities almost any senior resume already demonstrates narratively; there's no literal fact to add for them.
+
+Either/or qualification groups (score-first-resume-flow spec, item 2): a JD often phrases a requirement as a substitutable alternative - e.g. "Master's degree, OR Bachelor's degree plus 8+ years of experience," or "PMP certification or equivalent project management experience." Extract this as ONE item shaped {"any_of": [alternative1, alternative2, ...]} instead of flat independent keywords for each side - a candidate who satisfies either alternative has satisfied the whole requirement, and extracting the alternatives as separate flat keywords would falsely flag a real, satisfied requirement as a missing gap the moment the candidate takes the other branch. Each alternative in any_of MUST be a single, atomic, short (1-4 word) term in the posting's own wording, same as any other keyword - e.g. "Bachelor's degree", not "Associate's or Bachelor's Degree". If one side of the posting's own either/or itself lists multiple sub-options (e.g. "Associate's or Bachelor's Degree plus experience"), split those into separate atomic members of any_of too (e.g. "Associate's degree", "Bachelor's degree") rather than bundling them into one combined alternative string - a bundled alternative can't be matched against a candidate's real, differently-worded resume text downstream. Only use this shape when the posting genuinely states an "or"/substitutable relationship between two or more concrete alternatives - not for an ordinary list of several required skills, which stays flat."""
 
 
 # Deterministic backstop for the years-of-experience category above - a
@@ -340,8 +342,32 @@ Do NOT extract these three categories - a real gap caught live 2026-08-07: a can
 _YEARS_EXPERIENCE_KEYWORD_RE = re.compile(r"^\d+\+?\s*years?\b", re.IGNORECASE)
 
 
-def _drop_years_experience_keywords(keywords: list[str]) -> list[str]:
-    return [k for k in keywords if not _YEARS_EXPERIENCE_KEYWORD_RE.match(k.strip())]
+def _drop_years_experience_keywords(keywords: list) -> list:
+    # Group items ({"any_of": [...]}) pass through untouched - a
+    # years-of-experience threshold wouldn't sensibly appear as one side
+    # of a real either/or group, and .strip() would crash on a dict.
+    return [k for k in keywords if not (isinstance(k, str) and _YEARS_EXPERIENCE_KEYWORD_RE.match(k.strip()))]
+
+
+# Anthropic's structured-output schema rejects "oneOf" (confirmed live,
+# 2026-08-08: "Schema type 'oneOf' is not supported") - "anyOf" is the
+# supported equivalent for "this array item is either a plain string or an
+# either/or group object", used here for required_keywords/
+# preferred_keywords per the either/or extraction rule above. Also
+# confirmed live: "minItems" values other than 0 or 1 aren't supported
+# either, so "at least two real alternatives" is prompt guidance only
+# (the either/or rule above already says so), not schema-enforced.
+_KEYWORD_ITEM_SCHEMA = {
+    "anyOf": [
+        {"type": "string"},
+        {
+            "type": "object",
+            "properties": {"any_of": {"type": "array", "items": {"type": "string"}}},
+            "required": ["any_of"],
+            "additionalProperties": False,
+        },
+    ]
+}
 
 
 def _ats_keywords_schema() -> dict:
@@ -350,13 +376,21 @@ def _ats_keywords_schema() -> dict:
         "properties": {
             "required_keywords": {
                 "type": "array",
-                "items": {"type": "string"},
-                "description": "Short (1-4 word) required/must-have terms taken directly from the posting's own wording. Empty list if none are genuinely stated.",
+                "items": _KEYWORD_ITEM_SCHEMA,
+                "description": (
+                    "Short (1-4 word) required/must-have terms taken directly from the posting's own wording, "
+                    "or {\"any_of\": [...]} for a substitutable either/or requirement (see the either/or rule "
+                    "above). Empty list if none are genuinely stated."
+                ),
             },
             "preferred_keywords": {
                 "type": "array",
-                "items": {"type": "string"},
-                "description": "Short (1-4 word) preferred/nice-to-have terms taken directly from the posting's own wording. Empty list if none are genuinely stated.",
+                "items": _KEYWORD_ITEM_SCHEMA,
+                "description": (
+                    "Short (1-4 word) preferred/nice-to-have terms taken directly from the posting's own "
+                    "wording, or {\"any_of\": [...]} for a substitutable either/or preference. Empty list if "
+                    "none are genuinely stated."
+                ),
             },
         },
         "required": ["required_keywords", "preferred_keywords"],
@@ -364,7 +398,7 @@ def _ats_keywords_schema() -> dict:
     }
 
 
-def _extract_ats_keywords(client: "anthropic.Anthropic", job: dict, model: str | None = None) -> tuple[list[str], list[str]]:
+def _extract_ats_keywords(client: "anthropic.Anthropic", job: dict, model: str | None = None) -> tuple[list, list]:
     """One real-NLP-judgment AI call that pulls the literal required/
     preferred keyword list out of this job's own posting text (title +
     qualification_summary/description, whichever this job record has - see
@@ -659,7 +693,7 @@ def _suggested_answer_for_keyword_gap(term: str, profile: dict | None) -> str:
 
 
 def _merge_keyword_gap_questions(
-    clarifying_questions: list[dict], missing_required_keywords: list[str],
+    clarifying_questions: list[dict], missing_required_keywords: list[dict],
     previously_answered_skills: list[str] | None = None,
     profile: dict | None = None,
 ) -> list[dict]:
@@ -692,11 +726,21 @@ def _merge_keyword_gap_questions(
       naturally gain a skill the candidate confirmed they don't have. This
       is the same profile/interview.py._already_answered() precedent this
       module's own gap-detection already follows - a real answer (even a
-      "no") means don't ask again, not just a real yes."""
+      "no") means don't ask again, not just a real yes.
+
+    missing_required_keywords is now a list of {"label": str,
+    "point_value": float} dicts (score-first-resume-flow spec item 2,
+    2026-08-08) - label may itself read as an either/or group ("Master's
+    degree OR Bachelor's degree plus 8+ years experience") when
+    ats_score.py's either/or matching found no satisfying alternative;
+    point_value carries through onto the generated question so callers can
+    show the real, scorer-computed value of answering it, without
+    re-deriving that arithmetic themselves."""
     already_asked_lower = [(q.get("skill") or "").lower() for q in clarifying_questions if q.get("skill")]
     already_asked_lower += [s.lower() for s in (previously_answered_skills or []) if s]
     merged = list(clarifying_questions)
-    for term in missing_required_keywords:
+    for item in missing_required_keywords:
+        term = item["label"]
         term_lower = term.lower()
         if any(term_lower in skill or skill in term_lower for skill in already_asked_lower):
             continue
@@ -709,6 +753,7 @@ def _merge_keyword_gap_questions(
                 "added to your resume."
             ),
             "suggested_answer": _suggested_answer_for_keyword_gap(term, profile),
+            "point_value": item["point_value"],
         })
     return merged
 
@@ -851,6 +896,7 @@ def _draft_one(
             "ats_rationale": ats["ats_rationale"],
             "ats_next_actions": ats["ats_next_actions"],
             "clarifying_questions": _questions_worth_asking(merged_questions, ats["ats_score"]),
+            "ats_plateau_note": ats.get("plateau_note"),
         }
     if doc_key == "apply_answers":
         return data.get("apply_answers", [])
