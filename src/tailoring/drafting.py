@@ -26,6 +26,7 @@ from llm_client import (
     get_client as _client,
     is_configured,
 )
+from skill_label_match import skills_match
 from tailoring.ats_score import score_resume_against_keywords, score_resume_ats
 
 _RESUME_SPEC_COMMON = (
@@ -721,10 +722,17 @@ def _merge_keyword_gap_questions(
     box - something to react to and edit, not compose from scratch).
 
     Deduped two ways:
-    - Against the AI-generated clarifying_questions passed in (by substring
-      match against each existing question's own "skill" label, case-
-      insensitive, either direction) - the AI may have already asked about
-      the same skill in its own words this same round.
+    - Against the AI-generated clarifying_questions passed in (via
+      skill_label_match.skills_match against each existing question's own
+      "skill" label - normalized equality or a real word-boundary-
+      respecting phrase match, not a bare substring) - the AI may have
+      already asked about the same skill in its own words this same round.
+      Real gap flagged by Mirror 2026-08-08: bare bidirectional substring
+      containment ("x in y or y in x") is the same class of bug as this
+      week's proven "it"-pronoun/BSc case-sensitivity fixes in
+      ats_score.py - a short label like "IT" is a bare substring of
+      plenty of unrelated words ("credit", "legitimate"), which could
+      wrongly suppress a genuinely distinct question.
     - Against previously_answered_skills (pass profile["gap_interview_answers"]'s
       skill labels) - without this, a keyword the candidate already said
       "no, I don't have that" to would keep coming back as a "new" question
@@ -743,13 +751,12 @@ def _merge_keyword_gap_questions(
     point_value carries through onto the generated question so callers can
     show the real, scorer-computed value of answering it, without
     re-deriving that arithmetic themselves."""
-    already_asked_lower = [(q.get("skill") or "").lower() for q in clarifying_questions if q.get("skill")]
-    already_asked_lower += [s.lower() for s in (previously_answered_skills or []) if s]
+    already_asked = [q.get("skill") or "" for q in clarifying_questions if q.get("skill")]
+    already_asked += [s for s in (previously_answered_skills or []) if s]
     merged = list(clarifying_questions)
     for item in missing_required_keywords:
         term = item["label"]
-        term_lower = term.lower()
-        if any(term_lower in skill or skill in term_lower for skill in already_asked_lower):
+        if any(skills_match(term, skill) for skill in already_asked):
             continue
         merged.append({
             "type": "skill_gap",

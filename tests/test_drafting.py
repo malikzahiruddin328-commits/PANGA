@@ -254,6 +254,19 @@ def test_merge_keyword_gap_questions_dedupes_against_existing_question_by_skill(
     assert merged[0] is existing[0]
 
 
+def test_merge_keyword_gap_questions_does_not_bare_substring_false_match():
+    # Real gap flagged by Mirror 2026-08-08: the old bidirectional bare
+    # substring check ("x in y or y in x") would wrongly treat "IT" as
+    # already asked just because it's a substring of an unrelated label
+    # like "Credit risk modeling" - same class of bug as this week's
+    # ats_score.py "it"-pronoun fix. A genuinely distinct question must
+    # still be added.
+    existing = [{"skill": "Credit risk modeling", "type": "skill_gap", "question": "?", "suggested_answer": ""}]
+    merged = _merge_keyword_gap_questions(existing, _missing("IT"))
+    assert len(merged) == 2
+    assert {q["skill"] for q in merged} == {"Credit risk modeling", "IT"}
+
+
 def test_merge_keyword_gap_questions_dedup_is_case_insensitive():
     existing = [{"skill": "databricks", "type": "skill_gap", "question": "?", "suggested_answer": ""}]
     merged = _merge_keyword_gap_questions(existing, _missing("Databricks"))

@@ -16,6 +16,7 @@ from skills.lookup import skills_for  # noqa: E402
 from profile.storage import MASTER_PROFILE_PATH, load_profile, save_profile  # noqa: E402
 from profile.ingest import resume_text as _shared_resume_text  # noqa: E402
 from security.file_lock import locked  # noqa: E402
+from skill_label_match import skills_match  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RAW_DIR = PROJECT_ROOT / "data" / "profile" / "raw"
@@ -29,7 +30,7 @@ def _already_answered(skill: str) -> bool:
     if not MASTER_PROFILE_PATH.exists():
         return False
     profile = load_profile()
-    return any(a["skill"] == skill for a in profile.get("gap_interview_answers", []))
+    return any(skills_match(a["skill"], skill) for a in profile.get("gap_interview_answers", []))
 
 
 def detect_gaps(industry: str, role: str) -> list[dict]:
@@ -54,13 +55,18 @@ def save_answer(
     confirmation - drafting.SCORE_SYSTEM_PROMPT reads this flag and scores
     matching postings low regardless of subject-matter proximity.
 
-    Updates the existing entry in place (matched by exact skill string) if
-    this skill was already answered before, rather than appending a
-    duplicate - real bug fixed 2026-08-06 while building the "view/update a
-    previously answered question" UI (Zahir's ask): answering the same
-    skill_gap question again across rounds used to silently pile up
-    duplicate, potentially conflicting entries for the same skill instead
-    of reflecting the current, latest confirmed answer. question is the
+    Updates the existing entry in place (matched via skill_label_match's
+    normalized/word-boundary comparison, not exact string equality - real
+    gap flagged by Mirror 2026-08-08: an exact match against a free-text,
+    AI-generated label silently fails the moment the model phrases the
+    same underlying fact differently across rounds, e.g. "AWS" vs "cloud
+    infrastructure" - see skill_label_match.py's module docstring) if this
+    skill was already answered before, rather than appending a duplicate -
+    real bug fixed 2026-08-06 while building the "view/update a previously
+    answered question" UI (Zahir's ask): answering the same skill_gap
+    question again across rounds used to silently pile up duplicate,
+    potentially conflicting entries for the same skill instead of
+    reflecting the current, latest confirmed answer. question is the
     original clarifying_questions wording (optional - older callers/entries
     may not have one), stored so the answered-questions view can show what
     was actually asked, not just the short skill label.
@@ -76,7 +82,7 @@ def save_answer(
         profile = load_profile()
         answers = profile.setdefault("gap_interview_answers", [])
         for entry in answers:
-            if entry["skill"] == skill:
+            if skills_match(entry["skill"], skill):
                 entry["role_context"] = role_context
                 entry["answer"] = answer
                 entry["date_captured"] = date_captured
