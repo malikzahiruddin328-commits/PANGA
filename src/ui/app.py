@@ -77,6 +77,11 @@ from tailoring.cta_emails import get_active_cta_emails, request_archive, request
 from tailoring.interview_prep import load_interview_prep, record_round_outcome, build_prep_context, generate_prep, start_round, save_round
 from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
 from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed
+# TEMPORARY - swap for the real tailoring.drafting.analyze_fit_before_drafting()
+# and its item-6/7 counterpart once ATS Engine lands them (see
+# score_first_flow_stub.py's own module docstring for why these two are
+# imported from a real module rather than defined in this file directly).
+from tailoring.score_first_flow_stub import analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_needs_confirmation as _check_regenerate_needs_confirmation
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
 from prospector.rejection_diagnosis import gather_diagnosis_input, diagnose
 from prospector.target_accounts import load_target_accounts, set_status as set_target_account_status, set_website, load_website_lookup_cost, save_website_lookup_cost
@@ -776,83 +781,213 @@ def render_paste_jd_prompt(job: dict) -> None:
             )
 
 
-def render_gap_questions_section(job: dict, app_record: dict) -> None:
-    """The clarifying-questions answer-and-regenerate flow for one job's
-    resume - the Profile Gaps tab's per-job unit. Moved off the Results tab
-    2026-08-04 (Zahir: too much clutter mixed into per-job review) -
-    resume_ats_score/rationale/next_actions stay inline on Results (just
-    informative, no clutter issue), only this interactive part moved here.
+def _do_regenerate_resume(job: dict) -> None:
+    """Shared regenerate-with-progress-bar sequence for both the
+    heads-up (proceeds immediately) and the blocking-confirm (proceeds
+    after explicit Confirm) paths below - one real drafting call, exactly
+    Step 2 of the score-first flow (docs/score-first-resume-flow-spec.md).
 
-    Preserves the 2026-07-31 fix intact: each text_area is keyed by the
-    question's own content + suggested_answer, not its position - keying by
-    position let a later regeneration round's box at the same index
-    silently keep a stale answer under a completely different question."""
-    clarifying_questions = app_record.get("resume_clarifying_questions") or []
-    if not clarifying_questions:
-        return
-
+    Records the pre-regenerate score under the same prev_ats_score_{...}
+    key the "ATS compatibility score" st.metric already reads for its
+    delta arrow (Zahir's explicit ask 2026-08-06) - every regenerate goes
+    through this one function now (no more per-call-site duplication of
+    the old render_gap_questions_section's "Save answers & regenerate"
+    button), so it's set here once rather than at each of this function's
+    3 call sites."""
     job_key = f"{job.get('source')}_{job.get('job_id')}"
-    current_score = app_record.get("resume_ats_score")
-    prev_score_key = f"prev_ats_score_{job_key}"
+    prev_score = (get_application(job.get("source"), job.get("job_id")) or {}).get("resume_ats_score")
+    st.session_state[f"prev_ats_score_{job_key}"] = prev_score
+    regen_bar_key = f"analyze_fit_regen_progress_bar_{job_key}"
+    with st.container(key=regen_bar_key):
+        regen_bar = st.progress(0, text="Generating resume with everything confirmed so far...")
+    st.html(progress_shimmer_css(regen_bar_key))
 
-    st.markdown(
-        "**Answer these to raise the score further - only used if you "
-        "confirm they're true, nothing is ever invented:**"
+    def _update_regen_progress(i, total, doc_key2, substatus=None):
+        label = "Generating resume"
+        label += f" — {substatus}" if substatus else "..."
+        within_doc = progress_fraction(doc_key2, substatus)
+        regen_bar.progress(((i - 1) + within_doc) / total, text=label)
+
+    new_resume = regenerate_resume_and_persist(
+        job, _update_regen_progress, "Resume generated - new ATS score {score}/100.",
     )
+    if new_resume is None:
+        regen_bar.empty()
+    else:
+        regen_bar.progress(1.0, text=":material/check_circle: Done.")
+        st.rerun()
+
+
+@st.dialog("Regenerate this resume?")
+def _confirm_regenerate_dialog(job: dict, cost_info: dict) -> None:
+    # Item 6's blocking gate (docs/score-first-resume-flow-spec.md): only
+    # reached when there's genuinely nothing new confirmed since the last
+    # draft - every regenerate is a full rewrite (see the spec's "Why"),
+    # so with no new fact to add there's no expected upside, only the real
+    # chance of an accidental rewording dropping a previously-matched
+    # keyword. Same confirm/cancel dialog pattern as
+    # _confirm_imap_disconnect/_confirm_recovery_code_regen above.
+    last_cost = cost_info.get("last_generation_cost")
+    cost_line = f" (that draft cost ${last_cost:.2f})" if last_cost is not None else " (real cost not available yet - ATS Engine's cost-logging work, item 7, is still pending)"
     st.markdown(
-        "Some boxes are pre-filled with a proposed guess (worded "
-        "as a guess, e.g. \"Roughly 8-10 engineers?\") - edit it "
-        "to whatever's actually true, or clear it if it's wrong. "
-        "Nothing pre-filled is saved as-is."
+        f"Nothing new has been confirmed since the last draft{cost_line} - "
+        "regenerating now is pure downside risk: every regenerate is a "
+        "full rewrite, so there's no new fact to add, only a real chance "
+        "of losing a keyword the last draft already matched."
     )
+    confirm_col, cancel_col = st.columns(2)
+    with confirm_col:
+        if st.button("Regenerate anyway", type="primary", key="regen_confirm_confirm"):
+            st.session_state.pop("regen_confirm_pending", None)
+            _do_regenerate_resume(job)
+    with cancel_col:
+        if st.button("Cancel", key="regen_confirm_cancel"):
+            st.session_state.pop("regen_confirm_pending", None)
+            st.rerun()
+
+
+def render_analyze_fit_section(job: dict, app_record: dict) -> None:
+    """Step 1 (analyze fit, no document written) / Step 2 (generate,
+    once satisfied) of the score-first resume flow
+    (docs/score-first-resume-flow-spec.md, approved 2026-08-08, Option B
+    layout - Zahir's pick from 3 mockups). Replaces the old
+    render_gap_questions_section "answer a question, regenerate the whole
+    resume every single time" pattern - that per-answer regenerate was
+    both expensive (a full resume rewrite per answer) and a real
+    regression risk (a keyword that matched one draft has no guarantee of
+    surviving the next full rewrite, even when the new content is
+    objectively better - see the spec's "Why" section for the live
+    reproduction that motivated this).
+
+    Scope note: this section is reachable once a resume already exists
+    for this job (both call sites already gate on that, matching the old
+    function's entry condition) - it does NOT yet apply Step 1 BEFORE the
+    very first draft, since that needs ATS Engine's baseline-resume-
+    selection work (item 1, not built yet) to have anything real to score
+    against. The very first "Documents for this application" generation
+    (any doc type, including resume) is unchanged. Once item 1 lands,
+    extending Step 1 to cover the pre-first-draft case is a natural next
+    step - flagging this now rather than silently deciding scope.
+
+    Shared between the Results tab's per-job panel and the Profile Gaps
+    tab, same reasoning as the old function's docstring: one real
+    interactive flow, not duplicated.
+
+    Does NOT call _confirm_regenerate_dialog() itself, even though it's
+    the thing that decides a confirmation is needed - this function can
+    run more than once per script pass (Profile Gaps loops it once per
+    job with open questions), and Streamlit allows only one @st.dialog
+    call per run. It only ever WRITES st.session_state["regen_confirm_pending"];
+    each call site is responsible for checking it and calling the dialog
+    exactly once, after this function (and any loop calling it) has
+    finished for that run - same pattern _pass_reason_dialog already uses
+    for pass_dialog_pending."""
+    job_key = f"{job.get('source')}_{job.get('job_id')}"
+    profile = load_profile()
+    analysis = _analyze_fit_before_drafting(job, profile)
+    open_questions = analysis["open_questions"]
+
+    # Item 4: every answer saves immediately, regardless of whether the
+    # user ever clicks Generate - not gated behind any button (real gap in
+    # the old flow's design intent, explicitly called out in the spec:
+    # "easy to accidentally couple 'answer saved' to 'document generated'
+    # when restructuring this"). save_answer() (inside save_gap_answers())
+    # already upserts-in-place rather than appending a duplicate, so
+    # re-saving an unchanged answer on every rerun is safe, not wasteful
+    # writes - see profile/interview.py's save_answer() docstring.
     answer_entries = []
-    for q in clarifying_questions:
-        # See the docstring above - question-content keying, not position.
-        q_key = f"gapans_{job_key}_{abs(hash(q['question'] + '|' + (q.get('suggested_answer') or ''))) % 10_000_000}"
-        is_disqualifier = q.get("type") == "disqualifier_check"
-        if is_disqualifier:
-            st.markdown(
-                ":material/flag: This answer applies to every "
-                "future job match, not just this one - not a "
-                "guess, so the box starts empty."
-            )
-        answer_value = st.text_area(
-            q["question"], value=q.get("suggested_answer") or "",
-            key=q_key, height=68,
-            placeholder="Type your answer..." if is_disqualifier else None,
-        )
-        answer_entries.append({
-            "skill": q["skill"],
-            "type": q.get("type", "skill_gap"),
-            "answer": answer_value,
-            "question": q["question"],
-        })
-    if st.button("Save answers & regenerate resume", key=f"gapsave_{job_key}"):
-        answered = [e for e in answer_entries if e["answer"] and e["answer"].strip()]
-        if not answered:
-            st.toast("Answer at least one question first.", icon=":material/warning:")
-        else:
-            st.session_state[prev_score_key] = current_score
-            save_gap_answers(job, answered)
-            regen_bar_key = f"regen_progress_bar_{job_key}"
-            with st.container(key=regen_bar_key):
-                regen_bar = st.progress(0, text="Regenerating resume with your answers...")
-            st.html(progress_shimmer_css(regen_bar_key))
+    for q in open_questions:
+        q_key = f"analyzefit_{job_key}_{abs(hash(q['question'] + '|' + (q.get('suggested_answer') or ''))) % 10_000_000}"
+        answer_entries.append({"q": q, "key": q_key})
 
-            def _update_regen_progress(i, total, doc_key2, substatus=None):
-                label = "Regenerating resume"
-                label += f" — {substatus}" if substatus else "..."
-                within_doc = progress_fraction(doc_key2, substatus)
-                regen_bar.progress(((i - 1) + within_doc) / total, text=label)
+    header_col, list_col = st.columns([1, 2], gap="medium")
+    with header_col:
+        with st.container(border=True):
+            st.markdown("**Analyze fit**")
+            score = analysis["projected_score"]
+            st.metric("Projected score", f"{score}/100")
+            if analysis.get("projected_rationale"):
+                st.markdown(analysis["projected_rationale"])
+            st.markdown(f"Scored against: {analysis['baseline_source']}")
+            if analysis.get("plateau_note"):
+                st.markdown(analysis["plateau_note"])
 
-            new_resume = regenerate_resume_and_persist(
-                job, _update_regen_progress, "Resume regenerated - new ATS score {score}/100.",
-            )
-            if new_resume is None:
-                regen_bar.empty()
-            else:
-                regen_bar.progress(1.0, text=":material/check_circle: Done.")
+            # analysis is already re-fetched fresh at the top of every
+            # render regardless of this click - per the confirmed
+            # contract, analyze_fit_before_drafting(job, profile) takes no
+            # "give me a new round" flag; calling it again after new
+            # answers were just saved naturally excludes those skills via
+            # the same profile["gap_interview_answers"] dedup
+            # _merge_keyword_gap_questions already uses today. This button
+            # exists so there's an explicit, visible action for "I've
+            # answered what's here, check for more" - not because the
+            # click itself needs to carry any extra state.
+            if st.button("Answer more questions", key=f"answermore_{job_key}"):
                 st.rerun()
+
+            regen_needed_confirmation = app_record.get("resume_text") is not None
+            if st.button("Generate resume", type="primary", key=f"analyzefit_generate_{job_key}"):
+                if not regen_needed_confirmation:
+                    _do_regenerate_resume(job)
+                else:
+                    cost_info = _check_regenerate_needs_confirmation(job, profile)
+                    if cost_info["has_new_info"]:
+                        # Non-blocking heads-up (item 6) - proceeds
+                        # immediately, doesn't require a second click.
+                        fact_count = cost_info.get("new_fact_count")
+                        fact_phrase = f"{fact_count} new confirmed fact(s)" if fact_count is not None else "New confirmed facts"
+                        est_score = cost_info.get("estimated_new_score")
+                        score_phrase = f", should raise your score from {cost_info.get('current_score')} toward ~{est_score}" if est_score is not None else ""
+                        cost_estimate = cost_info.get("cost_estimate")
+                        cost_phrase = f", estimated cost ${cost_estimate:.2f}" if cost_estimate is not None else ""
+                        st.toast(f"{fact_phrase} aren't in your resume yet{score_phrase}{cost_phrase}.", icon=":material/info:")
+                        _do_regenerate_resume(job)
+                    else:
+                        st.session_state["regen_confirm_pending"] = {"job": job, "cost_info": cost_info}
+                        st.rerun()
+
+    with list_col:
+        if not open_questions:
+            if analysis.get("answer_more_exhausted_message"):
+                st.markdown(f":material/task_alt: {analysis['answer_more_exhausted_message']}")
+            else:
+                st.markdown("No open questions right now.")
+        else:
+            st.markdown(
+                "Answer these to raise the score further - only used if "
+                "you confirm they're true, nothing is ever invented. Some "
+                "boxes are pre-filled with a proposed guess (worded as a "
+                "guess, e.g. \"Roughly 8-10 engineers?\") - edit it to "
+                "whatever's actually true, or clear it if it's wrong."
+            )
+        for entry in answer_entries:
+            q, q_key = entry["q"], entry["key"]
+            is_disqualifier = q["type"] == "disqualifier_check"
+            with st.container(border=True):
+                badge_col, text_col = st.columns([1, 5])
+                with badge_col:
+                    if is_disqualifier:
+                        st.badge("standing pref", color="gray")
+                    elif q.get("point_value") is not None:
+                        st.badge(f"+{q['point_value']:g} pts", color="green")
+                with text_col:
+                    st.markdown(q["question"])
+                if is_disqualifier:
+                    st.markdown(
+                        ":material/flag: This answer applies to every "
+                        "future job match, not just this one - not a "
+                        "guess, so the box starts empty."
+                    )
+                answer_value = st.text_area(
+                    q["question"], value=q.get("suggested_answer") or "",
+                    key=q_key, height=68, label_visibility="collapsed",
+                    placeholder="Type your answer..." if is_disqualifier else None,
+                )
+                if answer_value and answer_value.strip():
+                    save_gap_answers(job, [{
+                        "skill": q["skill"], "type": q["type"],
+                        "answer": answer_value, "question": q["question"],
+                    }])
 
 
 def render_answered_gap_questions() -> None:
@@ -2757,10 +2892,9 @@ elif active_tab == "results":
                                     # THIS job - he wants to answer right there, not context-
                                     # switch to a separate tab). Profile Gaps still exists for
                                     # scanning across every job at once; this is additive, not a
-                                    # replacement - same shared render_gap_questions_section(),
-                                    # same "Save answers & regenerate resume" behavior, just
-                                    # rendered in both places now.
-                                    render_gap_questions_section(job, app_record)
+                                    # replacement - same shared render_analyze_fit_section(),
+                                    # just rendered in both places now.
+                                    render_analyze_fit_section(job, app_record)
                             if doc_key == "resume" and app_record.get("resume_ats_score") is not None:
                                 st.markdown(f"**Resume text (ATS score: {app_record['resume_ats_score']}/100):**")
                             st.code(drafted_text, language=None, wrap_lines=True)
@@ -2931,6 +3065,13 @@ elif active_tab == "results":
     pending_pass = st.session_state.get("pass_dialog_pending")
     if pending_pass:
         _pass_reason_dialog(pending_pass["source"], pending_pass["job_id"], pending_pass["label"])
+
+    # Checked once here, after every job's render_analyze_fit_section()
+    # call has already run for this pass - see that function's own
+    # docstring for why the dialog can't be called from inside it directly.
+    pending_regen_confirm = st.session_state.get("regen_confirm_pending")
+    if pending_regen_confirm:
+        _confirm_regenerate_dialog(pending_regen_confirm["job"], pending_regen_confirm["cost_info"])
 
 elif active_tab == "prospector":
     render_feedback_widget("prospector")
@@ -3470,9 +3611,16 @@ elif active_tab == "gaps":
             score = app_record.get("resume_ats_score")
             score_label = f" - ATS score {score}/100" if score is not None else ""
             with st.expander(f"{job.get('title', 'Untitled role')} @ {job.get('organization', 'Unknown organization')}{score_label} ({n} open)"):
-                render_gap_questions_section(job, app_record)
+                render_analyze_fit_section(job, app_record)
 
     render_answered_gap_questions()
+
+    # Checked once here, after every job's render_analyze_fit_section()
+    # call in the loop above has already run - see that function's own
+    # docstring for why the dialog can't be called from inside it directly.
+    pending_regen_confirm = st.session_state.get("regen_confirm_pending")
+    if pending_regen_confirm:
+        _confirm_regenerate_dialog(pending_regen_confirm["job"], pending_regen_confirm["cost_info"])
 
 elif active_tab == "linkedin":
     render_feedback_widget("linkedin")
