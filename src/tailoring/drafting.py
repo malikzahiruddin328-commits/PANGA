@@ -28,6 +28,7 @@ from llm_client import (
 )
 from skill_label_match import skills_match
 from tailoring.ats_score import score_resume_against_keywords, score_resume_ats
+from tailoring.baseline_resume import select_baseline_resume_text
 
 _RESUME_SPEC_COMMON = (
     "Tailored resume text for this specific job, written to be ATS-perfect - "
@@ -1034,6 +1035,66 @@ def generate_documents(
             on_progress(i, total, doc_key)
         results[doc_key] = _draft_one(client, shared_context, doc_key, model, on_progress, i, total, job=job, profile=profile)
     return results
+
+
+def analyze_fit_before_drafting(job: dict, profile: dict, app_record: dict) -> dict:
+    """Score-first-resume-flow spec, Step 1 ("analyze fit" - no document
+    written): composes the real backend pieces (baseline selection - item
+    1, either/or-aware deterministic scoring with point values - item 2,
+    keyword-gap-to-clarifying-question folding) into the exact contract
+    UI refinement's Step 1/2 screen (render_analyze_fit_section) already
+    renders against. Was tailoring.score_first_flow_stub's stand-in until
+    2026-08-08, when items 1/2/4 landed for real - see that file's
+    (deleted) module docstring for the swap history.
+
+    UI refinement's current scope only calls this once a resume already
+    exists for the job (render_analyze_fit_section's own docstring - the
+    pre-first-draft case is a natural next step once this lands, not
+    included here to keep this swap itself low-risk). Baseline is
+    therefore this job's OWN current drafted resume text, scored fresh
+    against its cached keyword lists - not select_baseline_resume_text()
+    (baseline_resume.py deliberately excludes a job's own resume from its
+    own candidate pool; that function is for the "no resume for THIS job
+    yet" case). Falls back to select_baseline_resume_text() anyway when
+    app_record somehow has no resume_text, so this degrades gracefully
+    rather than crashing if that scope ever does expand.
+
+    Returns {"projected_score": int, "projected_rationale": str,
+    "baseline_source": str, "plateau_note": str | None,
+    "open_questions": [...], "answer_more_exhausted_message": str | None} -
+    open_questions is the SAME clarifying_questions shape
+    render_analyze_fit_section already consumes (type/skill/question/
+    suggested_answer/point_value), folding missing_required_keywords in
+    via _merge_keyword_gap_questions rather than leaving them as inert
+    "how to raise it" text."""
+    baseline_text = app_record.get("resume_text")
+    baseline_source = "your current drafted resume for this job"
+    if not baseline_text:
+        baseline_text, baseline_source = select_baseline_resume_text(job)
+
+    required_keywords = job.get("ats_required_keywords") or []
+    preferred_keywords = job.get("ats_preferred_keywords") or []
+    score_result = score_resume_against_keywords(required_keywords, preferred_keywords, baseline_text)
+
+    previously_answered_skills = [a["skill"] for a in profile.get("gap_interview_answers", []) if a.get("skill")]
+    merged_questions = _merge_keyword_gap_questions(
+        app_record.get("resume_clarifying_questions") or [],
+        score_result["missing_required_keywords"],
+        previously_answered_skills=previously_answered_skills,
+        profile=profile,
+    )
+    open_questions = _questions_worth_asking(merged_questions, score_result["ats_score"])
+
+    return {
+        "projected_score": score_result["ats_score"],
+        "projected_rationale": score_result["ats_rationale"],
+        "baseline_source": baseline_source,
+        "plateau_note": score_result["plateau_note"],
+        "open_questions": open_questions,
+        "answer_more_exhausted_message": (
+            "No more real gaps found based on your current profile." if not open_questions else None
+        ),
+    }
 
 
 def check_regenerate_impact(job: dict, app_record: dict, profile: dict) -> dict:

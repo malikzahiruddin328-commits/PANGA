@@ -76,12 +76,7 @@ from tailoring.applications import load_applications, upsert_application, get_ap
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
 from tailoring.interview_prep import load_interview_prep, record_round_outcome, build_prep_context, generate_prep, start_round, save_round
 from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
-from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed
-# TEMPORARY - swap for the real tailoring.drafting.analyze_fit_before_drafting()
-# and its item-6/7 counterpart once ATS Engine lands them (see
-# score_first_flow_stub.py's own module docstring for why these two are
-# imported from a real module rather than defined in this file directly).
-from tailoring.score_first_flow_stub import analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_needs_confirmation as _check_regenerate_needs_confirmation
+from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed, analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_impact as _check_regenerate_impact
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
 from prospector.rejection_diagnosis import gather_diagnosis_input, diagnose
 from prospector.target_accounts import load_target_accounts, set_status as set_target_account_status, set_website, load_website_lookup_cost, save_website_lookup_cost
@@ -846,7 +841,7 @@ def _confirm_regenerate_dialog(job: dict, cost_info: dict) -> None:
             st.rerun()
 
 
-def render_analyze_fit_section(job: dict, app_record: dict) -> None:
+def render_analyze_fit_section(job: dict, app_record: dict, analysis: dict | None = None) -> None:
     """Step 1 (analyze fit, no document written) / Step 2 (generate,
     once satisfied) of the score-first resume flow
     (docs/score-first-resume-flow-spec.md, approved 2026-08-08, Option B
@@ -881,10 +876,18 @@ def render_analyze_fit_section(job: dict, app_record: dict) -> None:
     each call site is responsible for checking it and calling the dialog
     exactly once, after this function (and any loop calling it) has
     finished for that run - same pattern _pass_reason_dialog already uses
-    for pass_dialog_pending."""
+    for pass_dialog_pending.
+
+    analysis: pass a pre-computed _analyze_fit_before_drafting() result
+    when the caller already needed one anyway (Profile Gaps' loop needs
+    the real open_questions count for its expander label, computed BEFORE
+    the label - see that call site) - avoids running the same real
+    scoring/keyword-merge pass twice per job. Computed fresh here when not
+    given (the Results-tab call site, which doesn't need it beforehand)."""
     job_key = f"{job.get('source')}_{job.get('job_id')}"
     profile = load_profile()
-    analysis = _analyze_fit_before_drafting(job, profile)
+    if analysis is None:
+        analysis = _analyze_fit_before_drafting(job, profile, app_record)
     open_questions = analysis["open_questions"]
 
     # Item 4: every answer saves immediately, regardless of whether the
@@ -930,7 +933,7 @@ def render_analyze_fit_section(job: dict, app_record: dict) -> None:
                 if not regen_needed_confirmation:
                     _do_regenerate_resume(job)
                 else:
-                    cost_info = _check_regenerate_needs_confirmation(job, profile)
+                    cost_info = _check_regenerate_impact(job, app_record, profile)
                     if cost_info["has_new_info"]:
                         # Non-blocking heads-up (item 6) - proceeds
                         # immediately, doesn't require a second click.
@@ -978,12 +981,26 @@ def render_analyze_fit_section(job: dict, app_record: dict) -> None:
                         "future job match, not just this one - not a "
                         "guess, so the box starts empty."
                     )
+                suggested_answer = q.get("suggested_answer") or ""
                 answer_value = st.text_area(
-                    q["question"], value=q.get("suggested_answer") or "",
+                    q["question"], value=suggested_answer,
                     key=q_key, height=68, label_visibility="collapsed",
                     placeholder="Type your answer..." if is_disqualifier else None,
                 )
-                if answer_value and answer_value.strip():
+                # Real bug found live-verifying this stub-swap against real
+                # data (2026-08-08): a real, hedged suggested_answer guess
+                # (e.g. "Unknown - please describe...") is itself non-empty,
+                # so checking only "is there text in the box" auto-saved the
+                # UNTOUCHED PREFILL as a confirmed real answer on the very
+                # first render - before the user ever looked at it, let
+                # alone confirmed it. Reproduced live: opening Profile Gaps
+                # once silently wrote 31 placeholder "Unknown..." answers
+                # into the profile as if they were real facts. This is
+                # exactly the CLAUDE.md HCI principle already on record
+                # ("keep genuine guesses hedged and editable, never
+                # asserted") - a guess sitting in the box isn't consent,
+                # only a genuine edit away from that exact prefill is.
+                if answer_value and answer_value.strip() and answer_value != suggested_answer:
                     save_gap_answers(job, [{
                         "skill": q["skill"], "type": q["type"],
                         "answer": answer_value, "question": q["question"],
@@ -3603,15 +3620,25 @@ elif active_tab == "gaps":
         st.markdown("Nothing open right now.")
     else:
         jobs_by_key = {(j.get("source"), j.get("job_id")): j for j in jobs}
+        gaps_profile = load_profile()
         for app_record in gap_apps:
             job = jobs_by_key.get((app_record.get("source"), app_record.get("job_id")))
             if job is None:
                 continue
-            n = len(app_record.get("resume_clarifying_questions") or [])
+            # Real count of what's actually inside (missing-required-
+            # keyword questions - item 2 - can add more than what's
+            # stored in resume_clarifying_questions alone, the field
+            # get_applications_with_open_clarifying_questions() itself
+            # still filters on) - computed once here, before the
+            # expander label needs it, and passed through so
+            # render_analyze_fit_section doesn't redo the same real
+            # scoring/keyword-merge pass a second time.
+            analysis = _analyze_fit_before_drafting(job, gaps_profile, app_record)
+            n = len(analysis["open_questions"])
             score = app_record.get("resume_ats_score")
             score_label = f" - ATS score {score}/100" if score is not None else ""
             with st.expander(f"{job.get('title', 'Untitled role')} @ {job.get('organization', 'Unknown organization')}{score_label} ({n} open)"):
-                render_analyze_fit_section(job, app_record)
+                render_analyze_fit_section(job, app_record, analysis=analysis)
 
     render_answered_gap_questions()
 
