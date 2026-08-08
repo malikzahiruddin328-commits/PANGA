@@ -266,6 +266,31 @@ def _phrase_in_text(phrase: str, text_lower: str, text_original: str) -> bool:
     return False
 
 
+# Score-first-resume-flow spec (docs/score-first-resume-flow-spec.md, item
+# 2): a JD routinely phrases a requirement as a substitutable either/or -
+# "Master's degree, OR Bachelor's degree plus 8+ years of experience." The
+# old flat-list matcher had no way to represent this: it extracted
+# "Master's degree" as its own independent required keyword, so a
+# candidate who genuinely satisfies the Bachelor's+experience side got
+# dinged for a "gap" that was never real. A keyword item is now either a
+# plain string (unchanged behavior) or {"any_of": [alt1, alt2, ...]} - a
+# single satisfiable group, matched if ANY alternative matches.
+def _normalize_keyword_item(item) -> dict:
+    if isinstance(item, dict) and item.get("any_of"):
+        members = [str(m) for m in item["any_of"]]
+        return {"label": " OR ".join(members), "members": members, "is_group": True}
+    return {"label": str(item), "members": [str(item)], "is_group": False}
+
+
+def _match_keyword_item(item: dict, text_lower: str, text_original: str) -> str | None:
+    """Returns the specific member that satisfied this item (itself, for a
+    plain string), or None if nothing in it matched."""
+    for member in item["members"]:
+        if _phrase_in_text(member.lower(), text_lower, text_original):
+            return member
+    return None
+
+
 _STANDARD_HEADERS = (
     "professional experience", "experience", "work experience",
     "education", "skills", "core skills", "technical skills",
@@ -315,38 +340,16 @@ def score_resume_ats(posting_text: str, resume_text: str) -> dict:
     return score_resume_against_keywords(required, preferred, resume_text)
 
 
-def score_resume_against_keywords(
-    required_keywords: list[str], preferred_keywords: list[str], resume_text: str,
-) -> dict:
-    """The real, deterministic ATS score for one drafted resume against an
-    already-extracted required/preferred keyword list (lowercase or not -
-    matching is case-insensitive). Returns {"ats_score": int 0-100,
-    "ats_rationale": str, "ats_next_actions": [str, ...],
-    "missing_required_keywords": [str, ...]}. Always recomputed from the
-    actual text passed in - the score moves when the text does, because
-    this is literal keyword-overlap arithmetic plus formatting checks, not
-    an independent AI guess.
-
-    missing_required_keywords is returned separately from ats_next_actions
-    (2026-08-06, real gap Zahir hit live): these are the specific,
-    answerable "does the candidate actually have this" gaps, and
-    drafting.py merges them into the resume's real clarifying_questions
-    flow (the same interactive, savable mechanism Profile Gaps already
-    uses) rather than leaving them as inert bullet-point text with no way
-    to answer or act on them - see
-    tailoring.drafting._merge_keyword_gap_questions(). ats_next_actions
-    keeps only what's genuinely just informational/directive (structural
-    formatting fixes, optional preferred-keyword suggestions) - things
-    there's no real fact to "answer", just an edit to make."""
-    required = [k.lower() for k in required_keywords]
-    preferred = [k.lower() for k in preferred_keywords]
-    resume_lower = resume_text.lower()
-
-    matched_required = [k for k in required if _phrase_in_text(k, resume_lower, resume_text)]
-    matched_preferred = [k for k in preferred if _phrase_in_text(k, resume_lower, resume_text)]
-
-    required_coverage = (len(matched_required) / len(required)) if required else None
-    preferred_coverage = (len(matched_preferred) / len(preferred)) if preferred else None
+def _score_from_counts(
+    matched_required: int, total_required: int, matched_preferred: int, total_preferred: int, structure_score: float,
+) -> float:
+    """The scoring formula itself, isolated from keyword matching - lets
+    point-value computation below re-run the SAME formula with one more
+    hypothetical match rather than hand-deriving an approximation that
+    could silently drift from what this function actually does. Returns
+    an unrounded float; callers round only the final displayed score."""
+    required_coverage = (matched_required / total_required) if total_required else None
+    preferred_coverage = (matched_preferred / total_preferred) if total_preferred else None
 
     if required_coverage is not None and preferred_coverage is not None:
         keyword_score = 100.0 * (0.75 * required_coverage + 0.25 * preferred_coverage)
@@ -357,23 +360,104 @@ def score_resume_against_keywords(
     else:
         keyword_score = None
 
+    ats_score = structure_score if keyword_score is None else 0.75 * keyword_score + 0.25 * structure_score
+    return max(0.0, min(100.0, ats_score))
+
+
+def _plateau_note(missing_required: list[dict], matched_group_explanations: list[str]) -> str | None:
+    """Score-first-resume-flow spec item 2's second half: the system, not
+    the user, should notice when the score has genuinely plateaued and say
+    why in plain terms - rather than leaving Zahir to wonder "why did this
+    go up/down/nowhere." None when there's nothing notable to explain
+    (no remaining required gaps and no either/or group worth calling out)."""
+    if not missing_required and not matched_group_explanations:
+        return None
+    parts = []
+    if matched_group_explanations:
+        parts.append(
+            "Some requirements are alternatives you already satisfy a different way: "
+            + "; ".join(matched_group_explanations) + "."
+        )
+    if missing_required:
+        labels = ", ".join(f'"{m["label"]}"' for m in missing_required)
+        parts.append(
+            f"The remaining gap is real, not a phrasing issue: {labels}. Answering more "
+            "about your background will only raise this further if you genuinely have "
+            "this specific experience."
+        )
+    return " ".join(parts)
+
+
+def score_resume_against_keywords(
+    required_keywords: list, preferred_keywords: list, resume_text: str,
+) -> dict:
+    """The real, deterministic ATS score for one drafted resume against an
+    already-extracted required/preferred keyword list. Each item is either
+    a plain string (case-insensitive, lowercase or not) or a
+    {"any_of": [alt1, alt2, ...]} either/or group, satisfied if ANY
+    alternative matches (score-first-resume-flow spec item 2 - a JD's
+    "Master's degree, OR Bachelor's degree plus 8+ years" shouldn't score
+    as a flat, independently-required "Master's degree").
+
+    Returns {"ats_score": int 0-100, "ats_rationale": str,
+    "ats_next_actions": [str, ...],
+    "missing_required_keywords": [{"label": str, "point_value": float}, ...],
+    "plateau_note": str | None}. Always recomputed from the actual text
+    passed in - the score moves when the text does, because this is
+    literal keyword-overlap arithmetic plus formatting checks, not an
+    independent AI guess.
+
+    missing_required_keywords is returned separately from ats_next_actions
+    (2026-08-06, real gap Zahir hit live): these are the specific,
+    answerable "does the candidate actually have this" gaps, and
+    drafting.py merges them into the resume's real clarifying_questions
+    flow (the same interactive, savable mechanism Profile Gaps already
+    uses) rather than leaving them as inert bullet-point text with no way
+    to answer or act on them - see
+    tailoring.drafting._merge_keyword_gap_questions(). Each carries a
+    point_value (2026-08-08, score-first-resume-flow spec item 2/UI
+    contract) - computed by re-running _score_from_counts() with one more
+    hypothetical match, not a separately hand-derived formula that could
+    drift from the real one. ats_next_actions keeps only what's genuinely
+    just informational/directive (structural formatting fixes, optional
+    preferred-keyword suggestions) - things there's no real fact to
+    "answer", just an edit to make."""
+    required_items = [_normalize_keyword_item(k) for k in required_keywords]
+    preferred_items = [_normalize_keyword_item(k) for k in preferred_keywords]
+    resume_lower = resume_text.lower()
+
+    required_matches = [_match_keyword_item(item, resume_lower, resume_text) for item in required_items]
+    preferred_matches = [_match_keyword_item(item, resume_lower, resume_text) for item in preferred_items]
+
+    total_required = len(required_items)
+    total_preferred = len(preferred_items)
+    matched_required_count = sum(1 for m in required_matches if m)
+    matched_preferred_count = sum(1 for m in preferred_matches if m)
+
     structure_score, failed_checks = _structure_score(resume_text)
 
-    if keyword_score is None:
-        ats_score = round(structure_score)
-    else:
-        ats_score = round(0.75 * keyword_score + 0.25 * structure_score)
-    ats_score = max(0, min(100, ats_score))
+    ats_score_float = _score_from_counts(
+        matched_required_count, total_required, matched_preferred_count, total_preferred, structure_score,
+    )
+    ats_score = max(0, min(100, round(ats_score_float)))
 
-    total_kw = len(required) + len(preferred)
-    matched_kw = len(matched_required) + len(matched_preferred)
+    matched_group_explanations = [
+        f"\"{item['label']}\" satisfied via: {match}"
+        for item, match in zip(required_items + preferred_items, required_matches + preferred_matches)
+        if item["is_group"] and match
+    ]
+
+    total_kw = total_required + total_preferred
+    matched_kw = matched_required_count + matched_preferred_count
     if total_kw:
         rationale = (
             f"Matched {matched_kw}/{total_kw} keywords/skills extracted from the "
-            f"posting ({len(matched_required)}/{len(required)} required, "
-            f"{len(matched_preferred)}/{len(preferred)} preferred); "
+            f"posting ({matched_required_count}/{total_required} required, "
+            f"{matched_preferred_count}/{total_preferred} preferred); "
             f"formatting/structure check {round(structure_score)}%."
         )
+        if matched_group_explanations:
+            rationale += " " + "; ".join(matched_group_explanations) + "."
     else:
         rationale = (
             "This posting's stored text didn't have distinct extractable "
@@ -381,8 +465,28 @@ def score_resume_against_keywords(
             f"({round(structure_score)}%)."
         )
 
-    missing_required = [k for k in required if k not in matched_required]
-    missing_preferred = [k for k in preferred if k not in matched_preferred]
+    missing_required = [
+        {
+            "label": item["label"],
+            "point_value": round(
+                _score_from_counts(matched_required_count + 1, total_required, matched_preferred_count, total_preferred, structure_score)
+                - ats_score_float,
+                1,
+            ),
+        }
+        for item, match in zip(required_items, required_matches) if not match
+    ]
+    missing_preferred = [
+        {
+            "label": item["label"],
+            "point_value": round(
+                _score_from_counts(matched_required_count, total_required, matched_preferred_count + 1, total_preferred, structure_score)
+                - ats_score_float,
+                1,
+            ),
+        }
+        for item, match in zip(preferred_items, preferred_matches) if not match
+    ]
 
     # Structural fixes first - a resume an ATS can't even parse (no
     # headers, no plain-text contact info) is a bigger problem than any
@@ -402,8 +506,8 @@ def score_resume_against_keywords(
         next_actions.append("Put contact info (email/phone) as plain text at the very top of the document.")
 
     remaining = max(0, 6 - len(next_actions))
-    for term in missing_preferred[:remaining]:
-        next_actions.append(f"Consider adding the preferred term \"{term}\" if it genuinely applies.")
+    for item in missing_preferred[:remaining]:
+        next_actions.append(f"Consider adding the preferred term \"{item['label']}\" if it genuinely applies.")
 
     if not next_actions and not missing_required:
         next_actions.append("Resume already covers the posting's extractable keywords and standard formatting well.")
@@ -413,4 +517,5 @@ def score_resume_against_keywords(
         "ats_rationale": rationale,
         "ats_next_actions": next_actions[:6],
         "missing_required_keywords": missing_required,
+        "plateau_note": _plateau_note(missing_required, matched_group_explanations),
     }

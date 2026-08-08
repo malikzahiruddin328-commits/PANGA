@@ -52,3 +52,36 @@ def test_save_answer_preserves_is_disqualifier_flag_on_update(isolated_data):
     answers = load_profile()["gap_interview_answers"]
     assert len(answers) == 1
     assert answers[0]["is_disqualifier"] is True
+
+
+def test_save_answer_dedup_is_case_and_punctuation_insensitive(isolated_data):
+    # Real gap flagged by Mirror 2026-08-08: exact-string dedup against a
+    # free-text, AI-generated skill label silently fails on the most
+    # trivial phrasing drift ("Databricks" vs "databricks,"), let alone a
+    # genuinely different round's wording - see skill_label_match.py.
+    save_answer(skill="Databricks", role_context="Director at Acme", answer="Not sure.", date_captured="2026-08-01")
+    save_answer(skill="databricks,", role_context="Director at Beta", answer="Yes, 3 years.", date_captured="2026-08-06")
+
+    answers = load_profile()["gap_interview_answers"]
+    assert len(answers) == 1
+    assert answers[0]["answer"] == "Yes, 3 years."
+
+
+def test_save_answer_dedup_matches_a_label_that_is_a_real_phrase_within_another(isolated_data):
+    save_answer(skill="Databricks certification", role_context="X", answer="No.", date_captured="2026-08-01")
+    save_answer(skill="Databricks", role_context="X", answer="Yes, 3 years.", date_captured="2026-08-06")
+
+    answers = load_profile()["gap_interview_answers"]
+    assert len(answers) == 1
+    assert answers[0]["answer"] == "Yes, 3 years."
+
+
+def test_save_answer_dedup_does_not_false_match_on_a_bare_substring(isolated_data):
+    # "IT" must not match "Credit risk modeling" just because the letters
+    # "it" appear inside an unrelated word - same class of bug as this
+    # week's ats_score.py "it"-pronoun fix.
+    save_answer(skill="IT", role_context="X", answer="Yes.", date_captured="2026-08-01")
+    save_answer(skill="Credit risk modeling", role_context="X", answer="No.", date_captured="2026-08-06")
+
+    answers = load_profile()["gap_interview_answers"]
+    assert len(answers) == 2
