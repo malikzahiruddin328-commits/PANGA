@@ -167,6 +167,25 @@ def get_client() -> "anthropic.Anthropic":
     return anthropic.Anthropic()
 
 
+def _log_cost(response, model: str, purpose: str, job_key: tuple[str, str] | None) -> None:
+    """Logs one call's real cost (score-first-resume-flow spec item 7) -
+    swallows its own failures so a logging problem never breaks the actual
+    API call it's just trying to record. Runs even on a refused/truncated
+    response, since real tokens were still billed either way."""
+    try:
+        from api_cost import estimate_response_cost
+        from cost_log import log_api_cost
+
+        cost = estimate_response_cost(response, model)
+        log_api_cost(
+            purpose=purpose, model=model,
+            input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens,
+            cost_usd=cost, job_key=job_key,
+        )
+    except Exception:
+        logger.exception("Failed to log API call cost (purpose=%s) - the call itself still succeeded.", purpose)
+
+
 def call_structured(
     client: "anthropic.Anthropic",
     system,
@@ -178,6 +197,8 @@ def call_structured(
     thinking: bool = True,
     on_progress=None,
     refusal_message: str = "Claude declined to respond. Try again.",
+    purpose: str = "unspecified",
+    job_key: tuple[str, str] | None = None,
 ) -> dict:
     """One streamed call constrained to `schema` via structured output.
     Reports "thinking..."/"writing... (N characters so far)" through
@@ -195,7 +216,19 @@ def call_structured(
 
     Transient failures (overloaded/rate-limit/connection errors) are retried
     with backoff, then retried once more against a fallback model if the
-    primary is still overloaded - see _call_with_retries."""
+    primary is still overloaded - see _call_with_retries.
+
+    purpose/job_key (score-first-resume-flow spec item 7, 2026-08-08): every
+    real call's cost is logged via cost_log.log_api_cost() once the call
+    succeeds - api_cost.estimate_response_cost() already computed this from
+    real usage for call_with_web_search(), it just wasn't being persisted
+    anywhere for this function, which is the vast majority of real spend
+    (every job score, document draft, keyword extraction). purpose defaults
+    to "unspecified" so existing callers keep working unlabeled until
+    updated; job_key (source, job_id) lets a later regenerate-confirmation
+    prompt look up "what did the last real generation for this job cost."
+    Logging failure never breaks the actual call - a cost-log write error
+    is logged and swallowed, not raised, since it isn't the caller's job."""
     primary_model = model or os.environ.get("ANTHROPIC_MODEL") or DEFAULT_MODEL
 
     def make_request(call_model):
@@ -227,12 +260,14 @@ def call_structured(
             on_progress("Claude is busy, retrying...")
 
     try:
-        response, _ = _call_with_retries(make_request, primary_model, on_retry=report_retry)
+        response, call_model = _call_with_retries(make_request, primary_model, on_retry=report_retry)
     except anthropic.APIStatusError as exc:
         raise LLMCallFailed(_clean_message_for_status_error(exc)) from exc
     except anthropic.APIConnectionError as exc:
         logger.error("Claude API connection error: %s", exc)
         raise LLMCallFailed("Couldn't reach the Claude API - check your internet connection.") from exc
+
+    _log_cost(response, call_model, purpose, job_key)
 
     if response.stop_reason == "refusal":
         raise LLMCallFailed(refusal_message)
@@ -256,6 +291,8 @@ def call_with_web_search(
     max_tokens: int,
     max_uses: int = 5,
     model: str | None = None,
+    purpose: str = "unspecified",
+    job_key: tuple[str, str] | None = None,
 ) -> tuple[str, float]:
     """One-shot (non-streamed) call with the server-side web_search tool -
     the pattern tailoring/drafting.py's _lookup_company_address() and
@@ -264,7 +301,10 @@ def call_with_web_search(
     from the real response usage via api_cost.estimate_response_cost - cost
     is 0.0 if the call failed before any usage was billed. Never raises on
     API error (both original callers treated a failed lookup as "no
-    result found", not a hard error) - callers check for an empty string."""
+    result found", not a hard error) - callers check for an empty string.
+
+    purpose/job_key (score-first-resume-flow spec item 7): same real-cost
+    logging as call_structured() - see _log_cost()."""
     from api_cost import estimate_response_cost
 
     primary_model = model or DEFAULT_MODEL
@@ -291,5 +331,6 @@ def call_with_web_search(
         return "", 0.0
 
     cost = estimate_response_cost(response, call_model)
+    _log_cost(response, call_model, purpose, job_key)
     text = "".join(b.text for b in response.content if b.type == "text").strip()
     return text, cost

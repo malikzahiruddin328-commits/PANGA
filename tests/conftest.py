@@ -35,6 +35,7 @@ def isolated_data(tmp_path, monkeypatch):
     import fulfillment
     import profile.storage as profile_storage
     import profile.ingest as profile_ingest
+    import cost_log
 
     monkeypatch.setattr(job_store, "JOBS_PATH", tmp_path / "jobs.json")
     monkeypatch.setattr(applications, "APPLICATIONS_PATH", tmp_path / "applications.json")
@@ -61,4 +62,10 @@ def isolated_data(tmp_path, monkeypatch):
     monkeypatch.setattr(profile_ingest, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(profile_ingest, "OUTPUT_DIR", tmp_path / "profile_raw")
     monkeypatch.setattr(profile_ingest, "MANIFEST_RESULT_PATH", tmp_path / "profile_raw" / "manifest_result.json")
+    # score-first-resume-flow spec item 7 (2026-08-08): cost_log.py's
+    # running API-cost log is exactly the kind of store this fixture
+    # exists to isolate - added centrally so no test that exercises
+    # call_structured()/call_with_web_search() can ever write real cost
+    # entries into the actual data/ folder.
+    monkeypatch.setattr(cost_log, "COST_LOG_PATH", tmp_path / "cost_log.json")
     return tmp_path
