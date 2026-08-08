@@ -76,7 +76,7 @@ from tailoring.applications import load_applications, upsert_application, get_ap
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
 from tailoring.interview_prep import load_interview_prep, get_interview_prep, record_round_outcome, build_prep_context, generate_prep, start_round, save_round
 from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
-from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed
+from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed, analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_impact as _check_regenerate_impact
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
 from prospector.rejection_diagnosis import gather_diagnosis_input, diagnose
 from prospector.target_accounts import load_target_accounts, set_status as set_target_account_status, set_website, load_website_lookup_cost, save_website_lookup_cost
@@ -340,6 +340,44 @@ def _format_last_synced(iso_timestamp: str | None) -> tuple[str, bool]:
     return f"Last synced {days} day{'s' if days != 1 else ''} ago", is_stale
 
 
+def _cta_watch_signature() -> tuple:
+    """Cheap fingerprint of "would the Call to Action tab look any
+    different right now" - covers both things that can change it without
+    a click: panga-gmail-cta-scan adding/removing entries (doesn't touch
+    last_synced_at, that's fulfillment-only) and panga-cta-fulfillment
+    updating draft status on an existing entry or completing a sync.
+    Recomputed every tick of _cta_auto_refresh_watcher below; only ever
+    compared for equality, never displayed."""
+    cta = get_active_cta_emails()
+    entries = tuple(sorted(
+        (e.get("thread_id"), e.get("draft_created"), e.get("draft_requested"), e.get("draft_link"))
+        for e in cta
+    ))
+    return (entries, get_pending_count(), get_last_synced_at())
+
+
+@st.fragment(run_every="45s")
+def _cta_auto_refresh_watcher() -> None:
+    """Replaces the old "Reload view" button (2026-08-08, Mirror's sweep +
+    Zahir mockup approval): that button's only real purpose was catching
+    background-scheduled-task updates when Zahir hadn't otherwise
+    interacted with the page - there's no caching anywhere in this data
+    path, so literally any other click already re-reads fresh disk data
+    for free. This polls the same on-disk signature on a timer instead and
+    forces a full rerun only when it actually changed, so an unattended
+    tab quietly catches up on its own. A no-op tick (nothing changed, the
+    overwhelmingly common case) touches nothing else on the page - no
+    flicker, no risk of interrupting an in-progress "Send and receive"
+    click, since that owns its own session_state flag independent of this
+    watcher's ticks."""
+    sig = _cta_watch_signature()
+    watch_key = "cta_watch_signature"
+    previous = st.session_state.get(watch_key)
+    st.session_state[watch_key] = sig
+    if previous is not None and previous != sig:
+        st.rerun()
+
+
 _PROGRESS_CHAR_RE = re.compile(r"([\d,]+) characters")
 
 # Rough expected output length per direct-API call, used only to make a
@@ -543,7 +581,20 @@ def render_outreach_section(key_prefix: str, target_account_name: str | None = N
             set_outreach_strategy_tag(o["outreach_id"], new_o_tag)
             st.rerun()
 
-    with st.expander("Log new outreach"):
+    # Genuinely no persistence mechanism at all here before this fix (not
+    # even a bare key=) - typing into any field or changing the channel
+    # dropdown reruns the script and the box visually snapped shut mid-
+    # entry (Mirror's proactive sweep, 2026-08-08). Field values themselves
+    # survived (separately keyed), but it looked like the form collapsed/
+    # lost the in-progress entry. Same key=+on_change="rerun" fix already
+    # proven on the Results-tab channel/resume-drafted expanders - explicit
+    # expanded=st.session_state.get(...) included too (not just a bare
+    # default), confirmed necessary for a PROGRAMMATIC session_state write
+    # to actually take effect (key+on_change alone only reliably reflects
+    # a real user click on the header, not a Python-side pre-set value -
+    # found live while testing this exact fix, 2026-08-08).
+    log_outreach_key = f"{key_prefix}_log_outreach_expander"
+    with st.expander("Log new outreach", expanded=st.session_state.get(log_outreach_key, False), key=log_outreach_key, on_change="rerun"):
         oc_name = st.text_input("Contact name", key=f"{key_prefix}_new_contact_name")
         oc_title = st.text_input("Contact title (optional)", key=f"{key_prefix}_new_contact_title")
         oc_channel = st.selectbox("Channel", ["email", "linkedin", "phone", "in_person"], key=f"{key_prefix}_new_channel")
@@ -776,83 +827,235 @@ def render_paste_jd_prompt(job: dict) -> None:
             )
 
 
-def render_gap_questions_section(job: dict, app_record: dict) -> None:
-    """The clarifying-questions answer-and-regenerate flow for one job's
-    resume - the Profile Gaps tab's per-job unit. Moved off the Results tab
-    2026-08-04 (Zahir: too much clutter mixed into per-job review) -
-    resume_ats_score/rationale/next_actions stay inline on Results (just
-    informative, no clutter issue), only this interactive part moved here.
+def _do_regenerate_resume(job: dict) -> None:
+    """Shared regenerate-with-progress-bar sequence for both the
+    heads-up (proceeds immediately) and the blocking-confirm (proceeds
+    after explicit Confirm) paths below - one real drafting call, exactly
+    Step 2 of the score-first flow (docs/score-first-resume-flow-spec.md).
 
-    Preserves the 2026-07-31 fix intact: each text_area is keyed by the
-    question's own content + suggested_answer, not its position - keying by
-    position let a later regeneration round's box at the same index
-    silently keep a stale answer under a completely different question."""
-    clarifying_questions = app_record.get("resume_clarifying_questions") or []
-    if not clarifying_questions:
-        return
-
+    Records the pre-regenerate score under the same prev_ats_score_{...}
+    key the "ATS compatibility score" st.metric already reads for its
+    delta arrow (Zahir's explicit ask 2026-08-06) - every regenerate goes
+    through this one function now (no more per-call-site duplication of
+    the old render_gap_questions_section's "Save answers & regenerate"
+    button), so it's set here once rather than at each of this function's
+    3 call sites."""
     job_key = f"{job.get('source')}_{job.get('job_id')}"
-    current_score = app_record.get("resume_ats_score")
-    prev_score_key = f"prev_ats_score_{job_key}"
+    prev_score = (get_application(job.get("source"), job.get("job_id")) or {}).get("resume_ats_score")
+    st.session_state[f"prev_ats_score_{job_key}"] = prev_score
+    regen_bar_key = f"analyze_fit_regen_progress_bar_{job_key}"
+    with st.container(key=regen_bar_key):
+        regen_bar = st.progress(0, text="Generating resume with everything confirmed so far...")
+    st.html(progress_shimmer_css(regen_bar_key))
 
-    st.markdown(
-        "**Answer these to raise the score further - only used if you "
-        "confirm they're true, nothing is ever invented:**"
+    def _update_regen_progress(i, total, doc_key2, substatus=None):
+        label = "Generating resume"
+        label += f" — {substatus}" if substatus else "..."
+        within_doc = progress_fraction(doc_key2, substatus)
+        regen_bar.progress(((i - 1) + within_doc) / total, text=label)
+
+    new_resume = regenerate_resume_and_persist(
+        job, _update_regen_progress, "Resume generated - new ATS score {score}/100.",
     )
+    if new_resume is None:
+        regen_bar.empty()
+    else:
+        regen_bar.progress(1.0, text=":material/check_circle: Done.")
+        st.rerun()
+
+
+@st.dialog("Regenerate this resume?")
+def _confirm_regenerate_dialog(job: dict, cost_info: dict) -> None:
+    # Item 6's blocking gate (docs/score-first-resume-flow-spec.md): only
+    # reached when there's genuinely nothing new confirmed since the last
+    # draft - every regenerate is a full rewrite (see the spec's "Why"),
+    # so with no new fact to add there's no expected upside, only the real
+    # chance of an accidental rewording dropping a previously-matched
+    # keyword. Same confirm/cancel dialog pattern as
+    # _confirm_imap_disconnect/_confirm_recovery_code_regen above.
+    last_cost = cost_info.get("last_generation_cost")
+    cost_line = f" (that draft cost ${last_cost:.2f})" if last_cost is not None else " (real cost not available yet - ATS Engine's cost-logging work, item 7, is still pending)"
     st.markdown(
-        "Some boxes are pre-filled with a proposed guess (worded "
-        "as a guess, e.g. \"Roughly 8-10 engineers?\") - edit it "
-        "to whatever's actually true, or clear it if it's wrong. "
-        "Nothing pre-filled is saved as-is."
+        f"Nothing new has been confirmed since the last draft{cost_line} - "
+        "regenerating now is pure downside risk: every regenerate is a "
+        "full rewrite, so there's no new fact to add, only a real chance "
+        "of losing a keyword the last draft already matched."
     )
+    confirm_col, cancel_col = st.columns(2)
+    with confirm_col:
+        if st.button("Regenerate anyway", type="primary", key="regen_confirm_confirm"):
+            st.session_state.pop("regen_confirm_pending", None)
+            _do_regenerate_resume(job)
+    with cancel_col:
+        if st.button("Cancel", key="regen_confirm_cancel"):
+            st.session_state.pop("regen_confirm_pending", None)
+            st.rerun()
+
+
+def render_analyze_fit_section(job: dict, app_record: dict, analysis: dict | None = None) -> None:
+    """Step 1 (analyze fit, no document written) / Step 2 (generate,
+    once satisfied) of the score-first resume flow
+    (docs/score-first-resume-flow-spec.md, approved 2026-08-08, Option B
+    layout - Zahir's pick from 3 mockups). Replaces the old
+    render_gap_questions_section "answer a question, regenerate the whole
+    resume every single time" pattern - that per-answer regenerate was
+    both expensive (a full resume rewrite per answer) and a real
+    regression risk (a keyword that matched one draft has no guarantee of
+    surviving the next full rewrite, even when the new content is
+    objectively better - see the spec's "Why" section for the live
+    reproduction that motivated this).
+
+    Scope note: this section is reachable once a resume already exists
+    for this job (both call sites already gate on that, matching the old
+    function's entry condition) - it does NOT yet apply Step 1 BEFORE the
+    very first draft, since that needs ATS Engine's baseline-resume-
+    selection work (item 1, not built yet) to have anything real to score
+    against. The very first "Documents for this application" generation
+    (any doc type, including resume) is unchanged. Once item 1 lands,
+    extending Step 1 to cover the pre-first-draft case is a natural next
+    step - flagging this now rather than silently deciding scope.
+
+    Shared between the Results tab's per-job panel and the Profile Gaps
+    tab, same reasoning as the old function's docstring: one real
+    interactive flow, not duplicated.
+
+    Does NOT call _confirm_regenerate_dialog() itself, even though it's
+    the thing that decides a confirmation is needed - this function can
+    run more than once per script pass (Profile Gaps loops it once per
+    job with open questions), and Streamlit allows only one @st.dialog
+    call per run. It only ever WRITES st.session_state["regen_confirm_pending"];
+    each call site is responsible for checking it and calling the dialog
+    exactly once, after this function (and any loop calling it) has
+    finished for that run - same pattern _pass_reason_dialog already uses
+    for pass_dialog_pending.
+
+    analysis: pass a pre-computed _analyze_fit_before_drafting() result
+    when the caller already needed one anyway (Profile Gaps' loop needs
+    the real open_questions count for its expander label, computed BEFORE
+    the label - see that call site) - avoids running the same real
+    scoring/keyword-merge pass twice per job. Computed fresh here when not
+    given (the Results-tab call site, which doesn't need it beforehand)."""
+    job_key = f"{job.get('source')}_{job.get('job_id')}"
+    profile = load_profile()
+    if analysis is None:
+        analysis = _analyze_fit_before_drafting(job, profile, app_record)
+    open_questions = analysis["open_questions"]
+
+    # Item 4: every answer saves immediately, regardless of whether the
+    # user ever clicks Generate - not gated behind any button (real gap in
+    # the old flow's design intent, explicitly called out in the spec:
+    # "easy to accidentally couple 'answer saved' to 'document generated'
+    # when restructuring this"). save_answer() (inside save_gap_answers())
+    # already upserts-in-place rather than appending a duplicate, so
+    # re-saving an unchanged answer on every rerun is safe, not wasteful
+    # writes - see profile/interview.py's save_answer() docstring.
     answer_entries = []
-    for q in clarifying_questions:
-        # See the docstring above - question-content keying, not position.
-        q_key = f"gapans_{job_key}_{abs(hash(q['question'] + '|' + (q.get('suggested_answer') or ''))) % 10_000_000}"
-        is_disqualifier = q.get("type") == "disqualifier_check"
-        if is_disqualifier:
-            st.markdown(
-                ":material/flag: This answer applies to every "
-                "future job match, not just this one - not a "
-                "guess, so the box starts empty."
-            )
-        answer_value = st.text_area(
-            q["question"], value=q.get("suggested_answer") or "",
-            key=q_key, height=68,
-            placeholder="Type your answer..." if is_disqualifier else None,
-        )
-        answer_entries.append({
-            "skill": q["skill"],
-            "type": q.get("type", "skill_gap"),
-            "answer": answer_value,
-            "question": q["question"],
-        })
-    if st.button("Save answers & regenerate resume", key=f"gapsave_{job_key}"):
-        answered = [e for e in answer_entries if e["answer"] and e["answer"].strip()]
-        if not answered:
-            st.toast("Answer at least one question first.", icon=":material/warning:")
-        else:
-            st.session_state[prev_score_key] = current_score
-            save_gap_answers(job, answered)
-            regen_bar_key = f"regen_progress_bar_{job_key}"
-            with st.container(key=regen_bar_key):
-                regen_bar = st.progress(0, text="Regenerating resume with your answers...")
-            st.html(progress_shimmer_css(regen_bar_key))
+    for q in open_questions:
+        q_key = f"analyzefit_{job_key}_{abs(hash(q['question'] + '|' + (q.get('suggested_answer') or ''))) % 10_000_000}"
+        answer_entries.append({"q": q, "key": q_key})
 
-            def _update_regen_progress(i, total, doc_key2, substatus=None):
-                label = "Regenerating resume"
-                label += f" — {substatus}" if substatus else "..."
-                within_doc = progress_fraction(doc_key2, substatus)
-                regen_bar.progress(((i - 1) + within_doc) / total, text=label)
+    header_col, list_col = st.columns([1, 2], gap="medium")
+    with header_col:
+        with st.container(border=True):
+            st.markdown("**Analyze fit**")
+            score = analysis["projected_score"]
+            st.metric("Projected score", f"{score}/100")
+            if analysis.get("projected_rationale"):
+                st.markdown(analysis["projected_rationale"])
+            st.markdown(f"Scored against: {analysis['baseline_source']}")
+            if analysis.get("plateau_note"):
+                st.markdown(analysis["plateau_note"])
 
-            new_resume = regenerate_resume_and_persist(
-                job, _update_regen_progress, "Resume regenerated - new ATS score {score}/100.",
-            )
-            if new_resume is None:
-                regen_bar.empty()
-            else:
-                regen_bar.progress(1.0, text=":material/check_circle: Done.")
+            # analysis is already re-fetched fresh at the top of every
+            # render regardless of this click - per the confirmed
+            # contract, analyze_fit_before_drafting(job, profile) takes no
+            # "give me a new round" flag; calling it again after new
+            # answers were just saved naturally excludes those skills via
+            # the same profile["gap_interview_answers"] dedup
+            # _merge_keyword_gap_questions already uses today. This button
+            # exists so there's an explicit, visible action for "I've
+            # answered what's here, check for more" - not because the
+            # click itself needs to carry any extra state.
+            if st.button("Answer more questions", key=f"answermore_{job_key}"):
                 st.rerun()
+
+            regen_needed_confirmation = app_record.get("resume_text") is not None
+            if st.button("Generate resume", type="primary", key=f"analyzefit_generate_{job_key}"):
+                if not regen_needed_confirmation:
+                    _do_regenerate_resume(job)
+                else:
+                    cost_info = _check_regenerate_impact(job, app_record, profile)
+                    if cost_info["has_new_info"]:
+                        # Non-blocking heads-up (item 6) - proceeds
+                        # immediately, doesn't require a second click.
+                        fact_count = cost_info.get("new_fact_count")
+                        fact_phrase = f"{fact_count} new confirmed fact(s)" if fact_count is not None else "New confirmed facts"
+                        est_score = cost_info.get("estimated_new_score")
+                        score_phrase = f", should raise your score from {cost_info.get('current_score')} toward ~{est_score}" if est_score is not None else ""
+                        cost_estimate = cost_info.get("cost_estimate")
+                        cost_phrase = f", estimated cost ${cost_estimate:.2f}" if cost_estimate is not None else ""
+                        st.toast(f"{fact_phrase} aren't in your resume yet{score_phrase}{cost_phrase}.", icon=":material/info:")
+                        _do_regenerate_resume(job)
+                    else:
+                        st.session_state["regen_confirm_pending"] = {"job": job, "cost_info": cost_info}
+                        st.rerun()
+
+    with list_col:
+        if not open_questions:
+            if analysis.get("answer_more_exhausted_message"):
+                st.markdown(f":material/task_alt: {analysis['answer_more_exhausted_message']}")
+            else:
+                st.markdown("No open questions right now.")
+        else:
+            st.markdown(
+                "Answer these to raise the score further - only used if "
+                "you confirm they're true, nothing is ever invented. Some "
+                "boxes are pre-filled with a proposed guess (worded as a "
+                "guess, e.g. \"Roughly 8-10 engineers?\") - edit it to "
+                "whatever's actually true, or clear it if it's wrong."
+            )
+        for entry in answer_entries:
+            q, q_key = entry["q"], entry["key"]
+            is_disqualifier = q["type"] == "disqualifier_check"
+            with st.container(border=True):
+                badge_col, text_col = st.columns([1, 5])
+                with badge_col:
+                    if is_disqualifier:
+                        st.badge("standing pref", color="gray")
+                    elif q.get("point_value") is not None:
+                        st.badge(f"+{q['point_value']:g} pts", color="green")
+                with text_col:
+                    st.markdown(q["question"])
+                if is_disqualifier:
+                    st.markdown(
+                        ":material/flag: This answer applies to every "
+                        "future job match, not just this one - not a "
+                        "guess, so the box starts empty."
+                    )
+                suggested_answer = q.get("suggested_answer") or ""
+                answer_value = st.text_area(
+                    q["question"], value=suggested_answer,
+                    key=q_key, height=68, label_visibility="collapsed",
+                    placeholder="Type your answer..." if is_disqualifier else None,
+                )
+                # Real bug found live-verifying this stub-swap against real
+                # data (2026-08-08): a real, hedged suggested_answer guess
+                # (e.g. "Unknown - please describe...") is itself non-empty,
+                # so checking only "is there text in the box" auto-saved the
+                # UNTOUCHED PREFILL as a confirmed real answer on the very
+                # first render - before the user ever looked at it, let
+                # alone confirmed it. Reproduced live: opening Profile Gaps
+                # once silently wrote 31 placeholder "Unknown..." answers
+                # into the profile as if they were real facts. This is
+                # exactly the CLAUDE.md HCI principle already on record
+                # ("keep genuine guesses hedged and editable, never
+                # asserted") - a guess sitting in the box isn't consent,
+                # only a genuine edit away from that exact prefill is.
+                if answer_value and answer_value.strip() and answer_value != suggested_answer:
+                    save_gap_answers(job, [{
+                        "skill": q["skill"], "type": q["type"],
+                        "answer": answer_value, "question": q["question"],
+                    }])
 
 
 def render_answered_gap_questions() -> None:
@@ -880,7 +1083,19 @@ def render_answered_gap_questions() -> None:
     if not answers:
         return
 
-    with st.expander(f"Previously answered ({len(answers)})", expanded=False):
+    # Same key=+on_change="rerun" fix as the Results-tab channel/resume-
+    # drafted expanders - this one collapsed while editing a past answer
+    # (Mirror's proactive sweep, 2026-08-08). Rendered exactly once per
+    # script run (profile-wide, not per-job - see docstring above), so a
+    # static key is safe, no collision risk. Explicit
+    # expanded=st.session_state.get(...) (not just a bare False default) -
+    # confirmed necessary for a programmatic session_state write to
+    # actually take effect, not just a real click on the header.
+    with st.expander(
+        f"Previously answered ({len(answers)})",
+        expanded=st.session_state.get("previously_answered_expander", False),
+        key="previously_answered_expander", on_change="rerun",
+    ):
         for entry in answers:
             skill = entry.get("skill", "")
             question_text = entry.get("question") or f"Confirm: {skill}"
@@ -2031,7 +2246,18 @@ elif active_tab == "cta":
     # container instead of per-section. flex-wrap keeps it from
     # overflowing horizontally on a narrower window - it wraps to more
     # lines instead, verified down to mobile width.
+    #
+    # "Reload view" (the old plain st.rerun() button) is gone as of
+    # 2026-08-08 (Mirror's sweep + Zahir mockup approval) - its only real
+    # job was catching a background-scheduled-task update when Zahir
+    # hadn't otherwise interacted with the page, which
+    # _cta_auto_refresh_watcher() below now does on its own timer. Every
+    # other click already re-reads fresh disk data for free (no caching in
+    # this path), so a manual "reload" button was never actually needed
+    # for anything a click elsewhere in the app wouldn't already do.
     header_key = "cta_header_row"
+    sync_in_progress_key = "cta_sync_in_progress"
+    syncing = st.session_state.get(sync_in_progress_key, False)
     st.html(f"""<style>
 .st-key-{header_key}[data-testid="stVerticalBlock"] {{
     display: flex !important;
@@ -2045,12 +2271,40 @@ elif active_tab == "cta":
     width: fit-content !important;
     flex: 0 0 auto !important;
 }}
+.st-key-manual_sync_button [data-testid="stIconMaterial"] {{
+    animation: panga-btn-spin 1s linear infinite;
+}}
+@keyframes panga-btn-spin {{
+    from {{ transform: rotate(0deg); }}
+    to {{ transform: rotate(360deg); }}
+}}
+@media (prefers-reduced-motion: reduce) {{
+    .st-key-manual_sync_button [data-testid="stIconMaterial"] {{
+        animation: none;
+    }}
+}}
 </style>""")
     with st.container(key=header_key):
         st.markdown(status_line)
-        if st.button("Send and receive", type="primary", key="manual_sync_button"):
+        # Two-phase button (Zahir's mockup-approved ask, 2026-08-08 - the
+        # click needs its OWN visible feedback, not just the st.spinner
+        # overlay below): a single script run can't repaint a widget
+        # mid-execution, so the disabled/"Syncing..." state has to be its
+        # own rerun before the real work starts, not something toggled
+        # around the same st.button() call the click came from.
+        clicked = st.button(
+            "Syncing..." if syncing else "Send and receive",
+            type="primary", key="manual_sync_button",
+            icon=":material/progress_activity:" if syncing else None,
+            disabled=syncing,
+        )
+        if clicked and not syncing:
+            st.session_state[sync_in_progress_key] = True
+            st.rerun()
+        if syncing:
             with st.spinner("Syncing - archiving, drafting replies, checking sent drafts..."):
                 sync_summary = run_full_fulfillment()
+            st.session_state[sync_in_progress_key] = False
             parts = []
             if sync_summary["archived"]:
                 parts.append(f"{sync_summary['archived']} archived")
@@ -2064,18 +2318,9 @@ elif active_tab == "cta":
             else:
                 st.toast(f"Synced: {summary_text}.", icon=":material/check_circle:")
             st.rerun()
-        # Was labeled "Refresh", which read as "go check Gmail again" -
-        # it's actually just st.rerun(), no Gmail call at all (Mirror's
-        # first UI/UX review pass, 2026-08-06). "Send and receive" above is
-        # the one that does real syncing; this button's real, honest
-        # purpose is re-reading the on-disk CTA/application stores without
-        # a Gmail round-trip - useful right after a scheduled task updates
-        # them in the background, or after an action taken elsewhere in
-        # the app. Kept, just renamed to say what it actually does.
-        if st.button("Reload view", help="Re-reads the current data without contacting Gmail - use \"Send and receive\" above for a real sync."):
-            st.rerun()
         for cat in CATEGORY_ORDER:
             st.badge(f"{CATEGORY_LABELS[cat]} **{counts[cat]}**", color=CATEGORY_COLORS[cat])
+    _cta_auto_refresh_watcher()
 
     f1, f2 = st.columns([1, 2])
     with f1:
@@ -2465,7 +2710,20 @@ elif active_tab == "results":
         # the moment any nearby content shifts enough to force a resync
         # (which answering a question inside it does). on_change="rerun"
         # below is what actually makes the existing key= functional.
-        with st.expander(f"{channel} ({len(deduped)}{dup_note})", expanded=False, key=f"channel_expander_{channel}", on_change="rerun"):
+        #
+        # expanded= reads session_state explicitly (not just a bare False
+        # default) - a real click on the header is correctly reflected by
+        # key=+on_change="rerun" alone, but a PROGRAMMATIC session_state
+        # write (as opposed to a real click) needs this explicit read to
+        # actually take effect - found 2026-08-08 while building the
+        # outreach/previously-answered expander fixes and applied back
+        # here for the same robustness/testability.
+        channel_expander_key = f"channel_expander_{channel}"
+        with st.expander(
+            f"{channel} ({len(deduped)}{dup_note})",
+            expanded=st.session_state.get(channel_expander_key, False),
+            key=channel_expander_key, on_change="rerun",
+        ):
             table_rows = []
             for job in deduped:
                 pay_min, pay_max = format_pay(job.get("pay_min")), format_pay(job.get("pay_max"))
@@ -2828,10 +3086,9 @@ elif active_tab == "results":
                                     # THIS job - he wants to answer right there, not context-
                                     # switch to a separate tab). Profile Gaps still exists for
                                     # scanning across every job at once; this is additive, not a
-                                    # replacement - same shared render_gap_questions_section(),
-                                    # same "Save answers & regenerate resume" behavior, just
-                                    # rendered in both places now.
-                                    render_gap_questions_section(job, app_record)
+                                    # replacement - same shared render_analyze_fit_section(),
+                                    # just rendered in both places now.
+                                    render_analyze_fit_section(job, app_record)
                             if doc_key == "resume" and app_record.get("resume_ats_score") is not None:
                                 st.markdown(f"**Resume text (ATS score: {app_record['resume_ats_score']}/100):**")
                             st.code(drafted_text, language=None, wrap_lines=True)
@@ -3002,6 +3259,13 @@ elif active_tab == "results":
     pending_pass = st.session_state.get("pass_dialog_pending")
     if pending_pass:
         _pass_reason_dialog(pending_pass["source"], pending_pass["job_id"], pending_pass["label"])
+
+    # Checked once here, after every job's render_analyze_fit_section()
+    # call has already run for this pass - see that function's own
+    # docstring for why the dialog can't be called from inside it directly.
+    pending_regen_confirm = st.session_state.get("regen_confirm_pending")
+    if pending_regen_confirm:
+        _confirm_regenerate_dialog(pending_regen_confirm["job"], pending_regen_confirm["cost_info"])
 
 elif active_tab == "prospector":
     render_feedback_widget("prospector")
@@ -3454,7 +3718,46 @@ elif active_tab == "prep":
             just_generated = st.session_state.pop(
                 f"just_generated_prep_{record['source']}_{record['job_id']}_{round_['round_label']}", False,
             )
-            with st.expander(f"{round_['round_label']} - {status_note}", expanded=(round_["status"] == "in_progress" or just_generated)):
+            # Collapsed while recording an outcome (Mirror's proactive
+            # sweep, 2026-08-08): the plain `expanded=(status == "in_progress"
+            # or just_generated)` got re-evaluated on every rerun (any
+            # widget inside - the outcome selectbox, the notes box -
+            # losing focus reruns the script), and without key=+
+            # on_change="rerun" Python's `expanded=` argument is
+            # authoritative every time, snapping it shut mid-edit (same
+            # root cause already fixed on the Results-tab expanders).
+            #
+            # A plain key=+on_change="rerun" alone isn't quite enough here,
+            # unlike the simpler channel/resume-drafted expanders: once a
+            # key exists, Streamlit ignores the `expanded=` argument on
+            # every later render, so the one-shot just_generated force-open
+            # (test_force_expand_is_one_shot_not_sticky_on_a_later_unrelated_rerun,
+            # from the earlier 2026-08-06 fine-needle-audit work - a fresh
+            # round must NOT stay force-expanded forever just because it
+            # was recently generated) would otherwise become permanently
+            # sticky the moment the key is set, instead of reverting on the
+            # very next render like the un-keyed version correctly did. A
+            # second, delayed flag un-forces it exactly one render later -
+            # long enough for the force-open to actually render and be
+            # seen, short enough to still revert before any real "unrelated
+            # rerun" test/interaction happens - restoring the live
+            # status == "in_progress" default from that point on, same as
+            # if just_generated had never fired.
+            round_expander_key = f"prep_round_open_{record['source']}_{record['job_id']}_{round_['round_label']}"
+            pending_unforce_key = f"prep_round_unforce_pending_{record['source']}_{record['job_id']}_{round_['round_label']}"
+            if st.session_state.pop(pending_unforce_key, False):
+                st.session_state[round_expander_key] = round_["status"] == "in_progress"
+            if just_generated:
+                st.session_state[round_expander_key] = True
+                st.session_state[pending_unforce_key] = True
+            elif round_expander_key not in st.session_state:
+                st.session_state[round_expander_key] = round_["status"] == "in_progress"
+            with st.expander(
+                f"{round_['round_label']} - {status_note}",
+                expanded=st.session_state.get(round_expander_key, False),
+                key=round_expander_key,
+                on_change="rerun",
+            ):
                 logistics = " - ".join(v for v in [round_.get("date"), round_.get("format")] if v)
                 if logistics:
                     st.markdown(logistics)
@@ -3522,17 +3825,53 @@ elif active_tab == "gaps":
         st.markdown("Nothing open right now.")
     else:
         jobs_by_key = {(j.get("source"), j.get("job_id")): j for j in jobs}
+        gaps_profile = load_profile()
         for app_record in gap_apps:
             job = jobs_by_key.get((app_record.get("source"), app_record.get("job_id")))
             if job is None:
                 continue
-            n = len(app_record.get("resume_clarifying_questions") or [])
+            # Real count of what's actually inside (missing-required-
+            # keyword questions - item 2 - can add more than what's
+            # stored in resume_clarifying_questions alone, the field
+            # get_applications_with_open_clarifying_questions() itself
+            # still filters on) - computed once here, before the
+            # expander label needs it, and passed through so
+            # render_analyze_fit_section doesn't redo the same real
+            # scoring/keyword-merge pass a second time.
+            analysis = _analyze_fit_before_drafting(job, gaps_profile, app_record)
+            n = len(analysis["open_questions"])
             score = app_record.get("resume_ats_score")
             score_label = f" - ATS score {score}/100" if score is not None else ""
-            with st.expander(f"{job.get('title', 'Untitled role')} @ {job.get('organization', 'Unknown organization')}{score_label} ({n} open)"):
-                render_gap_questions_section(job, app_record)
+            # Same key=+on_change="rerun" fix as the Results-tab channel/
+            # resume-drafted expanders (Mirror's proactive sweep,
+            # 2026-08-08) - this instance was missed since it's rendered
+            # from a separate loop (Profile Gaps, not Results). Real data
+            # at the time this was found: 19 applications have open
+            # clarifying questions (some 6-9 each) - a heavily-used render
+            # path, not theoretical. expanded= reads session_state
+            # explicitly (not just a bare default) - needed for a
+            # programmatic write to take effect, not just a real click.
+            # Carried forward onto render_analyze_fit_section (the real
+            # backend-wired call that replaced render_gap_questions_section
+            # here) when the two branches landed together - the expander
+            # persistence fix and the stub-swap are independent changes to
+            # the same call site, not a rewrite of either.
+            gaps_expander_key = f"profile_gaps_expander_{job.get('source')}_{job.get('job_id')}"
+            with st.expander(
+                f"{job.get('title', 'Untitled role')} @ {job.get('organization', 'Unknown organization')}{score_label} ({n} open)",
+                expanded=st.session_state.get(gaps_expander_key, False),
+                key=gaps_expander_key, on_change="rerun",
+            ):
+                render_analyze_fit_section(job, app_record, analysis=analysis)
 
     render_answered_gap_questions()
+
+    # Checked once here, after every job's render_analyze_fit_section()
+    # call in the loop above has already run - see that function's own
+    # docstring for why the dialog can't be called from inside it directly.
+    pending_regen_confirm = st.session_state.get("regen_confirm_pending")
+    if pending_regen_confirm:
+        _confirm_regenerate_dialog(pending_regen_confirm["job"], pending_regen_confirm["cost_info"])
 
 elif active_tab == "linkedin":
     render_feedback_widget("linkedin")

@@ -112,3 +112,31 @@ def test_generating_one_jobs_prep_does_not_force_expand_another_jobs_round(prep_
     # terms (not via the one-shot flag) - stays expanded for that reason,
     # not because it leaked the other job's force-expand flag.
     assert by_status["Round 1 - in progress"] is True
+
+
+def test_round_expander_stays_open_while_recording_an_outcome(prep_app):
+    # Real bug (Mirror's proactive sweep, 2026-08-08): selecting a
+    # different outcome value (a real rerun-triggering interaction, before
+    # ever clicking "Save outcome") used to collapse the round's expander
+    # out from under the user mid-edit - the plain
+    # expanded=(status == "in_progress" or just_generated) had no
+    # persistence at all once status wasn't literally "in_progress" and
+    # the one-shot flag was long gone.
+    from tailoring.interview_prep import start_round
+
+    start_round("Indeed", "p1", "Round 1")
+
+    at = prep_app
+    at.session_state["active_tab"] = "prep"
+    at.run(timeout=30)
+
+    round_expander = next(e for e in at.expander if e.label.startswith("Round 1"))
+    assert round_expander.proto.expanded  # starts open - genuinely in_progress
+
+    outcome_box = next(s for s in at.selectbox if s.key and s.key.startswith("outcome_Indeed_p1_"))
+    outcome_box.set_value("went well")
+    at.run(timeout=30)  # the rerun the selectbox change itself triggers
+
+    assert not at.exception
+    round_expander = next(e for e in at.expander if e.label.startswith("Round 1"))
+    assert round_expander.proto.expanded

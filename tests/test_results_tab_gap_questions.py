@@ -1,42 +1,90 @@
-"""Real design correction Zahir made live 2026-08-06: after clarifying_
-questions moved off the Results tab entirely to the Profile Gaps tab
-(2026-08-04, to reduce clutter while scanning many jobs), he opened one
-job's own "Resume (drafted)" score card and expected to answer its
-questions right there - not get pointed to a separate tab. Expanding a
-specific job's score card is a clear signal of focus on THAT job; the
-Profile Gaps tab still exists for scanning across every job at once, this
-is additive. These tests drive the actual Results tab (via Streamlit's own
-AppTest) to confirm the real, interactive Q&A now renders inline.
-"""
+"""Covers the 2026-08-08 score-first resume flow (docs/score-first-resume-
+flow-spec.md, Option B layout, items 3/5/6 - the frontend half; items
+1/2/4/7 are ATS Engine's backend work, landed and merged 2026-08-08).
+Replaces the old "answer a question, regenerate the whole resume every
+single time" pattern (render_gap_questions_section) with
+render_analyze_fit_section(): answers now auto-save on every rerun with no
+button required (item 4), and generating is a separate, explicit action
+(item 6's confirmation logic) rather than bundled into the same click as
+saving.
+
+tailoring.drafting.analyze_fit_before_drafting() and
+check_regenerate_impact() are the real backend functions as of this file's
+2026-08-08 rewrite (previously tailoring.score_first_flow_stub's temporary
+stand-ins, deleted once the real functions landed - see
+analyze_fit_before_drafting's own docstring for the swap history). These
+tests exercise the real composed pipeline (baseline selection -> real
+either/or-aware keyword scoring -> missing-required-keyword-to-question
+folding), not a stub's approximation - fixture job records carry real
+ats_required_keywords so the projected score/point values are the actual
+deterministic scorer's output, not a hand-guessed number. Tests that need
+to force a specific check_regenerate_impact branch (has_new_info True/False)
+monkeypatch it on tailoring.drafting directly (not the name app.py imports
+it as - AppTest re-executes app.py fresh every .run(), so patching a name
+aliased inside app.py itself never takes effect)."""
 
 import pytest
 from streamlit.testing.v1 import AppTest
 
 from search.job_store import save_jobs, update_job_score
-from tailoring.applications import upsert_application
+from tailoring.applications import upsert_application, get_application
+from tailoring.ats_score import score_resume_against_keywords
 
 APP_PATH = "src/ui/app.py"
+
+REQUIRED_KEYWORDS = ["Python", "Databricks"]
+INITIAL_RESUME_TEXT = "PROFESSIONAL EXPERIENCE\nEngineer.\n\nEDUCATION\nBS\n\nSKILLS\nPython"
+REGENERATED_RESUME_TEXT = "PROFESSIONAL EXPERIENCE\nEngineer.\n\nSKILLS\nPython, Databricks"
+
+# Real output of the actual deterministic scorer for the fixture data above
+# (1/2 required keywords matched - "Databricks" missing) - computed once
+# here and reused, rather than a hand-guessed number that could silently
+# drift from what score_resume_against_keywords actually does.
+_INITIAL_SCORE_RESULT = score_resume_against_keywords(REQUIRED_KEYWORDS, [], INITIAL_RESUME_TEXT)
+INITIAL_SCORE = _INITIAL_SCORE_RESULT["ats_score"]
+DATABRICKS_POINT_VALUE = _INITIAL_SCORE_RESULT["missing_required_keywords"][0]["point_value"]
+DATABRICKS_QUESTION_TEXT = (
+    "The posting requires \"Databricks\" - do you have real, genuine experience with it? "
+    "If so, briefly describe it so it can be added to your resume."
+)
 
 
 @pytest.fixture
 def results_app_with_gap_questions(isolated_data, monkeypatch):
     monkeypatch.setenv("PANGA_TEST_MODE", "1")
 
-    save_jobs([
-        {"source": "Dice", "job_id": "job1", "title": "Director, Gaps", "organization": "Acme Corp", "location": "Remote", "description": "Requirements: Python, Databricks."},
-    ])
+    save_jobs([{
+        "source": "Dice", "job_id": "job1", "title": "Director, Gaps", "organization": "Acme Corp",
+        "location": "Remote", "description": "Requirements: Python, Databricks.",
+        "ats_required_keywords": REQUIRED_KEYWORDS, "ats_preferred_keywords": [],
+    }])
     update_job_score("Dice", "job1", 85, "Strong match.")
     upsert_application(
         "Dice", "job1", status="under review",
-        resume_text="PROFESSIONAL EXPERIENCE\nEngineer.\n\nEDUCATION\nBS\n\nSKILLS\nPython",
-        resume_ats_score=60, resume_ats_rationale="Matched 1/2 keywords.", resume_ats_next_actions=[],
+        resume_text=INITIAL_RESUME_TEXT,
+        resume_ats_score=INITIAL_SCORE, resume_ats_rationale=_INITIAL_SCORE_RESULT["ats_rationale"],
+        resume_ats_next_actions=[],
+        # Matches what _merge_keyword_gap_questions would have already
+        # produced and stored at the time this resume was drafted (real
+        # production shape - see tailoring.drafting._draft_one/
+        # _merge_keyword_gap_questions) - the point_value is already
+        # baked in from that original merge, not something Step 1
+        # re-derives independently.
         resume_clarifying_questions=[{
-            "type": "skill_gap", "skill": "Databricks",
-            "question": "The posting requires \"Databricks\" - do you have real, genuine experience with it?",
+            "type": "skill_gap", "skill": "Databricks", "question": DATABRICKS_QUESTION_TEXT,
             "suggested_answer": "Unknown - please describe your real experience (if any) with this.",
+            "point_value": DATABRICKS_POINT_VALUE,
         }],
     )
     return AppTest.from_file(APP_PATH)
+
+
+def _fake_generate_documents(job, profile, doc_keys, on_progress=None):
+    return {"resume": {
+        "text": REGENERATED_RESUME_TEXT,
+        "suggested_strategy_tag": "", "ats_score": 95,
+        "ats_rationale": "Matched 2/2 keywords.", "ats_next_actions": [], "clarifying_questions": [],
+    }}
 
 
 def test_gap_question_renders_inline_on_results_tab(results_app_with_gap_questions):
@@ -46,9 +94,8 @@ def test_gap_question_renders_inline_on_results_tab(results_app_with_gap_questio
     at.run(timeout=30)
 
     assert not at.exception
-    # The real interactive box, not just a pointer to the Profile Gaps tab.
-    assert any(t.label == "The posting requires \"Databricks\" - do you have real, genuine experience with it?" for t in at.text_area)
-    assert any(b.key and b.key.startswith("gapsave_") for b in at.button)
+    assert any(t.label == DATABRICKS_QUESTION_TEXT for t in at.text_area)
+    assert any(b.key and b.key.startswith("analyzefit_generate_") for b in at.button)
     markdown_text = " ".join(m.value for m in at.markdown)
     assert "see the" not in markdown_text.lower() or "profile gaps" not in markdown_text.lower()
 
@@ -63,22 +110,47 @@ def test_gap_question_suggested_answer_prefilled_inline(results_app_with_gap_que
     assert box.value == "Unknown - please describe your real experience (if any) with this."
 
 
-def test_answering_inline_on_results_tab_saves_and_regenerates(results_app_with_gap_questions, monkeypatch):
-    import tailoring.drafting as drafting
+def test_skill_gap_question_shows_a_point_badge(results_app_with_gap_questions):
+    at = results_app_with_gap_questions
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
 
-    def _fake_generate_documents(job, profile, doc_keys, on_progress=None):
-        return {"resume": {
-            "text": "PROFESSIONAL EXPERIENCE\nEngineer.\n\nSKILLS\nPython, Databricks",
-            "suggested_strategy_tag": "",
-            "ats_score": 95,
-            "ats_rationale": "Matched 2/2 keywords.",
-            "ats_next_actions": [],
-            "clarifying_questions": [],
-        }}
+    assert not at.exception
+    badge_lines = [m.value for m in at.markdown if "-badge[" in m.value]
+    assert any("pts" in b for b in badge_lines)
+    assert any(f"{DATABRICKS_POINT_VALUE:g}" in b for b in badge_lines)
 
-    monkeypatch.setattr(drafting, "generate_documents", _fake_generate_documents)
-    monkeypatch.setattr("tailoring.dossier.sync_workspace_documents", lambda *a, **k: None)
 
+def test_disqualifier_question_gets_no_point_badge_and_distinct_flag_note(results_app_with_gap_questions):
+    # A disqualifier_check question comes from the AI's own past drafted
+    # resume_clarifying_questions (missing_required_keywords never
+    # produces one - that mechanism only knows about literal keyword
+    # gaps, not standing preferences), so this seeds it there directly.
+    at = results_app_with_gap_questions
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    upsert_application(
+        "Dice", "job1", status="under review",
+        resume_clarifying_questions=[{
+            "type": "disqualifier_check", "skill": "role_level",
+            "question": "Should VP/CIO roles below a certain org size be excluded going forward?",
+            "suggested_answer": "",
+        }],
+    )
+    at.run(timeout=30)
+
+    assert not at.exception
+    badge_lines = [m.value for m in at.markdown if "-badge[" in m.value]
+    assert any("standing pref" in b for b in badge_lines)
+    markdown_text = " ".join(m.value for m in at.markdown)
+    assert "applies to every" in markdown_text.lower()
+
+
+def test_answer_saves_immediately_without_clicking_any_button(results_app_with_gap_questions):
+    # Item 4: answers persist even if the user never reaches Generate -
+    # real regression test for the old design's coupling of "answer
+    # saved" to "document generated" (spec's explicit warning about this).
     at = results_app_with_gap_questions
     at.session_state["active_tab"] = "results"
     at.session_state["selected_idx_Dice"] = 0
@@ -86,31 +158,73 @@ def test_answering_inline_on_results_tab_saves_and_regenerates(results_app_with_
 
     box = next(t for t in at.text_area if "Databricks" in t.label)
     box.set_value("Yes, led a 2-year Databricks migration.")
-    save_button = next(b for b in at.button if b.key and b.key.startswith("gapsave_"))
-    save_button.click().run(timeout=30)
+    at.run(timeout=30)  # a rerun from the text_area itself, not any button
 
     assert not at.exception
-    from tailoring.applications import get_application
-    app_record = get_application("Dice", "job1")
-    assert app_record["resume_ats_score"] == 95
-
     from profile.storage import load_profile
+
     answers = load_profile().get("gap_interview_answers", [])
     assert any(a["skill"] == "Databricks" and "migration" in a["answer"] for a in answers)
+    # Nothing was regenerated just from answering.
+    assert get_application("Dice", "job1")["resume_ats_score"] == INITIAL_SCORE
+
+
+def test_untouched_suggested_answer_does_not_get_saved_as_a_real_confirmed_answer(results_app_with_gap_questions):
+    # Real bug found live-verifying this stub-swap against real production
+    # data (2026-08-08): the suggested_answer prefill ("Unknown - please
+    # describe your real experience...") is itself non-empty text, so a
+    # bare "is there text in the box" check silently saved that untouched
+    # HEDGED GUESS as a real confirmed answer the moment the page
+    # rendered - before the user ever looked at it. Reproduced live:
+    # simply opening Profile Gaps once silently wrote 31 placeholder
+    # answers into the real profile as if they were confirmed facts.
+    # Merely rendering (even across several reruns) must never count as
+    # answering - only a genuine edit away from the exact prefill does.
+    at = results_app_with_gap_questions
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+    at.run(timeout=30)  # a second, unrelated rerun - still untouched
+    at.run(timeout=30)
+
+    assert not at.exception
+    from profile.storage import load_profile
+
+    answers = load_profile().get("gap_interview_answers", [])
+    assert not any(a["skill"] == "Databricks" for a in answers)
+
+
+def test_generate_button_regenerates_using_the_confirmed_answer(results_app_with_gap_questions, monkeypatch):
+    import tailoring.drafting as drafting
+
+    monkeypatch.setattr(drafting, "generate_documents", _fake_generate_documents)
+    monkeypatch.setattr("tailoring.dossier.sync_workspace_documents", lambda *a, **k: None)
+    # No prior draft's own resume_clarifying_questions and a fresh
+    # gap_interview_answers entry means check_regenerate_impact sees real
+    # new info (date_captured >= documents_drafted_at, which is unset) -
+    # the non-blocking heads-up path, so Generate proceeds immediately.
+    at = results_app_with_gap_questions
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+
+    box = next(t for t in at.text_area if "Databricks" in t.label)
+    box.set_value("Yes, led a 2-year Databricks migration.")
+    at.run(timeout=30)
+
+    generate_button = next(b for b in at.button if b.key and b.key.startswith("analyzefit_generate_"))
+    generate_button.click().run(timeout=30)
+
+    assert not at.exception
+    app_record = get_application("Dice", "job1")
+    assert app_record["resume_ats_score"] == 95
 
 
 def test_resume_expander_auto_expands_right_after_answering_a_gap_question(results_app_with_gap_questions, monkeypatch):
     # Zahir's explicit ask 2026-08-06: the new score/rationale/questions
-    # must be part of what he sees immediately after submitting an answer -
-    # not behind a collapsed expander he has to remember to reopen.
+    # must be part of what he sees immediately after generating - not
+    # behind a collapsed expander he has to remember to reopen.
     import tailoring.drafting as drafting
-
-    def _fake_generate_documents(job, profile, doc_keys, on_progress=None):
-        return {"resume": {
-            "text": "PROFESSIONAL EXPERIENCE\nEngineer.\n\nSKILLS\nPython, Databricks",
-            "suggested_strategy_tag": "", "ats_score": 95,
-            "ats_rationale": "Matched 2/2 keywords.", "ats_next_actions": [], "clarifying_questions": [],
-        }}
 
     monkeypatch.setattr(drafting, "generate_documents", _fake_generate_documents)
     monkeypatch.setattr("tailoring.dossier.sync_workspace_documents", lambda *a, **k: None)
@@ -122,27 +236,21 @@ def test_resume_expander_auto_expands_right_after_answering_a_gap_question(resul
 
     box = next(t for t in at.text_area if "Databricks" in t.label)
     box.set_value("Yes, led a 2-year Databricks migration.")
-    save_button = next(b for b in at.button if b.key and b.key.startswith("gapsave_"))
-    save_button.click().run(timeout=30)
+    at.run(timeout=30)
+    generate_button = next(b for b in at.button if b.key and b.key.startswith("analyzefit_generate_"))
+    generate_button.click().run(timeout=30)
 
     assert not at.exception
     resume_expander = next(e for e in at.expander if e.label == "Resume (drafted)")
     assert resume_expander.proto.expanded
 
 
-def test_score_delta_shown_after_answering_a_gap_question(results_app_with_gap_questions, monkeypatch):
+def test_score_delta_shown_after_regenerating(results_app_with_gap_questions, monkeypatch):
     # Zahir's explicit ask 2026-08-06: changing an answer must visibly show
     # the old -> new score change, reusing the existing delta-arrow pattern
     # already built for the JD-update flow, not just a bare new number.
     import tailoring.drafting as drafting
 
-    def _fake_generate_documents(job, profile, doc_keys, on_progress=None):
-        return {"resume": {
-            "text": "PROFESSIONAL EXPERIENCE\nEngineer.\n\nSKILLS\nPython, Databricks",
-            "suggested_strategy_tag": "", "ats_score": 95,
-            "ats_rationale": "Matched 2/2 keywords.", "ats_next_actions": [], "clarifying_questions": [],
-        }}
-
     monkeypatch.setattr(drafting, "generate_documents", _fake_generate_documents)
     monkeypatch.setattr("tailoring.dossier.sync_workspace_documents", lambda *a, **k: None)
 
@@ -153,49 +261,119 @@ def test_score_delta_shown_after_answering_a_gap_question(results_app_with_gap_q
 
     box = next(t for t in at.text_area if "Databricks" in t.label)
     box.set_value("Yes, led a 2-year Databricks migration.")
-    save_button = next(b for b in at.button if b.key and b.key.startswith("gapsave_"))
-    save_button.click().run(timeout=30)
+    at.run(timeout=30)
+    generate_button = next(b for b in at.button if b.key and b.key.startswith("analyzefit_generate_"))
+    generate_button.click().run(timeout=30)
 
     assert not at.exception
     metric = next(m for m in at.metric if m.label == "ATS compatibility score")
     assert metric.value == "95/100"
     assert metric.delta is not None
-    assert "35" in metric.delta  # 95 - 60 (fixture's original score)
+    assert str(95 - INITIAL_SCORE) in metric.delta
 
 
-def test_resume_expander_auto_expands_right_after_first_generate(isolated_data, monkeypatch):
-    from search.job_store import save_jobs, update_job_score
-
-    monkeypatch.setenv("PANGA_TEST_MODE", "1")
-    save_jobs([{"source": "Dice", "job_id": "job2", "title": "Director, Fresh", "organization": "Acme Corp", "location": "Remote", "description": "Requirements: Python."}])
-    update_job_score("Dice", "job2", 85, "Strong match.")
-
+def test_generate_with_no_new_info_opens_a_blocking_confirmation_dialog(results_app_with_gap_questions, monkeypatch):
+    # Item 6: regenerating with nothing new confirmed is pure downside
+    # risk (a full rewrite that could accidentally drop a matched
+    # keyword) - forces the has_new_info=False branch (no fresh
+    # gap_interview_answers) to verify the blocking gate.
     import tailoring.drafting as drafting
 
-    def _fake_generate_documents(job, profile, doc_keys, on_progress=None):
-        return {"resume": {
-            "text": "PROFESSIONAL EXPERIENCE\nEngineer.\n\nSKILLS\nPython",
-            "suggested_strategy_tag": "", "ats_score": 80,
-            "ats_rationale": "Matched 1/1 keywords.", "ats_next_actions": [], "clarifying_questions": [],
-        }}
-
-    monkeypatch.setattr(drafting, "generate_documents", _fake_generate_documents)
-    monkeypatch.setattr(drafting, "is_configured", lambda: True)
-    monkeypatch.setattr("tailoring.dossier.sync_workspace_documents", lambda *a, **k: None)
-
-    at = AppTest.from_file(APP_PATH)
+    monkeypatch.setattr(
+        drafting, "check_regenerate_impact",
+        lambda job, app_record, profile: {
+            "has_new_info": False, "new_fact_count": None, "estimated_new_score": None,
+            "cost_estimate": None, "last_generation_cost": 0.0421, "current_score": INITIAL_SCORE,
+        },
+    )
+    at = results_app_with_gap_questions
     at.session_state["active_tab"] = "results"
     at.session_state["selected_idx_Dice"] = 0
     at.run(timeout=30)
 
-    checkbox = next(c for c in at.checkbox if c.key and c.key.startswith("doc_resume_"))
-    checkbox.set_value(True)
-    gen_button = next(b for b in at.button if b.key and b.key.startswith("gendocs_"))
-    gen_button.click().run(timeout=30)
+    generate_button = next(b for b in at.button if b.key and b.key.startswith("analyzefit_generate_"))
+    generate_button.click().run(timeout=30)
 
     assert not at.exception
-    resume_expander = next(e for e in at.expander if e.label == "Resume (drafted)")
-    assert resume_expander.proto.expanded
+    # No regeneration happened yet - blocked behind the dialog.
+    assert get_application("Dice", "job1")["resume_ats_score"] == INITIAL_SCORE
+    assert "regen_confirm_pending" in at.session_state
+    dialog_text = " ".join(m.value for m in at.markdown)
+    assert "0.04" in dialog_text
+    assert any(b.key == "regen_confirm_confirm" for b in at.button)
+    assert any(b.key == "regen_confirm_cancel" for b in at.button)
+
+
+def test_confirming_the_blocking_dialog_regenerates(results_app_with_gap_questions, monkeypatch):
+    import tailoring.drafting as drafting
+
+    monkeypatch.setattr(drafting, "generate_documents", _fake_generate_documents)
+    monkeypatch.setattr("tailoring.dossier.sync_workspace_documents", lambda *a, **k: None)
+    monkeypatch.setattr(
+        drafting, "check_regenerate_impact",
+        lambda job, app_record, profile: {
+            "has_new_info": False, "new_fact_count": None, "estimated_new_score": None,
+            "cost_estimate": None, "last_generation_cost": 0.0421, "current_score": INITIAL_SCORE,
+        },
+    )
+    at = results_app_with_gap_questions
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+
+    generate_button = next(b for b in at.button if b.key and b.key.startswith("analyzefit_generate_"))
+    generate_button.click().run(timeout=30)
+
+    confirm_button = next(b for b in at.button if b.key == "regen_confirm_confirm")
+    confirm_button.click().run(timeout=30)
+
+    assert not at.exception
+    assert get_application("Dice", "job1")["resume_ats_score"] == 95
+
+
+def test_cancelling_the_blocking_dialog_does_not_regenerate(results_app_with_gap_questions, monkeypatch):
+    import tailoring.drafting as drafting
+
+    monkeypatch.setattr(
+        drafting, "check_regenerate_impact",
+        lambda job, app_record, profile: {
+            "has_new_info": False, "new_fact_count": None, "estimated_new_score": None,
+            "cost_estimate": None, "last_generation_cost": 0.0421, "current_score": INITIAL_SCORE,
+        },
+    )
+    at = results_app_with_gap_questions
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+
+    generate_button = next(b for b in at.button if b.key and b.key.startswith("analyzefit_generate_"))
+    generate_button.click().run(timeout=30)
+
+    cancel_button = next(b for b in at.button if b.key == "regen_confirm_cancel")
+    cancel_button.click().run(timeout=30)
+
+    assert not at.exception
+    assert get_application("Dice", "job1")["resume_ats_score"] == INITIAL_SCORE
+    assert "regen_confirm_pending" not in at.session_state
+
+
+def test_no_open_questions_shows_the_exhausted_message(results_app_with_gap_questions):
+    at = results_app_with_gap_questions
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    # A fully-matching resume - no missing required keywords left to ask
+    # about, and no stale stored questions carried over from before (a
+    # real regenerate would have replaced resume_clarifying_questions
+    # with a fresh, empty merge result at this same point).
+    upsert_application(
+        "Dice", "job1", status="under review",
+        resume_text=REGENERATED_RESUME_TEXT, resume_clarifying_questions=[],
+    )
+    at.run(timeout=30)
+
+    assert not at.exception
+    markdown_text = " ".join(m.value for m in at.markdown)
+    assert "no more real gaps found" in markdown_text.lower()
 
 
 def test_gap_question_also_still_appears_on_profile_gaps_tab(results_app_with_gap_questions):
@@ -209,3 +387,41 @@ def test_gap_question_also_still_appears_on_profile_gaps_tab(results_app_with_ga
 
     assert not at.exception
     assert any("Databricks" in t.label for t in at.text_area)
+
+
+def test_profile_gaps_expander_count_reflects_missing_keyword_questions_too(results_app_with_gap_questions):
+    # Real bug found live-verifying this stub-swap against real data
+    # (2026-08-08): the expander's "(N open)" label counted only
+    # len(resume_clarifying_questions) - the stored, AI-drafted-at-the-
+    # time set - which undercounts once a required keyword is missing
+    # that ISN'T yet captured in that stored list (e.g. keyword
+    # extraction ran/changed after the last draft). The real open count
+    # is len(open_questions) from analyze_fit_before_drafting, which also
+    # folds in fresh missing_required_keywords - the label must match
+    # what's actually inside the expander when opened, not undercount it.
+    save_jobs([{
+        "source": "Dice", "job_id": "job2", "title": "Director, Two Gaps", "organization": "Beta Inc",
+        "location": "Remote", "description": "Requirements: Python, Databricks, Snowflake.",
+        "ats_required_keywords": ["Python", "Databricks", "Snowflake"], "ats_preferred_keywords": [],
+    }])
+    update_job_score("Dice", "job2", 80, "Good match.")
+    upsert_application(
+        "Dice", "job2", status="under review",
+        resume_text=INITIAL_RESUME_TEXT,  # has Python, missing both Databricks and Snowflake
+        resume_ats_score=50, resume_ats_rationale="placeholder", resume_ats_next_actions=[],
+        # Only ONE of the two real gaps is captured in the stored field -
+        # the stale-count bug this test guards against.
+        resume_clarifying_questions=[{
+            "type": "skill_gap", "skill": "Databricks", "question": DATABRICKS_QUESTION_TEXT,
+            "suggested_answer": "Unknown - please describe your real experience (if any) with this.",
+            "point_value": DATABRICKS_POINT_VALUE,
+        }],
+    )
+
+    at = results_app_with_gap_questions
+    at.session_state["active_tab"] = "gaps"
+    at.run(timeout=30)
+
+    assert not at.exception
+    expander = next(e for e in at.expander if "Director, Two Gaps" in e.label)
+    assert "(2 open)" in expander.label, expander.label
