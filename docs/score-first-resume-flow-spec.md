@@ -1,8 +1,9 @@
 # Score-first resume flow — spec
 
-Status: approved for build (points 1-5). Point 6 (what "Generate" does once a
-resume already exists) is deliberately excluded from this build — still under
-discussion with Zahir, do not build ahead of it.
+Status: approved for build (points 1-7). Layout: **Option B** (split
+summary + list - score/baseline/plateau explanation in a sticky left rail,
+questions as their own cards on the right) is the confirmed choice out of
+the 3 mockup options - build against Option B, not A or C.
 
 ## Why
 
@@ -108,21 +109,51 @@ worth asking exists, say so explicitly ("no more real gaps found based on
 your current profile") rather than either erroring or inventing a
 low-value question to fill space.
 
-## Explicitly out of scope for this build
+### 6. Regenerating a job that already has a resume - conditional confirmation
 
-**Point 6 - what happens when "Generate" is clicked again after a resume
-already exists for this job.** Still being discussed with Zahir. Current
-leaning (not yet approved): the Step 1 panel doesn't disappear after first
-generation, it stays as "things that could still raise this further," and
-clicking Generate at any point (first time or later) just means "redraft
-using everything confirmed since the last draft" - but this is NOT approved
-yet, do not build against this assumption. Whoever picks this build up:
-ping the hub before touching what happens post-first-generation.
+The Step 1 panel doesn't disappear after first generation - it stays
+permanently as "things that could still raise this further." Clicking
+"Generate" at any point (first time or later) means "redraft using
+everything confirmed since the last draft." What happens on a *repeat*
+Generate click depends on whether there's genuinely new information:
+
+- **New confirmed answers exist since the last draft** - no blocking gate,
+  just an informational heads-up before proceeding: "N new confirmed facts
+  aren't in your resume yet - regenerating should raise your score from X
+  toward ~Y, estimated cost $Z. Go ahead?"
+- **Nothing new since the last draft** - a real yes/no confirmation gate.
+  Regenerating here is pure downside risk (every regenerate is a full
+  rewrite - see the "Why" section above - so with nothing new to add,
+  there's no expected upside, only the real chance of an accidental
+  rewording dropping a previously-matched keyword, exactly what happened in
+  the live case that motivated this whole redesign). Show the real cost of
+  the last generation call and ask for explicit confirmation before
+  proceeding.
+
+### 7. Real per-call cost logging (prerequisite for item 6)
+
+Item 6 needs a real dollar figure, not an estimate. `api_cost.py` already
+has `estimate_response_cost()` - computes real cost from a response's
+actual token usage, explicitly built (2026-07-31, Zahir's own request at the
+time) to be reused everywhere, but today it's only wired into
+`call_with_web_search()`, not into `call_structured()` - the function that
+actually powers job scoring, resume/cover-letter drafting, and everything
+else (the vast majority of real spend). Scope for this item:
+1. Wire `estimate_response_cost()` into `call_structured()` too.
+2. Persist each call's real cost to a simple running log (one row per call:
+   timestamp, what it was for, model, tokens, $ cost) rather than computing
+   and discarding it.
+3. Update the existing `panga-cost-report` skill to read real logged
+   numbers instead of estimating from guessed call frequency.
+Scope explicitly does NOT include a new cost-dashboard UI screen - Zahir
+wants that deferred ("for the other screens we can expose it later"). This
+item only needs to produce a real number item 6's popup can read.
 
 ## Ownership
 
-Spans both ats_score.py/drafting.py/job_store.py (baseline selection,
-either/or groups, question-value computation) and app.py (the new Step 1/
-Step 2 screen). Coordinate between ATS Engine (backend) and UI refinement
-(frontend) - backend pieces (1, 2, 4) are a prerequisite for the frontend
-screen (3, 5 are partly UI, partly backend-question-generation).
+Spans ats_score.py/drafting.py/job_store.py/llm_client.py/api_cost.py
+(baseline selection, either/or groups, question-value computation, cost
+logging) and app.py (the new Step 1/Step 2 screen, Option B layout, the
+regenerate-confirmation popup). Coordinate between ATS Engine (backend,
+items 1/2/4/7) and UI refinement (frontend, items 3/5/6's popup) - backend
+pieces are a prerequisite for the frontend screen.
