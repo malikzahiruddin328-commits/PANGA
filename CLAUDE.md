@@ -76,6 +76,43 @@ race-condition/performance checks above into a general standing posture:
 - When you finish a task, do a quick "what would break next" pass before
   reporting done - not just "does this satisfy the literal ask."
 
+**Known failure patterns (2026-08-08 retrospective) - check new/touched code
+against these specifically, don't wait to rediscover them tab by tab:**
+
+1. **Streamlit expander state.** `st.expander(..., key=...)` alone does NOT
+   persist a user's manual open/close across reruns in this Streamlit
+   version - `on_change="rerun"` must also be set on the same expander, or
+   Python's `expanded=` argument silently wins every rerun and closes it
+   again. Any expander meant to stay open across an unrelated interaction
+   (typing in a nearby box, toggling a filter) needs this. Found and fixed
+   on the Results tab's channel/resume-drafted expanders 2026-08-08 - check
+   any other `st.expander` for the same gap before assuming it's fine.
+2. **Regenerate-from-scratch is a silent regression risk.** Any flow that
+   re-drafts AI content instead of editing it in place has no guarantee a
+   fact/keyword/detail that used to be present survives the next draft,
+   even when the new version is objectively better. Real example: a
+   resume regenerate replaced "clinical development" with "clinical-stage"
+   and dropped a required-keyword match. Anywhere content gets
+   iteratively regenerated (cover letters, exec bios, outreach drafts,
+   apply-answers) carries this same risk - don't assume a later draft is
+   strictly better than an earlier one.
+3. **AI output checked by a literal/deterministic downstream rule is
+   fragile without a code-level backstop.** Prompt instructions alone have
+   proven unreliable multiple times this week (rank-prefix stripping,
+   BSc/bachelor's-degree synonyms, years-of-experience/title-list
+   over-extraction, either/or degree requirements) - each needed real
+   deterministic code, not just better prompt wording, to actually hold up
+   on every run. If AI-generated text feeds a literal string/keyword check
+   anywhere else in the app, don't trust the prompt alone to keep it
+   correct.
+4. **A feature can be fully built and merged but never actually turned
+   on.** The job-alert email scan sat completely inert for a day because
+   its sender allowlist was empty and its scheduled task was never
+   created - the code was real and correct, but nothing activated it.
+   When shipping a feature gated behind user config or a scheduled task,
+   verify the config is actually populated and the task actually exists,
+   not just that the code path is reachable.
+
 2026-08-06: Zahir made this explicit after having to personally spot and
 name a port-isolation issue (prod vs. test dev-server ports colliding)
 that was a predictable consequence of the multi-session setup itself -

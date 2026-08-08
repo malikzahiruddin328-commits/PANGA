@@ -1,0 +1,11 @@
+senders:
+  - sender: jobalerts-noreply@linkedin.com
+    source: linkedin
+  - sender: jobs-noreply@linkedin.com
+    source: linkedin
+  - sender: jobalert@lensa.com
+    source: lensa
+  - sender: lensa24@lensa.com
+    source: lensa
+  - sender: aggregated@lensa.com
+    source: lensa
