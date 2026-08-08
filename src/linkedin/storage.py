@@ -61,6 +61,22 @@ def save_snapshot(raw_text: str, source_files: list[str], saved_at: str) -> None
     _save(data)
 
 
+def _suggestion_identity(s: dict) -> tuple:
+    """Stable-ish identity used to carry status across a re-analysis (see
+    save_analysis below) - current_text quotes the profile's OWN existing
+    wording for that section, so it reproduces identically across
+    re-analyses of the same underlying profile export even though an LLM's
+    suggested_text/rationale wording won't. A suggestion that proposes
+    something new rather than editing existing text (e.g. a skill that
+    isn't listed at all) has no current_text to anchor on, so those match
+    on suggested_text instead."""
+    section = s.get("section")
+    current_text = (s.get("current_text") or "").strip()
+    if current_text:
+        return (section, "current", current_text)
+    return (section, "suggested", (s.get("suggested_text") or "").strip())
+
+
 def save_analysis(
     suggestions: list[dict],
     profile_strength_score: int,
@@ -71,24 +87,37 @@ def save_analysis(
     LLM architecture - Python never generates this content itself). Each
     suggestion dict needs: section (one of SECTIONS), current_text,
     suggested_text, rationale. Replaces the whole suggestions list - a fresh
-    analysis supersedes the prior one rather than accumulating stale items.
-    Assigns a stable id per suggestion (section + index within that section)
-    so mark_suggestion_status() can target one precisely."""
+    analysis supersedes the prior one rather than accumulating stale items -
+    but carries forward "applied"/"dismissed" status by matching suggestion
+    identity (see _suggestion_identity) against the prior list first (real
+    bug, Mirror's proactive sweep 2026-08-08: re-running analysis used to
+    silently reset every suggestion back to "suggested", wiping out
+    anything Zahir had already marked applied or dismissed, no warning -
+    same failure shape as the resume-regenerate bug, caught before it
+    actually fired for him). Assigns a stable id per suggestion (section +
+    index within that section) so mark_suggestion_status() can target one
+    precisely - the id itself isn't meant to survive a re-analysis, only
+    the applied/dismissed status is."""
     data = load_linkedin_profile()
+    prior_status_by_identity = {_suggestion_identity(s): s["status"] for s in data["suggestions"]}
     per_section_counter = {}
     stamped = []
     for s in suggestions:
         section = s["section"]
         idx = per_section_counter.get(section, 0)
         per_section_counter[section] = idx + 1
-        stamped.append({
+        new_suggestion = {
             "id": f"{section}_{idx}",
             "section": section,
             "current_text": s.get("current_text", ""),
             "suggested_text": s["suggested_text"],
             "rationale": s.get("rationale", ""),
             "status": "suggested",
-        })
+        }
+        carried_status = prior_status_by_identity.get(_suggestion_identity(new_suggestion))
+        if carried_status in ("applied", "dismissed"):
+            new_suggestion["status"] = carried_status
+        stamped.append(new_suggestion)
     data["suggestions"] = stamped
     data["profile_strength_score"] = profile_strength_score
     data["profile_strength_rationale"] = profile_strength_rationale
