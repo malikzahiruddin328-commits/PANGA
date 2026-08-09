@@ -86,6 +86,41 @@ def test_editing_an_answer_updates_it_in_place(gaps_app):
     assert answers[0]["answer"] == "Yes, 3 years - led the migration."
 
 
+def test_editing_an_answer_stamps_date_captured_in_utc_not_local(gaps_app, monkeypatch):
+    # Real bug found live 2026-08-08 (General): this call site had the
+    # same local-vs-UTC date_captured bug as drafting.py's
+    # save_gap_answers() - see test_save_gap_answers_stamps_date_captured_
+    # in_utc_not_local in test_drafting.py for the full explanation.
+    # Reproduces the exact real moment: local time still reads 2026-08-08
+    # but UTC has already rolled to 2026-08-09.
+    import datetime as datetime_module
+
+    class _FixedDatetime(datetime_module.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime_module.datetime(2026, 8, 9, 2, 30, tzinfo=tz)
+
+    save_answer(
+        skill="Databricks", role_context="Director at Acme", answer="Not sure.",
+        date_captured="2026-08-01", question="Do you have real experience with Databricks?",
+    )
+
+    at = gaps_app
+    at.session_state["active_tab"] = "gaps"
+    at.run(timeout=30)
+
+    answer_box = next(t for t in at.text_area if t.label == "Do you have real experience with Databricks?")
+    answer_box.set_value("Yes, 3 years - led the migration.")
+
+    monkeypatch.setattr(datetime_module, "datetime", _FixedDatetime)
+    save_button = next(b for b in at.button if b.key.startswith("answered_save_"))
+    save_button.click().run(timeout=30)
+
+    assert not at.exception
+    from profile.storage import load_profile
+    assert load_profile()["gap_interview_answers"][0]["date_captured"] == "2026-08-09"
+
+
 def test_clicking_update_with_no_changes_shows_info_toast(gaps_app):
     save_answer(
         skill="Databricks", role_context="Director at Acme", answer="Yes, 3 years.",
@@ -141,3 +176,32 @@ def test_disqualifier_answer_shows_the_applies_everywhere_flag(gaps_app):
     # rule (no st.caption anywhere in Panga, full-contrast text only).
     markdowns = [m.value for m in at.markdown]
     assert any("every future job match" in m for m in markdowns)
+
+
+def test_previously_answered_stays_open_while_editing(gaps_app):
+    # Real bug (Mirror's proactive sweep, 2026-08-08): editing a stored
+    # answer (a real rerun-triggering interaction, before ever clicking
+    # the update button) used to collapse this section out from under the
+    # user mid-edit - it had no key= at all before this fix.
+    save_answer(
+        skill="Databricks", role_context="Director at Acme", answer="Not sure.",
+        date_captured="2026-08-01", question="Do you have real experience with Databricks?",
+    )
+
+    at = gaps_app
+    at.session_state["active_tab"] = "gaps"
+    # Same as driving a real click - opened by hand, matching what the
+    # widget's own key=+on_change="rerun" would persist server-side.
+    at.session_state["previously_answered_expander"] = True
+    at.run(timeout=30)
+
+    expander = next(e for e in at.expander if e.label.startswith("Previously answered"))
+    assert expander.proto.expanded
+
+    answer_box = next(t for t in at.text_area if t.label == "Do you have real experience with Databricks?")
+    answer_box.set_value("Yes, 3 years - led the migration.")
+    at.run(timeout=30)  # the rerun the text_area's own change triggers
+
+    assert not at.exception
+    expander = next(e for e in at.expander if e.label.startswith("Previously answered"))
+    assert expander.proto.expanded

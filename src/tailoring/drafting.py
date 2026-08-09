@@ -26,7 +26,9 @@ from llm_client import (
     get_client as _client,
     is_configured,
 )
-from tailoring.ats_score import score_resume_against_keywords, score_resume_ats
+from skill_label_match import skills_match
+from tailoring.ats_score import plateau_note_for_gaps, score_resume_against_keywords, score_resume_ats
+from tailoring.baseline_resume import select_baseline_resume_text
 
 _RESUME_SPEC_COMMON = (
     "Tailored resume text for this specific job, written to be ATS-perfect - "
@@ -296,6 +298,7 @@ def generate_target_roles(resume_text: str, industries: list[str], seniority: st
         model=model,
         effort="high",
         refusal_message="Claude declined to propose target roles. Try again.",
+        purpose="target_roles",
     )
 
     ladder_industry = data.get("ladder_industry")
@@ -317,7 +320,57 @@ Rules:
 - preferred_keywords: terms from a "preferred"/"desired"/"nice-to-have"/"bonus" section, or that read as a plus rather than mandatory.
 - If the posting doesn't clearly separate required vs preferred, use your best judgment on which items read as mandatory vs a plus - don't force a 50/50 split.
 - Keep each term short (1-4 words) and in the posting's own wording - e.g. "SQL", "AWS", "Project Management", "Agile", "PMP certification" - not full sentences or restated requirements.
-- If the posting text is boilerplate/empty/has no real requirements in it at all, return empty lists for both - do not pad with generic guesses."""
+- If the posting text is boilerplate/empty/has no real requirements in it at all, return empty lists for both - do not pad with generic guesses.
+
+Do NOT extract these three categories - a real gap caught live 2026-08-07: a candidate with 25+ years of exactly this kind of experience was asked "do you have real, genuine experience with it?" for things that were never checkable skill gaps in the first place, just the extractor pulling the wrong category of thing out of the posting entirely:
+- Years-of-experience thresholds. This is a numeric tenure requirement, not a checkable skill/tool/fact - e.g. do NOT extract "8+ years", "10+ years IT leadership", "5 years executive technology" as a keyword (the ATS score's own structural checks already cover tenure elsewhere; this extractor is for discrete skills/tools/certifications only).
+- Alternate-title lists. When a posting lists acceptable prior job titles (e.g. "IT director, solutions architect, technology consultant, or similar role"), that's the posting describing what kind of role the candidate should have held - not separate skills each needing individual proof. Do NOT extract "IT director", "solutions architect", or "technology consultant" as individual keywords from a title-list phrase like this.
+- Generic soft-skill/leadership phrases with no single checkable term. e.g. do NOT extract "executive presence", "presentation", "c-suite stakeholders", "strong communication skills", "executive technology strategies" - these are vague qualities almost any senior resume already demonstrates narratively; there's no literal fact to add for them.
+
+Either/or qualification groups (score-first-resume-flow spec, item 2): a JD often phrases a requirement as a substitutable alternative - e.g. "Master's degree, OR Bachelor's degree plus 8+ years of experience," or "PMP certification or equivalent project management experience." Extract this as ONE item shaped {"any_of": [alternative1, alternative2, ...]} instead of flat independent keywords for each side - a candidate who satisfies either alternative has satisfied the whole requirement, and extracting the alternatives as separate flat keywords would falsely flag a real, satisfied requirement as a missing gap the moment the candidate takes the other branch. Each alternative in any_of MUST be a single, atomic, short (1-4 word) term in the posting's own wording, same as any other keyword - e.g. "Bachelor's degree", not "Associate's or Bachelor's Degree". If one side of the posting's own either/or itself lists multiple sub-options (e.g. "Associate's or Bachelor's Degree plus experience"), split those into separate atomic members of any_of too (e.g. "Associate's degree", "Bachelor's degree") rather than bundling them into one combined alternative string - a bundled alternative can't be matched against a candidate's real, differently-worded resume text downstream. Only use this shape when the posting genuinely states an "or"/substitutable relationship between two or more concrete alternatives - not for an ordinary list of several required skills, which stays flat."""
+
+
+# Deterministic backstop for the years-of-experience category above - a
+# regex is easy to catch here and shouldn't depend on the prompt being
+# followed perfectly every time (same lesson as the rank-prefix and
+# keyword-synonym fixes earlier this week: prompt-only guidance for this
+# extraction pipeline has already proven unreliable on its own more than
+# once). Matches when the WHOLE extracted keyword starts with a
+# number-of-years pattern, e.g. "8+ years", "10+ years IT leadership",
+# "5 years executive technology" - the tenure threshold is the entire
+# point of the string, not a discrete skill/tool/certification worth a
+# literal keyword-match check. The other two over-extraction categories
+# (alternate-title lists, generic soft-skill phrases) have no reliable
+# regex signature, so those rely on the tightened prompt above instead.
+_YEARS_EXPERIENCE_KEYWORD_RE = re.compile(r"^\d+\+?\s*years?\b", re.IGNORECASE)
+
+
+def _drop_years_experience_keywords(keywords: list) -> list:
+    # Group items ({"any_of": [...]}) pass through untouched - a
+    # years-of-experience threshold wouldn't sensibly appear as one side
+    # of a real either/or group, and .strip() would crash on a dict.
+    return [k for k in keywords if not (isinstance(k, str) and _YEARS_EXPERIENCE_KEYWORD_RE.match(k.strip()))]
+
+
+# Anthropic's structured-output schema rejects "oneOf" (confirmed live,
+# 2026-08-08: "Schema type 'oneOf' is not supported") - "anyOf" is the
+# supported equivalent for "this array item is either a plain string or an
+# either/or group object", used here for required_keywords/
+# preferred_keywords per the either/or extraction rule above. Also
+# confirmed live: "minItems" values other than 0 or 1 aren't supported
+# either, so "at least two real alternatives" is prompt guidance only
+# (the either/or rule above already says so), not schema-enforced.
+_KEYWORD_ITEM_SCHEMA = {
+    "anyOf": [
+        {"type": "string"},
+        {
+            "type": "object",
+            "properties": {"any_of": {"type": "array", "items": {"type": "string"}}},
+            "required": ["any_of"],
+            "additionalProperties": False,
+        },
+    ]
+}
 
 
 def _ats_keywords_schema() -> dict:
@@ -326,13 +379,21 @@ def _ats_keywords_schema() -> dict:
         "properties": {
             "required_keywords": {
                 "type": "array",
-                "items": {"type": "string"},
-                "description": "Short (1-4 word) required/must-have terms taken directly from the posting's own wording. Empty list if none are genuinely stated.",
+                "items": _KEYWORD_ITEM_SCHEMA,
+                "description": (
+                    "Short (1-4 word) required/must-have terms taken directly from the posting's own wording, "
+                    "or {\"any_of\": [...]} for a substitutable either/or requirement (see the either/or rule "
+                    "above). Empty list if none are genuinely stated."
+                ),
             },
             "preferred_keywords": {
                 "type": "array",
-                "items": {"type": "string"},
-                "description": "Short (1-4 word) preferred/nice-to-have terms taken directly from the posting's own wording. Empty list if none are genuinely stated.",
+                "items": _KEYWORD_ITEM_SCHEMA,
+                "description": (
+                    "Short (1-4 word) preferred/nice-to-have terms taken directly from the posting's own "
+                    "wording, or {\"any_of\": [...]} for a substitutable either/or preference. Empty list if "
+                    "none are genuinely stated."
+                ),
             },
         },
         "required": ["required_keywords", "preferred_keywords"],
@@ -340,7 +401,7 @@ def _ats_keywords_schema() -> dict:
     }
 
 
-def _extract_ats_keywords(client: "anthropic.Anthropic", job: dict, model: str | None = None) -> tuple[list[str], list[str]]:
+def _extract_ats_keywords(client: "anthropic.Anthropic", job: dict, model: str | None = None) -> tuple[list, list]:
     """One real-NLP-judgment AI call that pulls the literal required/
     preferred keyword list out of this job's own posting text (title +
     qualification_summary/description, whichever this job record has - see
@@ -363,6 +424,7 @@ def _extract_ats_keywords(client: "anthropic.Anthropic", job: dict, model: str |
     ]))
     if not posting_text.strip():
         return [], []
+    job_key = (job["source"], job["job_id"]) if job.get("source") and job.get("job_id") else None
     try:
         data = call_structured(
             client,
@@ -373,12 +435,14 @@ def _extract_ats_keywords(client: "anthropic.Anthropic", job: dict, model: str |
             model=model,
             effort="medium",
             refusal_message="Claude declined to extract ATS keywords.",
+            purpose="ats_keyword_extraction",
+            job_key=job_key,
         )
     except (DraftingNotConfigured, DraftingFailed):
         return [], []
 
-    required = data.get("required_keywords") or []
-    preferred = data.get("preferred_keywords") or []
+    required = _drop_years_experience_keywords(data.get("required_keywords") or [])
+    preferred = _drop_years_experience_keywords(data.get("preferred_keywords") or [])
 
     from search.job_store import update_job_ats_keywords
 
@@ -422,6 +486,7 @@ def score_job(job: dict, profile: dict, model: str | None = None, on_progress=No
         "JOB POSTING:\n" + json.dumps(job, indent=2, default=str) +
         "\n\nCANDIDATE'S MASTER PROFILE:\n" + json.dumps(profile, indent=2, default=str)
     )
+    job_key = (job["source"], job["job_id"]) if job.get("source") and job.get("job_id") else None
     data = call_structured(
         client,
         system=SCORE_SYSTEM_PROMPT,
@@ -432,6 +497,8 @@ def score_job(job: dict, profile: dict, model: str | None = None, on_progress=No
         effort="high",
         on_progress=on_progress,
         refusal_message="Claude declined to score this job. Try again.",
+        purpose="fit_score",
+        job_key=job_key,
     )
     return {"fit_score": data["fit_score"], "fit_rationale": data["fit_rationale"]}
 
@@ -443,6 +510,69 @@ def _schema(doc_keys: list[str]) -> dict:
         "required": doc_keys,
         "additionalProperties": False,
     }
+
+
+_CLARIFYING_QUESTION_ITEM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "type": {
+            "type": "string",
+            "enum": ["skill_gap", "disqualifier_check"],
+            "description": (
+                "\"skill_gap\" (the normal case) for a missing real "
+                "fact/number/name/date that would raise the ATS "
+                "score if confirmed. \"disqualifier_check\" only "
+                "when this posting's title/domain sits right at the "
+                "edge of what the profile's real experience covers, "
+                "in a way the candidate might want to hard-exclude "
+                "going forward (not just skip this one job) - the "
+                "same kind of thing as a candidate ruling out "
+                "CISO-titled roles despite broader cybersecurity "
+                "experience. Before proposing one, check whether the "
+                "profile's gap_interview_answers already has an "
+                "is_disqualifier entry covering this same role type "
+                "- if so, don't ask again, the scoring already "
+                "applies it."
+            ),
+        },
+        "skill": {
+            "type": "string",
+            "description": "Short label for this gap or disqualifier topic (e.g. 'SK Life Science IT team size/budget', or 'CISO-titled roles'), matching the master profile's gap-tracking convention.",
+        },
+        "question": {
+            "type": "string",
+            "description": (
+                "For skill_gap: a direct, specific question whose "
+                "answer is a genuine, checkable fact (a number, a "
+                "name, a date) that would close this gap - not "
+                "vague or stylistic. For disqualifier_check: a "
+                "direct yes/no-style question asking whether this "
+                "role type is one the candidate wants excluded from "
+                "future matches, or whether their experience "
+                "actually covers it after all."
+            ),
+        },
+        "suggested_answer": {
+            "type": "string",
+            "description": (
+                "For skill_gap: a proposed starting draft for the "
+                "answer, phrased as the candidate's own words - e.g. "
+                "a plausible number/scope guess given the role and "
+                "the rest of the profile ('Roughly 8-10 engineers, "
+                "~$2M budget?'). A suggestion to edit, never a "
+                "stated fact - make that uncertainty visible in the "
+                "phrasing itself (hedge words, a trailing '?') "
+                "rather than asserting it. Leave as an empty string "
+                "if you have no reasonable basis to propose "
+                "anything. For disqualifier_check: always an empty "
+                "string - this is a genuine judgment call only the "
+                "candidate can make, never a guess."
+            ),
+        },
+    },
+    "required": ["type", "skill", "question", "suggested_answer"],
+    "additionalProperties": False,
+}
 
 
 def _resume_schema(job: dict | None = None) -> dict:
@@ -495,67 +625,7 @@ def _resume_schema(job: dict | None = None) -> dict:
             },
             "clarifying_questions": {
                 "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "type": {
-                            "type": "string",
-                            "enum": ["skill_gap", "disqualifier_check"],
-                            "description": (
-                                "\"skill_gap\" (the normal case) for a missing real "
-                                "fact/number/name/date that would raise the ATS "
-                                "score if confirmed. \"disqualifier_check\" only "
-                                "when this posting's title/domain sits right at the "
-                                "edge of what the profile's real experience covers, "
-                                "in a way the candidate might want to hard-exclude "
-                                "going forward (not just skip this one job) - the "
-                                "same kind of thing as a candidate ruling out "
-                                "CISO-titled roles despite broader cybersecurity "
-                                "experience. Before proposing one, check whether the "
-                                "profile's gap_interview_answers already has an "
-                                "is_disqualifier entry covering this same role type "
-                                "- if so, don't ask again, the scoring already "
-                                "applies it."
-                            ),
-                        },
-                        "skill": {
-                            "type": "string",
-                            "description": "Short label for this gap or disqualifier topic (e.g. 'SK Life Science IT team size/budget', or 'CISO-titled roles'), matching the master profile's gap-tracking convention.",
-                        },
-                        "question": {
-                            "type": "string",
-                            "description": (
-                                "For skill_gap: a direct, specific question whose "
-                                "answer is a genuine, checkable fact (a number, a "
-                                "name, a date) that would close this gap - not "
-                                "vague or stylistic. For disqualifier_check: a "
-                                "direct yes/no-style question asking whether this "
-                                "role type is one the candidate wants excluded from "
-                                "future matches, or whether their experience "
-                                "actually covers it after all."
-                            ),
-                        },
-                        "suggested_answer": {
-                            "type": "string",
-                            "description": (
-                                "For skill_gap: a proposed starting draft for the "
-                                "answer, phrased as the candidate's own words - e.g. "
-                                "a plausible number/scope guess given the role and "
-                                "the rest of the profile ('Roughly 8-10 engineers, "
-                                "~$2M budget?'). A suggestion to edit, never a "
-                                "stated fact - make that uncertainty visible in the "
-                                "phrasing itself (hedge words, a trailing '?') "
-                                "rather than asserting it. Leave as an empty string "
-                                "if you have no reasonable basis to propose "
-                                "anything. For disqualifier_check: always an empty "
-                                "string - this is a genuine judgment call only the "
-                                "candidate can make, never a guess."
-                            ),
-                        },
-                    },
-                    "required": ["type", "skill", "question", "suggested_answer"],
-                    "additionalProperties": False,
-                },
+                "items": _CLARIFYING_QUESTION_ITEM_SCHEMA,
                 "description": (
                     "3-10 specific, directly answerable questions - either real "
                     "facts this resume is currently missing that would raise the "
@@ -635,9 +705,10 @@ def _suggested_answer_for_keyword_gap(term: str, profile: dict | None) -> str:
 
 
 def _merge_keyword_gap_questions(
-    clarifying_questions: list[dict], missing_required_keywords: list[str],
+    clarifying_questions: list[dict], missing_required_keywords: list[dict],
     previously_answered_skills: list[str] | None = None,
     profile: dict | None = None,
+    missing_preferred_keywords: list[dict] | None = None,
 ) -> list[dict]:
     """Folds missing-required-keyword gaps into the same clarifying_questions
     structure Profile Gaps already uses, instead of leaving them as inert
@@ -656,10 +727,17 @@ def _merge_keyword_gap_questions(
     box - something to react to and edit, not compose from scratch).
 
     Deduped two ways:
-    - Against the AI-generated clarifying_questions passed in (by substring
-      match against each existing question's own "skill" label, case-
-      insensitive, either direction) - the AI may have already asked about
-      the same skill in its own words this same round.
+    - Against the AI-generated clarifying_questions passed in (via
+      skill_label_match.skills_match against each existing question's own
+      "skill" label - normalized equality or a real word-boundary-
+      respecting phrase match, not a bare substring) - the AI may have
+      already asked about the same skill in its own words this same round.
+      Real gap flagged by Mirror 2026-08-08: bare bidirectional substring
+      containment ("x in y or y in x") is the same class of bug as this
+      week's proven "it"-pronoun/BSc case-sensitivity fixes in
+      ats_score.py - a short label like "IT" is a bare substring of
+      plenty of unrelated words ("credit", "legitimate"), which could
+      wrongly suppress a genuinely distinct question.
     - Against previously_answered_skills (pass profile["gap_interview_answers"]'s
       skill labels) - without this, a keyword the candidate already said
       "no, I don't have that" to would keep coming back as a "new" question
@@ -668,13 +746,51 @@ def _merge_keyword_gap_questions(
       naturally gain a skill the candidate confirmed they don't have. This
       is the same profile/interview.py._already_answered() precedent this
       module's own gap-detection already follows - a real answer (even a
-      "no") means don't ask again, not just a real yes."""
-    already_asked_lower = [(q.get("skill") or "").lower() for q in clarifying_questions if q.get("skill")]
-    already_asked_lower += [s.lower() for s in (previously_answered_skills or []) if s]
-    merged = list(clarifying_questions)
-    for term in missing_required_keywords:
-        term_lower = term.lower()
-        if any(term_lower in skill or skill in term_lower for skill in already_asked_lower):
+      "no") means don't ask again, not just a real yes.
+
+    missing_required_keywords is now a list of {"label": str,
+    "point_value": float} dicts (score-first-resume-flow spec item 2,
+    2026-08-08) - label may itself read as an either/or group ("Master's
+    degree OR Bachelor's degree plus 8+ years experience") when
+    ats_score.py's either/or matching found no satisfying alternative;
+    point_value carries through onto the generated question so callers can
+    show the real, scorer-computed value of answering it, without
+    re-deriving that arithmetic themselves.
+
+    missing_preferred_keywords (2026-08-09, real gap General caught Zahir
+    hit live) is the same shape as missing_required_keywords, used only to
+    backfill point_value onto the AI's OWN free-form clarifying_questions
+    (the "which CTMS product," "how many IT staff" kind, generated by the
+    same drafting call as the resume text) when one happens to correspond
+    to a real missing keyword the deterministic scorer already knows the
+    value of - matched via skills_match against that question's own
+    "skill" label, same non-fragile matcher as every other dedup in this
+    function, never a bare substring. A free-form question with no
+    corresponding keyword at all (asking for a fact like team size/budget
+    that was never one of the job's extracted keywords) has no
+    deterministic point value to attach - point_value stays None for those
+    rather than a guess, and the UI is expected to say so honestly rather
+    than silently omitting the badge."""
+    already_asked = [q.get("skill") or "" for q in clarifying_questions if q.get("skill")]
+    already_asked += [s for s in (previously_answered_skills or []) if s]
+    keyword_gap_lookup = list(missing_required_keywords) + list(missing_preferred_keywords or [])
+    merged = []
+    for q in clarifying_questions:
+        match = None
+        if q.get("point_value") is None and q.get("skill"):
+            match = next(
+                (item for item in keyword_gap_lookup if skills_match(item["label"], q["skill"])),
+                None,
+            )
+        # Only copy (breaking object identity) when there's actually a
+        # real value to backfill - callers that pass an existing question
+        # through untouched (the common case: most free-form questions
+        # have no corresponding keyword at all) get the exact same object
+        # back, not an unnecessary clone.
+        merged.append({**q, "point_value": match["point_value"]} if match is not None else q)
+    for item in missing_required_keywords:
+        term = item["label"]
+        if any(skills_match(term, skill) for skill in already_asked):
             continue
         merged.append({
             "type": "skill_gap",
@@ -685,6 +801,7 @@ def _merge_keyword_gap_questions(
                 "added to your resume."
             ),
             "suggested_answer": _suggested_answer_for_keyword_gap(term, profile),
+            "point_value": item["point_value"],
         })
     return merged
 
@@ -774,6 +891,7 @@ def _draft_one(
         if on_progress:
             on_progress(doc_index, doc_total, doc_key, substatus)
 
+    job_key = (job["source"], job["job_id"]) if job and job.get("source") and job.get("job_id") else None
     data = call_structured(
         client,
         system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
@@ -787,6 +905,8 @@ def _draft_one(
             "Claude declined to draft this document. This is unusual for resume "
             "content - try again, or check the job posting text for anything unusual."
         ),
+        purpose=f"draft_{doc_key}",
+        job_key=job_key,
     )
 
     if doc_key == "resume":
@@ -819,6 +939,7 @@ def _draft_one(
         merged_questions = _merge_keyword_gap_questions(
             data.get("clarifying_questions", []), ats.get("missing_required_keywords", []),
             previously_answered_skills, profile,
+            missing_preferred_keywords=ats.get("missing_preferred_keywords", []),
         )
         return {
             "text": resume_text,
@@ -827,13 +948,17 @@ def _draft_one(
             "ats_rationale": ats["ats_rationale"],
             "ats_next_actions": ats["ats_next_actions"],
             "clarifying_questions": _questions_worth_asking(merged_questions, ats["ats_score"]),
+            "ats_plateau_note": ats.get("plateau_note"),
         }
     if doc_key == "apply_answers":
         return data.get("apply_answers", [])
     return data.get(doc_key, "")
 
 
-def _lookup_company_address(client: "anthropic.Anthropic", organization: str, location: str | None) -> str | None:
+def _lookup_company_address(
+    client: "anthropic.Anthropic", organization: str, location: str | None,
+    job_key: tuple[str, str] | None = None,
+) -> str | None:
     """Looks up an organization's real mailing/headquarters address via the
     Claude API's server-side web search tool, for the cover letter's
     recipient block - never guessed, only used if a real source turns up.
@@ -855,6 +980,8 @@ def _lookup_company_address(client: "anthropic.Anthropic", organization: str, lo
         user_content=f"Company: {organization}{location_hint}",
         max_tokens=300,
         max_uses=3,
+        purpose="company_address_lookup",
+        job_key=job_key,
     )
     if not text or text == "NOT_FOUND" or len(text) > 300:
         return None
@@ -915,10 +1042,11 @@ def generate_documents(
         return {}
 
     client = _client()
+    job_key = (job["source"], job["job_id"]) if job.get("source") and job.get("job_id") else None
     if "cover_letter" in doc_keys and "organization_address" not in job and job.get("organization"):
         from search.job_store import update_job_address
 
-        address = _lookup_company_address(client, job["organization"], job.get("location")) or ""
+        address = _lookup_company_address(client, job["organization"], job.get("location"), job_key) or ""
         job["organization_address"] = address
         update_job_address(job.get("source"), job.get("job_id"), address)
 
@@ -943,6 +1071,308 @@ def generate_documents(
     return results
 
 
+def analyze_fit_before_drafting(job: dict, profile: dict, app_record: dict) -> dict:
+    """Score-first-resume-flow spec, Step 1 ("analyze fit" - no document
+    written): composes the real backend pieces (baseline selection - item
+    1, either/or-aware deterministic scoring with point values - item 2,
+    keyword-gap-to-clarifying-question folding) into the exact contract
+    UI refinement's Step 1/2 screen (render_analyze_fit_section) already
+    renders against. Was tailoring.score_first_flow_stub's stand-in until
+    2026-08-08, when items 1/2/4 landed for real - see that file's
+    (deleted) module docstring for the swap history.
+
+    UI refinement's current scope only calls this once a resume already
+    exists for the job (render_analyze_fit_section's own docstring - the
+    pre-first-draft case is a natural next step once this lands, not
+    included here to keep this swap itself low-risk). Baseline is
+    therefore this job's OWN current drafted resume text, scored fresh
+    against its cached keyword lists - not select_baseline_resume_text()
+    (baseline_resume.py deliberately excludes a job's own resume from its
+    own candidate pool; that function is for the "no resume for THIS job
+    yet" case). Falls back to select_baseline_resume_text() anyway when
+    app_record somehow has no resume_text, so this degrades gracefully
+    rather than crashing if that scope ever does expand.
+
+    Returns {"projected_score": int, "projected_rationale": str,
+    "baseline_source": str, "plateau_note": str | None,
+    "open_questions": [...], "answer_more_exhausted_message": str | None} -
+    open_questions is the SAME clarifying_questions shape
+    render_analyze_fit_section already consumes (type/skill/question/
+    suggested_answer/point_value), folding missing_required_keywords in
+    via _merge_keyword_gap_questions rather than leaving them as inert
+    "how to raise it" text.
+
+    projected_score is a REAL projection, not just this job's current
+    drafted-resume score (real gap Zahir hit live 2026-08-09, General):
+    baseline_text only changes when "Generate" actually rewrites it, so a
+    naive re-score of the same unchanged text can never move no matter how
+    many Step-1 questions get answered - answering a question only saves
+    the fact via save_gap_answers(), it doesn't touch resume_text. Once a
+    fact is genuinely confirmed, _merge_keyword_gap_questions already
+    drops the matching question out of open_questions (so it isn't asked
+    again) - but the real point_value that fact would add was being
+    dropped right along with it instead of counted. This adds it back: any
+    missing_required_keywords/missing_preferred_keywords entry whose label
+    matches an already-answered profile skill (via skills_match, same
+    matcher as every other dedup here) is a confirmed-but-not-yet-drafted
+    fact, and its point_value (the SAME number score_resume_against_keywords
+    already computed, not a separate guess) is added to the baseline
+    score, capped at 100 - exactly what a fresh Generate would produce
+    once that fact lands in the actual text. plateau_note is likewise
+    recomputed against only the gaps that are STILL genuinely open (not
+    yet confirmed), via ats_score.plateau_note_for_gaps - the raw
+    score_result's own plateau_note would otherwise keep calling an
+    already-answered gap "real, not a phrasing issue," which stops being
+    true the moment the candidate answers it."""
+    baseline_text = app_record.get("resume_text")
+    baseline_source = "your current drafted resume for this job"
+    if not baseline_text:
+        baseline_text, baseline_source = select_baseline_resume_text(job)
+
+    required_keywords = job.get("ats_required_keywords") or []
+    preferred_keywords = job.get("ats_preferred_keywords") or []
+    score_result = score_resume_against_keywords(required_keywords, preferred_keywords, baseline_text)
+
+    previously_answered_skills = [a["skill"] for a in profile.get("gap_interview_answers", []) if a.get("skill")]
+
+    def _already_confirmed(item: dict) -> bool:
+        return any(skills_match(item["label"], skill) for skill in previously_answered_skills)
+
+    missing_required = score_result["missing_required_keywords"]
+    missing_preferred = score_result["missing_preferred_keywords"]
+    confirmed_required = [item for item in missing_required if _already_confirmed(item)]
+    confirmed_preferred = [item for item in missing_preferred if _already_confirmed(item)]
+    still_open_required = [item for item in missing_required if item not in confirmed_required]
+
+    confirmed_bonus = sum(item["point_value"] for item in confirmed_required + confirmed_preferred)
+    projected_score = max(0, min(100, round(score_result["ats_score"] + confirmed_bonus)))
+
+    projected_rationale = score_result["ats_rationale"]
+    if confirmed_bonus:
+        confirmed_count = len(confirmed_required) + len(confirmed_preferred)
+        projected_rationale += (
+            f" Includes +{confirmed_bonus:g} pt(s) for {confirmed_count} already-confirmed "
+            "answer(s) not yet reflected in this draft - Generate to bake them in for real."
+        )
+
+    plateau_note = plateau_note_for_gaps(still_open_required, score_result["matched_group_explanations"])
+
+    merged_questions = _merge_keyword_gap_questions(
+        app_record.get("resume_clarifying_questions") or [],
+        missing_required,
+        previously_answered_skills=previously_answered_skills,
+        profile=profile,
+        missing_preferred_keywords=missing_preferred,
+    )
+    open_questions = _questions_worth_asking(merged_questions, projected_score)
+
+    return {
+        "projected_score": projected_score,
+        "projected_rationale": projected_rationale,
+        "baseline_source": baseline_source,
+        "plateau_note": plateau_note,
+        "open_questions": open_questions,
+        "answer_more_exhausted_message": (
+            "No more real gaps found based on your current profile." if not open_questions else None
+        ),
+    }
+
+
+_ANSWER_MORE_SYSTEM_PROMPT = (
+    "You already produced an initial set of resume clarifying_questions for "
+    "this job and candidate. The candidate clicked \"Answer more questions\" "
+    "and wants to know if there is ANYTHING further genuinely worth asking, "
+    "beyond what's already been asked or is already covered by a "
+    "deterministic keyword-gap check the app runs separately.\n\n"
+    "You will be given the job posting, the candidate's full master profile "
+    "(including every fact already confirmed via gap_interview_answers), "
+    "and an ALREADY COVERED list - topics from the last drafted resume's own "
+    "clarifying_questions, from already-confirmed profile answers, and from "
+    "keyword gaps the app's own deterministic scorer already tracks and "
+    "presents on its own. Do not repeat ANY of these, even reworded or "
+    "phrased differently - if a topic is on that list, it's handled.\n\n"
+    "Return 0-10 NEW, genuinely distinct, checkable facts (skill_gap) or "
+    "borderline-fit judgment calls (disqualifier_check) that would help if "
+    "confirmed - same bar as the original set: a real fact/number/name/date, "
+    "never invented, never vague or stylistic. If there is truly nothing "
+    "further worth asking, return an EMPTY list - do not invent a low-value "
+    "question just to have something to show; an honest empty answer is "
+    "correct and expected once the real gaps are exhausted."
+)
+
+
+def _answer_more_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "clarifying_questions": {
+                "type": "array",
+                "items": _CLARIFYING_QUESTION_ITEM_SCHEMA,
+                "description": (
+                    "0-10 genuinely NEW questions not already covered by the "
+                    "ALREADY COVERED list - an empty list is a valid, honest "
+                    "answer when nothing further is genuinely worth asking."
+                ),
+            },
+        },
+        "required": ["clarifying_questions"],
+        "additionalProperties": False,
+    }
+
+
+def request_additional_gap_questions(
+    job: dict, profile: dict, app_record: dict, model: str | None = None, on_progress=None,
+) -> dict:
+    """Score-first-resume-flow spec item 5: clicking "Answer more questions"
+    is supposed to trigger a real new round of AI question generation given
+    everything already asked/confirmed - not just re-show whatever
+    open_questions already happened to be. Real gap Zahir hit live
+    2026-08-09 (General, watching his session): the button was a bare
+    st.rerun() with no actual generation call behind it at all, so
+    open_questions just stayed whatever it already was, and the already-
+    built "no more real gaps found" honest message (answer_more_exhausted_
+    message above) could only ever fire from the deterministic keyword-gap
+    side happening to already be empty - never from genuinely asking the AI
+    for more and it coming back with nothing.
+
+    Returns {"added_count": int, "new_questions": [...],
+    "merged_clarifying_questions": [...]} - added_count is 0 when the AI
+    call itself legitimately found nothing further (the caller shows the
+    honest exhausted message); merged_clarifying_questions is
+    app_record's existing resume_clarifying_questions with new_questions
+    appended, ready for the caller to persist via upsert_application - this
+    function itself does not write to applications.json, matching this
+    module's existing boundary (save_gap_answers writes to the profile
+    store only; app.py owns every applications.json write).
+
+    Deduped the same non-fragile way as every other gap-question merge in
+    this module (skills_match, not a bare substring) against: this job's
+    already-stored resume_clarifying_questions, every skill already
+    confirmed anywhere in the profile, and every keyword the deterministic
+    scorer already tracks as a real gap. The AI is EXPLICITLY told not to
+    repeat any of these, but per this codebase's own established pattern
+    (CLAUDE.md known failure pattern #3 - prompt compliance alone isn't
+    trusted for anything checked downstream by a deterministic rule),
+    anything that slips through the prompt anyway is filtered out here
+    too, not just asked not to happen."""
+    client = _client()
+    required_keywords = job.get("ats_required_keywords") or []
+    preferred_keywords = job.get("ats_preferred_keywords") or []
+    resume_text = app_record.get("resume_text") or ""
+    score_result = score_resume_against_keywords(required_keywords, preferred_keywords, resume_text)
+
+    existing_questions = app_record.get("resume_clarifying_questions") or []
+    already_covered = (
+        [q["skill"] for q in existing_questions if q.get("skill")]
+        + [a["skill"] for a in profile.get("gap_interview_answers", []) if a.get("skill")]
+        + [
+            item["label"]
+            for item in score_result["missing_required_keywords"] + score_result["missing_preferred_keywords"]
+        ]
+    )
+
+    job_key = (job["source"], job["job_id"]) if job.get("source") and job.get("job_id") else None
+    content = (
+        "JOB POSTING:\n" + json.dumps(job, indent=2, default=str) +
+        "\n\nCANDIDATE'S MASTER PROFILE:\n" + json.dumps(profile, indent=2, default=str) +
+        "\n\nALREADY COVERED (do not repeat any of these, even reworded):\n" +
+        json.dumps(sorted(set(already_covered)), indent=2)
+    )
+    data = call_structured(
+        client,
+        system=_ANSWER_MORE_SYSTEM_PROMPT,
+        user_content=content,
+        schema=_answer_more_schema(),
+        max_tokens=3000,
+        model=model,
+        effort="high",
+        on_progress=on_progress,
+        refusal_message="Claude declined to check for more questions. Try again.",
+        purpose="answer_more_gap_questions",
+        job_key=job_key,
+    )
+
+    new_questions = [
+        q for q in data.get("clarifying_questions", [])
+        if q.get("skill") and not any(skills_match(q["skill"], covered) for covered in already_covered)
+    ]
+    return {
+        "added_count": len(new_questions),
+        "new_questions": new_questions,
+        "merged_clarifying_questions": existing_questions + new_questions,
+    }
+
+
+def check_regenerate_impact(job: dict, app_record: dict, profile: dict) -> dict:
+    """Score-first-resume-flow spec item 6: when "Generate" is clicked
+    again for a job that already has a resume, tells the caller (UI
+    refinement's confirmation popup) whether there's genuinely new
+    confirmed info to incorporate, and the real numbers to show either
+    way - never a UI-side approximation of arithmetic this module already
+    owns.
+
+    Returns {"has_new_info": bool, "new_fact_count": int,
+    "current_score": int, "estimated_new_score": int | None,
+    "cost_estimate": float | None, "last_generation_cost": float | None}.
+    estimated_new_score/cost_estimate are only meaningful when
+    has_new_info is True; last_generation_cost only when it's False.
+
+    "New" is determined by comparing each gap_interview_answers entry's
+    date_captured (a date, not a precise timestamp) against this
+    application's documents_drafted_at date - there's no existing link
+    between "which specific answers were used for this job's last draft,"
+    so this is the best available real signal without new data plumbing,
+    not perfect same-day precision. estimated_new_score reuses the exact
+    point_value already computed for this job's stored
+    resume_clarifying_questions (score_resume_against_keywords' own
+    formula, score-first-resume-flow item 2) rather than a separate guess,
+    matched to a newly-answered skill by exact case-insensitive label
+    equality - by construction, save_gap_answers() saves a question's
+    "skill" field back verbatim, so this isn't the same fragile
+    AI-vs-deterministic substring matching Mirror flagged elsewhere
+    (2026-08-08) - it's comparing a string to its own origin."""
+    from cost_log import last_cost_for_job
+
+    current_score = app_record.get("resume_ats_score") or 0
+    drafted_at = app_record.get("documents_drafted_at")
+    drafted_date = drafted_at[:10] if drafted_at else None
+
+    new_answers = [
+        a for a in profile.get("gap_interview_answers", [])
+        if a.get("date_captured") and (drafted_date is None or a["date_captured"] >= drafted_date)
+    ]
+    has_new_info = bool(new_answers)
+
+    source, job_id = job.get("source"), job.get("job_id")
+    last_cost = last_cost_for_job(source, job_id, purpose="draft_resume") if source and job_id else None
+
+    if not has_new_info:
+        return {
+            "has_new_info": False, "new_fact_count": 0, "current_score": current_score,
+            "estimated_new_score": None, "cost_estimate": None, "last_generation_cost": last_cost,
+        }
+
+    new_skills_lower = {a["skill"].lower() for a in new_answers if a.get("skill")}
+    point_values = [
+        q["point_value"] for q in (app_record.get("resume_clarifying_questions") or [])
+        if q.get("point_value") and (q.get("skill") or "").lower() in new_skills_lower
+    ]
+    estimated_new_score = min(100, round(current_score + sum(point_values)))
+
+    return {
+        "has_new_info": True,
+        "new_fact_count": len(new_answers),
+        "current_score": current_score,
+        "estimated_new_score": estimated_new_score,
+        # Best available forward-looking estimate: the real logged cost of
+        # this job's last actual resume draft, not a fresh pricing guess -
+        # a redraft's real cost depends on final resume length, which
+        # isn't knowable before the call happens.
+        "cost_estimate": last_cost,
+        "last_generation_cost": None,
+    }
+
+
 def save_gap_answers(job: dict, answered_questions: list[dict]) -> None:
     """Persists confirmed answers to a resume's clarifying_questions into the
     master profile's gap_interview_answers - the same store/shape
@@ -960,12 +1390,20 @@ def save_gap_answers(job: dict, answered_questions: list[dict]) -> None:
     anything else (including missing/old-shape entries) saves as an ordinary
     skill-gap fact. Never called with an invented answer - the Results tab
     UI only calls this with what the candidate actually typed."""
-    from datetime import date
+    from datetime import datetime, timezone
 
     from profile.interview import save_answer
 
     role_context = f"{job.get('title', 'Unknown role')} at {job.get('organization', 'Unknown organization')}"
-    today = date.today().isoformat()
+    # UTC, not local time (real bug found live 2026-08-08, General): this
+    # gets compared against applications.py's documents_drafted_at, which
+    # is stamped in UTC - a local-time date here disagrees with it for
+    # part of every day (e.g. any evening in a timezone behind UTC, once
+    # UTC has already rolled to the next calendar date), making
+    # check_regenerate_impact()'s "has new info since last draft"
+    # comparison silently wrong in either direction depending on which
+    # side of midnight either clock happens to be on.
+    today = datetime.now(timezone.utc).date().isoformat()
     for q in answered_questions:
         answer = (q.get("answer") or "").strip()
         if not answer:

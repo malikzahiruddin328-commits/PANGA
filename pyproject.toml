@@ -1,3 +1,12 @@
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+# pytest-randomly (2026-08-09) is installed for deliberately hunting
+# order-dependent test pollution (see tests/test_extension_bridge.py's own
+# module docstring for the real bug this caught) - "-p no:randomly" keeps
+# a plain `pytest` run exactly as deterministic as it's always been for
+# every other session, since this is a shared venv. Opt into random
+# ordering explicitly with `-p randomly` (or `--randomly-seed=<N>` to
+# reproduce a specific failing order) when actually hunting this class of
+# bug - never as the default.
+addopts = "-p no:randomly"

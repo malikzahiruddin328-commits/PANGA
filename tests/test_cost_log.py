@@ -1,0 +1,61 @@
+import cost_log
+from cost_log import last_cost_for_job, load_cost_log, log_api_cost
+
+
+def test_log_api_cost_appends_a_real_entry(isolated_data):
+    log_api_cost(purpose="fit_score", model="claude-opus-5", input_tokens=1000, output_tokens=200, cost_usd=0.01)
+    entries = load_cost_log()
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["purpose"] == "fit_score"
+    assert entry["model"] == "claude-opus-5"
+    assert entry["input_tokens"] == 1000
+    assert entry["output_tokens"] == 200
+    assert entry["cost_usd"] == 0.01
+    assert "timestamp" in entry
+    assert "source" not in entry
+    assert "job_id" not in entry
+
+
+def test_log_api_cost_stamps_job_key_when_given(isolated_data):
+    log_api_cost(
+        purpose="draft_resume", model="claude-opus-5", input_tokens=5000, output_tokens=3000, cost_usd=0.1,
+        job_key=("linkedin", "12345"),
+    )
+    entry = load_cost_log()[0]
+    assert entry["source"] == "linkedin"
+    assert entry["job_id"] == "12345"
+
+
+def test_log_api_cost_appends_without_clobbering_prior_entries(isolated_data):
+    log_api_cost(purpose="a", model="claude-opus-5", input_tokens=1, output_tokens=1, cost_usd=0.001)
+    log_api_cost(purpose="b", model="claude-opus-5", input_tokens=2, output_tokens=2, cost_usd=0.002)
+    entries = load_cost_log()
+    assert len(entries) == 2
+    assert [e["purpose"] for e in entries] == ["a", "b"]
+
+
+def test_last_cost_for_job_returns_the_most_recent_matching_entry(isolated_data, monkeypatch):
+    # Stamp timestamps explicitly rather than relying on real wall-clock
+    # ordering across fast successive calls in a test.
+    entries = [
+        {"timestamp": "2026-08-01T00:00:00+00:00", "source": "linkedin", "job_id": "1", "purpose": "draft_resume", "cost_usd": 0.05},
+        {"timestamp": "2026-08-05T00:00:00+00:00", "source": "linkedin", "job_id": "1", "purpose": "draft_resume", "cost_usd": 0.09},
+        {"timestamp": "2026-08-03T00:00:00+00:00", "source": "linkedin", "job_id": "2", "purpose": "draft_resume", "cost_usd": 0.20},
+    ]
+    from security.crypto_store import write_json
+    write_json(cost_log.COST_LOG_PATH, entries)
+
+    assert last_cost_for_job("linkedin", "1") == 0.09
+    assert last_cost_for_job("linkedin", "2") == 0.20
+
+
+def test_last_cost_for_job_returns_none_when_nothing_logged(isolated_data):
+    assert last_cost_for_job("linkedin", "does-not-exist") is None
+
+
+def test_last_cost_for_job_can_narrow_to_a_specific_purpose(isolated_data):
+    log_api_cost(purpose="ats_keyword_extraction", model="claude-opus-5", input_tokens=1, output_tokens=1, cost_usd=0.001, job_key=("linkedin", "1"))
+    log_api_cost(purpose="draft_resume", model="claude-opus-5", input_tokens=1, output_tokens=1, cost_usd=0.05, job_key=("linkedin", "1"))
+    assert last_cost_for_job("linkedin", "1", purpose="draft_resume") == 0.05
+    assert last_cost_for_job("linkedin", "1", purpose="ats_keyword_extraction") == 0.001

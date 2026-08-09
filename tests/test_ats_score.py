@@ -1,4 +1,10 @@
-from tailoring.ats_score import extract_keywords, score_resume_against_keywords, score_resume_ats
+from tailoring.ats_score import (
+    detect_matched_keyword_regressions,
+    extract_keywords,
+    plateau_note_for_gaps,
+    score_resume_against_keywords,
+    score_resume_ats,
+)
 
 POSTING = (
     "Minimum Qualifications: Proficiency with Python, SQL, and AWS. "
@@ -69,7 +75,8 @@ def test_missing_required_keywords_returned_separately_from_next_actions():
     # duplicate them as inert text.
     resume = "PROFESSIONAL EXPERIENCE\nEngineer.\n\nEDUCATION\nBS\n\nSKILLS\nJava"
     result = score_resume_ats(POSTING, resume)
-    assert set(result["missing_required_keywords"]) >= {"python", "sql", "aws"}
+    missing_labels = {m["label"] for m in result["missing_required_keywords"]}
+    assert missing_labels >= {"python", "sql", "aws"}
     joined = " ".join(result["ats_next_actions"]).lower()
     assert "python" not in joined and "sql" not in joined and "aws" not in joined
 
@@ -90,7 +97,7 @@ def test_next_actions_does_not_falsely_claim_resume_is_complete_when_required_ke
         "- Did things.\n\nEDUCATION\nBS\n\nSKILLS\nJava"
     )
     result = score_resume_against_keywords(["python", "sql"], [], resume)
-    assert result["missing_required_keywords"] == ["python", "sql"]
+    assert [m["label"] for m in result["missing_required_keywords"]] == ["python", "sql"]
     assert "already covers" not in " ".join(result["ats_next_actions"]).lower()
 
 
@@ -181,7 +188,7 @@ def test_alias_matching_does_not_match_unrelated_terms():
     result = score_resume_against_keywords(
         ["computer science"], [], "PROFESSIONAL EXPERIENCE\nCustomer Service Representative\n",
     )
-    assert result["missing_required_keywords"] == ["computer science"]
+    assert [m["label"] for m in result["missing_required_keywords"]] == ["computer science"]
 
 
 def test_lowercase_it_pronoun_in_prose_does_not_falsely_satisfy_information_technology():
@@ -199,13 +206,13 @@ def test_lowercase_it_pronoun_in_prose_does_not_falsely_satisfy_information_tech
         "- Owned it from kickoff to close, presenting it to the board each quarter.\n"
     )
     result = score_resume_against_keywords(["information technology"], [], resume)
-    assert result["missing_required_keywords"] == ["information technology"]
+    assert [m["label"] for m in result["missing_required_keywords"]] == ["information technology"]
 
 
 def test_lowercase_cs_style_token_in_prose_does_not_falsely_satisfy_computer_science():
     resume = "PROFESSIONAL EXPERIENCE\nSales rep vs cs team on pricing disputes.\n"
     result = score_resume_against_keywords(["computer science"], [], resume)
-    assert result["missing_required_keywords"] == ["computer science"]
+    assert [m["label"] for m in result["missing_required_keywords"]] == ["computer science"]
 
 
 def test_uppercase_it_acronym_still_satisfies_information_technology():
@@ -236,5 +243,159 @@ def test_extract_keywords_fallback_path_also_benefits_from_equivalence():
     posting = "Minimum Qualifications: Bachelor's degree required. Experience with Information Technology systems."
     resume = "EDUCATION\nBSc, Brunel University\n\nPROFESSIONAL EXPERIENCE\nHead of IT\n"
     result = score_resume_ats(posting, resume)
-    assert "bachelor's degree" not in result["missing_required_keywords"]
-    assert "information technology" not in result["missing_required_keywords"]
+    missing_labels = {m["label"] for m in result["missing_required_keywords"]}
+    assert "bachelor's degree" not in missing_labels
+    assert "information technology" not in missing_labels
+
+
+def test_either_or_group_satisfied_by_one_alternative_is_not_a_missing_gap():
+    # score-first-resume-flow spec item 2: a JD's "Master's degree, OR
+    # Bachelor's degree plus 8+ years" must not flag "Master's degree" as
+    # a flat, independently-required keyword when the candidate genuinely
+    # satisfies the Bachelor's-side alternative instead.
+    required = [{"any_of": ["Master's degree", "Bachelor's degree"]}, "Python"]
+    resume = "EDUCATION\nBachelor of Science, Computer Science\n\nSKILLS\nPython\n"
+    result = score_resume_against_keywords(required, [], resume)
+    assert result["missing_required_keywords"] == []
+    # Full keyword coverage - the remaining gap below 100 (if any) is
+    # structural formatting, not this either/or group.
+    assert result["ats_score"] >= 75
+
+
+def test_either_or_group_unsatisfied_becomes_one_consolidated_missing_item():
+    required = [{"any_of": ["Master's degree", "Bachelor's degree plus 8+ years experience"]}, "Python"]
+    resume = "SKILLS\nPython\n"
+    result = score_resume_against_keywords(required, [], resume)
+    labels = [m["label"] for m in result["missing_required_keywords"]]
+    assert labels == ["Master's degree OR Bachelor's degree plus 8+ years experience"]
+
+
+def test_either_or_group_explanation_names_the_satisfying_alternative():
+    required = [{"any_of": ["Master's degree", "Bachelor's degree"]}, "Python"]
+    resume = "EDUCATION\nBachelor of Science\n\nSKILLS\nPython\n"
+    result = score_resume_against_keywords(required, [], resume)
+    assert "Bachelor's degree" in result["ats_rationale"]
+    assert "satisfied via" in result["ats_rationale"]
+
+
+def test_point_value_is_computed_from_the_real_scoring_formula_not_guessed():
+    # UI contract: point_value must come from re-running the same formula
+    # with one more hypothetical match, not a separately hand-derived
+    # number that could drift.
+    result = score_resume_against_keywords(["python", "sql", "aws", "kubernetes"], [], "SKILLS\nPython\n")
+    missing = {m["label"]: m["point_value"] for m in result["missing_required_keywords"]}
+    assert set(missing) == {"sql", "aws", "kubernetes"}
+    # Each of the 3 missing required keywords should be worth the same
+    # amount here (symmetric weighting, no preferred keywords, no
+    # structural penalty differences between them).
+    values = set(missing.values())
+    assert len(values) == 1
+    assert next(iter(values)) > 0
+
+
+def test_required_point_value_outweighs_an_equivalent_preferred_one():
+    # The scoring formula weights required keywords 3x preferred (0.75 vs
+    # 0.25 split) - point values must reflect that real weighting, and
+    # must match the actual observed score delta (computed by re-running
+    # the same formula, not a separately hand-derived approximation).
+    required, preferred = ["python", "sql"], ["docker", "kubernetes"]
+    base_resume = "SKILLS\nJava\n"
+    gains_required = "SKILLS\nJava, Python\n"
+    gains_preferred = "SKILLS\nJava, Docker\n"
+
+    base = score_resume_against_keywords(required, preferred, base_resume)
+    with_required = score_resume_against_keywords(required, preferred, gains_required)["ats_score"]
+    with_preferred = score_resume_against_keywords(required, preferred, gains_preferred)["ats_score"]
+
+    required_gain = with_required - base["ats_score"]
+    preferred_gain = with_preferred - base["ats_score"]
+    assert required_gain > preferred_gain > 0
+
+    # point_value keeps 1-decimal precision while the displayed ats_score
+    # is rounded to a whole int, so these can differ by rounding alone -
+    # not a bug, just two different precisions of the same real formula.
+    python_point_value = next(m["point_value"] for m in base["missing_required_keywords"] if m["label"] == "python")
+    assert abs(python_point_value - required_gain) <= 1
+
+
+def test_plateau_note_is_none_when_nothing_notable_to_explain():
+    result = score_resume_against_keywords(["python"], [], "SKILLS\nPython\n")
+    assert result["plateau_note"] is None
+
+
+def test_plateau_note_names_the_real_remaining_gap():
+    result = score_resume_against_keywords(["python", "sql"], [], "SKILLS\nPython\n")
+    assert result["plateau_note"] is not None
+    assert "sql" in result["plateau_note"].lower()
+
+
+def test_plateau_note_credits_a_satisfied_either_or_group():
+    required = [{"any_of": ["Master's degree", "Bachelor's degree"]}]
+    resume = "EDUCATION\nBachelor of Science\n"
+    result = score_resume_against_keywords(required, [], resume)
+    assert result["plateau_note"] is not None
+    assert "already satisfy a different way" in result["plateau_note"]
+
+
+def test_missing_preferred_keywords_are_returned_with_point_values():
+    # 2026-08-09: previously computed internally (to build ats_next_actions
+    # text) but never handed back to the caller - drafting.py's
+    # analyze_fit_before_drafting needs these real numbers to attach a
+    # point_value to a free-form AI clarifying_question that happens to
+    # correspond to a preferred (not required) keyword, and
+    # detect_matched_keyword_regressions() needs them to catch a dropped
+    # PREFERRED keyword too, not just required ones.
+    result = score_resume_against_keywords(["python"], ["kubernetes"], "SKILLS\nPython\n")
+    assert result["missing_preferred_keywords"] == [
+        {"label": "kubernetes", "point_value": result["missing_preferred_keywords"][0]["point_value"]},
+    ]
+    assert result["missing_preferred_keywords"][0]["point_value"] > 0
+
+
+def test_matched_group_explanations_are_returned():
+    required = [{"any_of": ["Master's degree", "Bachelor's degree"]}]
+    resume = "EDUCATION\nBachelor of Science\n"
+    result = score_resume_against_keywords(required, [], resume)
+    assert result["matched_group_explanations"]
+
+
+def test_plateau_note_for_gaps_is_public_and_reusable():
+    # Exported (not module-private) so drafting.py's analyze_fit_before_
+    # drafting can recompute this against a narrowed missing_required list
+    # (already-confirmed-but-not-yet-drafted gaps removed) without
+    # reimplementing this exact sentence-building logic a second time.
+    assert plateau_note_for_gaps([], []) is None
+    note = plateau_note_for_gaps([{"label": "sql", "point_value": 5.0}], [])
+    assert "sql" in note
+
+
+def test_detect_matched_keyword_regressions_catches_a_dropped_required_keyword():
+    # Real bug live-reproduced 2026-08-09 (Upstream Bio job, CLAUDE.md
+    # known failure pattern #2): a regenerate fixed one required keyword
+    # ("Engineering") while silently dropping a previously-matched one
+    # ("life sciences") - net score stayed flat (27/30 both times), which
+    # is exactly why this needs a real before/after diff, not just
+    # trusting the net score didn't get worse.
+    required = ["Engineering", "life sciences"]
+    old_text = "SKILLS\nlife sciences background\n"
+    new_text = "SKILLS\nEngineering background\n"
+    assert detect_matched_keyword_regressions(required, [], old_text, new_text) == ["life sciences"]
+
+
+def test_detect_matched_keyword_regressions_empty_when_nothing_lost():
+    required = ["Python"]
+    old_text = "SKILLS\nPython\n"
+    new_text = "SKILLS\nPython, Databricks\n"  # only gained, nothing lost
+    assert detect_matched_keyword_regressions(required, [], old_text, new_text) == []
+
+
+def test_detect_matched_keyword_regressions_catches_a_dropped_preferred_keyword():
+    old_text = "SKILLS\nKubernetes, Python\n"
+    new_text = "SKILLS\nPython\n"
+    assert detect_matched_keyword_regressions(["Python"], ["Kubernetes"], old_text, new_text) == ["Kubernetes"]
+
+
+def test_detect_matched_keyword_regressions_returns_nothing_with_no_prior_text():
+    # A first-ever draft has nothing to regress against.
+    assert detect_matched_keyword_regressions(["Python"], [], None, "SKILLS\nPython\n") == []
+    assert detect_matched_keyword_regressions(["Python"], [], "", "SKILLS\nPython\n") == []

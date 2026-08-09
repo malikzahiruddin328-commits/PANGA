@@ -16,9 +16,11 @@ import inbox_accounts
 def test_gmail_list_recent_unreviewed_builds_query_and_maps_fields(monkeypatch):
     captured = {}
 
+    monkeypatch.setattr(gmail_client, "ensure_label", lambda name: f"id-{name}")
+
     def fake_search_threads(query, max_results=50):
         captured["query"] = query
-        return [{"thread_id": "t1", "message_id": "m1", "subject": "Subj", "sender": "a@b.com", "date": "2026-08-04", "snippet": "snip"}]
+        return [{"thread_id": "t1", "message_id": "m1", "subject": "Subj", "sender": "a@b.com", "date": "2026-08-04", "snippet": "snip", "label_ids": []}]
     monkeypatch.setattr(gmail_client, "search_threads", fake_search_threads)
 
     acct = inbox_accounts.GmailAccount()
@@ -26,8 +28,22 @@ def test_gmail_list_recent_unreviewed_builds_query_and_maps_fields(monkeypatch):
     assert len(results) == 1
     assert results[0].ref == "t1"
     assert results[0].message_id == "m1"
-    assert "-label:Panga/Reviewed" in captured["query"]
+    # No "-label:" term - see gmail_client.search_threads' docstring for
+    # why that query operator is unreliable (thread- vs message-level
+    # label semantics); filtered client-side against label_ids instead.
+    assert "-label:" not in captured["query"]
     assert "newer_than:2d" in captured["query"]
+
+
+def test_gmail_list_recent_unreviewed_excludes_already_reviewed_thread(monkeypatch):
+    monkeypatch.setattr(gmail_client, "ensure_label", lambda name: f"id-{name}")
+    monkeypatch.setattr(gmail_client, "search_threads", lambda query, max_results=50: [
+        {"thread_id": "t1", "message_id": "m1", "subject": "Subj", "sender": "a@b.com", "date": "d", "snippet": "s", "label_ids": ["id-Panga/Reviewed"]},
+        {"thread_id": "t2", "message_id": "m2", "subject": "Subj2", "sender": "b@b.com", "date": "d", "snippet": "s", "label_ids": []},
+    ])
+
+    results = inbox_accounts.GmailAccount().list_recent_unreviewed()
+    assert [r.ref for r in results] == ["t2"]
 
 
 def test_gmail_mark_cta_ensures_labels_once_and_applies_both(monkeypatch):
@@ -144,17 +160,31 @@ def test_configured_accounts_empty_when_nothing_configured(monkeypatch):
 def test_gmail_job_alert_candidates_builds_from_clause_and_excludes_own_label(monkeypatch):
     captured = {}
 
+    monkeypatch.setattr(gmail_client, "ensure_label", lambda name: f"id-{name}")
+
     def fake_search_threads(query, max_results=50):
         captured["query"] = query
-        return [{"thread_id": "t1", "message_id": "m1", "subject": "5 jobs for you", "sender": "jobs@linkedin.com", "date": "d", "snippet": "s"}]
+        return [{"thread_id": "t1", "message_id": "m1", "subject": "5 jobs for you", "sender": "jobs@linkedin.com", "date": "d", "snippet": "s", "label_ids": []}]
     monkeypatch.setattr(gmail_client, "search_threads", fake_search_threads)
 
     acct = inbox_accounts.GmailAccount()
     results = acct.list_job_alert_candidates(["jobalerts-noreply@linkedin.com", "lensa.com"])
     assert len(results) == 1
     assert "from:jobalerts-noreply@linkedin.com OR from:lensa.com" in captured["query"]
-    assert "-label:Panga/JobAlertReviewed" in captured["query"]
-    assert "-label:Panga/Reviewed" not in captured["query"]  # independent of the CTA scan's own marker
+    # No "-label:" term in the query - see search_threads' docstring;
+    # filtered client-side against label_ids instead.
+    assert "-label:" not in captured["query"]
+
+
+def test_gmail_job_alert_candidates_excludes_already_reviewed_thread(monkeypatch):
+    monkeypatch.setattr(gmail_client, "ensure_label", lambda name: f"id-{name}")
+    monkeypatch.setattr(gmail_client, "search_threads", lambda query, max_results=50: [
+        {"thread_id": "t1", "message_id": "m1", "subject": "Jobs", "sender": "jobs@linkedin.com", "date": "d", "snippet": "s", "label_ids": ["id-Panga/JobAlertReviewed"]},
+        {"thread_id": "t2", "message_id": "m2", "subject": "Jobs", "sender": "jobs@linkedin.com", "date": "d", "snippet": "s", "label_ids": []},
+    ])
+
+    results = inbox_accounts.GmailAccount().list_job_alert_candidates(["linkedin.com"])
+    assert [r.ref for r in results] == ["t2"]
 
 
 def test_gmail_job_alert_candidates_empty_senders_short_circuits(monkeypatch):

@@ -137,12 +137,18 @@ class GmailAccount:
         return self._job_alert_id
 
     def list_recent_unreviewed(self) -> list[InboxMessage]:
-        query = f"-label:{REVIEWED_LABEL} -in:spam -in:trash newer_than:{_LOOKBACK_DAYS}d in:inbox"
+        # No "-label:REVIEWED_LABEL" term in the query - see
+        # gmail_client.search_threads' docstring for why that's unreliable
+        # (thread- vs message-level label semantics). Filtered client-side
+        # instead, against the real label ID (not the name).
+        reviewed_id, _, _ = self._label_ids()
+        query = f"-in:spam -in:trash newer_than:{_LOOKBACK_DAYS}d in:inbox"
         threads = gmail_client.search_threads(query)
         return [
             InboxMessage(self.provider, self.account, t["thread_id"], t.get("message_id"),
                          t["subject"], t["sender"], t["date"], t["snippet"])
             for t in threads
+            if reviewed_id not in (t.get("label_ids") or [])
         ]
 
     def get_body(self, ref: str) -> str:
@@ -181,13 +187,18 @@ class GmailAccount:
         filter to build on)."""
         if not senders:
             return []
+        # Same "-label:X" thread-vs-message-level fix as
+        # list_recent_unreviewed() above - filtered client-side against the
+        # real label ID instead of trusting the query operator.
+        job_alert_id = self._job_alert_label_id()
         from_clause = " OR ".join(f"from:{s}" for s in senders)
-        query = f"({from_clause}) -label:{JOB_ALERT_LABEL} -in:spam -in:trash newer_than:{_JOB_ALERT_LOOKBACK_DAYS}d in:inbox"
+        query = f"({from_clause}) -in:spam -in:trash newer_than:{_JOB_ALERT_LOOKBACK_DAYS}d in:inbox"
         threads = gmail_client.search_threads(query)
         return [
             InboxMessage(self.provider, self.account, t["thread_id"], t.get("message_id"),
                          t["subject"], t["sender"], t["date"], t["snippet"])
             for t in threads
+            if job_alert_id not in (t.get("label_ids") or [])
         ]
 
     def mark_job_alert_reviewed(self, ref: str) -> None:

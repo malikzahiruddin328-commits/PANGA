@@ -35,6 +35,8 @@ def isolated_data(tmp_path, monkeypatch):
     import fulfillment
     import profile.storage as profile_storage
     import profile.ingest as profile_ingest
+    import cost_log
+    import linkedin.storage as linkedin_storage
 
     monkeypatch.setattr(job_store, "JOBS_PATH", tmp_path / "jobs.json")
     monkeypatch.setattr(applications, "APPLICATIONS_PATH", tmp_path / "applications.json")
@@ -61,4 +63,18 @@ def isolated_data(tmp_path, monkeypatch):
     monkeypatch.setattr(profile_ingest, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(profile_ingest, "OUTPUT_DIR", tmp_path / "profile_raw")
     monkeypatch.setattr(profile_ingest, "MANIFEST_RESULT_PATH", tmp_path / "profile_raw" / "manifest_result.json")
+    # score-first-resume-flow spec item 7 (2026-08-08): cost_log.py's
+    # running API-cost log is exactly the kind of store this fixture
+    # exists to isolate - added centrally so no test that exercises
+    # call_structured()/call_with_web_search() can ever write real cost
+    # entries into the actual data/ folder.
+    monkeypatch.setattr(cost_log, "COST_LOG_PATH", tmp_path / "cost_log.json")
+    # Same class of gap as MASTER_PROFILE_PATH/PROJECT_ROOT above - found
+    # 2026-08-08 while writing tests for the LinkedIn suggestion-persist
+    # fix: linkedin.storage.LINKEDIN_PATH was never isolated either, so any
+    # test exercising save_analysis()/mark_suggestion_status() would have
+    # silently read/written the real data/linkedin folder (a full LinkedIn
+    # profile export - at least as sensitive as the resume text this
+    # fixture already protects).
+    monkeypatch.setattr(linkedin_storage, "LINKEDIN_PATH", tmp_path / "linkedin_profile.json")
     return tmp_path

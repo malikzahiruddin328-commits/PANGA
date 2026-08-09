@@ -151,7 +151,12 @@ def test_confirming_a_categorized_reason_sets_status_and_skip_reason(results_app
     assert "pass_dialog_pending" not in at.session_state
 
 
-def test_confirming_something_else_uses_the_free_text_as_the_reason(results_app):
+def test_confirming_something_else_keeps_both_the_category_and_the_free_text(results_app):
+    # Regression test for a real bug (Zahir's original ask, weeks earlier,
+    # never actually built - caught live-testing again 2026-08-07): the
+    # confirm handler used to store ONLY the typed free text, silently
+    # discarding "Something else" so future data-profiling could no longer
+    # tell "which bucket" from "what he actually said".
     at = results_app
     at.session_state["active_tab"] = "results"
     at.session_state["pass_dialog_pending"] = {"source": "Indeed", "job_id": "i1", "label": "Data Engineer - Acme Corp"}
@@ -169,7 +174,39 @@ def test_confirming_something_else_uses_the_free_text_as_the_reason(results_app)
     assert not at.exception
     app_record = get_application("Indeed", "i1")
     assert app_record["status"] == "not interested"
-    assert app_record["skip_reason"] == "Hiring manager gave off bad vibes on the phone screen."
+    assert app_record["skip_reason"] == "Something else\nHiring manager gave off bad vibes on the phone screen."
+    category, detail = app_record["skip_reason"].split("\n", 1)
+    assert category == "Something else"
+    assert detail == "Hiring manager gave off bad vibes on the phone screen."
+
+    # upsert_application() regenerates the dossier as a real side effect
+    # (applications.py's _write_dossier calls) - closes the loop end to end,
+    # driven by the same widget interactions a real click would produce,
+    # not just an assertion on the in-memory application record.
+    from tailoring.dossier import dossier_path
+    path = dossier_path("Indeed", "i1", "Acme Corp", "Data Engineer")
+    dossier_lines = path.read_text(encoding="utf-8").splitlines()
+    assert "- **Skip reason:** Something else" in dossier_lines
+    assert "  - Hiring manager gave off bad vibes on the phone screen." in dossier_lines
+
+
+def test_confirming_something_else_with_blank_free_text_stores_just_the_category(results_app):
+    # If Zahir picks "Something else" but leaves the box blank, there's no
+    # detail to preserve - falls back to the plain category string, same
+    # as every other category.
+    at = results_app
+    at.session_state["active_tab"] = "results"
+    at.session_state["pass_dialog_pending"] = {"source": "Dice", "job_id": "d1", "label": "Platform Engineer - Beta Inc"}
+    at.run(timeout=30)
+
+    radio = next(r for r in at.radio if r.key == "pass_reason_category")
+    radio.set_value("Something else")
+    confirm = next(b for b in at.button if b.key == "pass_reason_confirm")
+    confirm.click().run(timeout=30)
+
+    assert not at.exception
+    app_record = get_application("Dice", "d1")
+    assert app_record["skip_reason"] == "Something else"
 
 
 def test_cancel_closes_the_dialog_without_changing_status(results_app):
