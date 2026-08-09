@@ -10,6 +10,7 @@ AND a regulatory filing), not just 2 instances of the same type (two Phase
 sticky - a new signal arriving later never silently overwrites a status
 Zahir set himself; that's his call, not automation's.
 """
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -130,3 +131,80 @@ def set_website(company_name: str, website: str) -> None:
             acc["website"] = website
             _save_all(accounts)
             return
+
+
+def _normalize_company(name: str) -> str:
+    """Light punctuation/whitespace normalization for company-name
+    matching - same approach as linkedin/connections.py's and
+    learn_engine.py's near-identical helpers (kept separate rather than a
+    cross-package import, same precedent as those two)."""
+    if not name:
+        return ""
+    return re.sub(r"\s+", " ", re.sub(r"[.,]", "", name.lower())).strip()
+
+
+def find_disqualified_with_new_activity(jobs: list[dict], applications: list[dict]) -> list[dict]:
+    """Real gap found live 2026-08-09: "disqualified" is sticky on purpose
+    (see MANUAL_STATUSES above - a new signal never silently overwrites
+    Zahir's own call) but sticky isn't the same as invisible. UCB Pharma,
+    BAUSCH, and BeOne Medicines USA were all disqualified for good reasons
+    at the time (a stale trial, an already-approved-drug signal that isn't
+    forward-looking) - then each later picked up a REAL job posting, BeOne's
+    now an application Zahir has under review, with nothing ever surfacing
+    that mismatch back to him. This doesn't change any status - manual
+    stays manual - it just flags "here's new evidence you didn't have when
+    you disqualified this" for Zahir to re-review himself.
+
+    Matches by company name (same normalize-and-substring approach as
+    commercial_hiring.py/connections.py) against both jobs.json and
+    applications.json. Critically, a matching job is only reported if its
+    ref ("<source>:<job_id>") ISN'T already one of the account's own
+    signal refs - otherwise a company disqualified BECAUSE of a specific
+    posting (e.g. "Securitas", disqualified as an unrelated industry whose
+    job title matched a keyword by coincidence) would re-flag itself
+    forever on the exact same posting that already got reviewed and
+    rejected. Found by testing against real data before this filter was
+    added - Securitas was a false positive until this ref check went in.
+    """
+    accounts = load_target_accounts()
+    disqualified = [a for a in accounts if a["status"] == "disqualified"]
+    if not disqualified:
+        return []
+
+    app_lookup = {(a.get("source"), a.get("job_id")): a for a in applications}
+
+    out = []
+    for acc in disqualified:
+        norm = _normalize_company(acc["company_name"])
+        if not norm:
+            continue
+        known_refs = {s.get("ref") for s in acc["signals"] if s.get("ref")}
+
+        matches = []
+        for job in jobs:
+            org = job.get("organization")
+            if not org:
+                continue
+            job_norm = _normalize_company(org)
+            if not job_norm or not (norm in job_norm or job_norm in norm):
+                continue
+            job_ref = f"{job.get('source')}:{job.get('job_id')}"
+            if job_ref in known_refs:
+                continue
+            app = app_lookup.get((job.get("source"), job.get("job_id")))
+            matches.append({
+                "source": job.get("source"),
+                "job_id": job.get("job_id"),
+                "organization": org,
+                "title": job.get("title"),
+                "application_status": app["status"] if app else None,
+            })
+
+        if matches:
+            out.append({
+                "company_name": acc["company_name"],
+                "notes": acc.get("notes"),
+                "matching_jobs": matches,
+            })
+
+    return out
