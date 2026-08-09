@@ -744,7 +744,7 @@ def render_paste_jd_notice() -> None:
     )
 
 
-def render_paste_jd_prompt_before_drafting(job: dict) -> None:
+def render_paste_jd_prompt_before_drafting(job: dict, app_record: dict) -> None:
     """Proactive paste-JD prompt - Zahir's follow-up ask 2026-08-06: the
     post-hoc version below only ever appeared after a resume had already
     been drafted blind against no real JD text, buried inside that
@@ -756,29 +756,37 @@ def render_paste_jd_prompt_before_drafting(job: dict) -> None:
     resume - is already tailored against the real JD rather than drafted
     blind and fixed up after the fact.
 
-    Saving here does NOT trigger a regenerate the way the post-hoc version
-    does - nothing has been drafted yet to regenerate. It just persists
-    the text via search.job_store.update_job_description() (clears the
-    stale empty ats_required_keywords/ats_preferred_keywords cache too),
-    so whatever gets drafted next through the normal "Generate documents"
-    button reads it naturally through the same generate_documents() call
-    every draft already goes through - no new downstream code path.
+    For a manually-pasted JD (no extension capture), saving does NOT
+    trigger a regenerate the way the post-hoc version does - nothing has
+    been drafted yet to regenerate. It just persists the text via
+    search.job_store.update_job_description() (clears the stale empty
+    ats_required_keywords/ats_preferred_keywords cache too), so whatever
+    gets drafted next through the normal "Generate documents" button reads
+    it naturally through the same generate_documents() call every draft
+    already goes through - no new downstream code path. See the
+    extension-capture branch below for why THAT path additionally
+    auto-scores inline instead of stopping at "saved."
 
     This is additive, not a replacement: the post-hoc render_paste_jd_prompt()
     stays in place too, so someone who already has a blind-drafted resume
-    can still paste a JD there and get everything correctly redrafted."""
+    can still paste a JD there and get everything correctly redrafted.
+
+    app_record: needed (not looked up here) because the caller already has
+    it and the extension-capture branch below passes it straight into
+    render_analyze_fit_section() - avoids a second get_application() read
+    for the same job in the same render."""
     job_key = f"{job.get('source')}_{job.get('job_id')}"
 
     # Extension auto-fill (2026-08-08): matches the extension's last capture
     # against THIS job's own posting_url (only LinkedIn/Dice jobs have one
     # from add_manual_job()/the Dice scraper, so this is a no-op for every
-    # other source). Only ever seeds the text_area's initial value - nothing
-    # is saved/regenerated until the user clicks "Save job description"
-    # below, same as always, so there's no silent-overwrite risk even if the
-    # match is wrong. The capture's own timestamp is folded into the widget
-    # key (codemap's documented Streamlit gotcha: a bare key ignores a new
-    # value= once session_state already has that key) so a fresh capture for
-    # the same job actually replaces stale text instead of being ignored.
+    # other source). Only ever seeds the text_area's initial value - actual
+    # persistence happens below, either automatically (a real capture
+    # exists) or via the explicit Save button (manual paste, no capture).
+    # The capture's own timestamp is folded into the widget key (codemap's
+    # documented Streamlit gotcha: a bare key ignores a new value= once
+    # session_state already has that key) so a fresh capture for the same
+    # job actually replaces stale text instead of being ignored.
     #
     # Looked up BEFORE deciding whether to show render_paste_jd_notice()'s
     # "we don't have this posting's full description yet" banner - Zahir
@@ -806,19 +814,65 @@ def render_paste_jd_prompt_before_drafting(job: dict) -> None:
         placeholder="Paste the full job posting text here...",
         label_visibility="collapsed",
     )
-    if st.button("Save job description", key=f"jd_paste_pre_save_{job_key}"):
-        if not pasted_jd.strip():
-            st.toast("Paste the job description text first.", icon=":material/warning:")
-        else:
+
+    if capture:
+        # Auto-save + auto-score (2026-08-09, Zahir-approved polish pass -
+        # see the hub session's own reasoning, carried into this comment
+        # since it explains a real behavior change, not just what the code
+        # does): the real human-in-the-loop moment already happened when
+        # the user clicked "Send to Panga" on a page they were actually
+        # looking at - a second manual "Save" click here is friction
+        # nobody actually uses, not real verification. Not a one-time
+        # auto-action either: this re-saves and re-scores on every render
+        # where the box's CURRENT text differs from what's already
+        # persisted, so a later manual edit to this same box goes through
+        # the identical auto-save+auto-score path, synchronously, rather
+        # than leaving a stale score on screen until some other click
+        # happens to trigger a refresh.
+        #
+        # Cheap enough to not need a stronger change-detection guard than
+        # a plain string comparison against job["description"] - matches
+        # analyze_fit_before_drafting() itself already being "recomputed
+        # fresh at the top of every render" elsewhere in this file, and
+        # update_job_description() is a single small locked JSON write,
+        # not an AI call (the score is deterministic keyword-overlap
+        # arithmetic - ats_score.py's score_resume_against_keywords() -
+        # not a fresh AI extraction; a job with no ats_required_keywords
+        # cached yet, i.e. never drafted before, scores honestly against
+        # "no extractable requirements yet, formatting only" rather than a
+        # misleading 100%, so this is safe to show immediately even before
+        # any AI call has ever run for this job).
+        stripped = pasted_jd.strip()
+        if stripped and stripped != (job.get("description") or ""):
             from search.job_store import update_job_description
 
-            update_job_description(job["source"], job["job_id"], pasted_jd.strip())
-            job["description"] = pasted_jd.strip()
-            st.toast(
-                "Saved - whatever you generate next will be tailored against it.",
-                icon=":material/check_circle:",
-            )
-            st.rerun()
+            update_job_description(job["source"], job["job_id"], stripped)
+            job["description"] = stripped
+        if stripped:
+            st.markdown(":material/check_circle: Saved automatically")
+            analysis = _analyze_fit_before_drafting(job, load_profile(), app_record)
+            # show_generate_actions=False: this renders directly above the
+            # "Documents for this application" checkbox+Generate flow below
+            # (which already covers resume among 5 doc types for a job
+            # with no draft yet) - showing this section's OWN "Generate
+            # resume" button too would be a second, resume-only way to do
+            # the same thing one scroll away. See render_analyze_fit_section's
+            # own docstring for the full reasoning.
+            render_analyze_fit_section(job, app_record, analysis=analysis, show_generate_actions=False)
+    else:
+        if st.button("Save job description", key=f"jd_paste_pre_save_{job_key}"):
+            if not pasted_jd.strip():
+                st.toast("Paste the job description text first.", icon=":material/warning:")
+            else:
+                from search.job_store import update_job_description
+
+                update_job_description(job["source"], job["job_id"], pasted_jd.strip())
+                job["description"] = pasted_jd.strip()
+                st.toast(
+                    "Saved - whatever you generate next will be tailored against it.",
+                    icon=":material/check_circle:",
+                )
+                st.rerun()
 
 
 def render_paste_jd_prompt(job: dict) -> None:
@@ -927,7 +981,7 @@ def _confirm_regenerate_dialog(job: dict, cost_info: dict) -> None:
             st.rerun()
 
 
-def render_analyze_fit_section(job: dict, app_record: dict, analysis: dict | None = None) -> None:
+def render_analyze_fit_section(job: dict, app_record: dict, analysis: dict | None = None, show_generate_actions: bool = True) -> None:
     """Step 1 (analyze fit, no document written) / Step 2 (generate,
     once satisfied) of the score-first resume flow
     (docs/score-first-resume-flow-spec.md, approved 2026-08-08, Option B
@@ -969,7 +1023,20 @@ def render_analyze_fit_section(job: dict, app_record: dict, analysis: dict | Non
     the real open_questions count for its expander label, computed BEFORE
     the label - see that call site) - avoids running the same real
     scoring/keyword-merge pass twice per job. Computed fresh here when not
-    given (the Results-tab call site, which doesn't need it beforehand)."""
+    given (the Results-tab call site, which doesn't need it beforehand).
+
+    show_generate_actions: False for the extension auto-save/auto-score
+    integration (render_paste_jd_prompt_before_drafting, 2026-08-09) -
+    that call site sits directly above the existing "Documents for this
+    application" checkbox+Generate flow (which already covers resume among
+    5 doc types) for a job with no draft yet, so this section's OWN
+    "Generate resume" button would be a second, resume-only way to do the
+    same thing one screen-scroll away - the exact "duplicate box" class of
+    bug this file has hit and fixed before (see the proactive-prompt/
+    post-hoc-prompt duplicate-content fix, 2026-08-06). The score
+    card/open-questions display is pure added value there (nothing else
+    shows gap questions before a first draft), so only the button row is
+    gated, not the whole section."""
     job_key = f"{job.get('source')}_{job.get('job_id')}"
     profile = load_profile()
     if analysis is None:
@@ -1001,39 +1068,40 @@ def render_analyze_fit_section(job: dict, app_record: dict, analysis: dict | Non
             if analysis.get("plateau_note"):
                 st.markdown(analysis["plateau_note"])
 
-            # analysis is already re-fetched fresh at the top of every
-            # render regardless of this click - per the confirmed
-            # contract, analyze_fit_before_drafting(job, profile) takes no
-            # "give me a new round" flag; calling it again after new
-            # answers were just saved naturally excludes those skills via
-            # the same profile["gap_interview_answers"] dedup
-            # _merge_keyword_gap_questions already uses today. This button
-            # exists so there's an explicit, visible action for "I've
-            # answered what's here, check for more" - not because the
-            # click itself needs to carry any extra state.
-            if st.button("Answer more questions", key=f"answermore_{job_key}"):
-                st.rerun()
+            if show_generate_actions:
+                # analysis is already re-fetched fresh at the top of every
+                # render regardless of this click - per the confirmed
+                # contract, analyze_fit_before_drafting(job, profile) takes no
+                # "give me a new round" flag; calling it again after new
+                # answers were just saved naturally excludes those skills via
+                # the same profile["gap_interview_answers"] dedup
+                # _merge_keyword_gap_questions already uses today. This button
+                # exists so there's an explicit, visible action for "I've
+                # answered what's here, check for more" - not because the
+                # click itself needs to carry any extra state.
+                if st.button("Answer more questions", key=f"answermore_{job_key}"):
+                    st.rerun()
 
-            regen_needed_confirmation = app_record.get("resume_text") is not None
-            if st.button("Generate resume", type="primary", key=f"analyzefit_generate_{job_key}"):
-                if not regen_needed_confirmation:
-                    _do_regenerate_resume(job)
-                else:
-                    cost_info = _check_regenerate_impact(job, app_record, profile)
-                    if cost_info["has_new_info"]:
-                        # Non-blocking heads-up (item 6) - proceeds
-                        # immediately, doesn't require a second click.
-                        fact_count = cost_info.get("new_fact_count")
-                        fact_phrase = f"{fact_count} new confirmed fact(s)" if fact_count is not None else "New confirmed facts"
-                        est_score = cost_info.get("estimated_new_score")
-                        score_phrase = f", should raise your score from {cost_info.get('current_score')} toward ~{est_score}" if est_score is not None else ""
-                        cost_estimate = cost_info.get("cost_estimate")
-                        cost_phrase = f", estimated cost ${cost_estimate:.2f}" if cost_estimate is not None else ""
-                        st.toast(f"{fact_phrase} aren't in your resume yet{score_phrase}{cost_phrase}.", icon=":material/info:")
+                regen_needed_confirmation = app_record.get("resume_text") is not None
+                if st.button("Generate resume", type="primary", key=f"analyzefit_generate_{job_key}"):
+                    if not regen_needed_confirmation:
                         _do_regenerate_resume(job)
                     else:
-                        st.session_state["regen_confirm_pending"] = {"job": job, "cost_info": cost_info}
-                        st.rerun()
+                        cost_info = _check_regenerate_impact(job, app_record, profile)
+                        if cost_info["has_new_info"]:
+                            # Non-blocking heads-up (item 6) - proceeds
+                            # immediately, doesn't require a second click.
+                            fact_count = cost_info.get("new_fact_count")
+                            fact_phrase = f"{fact_count} new confirmed fact(s)" if fact_count is not None else "New confirmed facts"
+                            est_score = cost_info.get("estimated_new_score")
+                            score_phrase = f", should raise your score from {cost_info.get('current_score')} toward ~{est_score}" if est_score is not None else ""
+                            cost_estimate = cost_info.get("cost_estimate")
+                            cost_phrase = f", estimated cost ${cost_estimate:.2f}" if cost_estimate is not None else ""
+                            st.toast(f"{fact_phrase} aren't in your resume yet{score_phrase}{cost_phrase}.", icon=":material/info:")
+                            _do_regenerate_resume(job)
+                        else:
+                            st.session_state["regen_confirm_pending"] = {"job": job, "cost_info": cost_info}
+                            st.rerun()
 
     with list_col:
         if not open_questions:
@@ -2918,7 +2986,21 @@ elif active_tab == "results":
                 # moot once a draft exists - the post-hoc one takes over
                 # from there, same as it already did before this box existed.
                 if app_record.get("resume_ats_score") is None:
-                    if _job_has_captured_jd_text(job):
+                    # A live extension capture routes here EVEN when the job
+                    # already has saved JD text (real gap found live
+                    # 2026-08-09 building this: the very first auto-save
+                    # flips _job_has_captured_jd_text() to True, which would
+                    # otherwise fall through to the plain view/update-box
+                    # branch below on the VERY NEXT rerun - that box has no
+                    # auto-score integration and requires an explicit
+                    # "Update" click, directly contradicting "not a one-time
+                    # auto-action that then locks into a static gate."
+                    # Falls back to the plain view/update box once the
+                    # capture expires (extension_bridge's own 30-min TTL) or
+                    # stops matching - graceful degradation, not a dead end.
+                    if extension_bridge.get_capture_for_url(job.get("posting_url")) or not _job_has_captured_jd_text(job):
+                        render_paste_jd_prompt_before_drafting(job, app_record)
+                    else:
                         pre_job_key = f"pre_{job.get('source')}_{job.get('job_id')}"
                         updated_text = render_jd_view_or_update_box(job, pre_job_key)
                         if updated_text is not None:
@@ -2931,8 +3013,6 @@ elif active_tab == "results":
                                 icon=":material/check_circle:",
                             )
                             st.rerun()
-                    else:
-                        render_paste_jd_prompt_before_drafting(job)
 
                 st.markdown("**Documents for this application**")
                 doc_types = [

@@ -28,11 +28,13 @@ def results_app(isolated_data, monkeypatch):
         {"source": "Dice", "job_id": "withjd1", "title": "Director, With JD", "organization": "Beta Inc", "location": "Remote", "description": "Requirements: Python, SQL."},
         {"source": "Indeed", "job_id": "nojd2", "title": "Director, Never Drafted", "organization": "Gamma LLC", "location": "Remote"},
         {"source": "Dice", "job_id": "withjd2", "title": "Director, JD Never Drafted", "organization": "Delta Co", "location": "Remote", "description": "Requirements: Go, Rust."},
+        {"source": "Dice", "job_id": "capture1", "title": "Director, Extension Capture", "organization": "Zeta LLC", "location": "Remote", "posting_url": "https://www.dice.com/job-detail/capture-test-guid"},
     ])
     update_job_score("Indeed", "nojd1", 85, "Strong match.")
     update_job_score("Dice", "withjd1", 85, "Strong match.")
     update_job_score("Indeed", "nojd2", 85, "Strong match.")
     update_job_score("Dice", "withjd2", 85, "Strong match.")
+    update_job_score("Dice", "capture1", 85, "Strong match.")
     upsert_application(
         "Indeed", "nojd1", status="under review",
         resume_text="PROFESSIONAL EXPERIENCE\nEngineer.\n\nEDUCATION\nBS\n\nSKILLS\nJava",
@@ -193,6 +195,88 @@ def test_proactive_save_persists_description_without_drafting_anything(results_a
     from search.job_store import load_jobs
     job = next(j for j in load_jobs() if j["job_id"] == "nojd2")
     assert job["description"] == "Requirements: Python, AWS."
+
+
+def _patch_capture(monkeypatch, description, ts=1700000000.0):
+    def _fake_capture(url):
+        return {
+            "title": "Director, Extension Capture",
+            "company": "Zeta LLC",
+            "description": description,
+            "source": "dice",
+            "url": url,
+            "ts": ts,
+        }
+
+    monkeypatch.setattr("extension_bridge.get_capture_for_url", _fake_capture)
+
+
+def test_extension_capture_auto_saves_with_no_save_button(results_app, monkeypatch):
+    # Zahir-approved polish pass (2026-08-09): a real extension capture
+    # (unlike a manual paste) saves itself the moment it's detected - the
+    # human confirmation already happened when the user clicked "Send to
+    # Panga" on a real page, so a second manual "Save" click here would be
+    # pure friction. "capture1" has no application/draft yet - the
+    # pre-first-draft (proactive) box.
+    _patch_capture(monkeypatch, "Requirements: Kubernetes, GraphQL.")
+
+    at = results_app
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 2
+    at.run(timeout=30)
+
+    assert not at.exception
+    assert not any(b.key == "jd_paste_pre_save_Dice_capture1" for b in at.button)
+    assert any("Saved automatically" in m.value for m in at.markdown)
+
+    from search.job_store import load_jobs
+    job = next(j for j in load_jobs() if j["job_id"] == "capture1")
+    assert job["description"] == "Requirements: Kubernetes, GraphQL."
+
+
+def test_extension_capture_renders_score_card_inline_without_generate_button(results_app, monkeypatch):
+    # The inline score card is pure added value (nothing else shows a fit
+    # score before a first draft exists), but its own "Generate resume"
+    # button is deliberately suppressed (show_generate_actions=False) -
+    # the "Documents for this application" checkbox+Generate flow right
+    # below already covers resume generation for this same job, and a
+    # second resume-only button one scroll away would be exactly the kind
+    # of duplicate-entry-point confusion this file has hit and fixed
+    # before (2026-08-06 proactive/post-hoc duplicate-box bug).
+    _patch_capture(monkeypatch, "Requirements: Kubernetes, GraphQL.")
+
+    at = results_app
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 2
+    at.run(timeout=30)
+
+    assert not at.exception
+    assert any(m.label == "Projected score" for m in at.metric)
+    assert not any(b.key == "analyzefit_generate_Dice_capture1" for b in at.button)
+    assert not any(b.key == "answermore_Dice_capture1" for b in at.button)
+
+
+def test_extension_capture_edit_resaves_and_rescores_without_a_button(results_app, monkeypatch):
+    # Not a one-time auto-action that then locks into a static gate
+    # (Zahir's explicit ask, relayed via the hub session): a manual edit to
+    # the already-auto-filled box goes through the exact same auto-save
+    # path, synchronously - the score shown always reflects the box's
+    # CURRENT text, not just whatever the extension first sent.
+    _patch_capture(monkeypatch, "Requirements: Kubernetes, GraphQL.")
+
+    at = results_app
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 2
+    at.run(timeout=30)
+
+    paste_box = next(t for t in at.text_area if t.key.startswith("jd_paste_pre_Dice_capture1"))
+    paste_box.set_value("Requirements: Python, AWS, Rust.")
+    at.run(timeout=30)
+
+    assert not at.exception
+    from search.job_store import load_jobs
+    job = next(j for j in load_jobs() if j["job_id"] == "capture1")
+    assert job["description"] == "Requirements: Python, AWS, Rust."
 
 
 def test_jd_column_shown_in_results_table(results_app):

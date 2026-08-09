@@ -23,6 +23,24 @@
     font-weight: 600;
     margin-bottom: 10px;
   }
+  #preview {
+    display: none;
+    font-size: 11px;
+    color: #444;
+    background: #f5f6f8;
+    border-left: 3px solid #0a66c2;
+    padding: 8px 10px;
+    margin-bottom: 10px;
+    border-radius: 3px;
+  }
+  #preview .count {
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+  #preview .snippet {
+    font-style: italic;
+    color: #555;
+  }
   button {
     width: 100%;
     padding: 9px;
@@ -48,6 +66,7 @@
   <h1>Panga Job Capture</h1>
   <div id="status">Checking this page...</div>
   <div id="job"></div>
+  <div id="preview"></div>
   <button id="sendBtn" style="display: none">Send to Panga</button>
   <div id="result"></div>
   <script src="popup.js"></script>
