@@ -2,10 +2,12 @@ from tailoring.drafting import (
     ATS_KEYWORDS_SYSTEM_PROMPT,
     RESUME_SPEC,
     RESUME_SPEC_USAJOBS,
+    _draft_one,
     _drop_generic_soft_skill_keywords,
     _drop_years_experience_keywords,
     _merge_keyword_gap_questions,
     _questions_worth_asking,
+    _resume_schema,
     _strip_rank_prefixes,
     _suggested_answer_for_keyword_gap,
     analyze_fit_before_drafting,
@@ -40,6 +42,51 @@ def test_ats_keywords_prompt_explains_either_or_group_extraction():
     assert "any_of" in ATS_KEYWORDS_SYSTEM_PROMPT
     assert "Either/or qualification groups" in ATS_KEYWORDS_SYSTEM_PROMPT
     assert "Master's degree, OR Bachelor's degree" in ATS_KEYWORDS_SYSTEM_PROMPT
+
+
+def test_resume_spec_explains_the_hedged_unconfirmed_claim_exception():
+    # Zahir's explicit, deliberate exception to "never invent or embellish"
+    # (2026-08-09): a plausible-but-unconfirmed guess may be written
+    # directly into resume text with a trailing "?", matching the existing
+    # suggested_answer hedge convention - but only with real contextual
+    # basis, never a fact with zero basis, and every such guess must also
+    # appear in the unconfirmed_claims field.
+    for spec in (RESUME_SPEC, RESUME_SPEC_USAJOBS):
+        assert "trailing '?'" in spec
+        assert "unconfirmed_claims" in spec
+        assert "Never guess a fact with NO real basis" in spec
+
+
+def test_resume_schema_requires_unconfirmed_claims_field():
+    schema = _resume_schema()
+    assert "unconfirmed_claims" in schema["properties"]
+    assert "unconfirmed_claims" in schema["required"]
+    item_props = schema["properties"]["unconfirmed_claims"]["items"]["properties"]
+    assert set(item_props) == {"skill", "text"}
+
+
+def test_draft_one_resume_threads_unconfirmed_claims_through(monkeypatch):
+    # The AI's self-reported unconfirmed_claims must survive _draft_one's
+    # post-processing (rank-prefix stripping, ATS rescoring, question
+    # merging) and land in the returned dict unchanged - this is the only
+    # snapshot tailoring.unconfirmed_claims.find_unconfirmed_markers() has
+    # to attach a friendly skill label to a flagged "?" line.
+    import tailoring.drafting as drafting
+
+    def _fake_call_structured(client, **kwargs):
+        return {
+            "text": "SKILLS\nLed a team of 8-10 engineers?",
+            "target_seniority_at_least_vp": False,
+            "suggested_strategy_tag": "",
+            "clarifying_questions": [],
+            "unconfirmed_claims": [{"skill": "Team size", "text": "Led a team of 8-10 engineers?"}],
+        }
+
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured)
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": [], "ats_preferred_keywords": []}
+
+    result = _draft_one(object(), [], "resume", None, job=job, profile={})
+    assert result["unconfirmed_claims"] == [{"skill": "Team size", "text": "Led a team of 8-10 engineers?"}]
 
 
 def test_ats_keywords_schema_supports_either_or_group_items():

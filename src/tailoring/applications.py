@@ -66,6 +66,7 @@ def upsert_application(
     documents_requested: list[str] | None = None,
     skip_reason: str | None = None,
     apply_answers: list[dict] | None = None,
+    resume_unconfirmed_claims_ai_reported: list[dict] | None = None,
 ) -> None:
     """Creates or updates the application record for (source, job_id).
     Fields left as None don't overwrite previously saved values -
@@ -92,7 +93,13 @@ def upsert_application(
     {"label": ..., "value": ...} ready-to-paste answers for an ATS form's
     recurring fields, drafted the same way as the other documents - Zahir
     still opens the real application and pastes/submits it himself, this
-    only removes the retyping. suggested_strategy_tag (2026-07-31) is a
+    only removes the retyping. resume_unconfirmed_claims_ai_reported
+    (2026-08-09) is the AI's own self-reported list of hedged, "?"-marked
+    guesses it wrote directly into resume_text this draft - a stored
+    snapshot only for friendly skill labels; the actual safety gate
+    (tailoring.unconfirmed_claims.find_unconfirmed_markers) always
+    recomputes fresh from the current resume_text, never trusts this
+    snapshot alone. suggested_strategy_tag (2026-07-31) is a
     short label Claude proposes describing what's distinctive about this
     specific resume draft (e.g. "concise-2-page-ats-focused") - stored
     separately from the real strategy_tag field (set_strategy_tag()) so a
@@ -133,6 +140,8 @@ def upsert_application(
                     app["skip_reason_reviewed"] = False
                 if apply_answers is not None:
                     app["apply_answers"] = apply_answers
+                if resume_unconfirmed_claims_ai_reported is not None:
+                    app["resume_unconfirmed_claims_ai_reported"] = resume_unconfirmed_claims_ai_reported
                 _save_all(applications)
                 _write_dossier(source, job_id)
                 return
@@ -162,6 +171,7 @@ def upsert_application(
             "skip_reason": skip_reason,
             "skip_reason_reviewed": False if skip_reason is not None else None,
             "apply_answers": apply_answers if apply_answers is not None else [],
+            "resume_unconfirmed_claims_ai_reported": resume_unconfirmed_claims_ai_reported if resume_unconfirmed_claims_ai_reported is not None else [],
         })
         _save_all(applications)
         _write_dossier(source, job_id)
