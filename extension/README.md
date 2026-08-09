@@ -90,6 +90,10 @@ little and click the button again. Dice doesn't have this issue at all.
   pasting manually every time.
 - **Nothing happens after "Send to Panga"**: check that Panga is open in a
   browser tab somewhere (it needs to be running, not just installed).
+- **"Couldn't read this page - try reloading it."**: fixed automatically as
+  of 2026-08-09 - the extension now retries this itself, so you shouldn't
+  see it anymore. If it still shows up, reload the LinkedIn/Dice tab once
+  and try again; if it keeps happening on the same posting, flag it.
 
 ## For whoever's maintaining this (not Zahir)
 
@@ -136,8 +140,8 @@ of popup.js (the real extraction call, the real send) still need the same
 real-extension check as the badge above - this only verifies the preview
 rendering itself.
 
-**Post-send notification + deep link (2026-08-09, IN PROGRESS - not done
-yet):** `background.js`'s `showSentNotification()` fires a
+**Post-send notification + deep link (2026-08-09, DONE - both halves
+landed):** `background.js`'s `showSentNotification()` fires a
 `chrome.notifications` popup after a successful `/capture`, with an "Open
 in Panga" button (`onButtonClicked`/`onClicked` both open the same URL,
 then clear the notification). The deep-link URL is
@@ -146,23 +150,18 @@ the job's own `posting_url` (normalized the same way
 `extension_bridge.py`'s `_normalize_url()` already does) rather than by
 `?job=<source>_<job_id>`, specifically to avoid duplicating Panga's
 per-source job_id derivation logic (LinkedIn: URL regex; Dice: content
-hash) inside the extension. **Two things still needed before this works
-end-to-end:**
-1. Panga's own side: `src/ui/app.py` needs to read `job_url` from
-   `st.query_params` on load, find the matching job, switch to the Results
-   tab, and set the same `selected_idx_{channel}`/`scroll_pending_{channel}`
-   session-state keys the existing Role-click handler already sets -
-   coordinated with the session that owns `app.py` generally (this
-   session only owns the auto-fill/status-indicator bits of it), not yet
-   landed.
-2. Live verification: `chrome.notifications.create()`/`chrome.tabs.create()`
-   are real-extension-only APIs, same limitation as the badge above -
-   needs a real loaded extension to confirm the notification actually
-   appears and its button actually navigates correctly.
-Manifest updated with the `notifications` permission and real icon files
-(`extension/icons/`, generated 2026-08-09 - previously the extension had
-no icons at all, which is fine for `chrome.action` but `chrome.notifications`
-requires a real `iconUrl`).
+hash) inside the extension. Panga's side (`src/ui/app.py` reading
+`job_url` from `st.query_params`, matching, landing on Results with the
+job selected/scrolled-to) was built separately by the session that owns
+`app.py` generally and merged as `feature/results-deep-link` - live-
+verified by them against a real job's real posting_url. Manifest updated
+with the `notifications` permission and real icon files (`extension/icons/`,
+generated 2026-08-09 - previously the extension had no icons at all, which
+is fine for `chrome.action` but `chrome.notifications` requires a real
+`iconUrl`). Not yet verified: the actual `chrome.notifications` popup
+rendering itself (real-extension-only API, same limitation as the badge
+above) - load the unpacked extension and confirm the notification appears
+and its button navigates correctly before fully trusting this piece.
 
 **Dice: confirmed live and working end-to-end**, including a real user
 click (2026-08-08 for the extraction logic; 2026-08-09 Zahir sent a real
@@ -200,3 +199,45 @@ instantly, zero added delay), extraction just works. If not, it fails
 within ~1.2s with an actionable message telling them to scroll and retry -
 see "A LinkedIn quirk" above. This is the correct, honest end state, not
 an interim fix waiting on more engineering.
+
+**"Couldn't read this page" - content script never injected (2026-08-09,
+FIXED):** real bug from Zahir on a real listing
+(`linkedin.com/jobs/view/4445190785/`, MBX Biosciences VP IT). The error
+message is popup.js's OWN fallback (`chrome.runtime.lastError` or no
+response at all from `chrome.tabs.sendMessage`) - a different failure
+class from content.js's two known "couldn't find a description" messages
+above, because it means content.js never got a chance to run its
+extraction logic at all. `content_scripts.matches` was already correct
+for the URL, ruling out a manifest typo. Leading hypothesis (unverified
+against this exact posting - no live LinkedIn session available to
+confirm, same limitation as elsewhere in this file): LinkedIn is a heavy
+single-page app, and clicking into a job from search results/a feed/a
+"similar jobs" list likely updates the URL via the History API without a
+real page navigation - Chrome's declarative `content_scripts` injection
+only fires on actual navigation events, not client-side route changes, so
+a tab that arrived at the job via in-page routing (rather than a fresh
+page load or a directly-pasted URL) may never get content.js injected at
+all.
+
+Fix: `popup.js`'s `ensureContentScriptAndExtract()` now falls back to
+`chrome.scripting.executeScript()` (new `scripting` permission) to inject
+`content.js` on demand, right when the user clicks the extension icon, if
+the first message attempt gets no response - fits this extension's
+existing "act on an explicit click, no background surveillance" design
+better than a persistent `chrome.webNavigation` listener watching every
+tab for SPA route changes. Since a tab can now legitimately receive
+`content.js` twice, `content.js` itself gained an idempotency guard (an
+IIFE gated on a `window.__pangaContentScriptActive` flag) - without it, a
+second real injection would throw a `SyntaxError` re-declaring top-level
+`const`s (re-injection runs in the SAME page/window, not a fresh module
+scope) and register a duplicate message listener/MutationObserver.
+**Verified live 2026-08-09:** ran the actual `content.js` source through
+three simulated injections in a Node `vm` sandbox (stubbed
+`chrome`/`document`/`MutationObserver`) - only one listener registered,
+one observer created, one message sent, no crash. **Not verified:** the
+SPA-navigation hypothesis itself against the real reported posting (needs
+a live logged-in LinkedIn session this build couldn't access) - the fix
+is a genuine improvement regardless of whether that specific hypothesis
+is exactly right (it also covers "clicked the icon before document_idle
+fired," a plain timing race), but if it doesn't fully resolve Zahir's
+case, verifying the SPA-navigation theory directly is the next step.
