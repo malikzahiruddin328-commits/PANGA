@@ -21,12 +21,13 @@ from llm_client import (
     DEFAULT_MODEL,
     LLMCallFailed as DraftingFailed,
     LLMNotConfigured as DraftingNotConfigured,
+    LLMResponseTruncated,
     call_structured,
     call_with_web_search,
     get_client as _client,
     is_configured,
 )
-from skill_label_match import skills_match
+from skill_label_match import normalize_skill_label, skills_match
 from tailoring.ats_score import plateau_note_for_gaps, score_resume_against_keywords, score_resume_ats
 from tailoring.baseline_resume import select_baseline_resume_text
 
@@ -339,10 +340,56 @@ Either/or qualification groups (score-first-resume-flow spec, item 2): a JD ofte
 # number-of-years pattern, e.g. "8+ years", "10+ years IT leadership",
 # "5 years executive technology" - the tenure threshold is the entire
 # point of the string, not a discrete skill/tool/certification worth a
-# literal keyword-match check. The other two over-extraction categories
-# (alternate-title lists, generic soft-skill phrases) have no reliable
-# regex signature, so those rely on the tightened prompt above instead.
+# literal keyword-match check.
+#
+# Corrected 2026-08-09 (Mirror's audit flagged the original 2026-08-07
+# commit's title - "Stop ATS keyword extraction from pulling tenure/
+# titles/soft-skills" - as reading like all three categories got a real
+# fix, when only this one did; the code comment here was already honest
+# about the gap, but CLAUDE.md's own retrospective wasn't). Generic
+# soft-skill phrases now ALSO get a real deterministic backstop below
+# (_drop_generic_soft_skill_keywords) - a curated deny-list, not a regex,
+# since these are known fixed phrases rather than a number pattern.
+# Alternate-title lists genuinely still have none: the giveaway that
+# makes "IT director" an alternate-title mention rather than a real
+# required title ("...or similar role" trailing the list) lives in the
+# posting's surrounding prose, which no longer exists once "IT director"
+# has already been extracted as a bare string - there's nothing left in
+# the extracted keyword itself for a regex or deny-list to key off, so
+# this one category is still prompt-reliant alone, not solved.
 _YEARS_EXPERIENCE_KEYWORD_RE = re.compile(r"^\d+\+?\s*years?\b", re.IGNORECASE)
+
+# Curated, deliberately narrow deny-list for the generic-soft-skill
+# category - the exact phrases ATS_KEYWORDS_SYSTEM_PROMPT already names
+# as never-extract, plus their most common real-world variants. Matched
+# via normalize_skill_label's plain case/punctuation-insensitive equality
+# (NOT skills_match's looser phrase-containment) - a deny-list has to be
+# exact-ish, or it risks dropping a real keyword that happens to contain
+# a denied phrase as a whole word (e.g. "Presentation Layer Architecture"
+# containing "presentation").
+_GENERIC_SOFT_SKILL_PHRASES = {
+    "executive presence",
+    "presentation",
+    "presentation skills",
+    "c suite stakeholders",
+    "strong communication skills",
+    "excellent communication skills",
+    "communication skills",
+    "executive technology strategies",
+    "strategic thinking",
+    "results driven",
+    "results oriented",
+    "team player",
+    "stakeholder management",
+    "cross functional leadership",
+    "leadership skills",
+    "interpersonal skills",
+    "problem solving skills",
+    "analytical skills",
+    "attention to detail",
+    "self starter",
+    "fast paced environment",
+}
 
 
 def _drop_years_experience_keywords(keywords: list) -> list:
@@ -350,6 +397,13 @@ def _drop_years_experience_keywords(keywords: list) -> list:
     # years-of-experience threshold wouldn't sensibly appear as one side
     # of a real either/or group, and .strip() would crash on a dict.
     return [k for k in keywords if not (isinstance(k, str) and _YEARS_EXPERIENCE_KEYWORD_RE.match(k.strip()))]
+
+
+def _drop_generic_soft_skill_keywords(keywords: list) -> list:
+    return [
+        k for k in keywords
+        if not (isinstance(k, str) and normalize_skill_label(k) in _GENERIC_SOFT_SKILL_PHRASES)
+    ]
 
 
 # Anthropic's structured-output schema rejects "oneOf" (confirmed live,
@@ -441,8 +495,8 @@ def _extract_ats_keywords(client: "anthropic.Anthropic", job: dict, model: str |
     except (DraftingNotConfigured, DraftingFailed):
         return [], []
 
-    required = _drop_years_experience_keywords(data.get("required_keywords") or [])
-    preferred = _drop_years_experience_keywords(data.get("preferred_keywords") or [])
+    required = _drop_generic_soft_skill_keywords(_drop_years_experience_keywords(data.get("required_keywords") or []))
+    preferred = _drop_generic_soft_skill_keywords(_drop_years_experience_keywords(data.get("preferred_keywords") or []))
 
     from search.job_store import update_job_ats_keywords
 
@@ -1201,6 +1255,20 @@ _ANSWER_MORE_SYSTEM_PROMPT = (
 )
 
 
+# Real crash found by RM's live-fire test against Zahir's actual profile
+# (2026-08-09): the prompt embeds the CANDIDATE'S MASTER PROFILE in full
+# (~98,000 characters on real data, not job-specific - every job's prompt
+# carries the same full profile), and a fixed max_tokens=3000 with no
+# retry truncated on essentially the first real call, not an edge case.
+# Same escalate-on-genuine-truncation pattern job_alert_reasoning.py's
+# extract_listings() already proved out against a comparably real-world-
+# large input (a bundled digest email) - not a per-input formula (the
+# real digests needing the most tokens weren't reliably the ones with the
+# most input either), just retry with more budget only when the response
+# actually came back cut off.
+_ANSWER_MORE_MAX_TOKENS_TIERS = [8000, 16000, 32000]
+
+
 def _answer_more_schema() -> dict:
     return {
         "type": "object",
@@ -1254,7 +1322,18 @@ def request_additional_gap_questions(
     (CLAUDE.md known failure pattern #3 - prompt compliance alone isn't
     trusted for anything checked downstream by a deterministic rule),
     anything that slips through the prompt anyway is filtered out here
-    too, not just asked not to happen."""
+    too, not just asked not to happen.
+
+    Escalates max_tokens across _ANSWER_MORE_MAX_TOKENS_TIERS if the
+    response comes back genuinely truncated (LLMResponseTruncated) - real
+    crash found by RM's live-fire test 2026-08-09: a real master profile
+    is large enough (~98,000 characters) that a fixed, low max_tokens
+    truncated on essentially the first real call, not an edge case. Raises
+    LLMCallFailed (of which LLMResponseTruncated is a subclass, so an
+    `except DraftingFailed`/`except LLMCallFailed` catches either) if even
+    the largest tier still truncates, or on any other failure - those
+    aren't retried, since a bigger token budget wouldn't fix a refusal or
+    invalid JSON."""
     client = _client()
     required_keywords = job.get("ats_required_keywords") or []
     preferred_keywords = job.get("ats_preferred_keywords") or []
@@ -1278,19 +1357,26 @@ def request_additional_gap_questions(
         "\n\nALREADY COVERED (do not repeat any of these, even reworded):\n" +
         json.dumps(sorted(set(already_covered)), indent=2)
     )
-    data = call_structured(
-        client,
-        system=_ANSWER_MORE_SYSTEM_PROMPT,
-        user_content=content,
-        schema=_answer_more_schema(),
-        max_tokens=3000,
-        model=model,
-        effort="high",
-        on_progress=on_progress,
-        refusal_message="Claude declined to check for more questions. Try again.",
-        purpose="answer_more_gap_questions",
-        job_key=job_key,
-    )
+    for max_tokens in _ANSWER_MORE_MAX_TOKENS_TIERS:
+        try:
+            data = call_structured(
+                client,
+                system=_ANSWER_MORE_SYSTEM_PROMPT,
+                user_content=content,
+                schema=_answer_more_schema(),
+                max_tokens=max_tokens,
+                model=model,
+                effort="high",
+                on_progress=on_progress,
+                refusal_message="Claude declined to check for more questions. Try again.",
+                purpose="answer_more_gap_questions",
+                job_key=job_key,
+            )
+        except LLMResponseTruncated:
+            if max_tokens == _ANSWER_MORE_MAX_TOKENS_TIERS[-1]:
+                raise
+            continue
+        break
 
     new_questions = [
         q for q in data.get("clarifying_questions", [])

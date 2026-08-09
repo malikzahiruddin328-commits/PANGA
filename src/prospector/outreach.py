@@ -16,12 +16,21 @@ get_awaiting_draft_send() reconciliation loop, just a second table it
 checks. LinkedIn/phone/in-person outreach is logged here but Panga can
 never draft or send on those channels - Zahir handles those himself and
 just records status manually.
+
+Every read-modify-write function below runs inside security.file_lock.
+locked("outreach") (found missing 2026-08-09 by Mirror's audit - src/
+fulfillment.py's own docstring already claimed this store was covered,
+but it wasn't; the scheduled fulfillment task and the dashboard's manual
+"Send and receive" button are two separate processes that can genuinely
+race here, same class of bug as the gmail/microsoft OAuth token fix,
+commit 81259f8) - same pattern as applications.py/cta_emails.py.
 """
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 
 from security.crypto_store import read_json, write_json
+from security.file_lock import locked
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 OUTREACH_PATH = PROJECT_ROOT / "data" / "outreach" / "outreach.json"
@@ -66,54 +75,57 @@ def add_outreach(
     if not ((job_source and job_id) or target_account_name):
         raise ValueError("outreach needs either a (job_source, job_id) pair or a target_account_name")
 
-    records = load_outreach()
     outreach_id = secrets.token_hex(8)
     now = datetime.now(timezone.utc).isoformat()
-    records.append({
-        "outreach_id": outreach_id,
-        "job_source": job_source,
-        "job_id": job_id,
-        "target_account_name": target_account_name,
-        "contact_name": contact_name,
-        "contact_title": contact_title,
-        "contact_email": contact_email,
-        "channel": channel,
-        "status": "planned",
-        "content": None,
-        "strategy_tag": None,
-        "notes": notes,
-        "created_at": now,
-        "status_updated_at": now,
-        "draft_requested": False,
-        "provider": None,
-        "account": None,
-        "draft_id": None,
-        "draft_link": None,
-    })
-    _save_all(records)
+    with locked("outreach"):
+        records = load_outreach()
+        records.append({
+            "outreach_id": outreach_id,
+            "job_source": job_source,
+            "job_id": job_id,
+            "target_account_name": target_account_name,
+            "contact_name": contact_name,
+            "contact_title": contact_title,
+            "contact_email": contact_email,
+            "channel": channel,
+            "status": "planned",
+            "content": None,
+            "strategy_tag": None,
+            "notes": notes,
+            "created_at": now,
+            "status_updated_at": now,
+            "draft_requested": False,
+            "provider": None,
+            "account": None,
+            "draft_id": None,
+            "draft_link": None,
+        })
+        _save_all(records)
     return outreach_id
 
 
 def update_status(outreach_id: str, status: str, notes: str | None = None) -> None:
-    records = load_outreach()
-    r = _find(records, outreach_id)
-    if r:
-        if r["status"] != status:
-            r["status_updated_at"] = datetime.now(timezone.utc).isoformat()
-        r["status"] = status
-        if notes is not None:
-            r["notes"] = notes
-        _save_all(records)
+    with locked("outreach"):
+        records = load_outreach()
+        r = _find(records, outreach_id)
+        if r:
+            if r["status"] != status:
+                r["status_updated_at"] = datetime.now(timezone.utc).isoformat()
+            r["status"] = status
+            if notes is not None:
+                r["notes"] = notes
+            _save_all(records)
 
 
 def set_strategy_tag(outreach_id: str, strategy_tag: str) -> None:
     """PRD §16d/§17 - same idea as applications.set_strategy_tag(), same
     field already reserved on every outreach record (see add_outreach)."""
-    records = load_outreach()
-    r = _find(records, outreach_id)
-    if r:
-        r["strategy_tag"] = strategy_tag
-        _save_all(records)
+    with locked("outreach"):
+        records = load_outreach()
+        r = _find(records, outreach_id)
+        if r:
+            r["strategy_tag"] = strategy_tag
+            _save_all(records)
 
 
 def request_draft(outreach_id: str) -> None:
@@ -122,11 +134,12 @@ def request_draft(outreach_id: str) -> None:
     the dashboard's synchronous "Send and receive" button) to compose and
     create a real draft on its next run - same "prepare but don't submit"
     rule as CTA replies."""
-    records = load_outreach()
-    r = _find(records, outreach_id)
-    if r:
-        r["draft_requested"] = True
-        _save_all(records)
+    with locked("outreach"):
+        records = load_outreach()
+        r = _find(records, outreach_id)
+        if r:
+            r["draft_requested"] = True
+            _save_all(records)
 
 
 def get_pending_draft_requests() -> list[dict]:
@@ -140,20 +153,21 @@ def mark_draft_created(outreach_id: str, draft_id: str, provider: str = "gmail",
     support. `draft_link` defaults to Gmail's own compose-deep-link format
     only when the record's provider is Gmail and no link was given (same
     rule as tailoring.cta_emails.mark_draft_created)."""
-    records = load_outreach()
-    r = _find(records, outreach_id)
-    if r:
-        r["draft_requested"] = False
-        r["provider"] = provider
-        r["account"] = account
-        r["draft_id"] = draft_id
-        if draft_link is None and provider == "gmail":
-            draft_link = f"https://mail.google.com/mail/u/0/#drafts?compose={draft_id}"
-        r["draft_link"] = draft_link
-        if r["status"] == "planned":
-            r["status_updated_at"] = datetime.now(timezone.utc).isoformat()
-            r["status"] = "drafted"
-        _save_all(records)
+    with locked("outreach"):
+        records = load_outreach()
+        r = _find(records, outreach_id)
+        if r:
+            r["draft_requested"] = False
+            r["provider"] = provider
+            r["account"] = account
+            r["draft_id"] = draft_id
+            if draft_link is None and provider == "gmail":
+                draft_link = f"https://mail.google.com/mail/u/0/#drafts?compose={draft_id}"
+            r["draft_link"] = draft_link
+            if r["status"] == "planned":
+                r["status_updated_at"] = datetime.now(timezone.utc).isoformat()
+                r["status"] = "drafted"
+            _save_all(records)
 
 
 def get_awaiting_draft_send() -> list[dict]:

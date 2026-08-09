@@ -33,6 +33,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from security.crypto_store import read_text, write_text
+from security.file_lock import locked
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CREDENTIALS_PATH = PROJECT_ROOT / "data" / "google_calendar" / "credentials.json"
@@ -84,7 +85,18 @@ def _save_credentials(creds: Credentials) -> None:
 def get_credentials() -> Credentials:
     """Same refresh-or-consent shape as gmail_client.py's get_credentials.
     Raises GoogleCalendarNotConfigured if neither this module's own OAuth
-    client nor Gmail's existing one is available."""
+    client nor Gmail's existing one is available.
+
+    The load-check-refresh-save sequence runs under a lock (2026-08-08,
+    Mirror's audit flagged this module as missing the same fix
+    gmail_client.py/microsoft_client.py already got in commit 81259f8 -
+    Calendar is reachable from the same shared fulfillment path
+    (interview-reply calendar-slot lookups) that motivated the original
+    fix, so it needed the identical treatment, just missed at the time).
+    Locking around the network refresh call itself (not just the file
+    write) is deliberate: it serializes concurrent refresh attempts, not
+    just concurrent writes - same reasoning as gmail_client.py's
+    get_credentials."""
     source = _credentials_source_path()
     if source is None:
         raise GoogleCalendarNotConfigured(
@@ -95,18 +107,27 @@ def get_credentials() -> Credentials:
             f"'Desktop app'), download its JSON, and save it as {CREDENTIALS_PATH}."
         )
 
-    creds = _load_cached_credentials()
-    if creds and creds.valid:
-        return creds
-
-    if creds and creds.expired and creds.refresh_token:
-        try:
-            creds.refresh(Request())
-            _save_credentials(creds)
+    with locked("google_calendar_token"):
+        creds = _load_cached_credentials()
+        if creds and creds.valid:
             return creds
-        except RefreshError:
-            creds = None
 
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+                _save_credentials(creds)
+                return creds
+            except RefreshError:
+                creds = None  # refresh token itself revoked/expired - fall through to re-consent
+
+    # No valid or refreshable cached token - the one-time interactive
+    # consent flow, deliberately OUTSIDE the lock above: this needs a real
+    # person clicking through a browser window, which can take far longer
+    # than the lock's own wait bound, and two processes both hitting
+    # first-time consent at once doesn't corrupt anything even unlocked -
+    # each just uses its own in-memory result regardless of which write to
+    # token.json ends up "winning". Same reasoning as gmail_client.py's
+    # get_credentials.
     flow = InstalledAppFlow.from_client_secrets_file(str(source), SCOPES)
     creds = flow.run_local_server(port=0, timeout_seconds=300)
     _save_credentials(creds)
