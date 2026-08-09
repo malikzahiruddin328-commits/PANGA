@@ -26,9 +26,10 @@ aliased inside app.py itself never takes effect)."""
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from search.job_store import save_jobs, update_job_score
+from search.job_store import save_jobs, update_job_score, load_jobs
 from tailoring.applications import upsert_application, get_application
 from tailoring.ats_score import score_resume_against_keywords
+from tailoring.drafting import save_gap_answers
 
 APP_PATH = "src/ui/app.py"
 
@@ -85,6 +86,33 @@ def _fake_generate_documents(job, profile, doc_keys, on_progress=None):
         "suggested_strategy_tag": "", "ats_score": 95,
         "ats_rationale": "Matched 2/2 keywords.", "ats_next_actions": [], "clarifying_questions": [],
     }}
+
+
+def _answer_databricks_question_directly(answer="Yes, led a 2-year Databricks migration."):
+    # Calls the real save path directly instead of driving it through
+    # box.set_value(at).run() - AppTest limitation found while building
+    # the toast+rerun fix (2026-08-09): once save_gap_answers()'s own new
+    # st.rerun() makes this exact text_area disappear from open_questions
+    # (correctly - it's genuinely answered now, confirmed independently
+    # against the real function's output), AppTest's internal widget-tree
+    # bookkeeping for that SPECIFIC widget breaks on any FURTHER .run()/
+    # .click().run() in the SAME test - a KeyError trying to read a
+    # session_state entry Streamlit itself already garbage-collected once
+    # the widget stopped rendering. Reproduced independently of this
+    # fix's own logic (confirmed correct via a standalone script: real
+    # open_questions correctly excludes the answered skill) - specific to
+    # widgets that vanish as a direct result of their OWN .set_value()
+    # interaction being processed, not to reruns/disappearances
+    # triggered any other way. Calling the underlying function directly
+    # (matching exactly what app.py's own save_gap_answers([...]) call
+    # does) produces the identical real state without ever exercising
+    # AppTest's own set_value() path, sidestepping the limitation
+    # entirely while still testing the real downstream behavior.
+    job = next(j for j in load_jobs() if j["source"] == "Dice" and j["job_id"] == "job1")
+    save_gap_answers(job, [{
+        "skill": "Databricks", "type": "skill_gap", "answer": answer,
+        "question": DATABRICKS_QUESTION_TEXT,
+    }])
 
 
 def test_gap_question_renders_inline_on_results_tab(results_app_with_gap_questions):
@@ -160,10 +188,8 @@ def test_projected_score_moves_after_answering_before_generating(results_app_wit
     metric = next(m for m in at.metric if m.label == "Projected score")
     assert metric.value == f"{INITIAL_SCORE}/100"
 
-    box = next(t for t in at.text_area if "Databricks" in t.label)
-    box.set_value("Yes, led a 2-year Databricks migration.")
-    at.run(timeout=30)  # this run saves the answer, but re-scores BEFORE that save happens
-    at.run(timeout=30)  # a plain rerun now sees the just-saved answer
+    _answer_databricks_question_directly()
+    at.run(timeout=30)
 
     assert not at.exception
     metric = next(m for m in at.metric if m.label == "Projected score")
@@ -202,6 +228,10 @@ def test_answer_saves_immediately_without_clicking_any_button(results_app_with_g
     # Item 4: answers persist even if the user never reaches Generate -
     # real regression test for the old design's coupling of "answer
     # saved" to "document generated" (spec's explicit warning about this).
+    # Deliberately drives the real text_area (not
+    # _answer_databricks_question_directly()) - this is specifically
+    # testing that the WIDGET ITSELF triggers the auto-save with no
+    # button click, not just the downstream save behavior.
     at = results_app_with_gap_questions
     at.session_state["active_tab"] = "results"
     at.session_state["selected_idx_Dice"] = 0
@@ -218,6 +248,70 @@ def test_answer_saves_immediately_without_clicking_any_button(results_app_with_g
     assert any(a["skill"] == "Databricks" and "migration" in a["answer"] for a in answers)
     # Nothing was regenerated just from answering.
     assert get_application("Dice", "job1")["resume_ats_score"] == INITIAL_SCORE
+
+
+def test_answering_shows_a_saved_toast(results_app_with_gap_questions):
+    # Real gap Zahir hit live (2026-08-09): the save genuinely worked
+    # (verified directly against his real profile data) but the screen
+    # gave zero visible confirmation either way - no toast, no checkmark,
+    # nothing changed, no way to tell "saved silently" from "ignored"
+    # without checking the raw data. st.toast (not st.success/st.info,
+    # which wouldn't survive the immediate st.rerun() right after it) is
+    # what the real fix uses - reliably observable via AppTest through a
+    # real widget interaction, unlike the "does the list already reflect
+    # the drop on this same cycle" half of this fix (see
+    # test_open_questions_correctly_excludes_an_answered_skill below for
+    # why that one isn't AppTest-testable through the widget itself, and
+    # this worktree's live-verification notes for the real-browser check).
+    at = results_app_with_gap_questions
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+
+    box = next(t for t in at.text_area if "Databricks" in t.label)
+    box.set_value("Yes, led a 2-year Databricks migration.")
+    at.run(timeout=30)
+
+    assert not at.exception
+    assert any(t.value == "Saved." for t in at.toast)
+
+
+def test_open_questions_correctly_excludes_an_answered_skill(results_app_with_gap_questions):
+    # The other half of the same fix (see test_answering_shows_a_saved_
+    # toast above): open_questions is computed once at the top of
+    # render_analyze_fit_section, before the per-question loop reaches
+    # the save - without a rerun right after saving, the just-answered
+    # question would still show as open for one more render. AppTest
+    # limitation found building this fix: driving this through the real
+    # text_area widget (box.set_value().run(), even with one extra plain
+    # .run() to let the triggered rerun settle) hits a real AppTest bug -
+    # once a keyed widget disappears as a direct result of its OWN
+    # .set_value() being processed, AppTest's internal widget-tree
+    # bookkeeping for that specific widget breaks on any further .run(),
+    # raising a KeyError trying to read a session_state entry Streamlit
+    # itself already garbage-collected once the widget stopped
+    # rendering - reproducible independently of whether the underlying
+    # fix is correct. So this asserts the real function's output directly
+    # (same one render_analyze_fit_section calls) - the actual
+    # same-cycle "does it disappear from what's rendered" claim is
+    # verified live in a real browser instead (this worktree's
+    # live-verification notes), matching the documented-limitation
+    # pattern already used elsewhere in this suite (canvas ButtonColumns,
+    # etc.) rather than a test that can't reliably pass or fail on its
+    # own merits.
+    from tailoring.applications import get_application
+    from tailoring.drafting import analyze_fit_before_drafting
+    from profile.storage import load_profile
+
+    job = next(j for j in load_jobs() if j["source"] == "Dice" and j["job_id"] == "job1")
+    app_record = get_application("Dice", "job1")
+    before = analyze_fit_before_drafting(job, load_profile(), app_record)
+    assert any(q["skill"] == "Databricks" for q in before["open_questions"])
+
+    _answer_databricks_question_directly()
+
+    after = analyze_fit_before_drafting(job, load_profile(), app_record)
+    assert not any(q["skill"] == "Databricks" for q in after["open_questions"])
 
 
 def test_untouched_suggested_answer_does_not_get_saved_as_a_real_confirmed_answer(results_app_with_gap_questions):
@@ -259,8 +353,7 @@ def test_generate_button_regenerates_using_the_confirmed_answer(results_app_with
     at.session_state["selected_idx_Dice"] = 0
     at.run(timeout=30)
 
-    box = next(t for t in at.text_area if "Databricks" in t.label)
-    box.set_value("Yes, led a 2-year Databricks migration.")
+    _answer_databricks_question_directly()
     at.run(timeout=30)
 
     generate_button = next(b for b in at.button if b.key and b.key.startswith("analyzefit_generate_"))
@@ -300,8 +393,7 @@ def test_generate_warns_when_a_regenerate_drops_a_previously_matched_keyword(res
     at.session_state["selected_idx_Dice"] = 0
     at.run(timeout=30)
 
-    box = next(t for t in at.text_area if "Databricks" in t.label)
-    box.set_value("Yes, led a 2-year Databricks migration.")
+    _answer_databricks_question_directly()
     at.run(timeout=30)
 
     generate_button = next(b for b in at.button if b.key and b.key.startswith("analyzefit_generate_"))
@@ -328,8 +420,7 @@ def test_generate_shows_no_regression_warning_when_nothing_was_lost(results_app_
     at.session_state["selected_idx_Dice"] = 0
     at.run(timeout=30)
 
-    box = next(t for t in at.text_area if "Databricks" in t.label)
-    box.set_value("Yes, led a 2-year Databricks migration.")
+    _answer_databricks_question_directly()
     at.run(timeout=30)
 
     generate_button = next(b for b in at.button if b.key and b.key.startswith("analyzefit_generate_"))
@@ -412,8 +503,7 @@ def test_resume_expander_auto_expands_right_after_answering_a_gap_question(resul
     at.session_state["selected_idx_Dice"] = 0
     at.run(timeout=30)
 
-    box = next(t for t in at.text_area if "Databricks" in t.label)
-    box.set_value("Yes, led a 2-year Databricks migration.")
+    _answer_databricks_question_directly()
     at.run(timeout=30)
     generate_button = next(b for b in at.button if b.key and b.key.startswith("analyzefit_generate_"))
     generate_button.click().run(timeout=30)
@@ -437,8 +527,7 @@ def test_score_delta_shown_after_regenerating(results_app_with_gap_questions, mo
     at.session_state["selected_idx_Dice"] = 0
     at.run(timeout=30)
 
-    box = next(t for t in at.text_area if "Databricks" in t.label)
-    box.set_value("Yes, led a 2-year Databricks migration.")
+    _answer_databricks_question_directly()
     at.run(timeout=30)
     generate_button = next(b for b in at.button if b.key and b.key.startswith("analyzefit_generate_"))
     generate_button.click().run(timeout=30)

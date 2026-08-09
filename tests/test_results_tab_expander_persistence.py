@@ -45,10 +45,37 @@ def results_app_with_gap_questions(isolated_data, monkeypatch):
     return AppTest.from_file(APP_PATH)
 
 
-def test_both_expanders_stay_open_while_answering_without_saving(results_app_with_gap_questions):
-    # The exact reported scenario: type an answer and move on, WITHOUT
-    # clicking "Save answers & regenerate resume" yet - any text_area
-    # losing focus already triggers a script rerun on its own.
+def test_both_expanders_stay_open_while_answering(results_app_with_gap_questions):
+    # The exact reported scenario: answer a question and move on - any
+    # text_area losing focus already triggers a script rerun on its own.
+    #
+    # 2026-08-09 update: item 4's auto-save (already existed before this
+    # test was written) now also fires a real st.toast + st.rerun() right
+    # after a genuine save (a separate real gap Zahir hit live - the save
+    # always worked, but gave zero visible confirmation and the list
+    # didn't reflect it same-cycle). That means a genuinely different
+    # answer no longer sits in "not saved yet" limbo the way this test's
+    # original name assumed - it saves immediately and the now-answered
+    # question correctly drops off the open list on this same rerun. This
+    # test's real, still-valid point - the CONTAINING expanders must not
+    # collapse out from under an in-progress edit - is unaffected by that;
+    # only the specific "box still shows my typed text afterward"
+    # assertion no longer applies, since that specific question is gone
+    # now, by design.
+    #
+    # Driven via a direct save_gap_answers() call rather than
+    # box.set_value() - AppTest limitation found building the toast+rerun
+    # fix: once a keyed text_area disappears as a direct result of its
+    # OWN .set_value() being processed, AppTest's internal widget-tree
+    # bookkeeping for that widget breaks on any further .run(), raising a
+    # KeyError for a session_state entry Streamlit itself already
+    # garbage-collected. Calling the same underlying function app.py's
+    # own save path calls produces the identical real state without ever
+    # touching AppTest's set_value() path for a widget that's about to
+    # stop existing.
+    from search.job_store import load_jobs
+    from tailoring.drafting import save_gap_answers
+
     at = results_app_with_gap_questions
     at.session_state["active_tab"] = "results"
     at.session_state["selected_idx_Dice"] = 0
@@ -57,17 +84,19 @@ def test_both_expanders_stay_open_while_answering_without_saving(results_app_wit
     at.session_state["resume_drafted_open_Dice_job1"] = True
     at.run(timeout=30)
 
-    box = next(t for t in at.text_area if "Databricks" in t.label)
-    box.set_value("Yes, I've led a couple of Databricks migrations.")
-    at.run(timeout=30)  # rerun from the text_area change, not a save click
+    job = next(j for j in load_jobs() if j["source"] == "Dice" and j["job_id"] == "job1")
+    save_gap_answers(job, [{
+        "skill": "Databricks", "type": "skill_gap",
+        "answer": "Yes, I've led a couple of Databricks migrations.",
+        "question": "The posting requires \"Databricks\" - do you have real, genuine experience with it?",
+    }])
+    at.run(timeout=30)
 
     assert not at.exception
     channel_expander = next(e for e in at.expander if e.label.startswith("Dice"))
     assert channel_expander.proto.expanded
     resume_expander = next(e for e in at.expander if e.label == "Resume (drafted)")
     assert resume_expander.proto.expanded
-    box = next(t for t in at.text_area if "Databricks" in t.label)
-    assert box.value == "Yes, I've led a couple of Databricks migrations."
 
 
 def test_resume_expander_defaults_open_when_job_has_unanswered_questions(results_app_with_gap_questions):
