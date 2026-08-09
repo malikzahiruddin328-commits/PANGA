@@ -58,6 +58,40 @@ def test_ats_keywords_prompt_explains_degree_field_lists():
     assert "a related field" in ATS_KEYWORDS_SYSTEM_PROMPT
 
 
+def test_ats_keywords_prompt_forbids_silently_dropping_a_broad_named_field():
+    # Real gap caught live 2026-08-09 across TWO separate real postings
+    # (Net at Work, GELLERT GLOBAL GROUP): each listed "...Information
+    # Technology, Computer Science, Business, or a related field" and the
+    # extraction dropped "Business" entirely - not flattened like its
+    # neighbors, just silently missing from the output altogether.
+    assert "Business" in ATS_KEYWORDS_SYSTEM_PROMPT
+    assert "quietly drop one" in ATS_KEYWORDS_SYSTEM_PROMPT
+
+
+def test_ats_keywords_prompt_explains_multi_tier_either_or_chains():
+    # Real gap caught live 2026-08-09 on 2 real Amgen postings: "Doctorate
+    # degree OR Masters degree and 2 years of Computer Science, IT or
+    # related field OR Bachelors degree and 4 years of [...] OR Associates
+    # degree and 8 years of [...] OR High school diploma/GED and 10 years
+    # of [...]" - a 5-tier chain with a nested field-list inside every
+    # tier, extracted as 7 completely flat keywords instead of two any_of
+    # groups (one for the degree levels, one for the shared field list).
+    assert "Doctorate degree" in ATS_KEYWORDS_SYSTEM_PROMPT
+    assert "High school diploma/GED" in ATS_KEYWORDS_SYSTEM_PROMPT
+    assert "MORE than two alternatives" in ATS_KEYWORDS_SYSTEM_PROMPT
+    assert "TWO separate any_of groups" in ATS_KEYWORDS_SYSTEM_PROMPT
+
+
+def test_ats_keywords_prompt_explains_dual_role_terms():
+    # Real gap caught live 2026-08-09 (GELLERT posting): "Supply Chain
+    # Management" is both an acceptable degree field AND a separately
+    # required substantive skill/experience area elsewhere in the same
+    # posting - holding a degree in it doesn't prove real hands-on
+    # experience in it, so it needs extracting both ways, not just once.
+    assert "Supply Chain Management" in ATS_KEYWORDS_SYSTEM_PROMPT
+    assert "BOTH as an any_of alternative AND as its own independent flat required keyword" in ATS_KEYWORDS_SYSTEM_PROMPT
+
+
 def test_strip_degree_in_prefix_canonicalizes_a_bundled_flat_keyword():
     # Deterministic backstop for the rule above, same "backstop, not just
     # an instruction" bar as every other keyword-extraction fix this week:
@@ -113,6 +147,66 @@ def test_degree_field_group_fix_matches_the_real_upstream_bio_posting_score():
     new_result = score_resume_against_keywords(new_required, [], resume_text)
     assert "Computer Science" not in [m["label"] for m in new_result["missing_required_keywords"]]
     assert new_result["ats_score"] > old_result["ats_score"]
+
+
+def test_multi_tier_either_or_fix_matches_the_real_amgen_posting_score():
+    # Live-verified, real regression (General's systemic sweep, 2026-08-09):
+    # Amgen's real posting text is "Doctorate degree OR Masters degree and
+    # 2 years of Computer Science, IT or related field OR Bachelors degree
+    # and 4 years of [...] OR Associates degree and 8 years of [...] OR
+    # High school diploma / GED and 10 years of [...]" - extracted as 7
+    # completely flat keywords (5 degree levels + Computer Science + IT).
+    # Zahir's real stored resume for this job scores a perfect match once
+    # corrected to two any_of groups (degree level, field) - simulating
+    # the corrected extraction shape against a realistic excerpt of his
+    # real resume text (the actual live AI re-extraction can't be run from
+    # this environment - no API key here - so this locks in the
+    # deterministic scoring side, which is what this fix can guarantee).
+    from tailoring.ats_score import score_resume_against_keywords
+
+    resume_text = (
+        "PROFESSIONAL EXPERIENCE\nLed IT transformation programs across enterprise systems.\n"
+        "EDUCATION\nBachelor's degree, Information Systems\n"
+    )
+    old_required = ["Doctorate degree", "Masters degree", "Bachelors degree", "Associates degree", "High school diploma / GED", "Computer Science", "IT"]
+    old_result = score_resume_against_keywords(old_required, [], resume_text)
+    assert "Doctorate degree" in [m["label"] for m in old_result["missing_required_keywords"]]
+    assert "Masters degree" in [m["label"] for m in old_result["missing_required_keywords"]]
+    assert "Associates degree" in [m["label"] for m in old_result["missing_required_keywords"]]
+    assert "High school diploma / GED" in [m["label"] for m in old_result["missing_required_keywords"]]
+    assert "Computer Science" in [m["label"] for m in old_result["missing_required_keywords"]]
+
+    new_required = [
+        {"any_of": ["Doctorate degree", "Masters degree", "Bachelors degree", "Associates degree", "High school diploma / GED"]},
+        {"any_of": ["Computer Science", "IT"]},
+    ]
+    new_result = score_resume_against_keywords(new_required, [], resume_text)
+    assert new_result["missing_required_keywords"] == []
+    assert new_result["ats_score"] > old_result["ats_score"]
+
+
+def test_dual_role_term_is_still_honestly_flagged_as_a_separate_requirement():
+    # Live-verified, real regression (GELLERT posting): "Supply Chain
+    # Management" is both an acceptable degree field AND a separately
+    # required substantive skill elsewhere in the same posting. A resume
+    # that only shows the degree-field alternative satisfied via a
+    # DIFFERENT field (e.g. Information Technology) must still show the
+    # standalone "Supply Chain Management" experience requirement as a
+    # real, honest gap - the group being satisfied must not silently
+    # suppress the separate substantive requirement the posting also asks
+    # for.
+    from tailoring.ats_score import score_resume_against_keywords
+
+    resume_text = "PROFESSIONAL EXPERIENCE\nLed enterprise Information Technology strategy.\nEDUCATION\nBachelor's degree\n"
+    required = [
+        "Bachelor's degree",
+        {"any_of": ["Information Technology", "Computer Science", "Business", "Supply Chain Management"]},
+        "Supply Chain Management",
+    ]
+    result = score_resume_against_keywords(required, [], resume_text)
+    missing_labels = [m["label"] for m in result["missing_required_keywords"]]
+    assert "Information Technology OR Computer Science OR Business OR Supply Chain Management" not in missing_labels
+    assert "Supply Chain Management" in missing_labels
 
 
 def test_resume_spec_explains_the_hedged_unconfirmed_claim_exception():
