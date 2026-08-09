@@ -80,6 +80,7 @@ from tailoring.cta_emails import get_active_cta_emails, request_archive, request
 from tailoring.interview_prep import load_interview_prep, get_interview_prep, record_round_outcome, build_prep_context, generate_prep, start_round, save_round
 from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
 from tailoring.ats_score import detect_matched_keyword_regressions
+from tailoring.unconfirmed_claims import find_unconfirmed_markers
 from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed, analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_impact as _check_regenerate_impact, request_additional_gap_questions as _request_additional_gap_questions
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
 from prospector.rejection_diagnosis import gather_diagnosis_input, diagnose
@@ -652,6 +653,7 @@ def regenerate_resume_and_persist(job: dict, on_progress, success_message: str) 
         resume_ats_next_actions=new_resume["ats_next_actions"],
         resume_clarifying_questions=new_resume["clarifying_questions"],
         suggested_strategy_tag=new_resume["suggested_strategy_tag"],
+        resume_unconfirmed_claims_ai_reported=new_resume.get("unconfirmed_claims", []),
     )
     sync_workspace_documents(
         job["source"], job["job_id"], ["resume"],
@@ -3216,6 +3218,7 @@ elif active_tab == "results":
                                 resume_ats_next_actions=resume_draft["ats_next_actions"] if resume_is_scored else None,
                                 resume_clarifying_questions=resume_draft["clarifying_questions"] if resume_is_scored else None,
                                 suggested_strategy_tag=resume_draft["suggested_strategy_tag"] if resume_is_scored else None,
+                                resume_unconfirmed_claims_ai_reported=resume_draft.get("unconfirmed_claims", []) if resume_is_scored else None,
                                 cover_letter_text=drafted.get("cover_letter"),
                                 exec_bio_text=drafted.get("exec_bio"),
                                 leadership_summary_text=drafted.get("leadership_summary"),
@@ -3246,16 +3249,32 @@ elif active_tab == "results":
                     if doc_key == "apply_answers":
                         if drafted_text:
                             with st.expander(f"{doc_label} (drafted)"):
-                                st.markdown(
-                                    "Open the real application yourself and paste each "
-                                    "answer below into the matching field - nothing here "
-                                    "is submitted automatically."
-                                )
-                                for item in drafted_text:
-                                    label = item.get("label", "")
-                                    value = item.get("value", "")
-                                    st.markdown(label)
-                                    st.code(value, language=None, wrap_lines=True)
+                                unresolved_claims = find_unconfirmed_markers(app_record)
+                                if unresolved_claims:
+                                    # Same hard, deterministic gate as the
+                                    # "applied" status block above - the
+                                    # packet is meant to be pasted directly
+                                    # into a real application, so it can't
+                                    # render with an unresolved "?" in it
+                                    # any more than the .docx can be synced
+                                    # under its real filename with one.
+                                    st.error(
+                                        "This packet can't be used yet - unconfirmed claim(s) "
+                                        "still need resolving first:"
+                                    )
+                                    for c in unresolved_claims:
+                                        st.markdown(f"- {c['line']}")
+                                else:
+                                    st.markdown(
+                                        "Open the real application yourself and paste each "
+                                        "answer below into the matching field - nothing here "
+                                        "is submitted automatically."
+                                    )
+                                    for item in drafted_text:
+                                        label = item.get("label", "")
+                                        value = item.get("value", "")
+                                        st.markdown(label)
+                                        st.code(value, language=None, wrap_lines=True)
                         continue
                     if drafted_text:
                         resume_expander_key = None
@@ -3499,8 +3518,21 @@ elif active_tab == "results":
                         )
 
                 if st.button("Save status", key=f"save_status_{job.get('source')}_{job.get('job_id')}"):
+                    unresolved_claims = find_unconfirmed_markers(app_record)
                     if new_status == "-":
                         st.toast("Pick a status first.", icon=":material/warning:")
+                    elif new_status == "applied" and unresolved_claims:
+                        # Zahir's explicit, non-negotiable requirement
+                        # (2026-08-09): a hedged "?" guess baked into
+                        # resume_text to move the score can never leave
+                        # this app unresolved - a hard, deterministic block,
+                        # not a nag, same bar as needs_edit_review below.
+                        flagged_lines = "; ".join(f'"{c["line"]}"' for c in unresolved_claims[:5])
+                        st.error(
+                            f"Resolve the unconfirmed claim(s) still in your documents before "
+                            f"marking this applied: {flagged_lines}"
+                            + (f" (+{len(unresolved_claims) - 5} more)" if len(unresolved_claims) > 5 else "")
+                        )
                     elif new_status == "applied" and needs_edit_review(app_record) and not why_reason.strip():
                         st.error(
                             "Check your edited documents (button above) and explain why in the "

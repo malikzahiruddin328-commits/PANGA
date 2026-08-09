@@ -42,6 +42,7 @@ from search.job_store import load_jobs
 from tailoring.applications import get_application
 from tailoring.interview_prep import get_interview_prep
 from tailoring.docx_export import text_to_docx_bytes, cover_letter_to_docx_bytes
+from tailoring.unconfirmed_claims import has_unconfirmed_marker
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DOSSIER_DIR = PROJECT_ROOT / "data" / "applications" / "dossiers"
@@ -202,6 +203,18 @@ def _workspace_filename(field: str, candidate_name: str | None, job: dict) -> st
 
     parts = [p for p in [name, doc_label, org] if p]
     return "_".join(parts) + ext
+
+
+def _draft_unconfirmed_filename(real_filename: str) -> str:
+    """The real filename with a "-DRAFT-UNCONFIRMED" marker inserted before
+    the extension - deliberately NOT subject to _MAX_WORKSPACE_FILENAME_LEN's
+    normal cap (that budget exists so a file survives being emailed/moved
+    off Panga entirely; this filename is the opposite - a purposefully
+    unmissable, internal-only marker that only ever needs to make sense
+    inside this one dossier folder while unresolved, never meant to leave
+    it)."""
+    stem, ext = real_filename.rsplit(".", 1)
+    return f"{stem}-DRAFT-UNCONFIRMED.{ext}"
 
 
 def _migrate_legacy_filename(folder: Path, field: str, new_filename: str) -> None:
@@ -443,6 +456,23 @@ def sync_workspace_documents(
     written - his edits are preserved on disk, never silently overwritten,
     even though the app can no longer treat that specific text as "the
     current working copy" once a fresh regenerate has happened.
+
+    2026-08-09, the real safety guarantee behind the unconfirmed-"?"-claims
+    feature: if a field's new text still has an unresolved "?" in it
+    (tailoring.unconfirmed_claims.has_unconfirmed_marker), this writes to a
+    distinctly-named *-DRAFT-UNCONFIRMED.docx file instead of the real
+    expected filename, and leaves any existing real file (from a
+    previously resolved draft) untouched rather than overwriting it with
+    unconfirmed content. This is what makes it safe to write a hedged "?"
+    guess into resume_text at all - real gap General/Zahir caught before
+    shipping: blocking only in-app actions (the "applied" status
+    transition, the Apply Assist render) still leaves the actual .docx
+    sitting on disk, fully double-clickable/attachable from File Explorer
+    regardless of any in-app gate - so the gate has to live here, at the
+    one place that ever writes the real filename, not just upstream of it.
+    Once a field's text is clean again, any stale *-DRAFT-UNCONFIRMED.docx
+    from an earlier unresolved round is deleted - it served its purpose
+    once the real file exists for real.
     apply_answers is skipped here (see DOC_KEY_TO_FIELD) - it isn't rendered
     as an editable docx, the Results tab shows it as copy-paste fields
     directly.
@@ -468,6 +498,24 @@ def sync_workspace_documents(
         _migrate_descriptive_filename(folder, field, filename, candidate_name, job)
         _migrate_hash_suffixed_filename(folder, field, filename, candidate_name, job)
         file_path = folder / filename
+        draft_path = folder / _draft_unconfirmed_filename(filename)
+
+        if has_unconfirmed_marker(new_text):
+            # Real gap General/Zahir caught before this shipped: blocking
+            # only the "applied" status transition and the Apply Assist
+            # render still left the REAL synced .docx sitting on disk with
+            # an unresolved "?" in it, fully double-clickable/attachable
+            # from File Explorer regardless of either in-app gate. This is
+            # the actual guarantee: the real expected filename is never
+            # created/overwritten from text that still has a "?" in it -
+            # written to a distinctly-named draft file instead, and the
+            # last known-good real file (if one exists from a previously
+            # resolved draft) is left untouched rather than overwritten
+            # with unconfirmed content.
+            doc_bytes = _render_doc_key_to_bytes(doc_key, new_text, candidate_name, job)
+            draft_path.write_bytes(doc_bytes)
+            continue
+
         if file_path.exists():
             previous_stored_text = application.get(field)
             try:
@@ -487,6 +535,11 @@ def sync_workspace_documents(
 
         doc_bytes = _render_doc_key_to_bytes(doc_key, new_text, candidate_name, job)
         file_path.write_bytes(doc_bytes)
+        # This text is clean (no gate above triggered) - a stale draft
+        # file from a previously unresolved round, if any, is no longer
+        # needed once the real file has been written for real.
+        if draft_path.exists():
+            draft_path.unlink()
 
 
 def check_for_edits(source: str, job_id: str) -> dict:

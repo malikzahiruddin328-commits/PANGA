@@ -68,6 +68,27 @@ _RESUME_SPEC_COMMON = (
     "automatically for a below-VP posting based on the "
     "target_seniority_at_least_vp field, so don't try to handle it "
     "yourself in the text. "
+    "Zahir's explicit, deliberate exception to 'never invent or embellish': "
+    "when a specific fact (a number, a name, a scope detail) would "
+    "genuinely strengthen a bullet and there's real contextual basis for a "
+    "plausible guess (the same standard as this app's own keyword-gap "
+    "suggested answers - e.g. the term or something close to it already "
+    "appears elsewhere in the profile), you may write that guess directly "
+    "into the resume text with a trailing '?' marking it as unconfirmed "
+    "(e.g. 'Led a team of 8-10 engineers?', 'Reduced incident response "
+    "time by roughly 30%?') - same hedge-marker convention already used "
+    "for suggested_answer guesses elsewhere in this app. Never guess a "
+    "fact with NO real basis at all (an employer, a title, a date, or a "
+    "number with nothing in the profile even loosely suggesting it) - "
+    "omit it instead. This app enforces a hard, code-level rule that no "
+    "document ever leaves with an unresolved '?' still in it, so a hedge "
+    "marker here is safe to use, not a shortcut around honesty - it is "
+    "exactly what tells the app and the candidate this specific claim "
+    "still needs a real answer before it's final. Every fact you write "
+    "this way MUST also appear in the unconfirmed_claims field below, "
+    "using the EXACT SAME wording as it appears in resume_text, so the "
+    "app can find and resolve it - never leave a '?' in resume_text "
+    "without a matching unconfirmed_claims entry."
 )
 
 _RESUME_SPEC_TWO_PAGE_RULES = (
@@ -693,8 +714,36 @@ def _resume_schema(job: dict | None = None) -> dict:
                     "purely about wording/structure rather than a missing fact."
                 ),
             },
+            "unconfirmed_claims": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "skill": {
+                            "type": "string",
+                            "description": "Short label for what this unconfirmed guess is about, matching the master profile's gap-tracking convention (same style as clarifying_questions' skill field).",
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": "The EXACT text you wrote in resume_text for this guess, trailing '?' included, character for character - used to find and resolve it later.",
+                        },
+                    },
+                    "required": ["skill", "text"],
+                    "additionalProperties": False,
+                },
+                "description": (
+                    "One entry for EVERY hedged, unconfirmed guess written into "
+                    "resume_text with a trailing '?' (see the resume-writing "
+                    "rules above) - empty list if you didn't write any. Every "
+                    "'?' in resume_text must have a matching entry here; never "
+                    "leave one unaccounted for."
+                ),
+            },
         },
-        "required": ["text", "target_seniority_at_least_vp", "suggested_strategy_tag", "clarifying_questions"],
+        "required": [
+            "text", "target_seniority_at_least_vp", "suggested_strategy_tag",
+            "clarifying_questions", "unconfirmed_claims",
+        ],
         "additionalProperties": False,
     }
 
@@ -1003,6 +1052,7 @@ def _draft_one(
             "ats_next_actions": ats["ats_next_actions"],
             "clarifying_questions": _questions_worth_asking(merged_questions, ats["ats_score"]),
             "ats_plateau_note": ats.get("plateau_note"),
+            "unconfirmed_claims": data.get("unconfirmed_claims", []),
         }
     if doc_key == "apply_answers":
         return data.get("apply_answers", [])
