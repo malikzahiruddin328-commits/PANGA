@@ -2,6 +2,7 @@ from tailoring.drafting import (
     ATS_KEYWORDS_SYSTEM_PROMPT,
     RESUME_SPEC,
     RESUME_SPEC_USAJOBS,
+    _drop_generic_soft_skill_keywords,
     _drop_years_experience_keywords,
     _merge_keyword_gap_questions,
     _questions_worth_asking,
@@ -86,6 +87,41 @@ def test_drop_years_experience_keywords_does_not_eat_a_real_skill_containing_a_n
     # a digit - only ones that START with a number-of-years pattern.
     keywords = ["3D modeling", "Office 365", "24/7 on-call rotation"]
     assert _drop_years_experience_keywords(keywords) == keywords
+
+
+def test_drop_generic_soft_skill_keywords_filters_the_exact_named_examples():
+    # Real gap Mirror's audit caught 2026-08-09: the 2026-08-07 fix
+    # ("Stop ATS keyword extraction from pulling tenure/titles/soft-
+    # skills") only ever gave years-of-experience a real deterministic
+    # backstop - soft-skills relied on the prompt alone despite the
+    # commit title reading as fully solved. This is the real backstop,
+    # covering the exact phrases ATS_KEYWORDS_SYSTEM_PROMPT already names
+    # as never-extract.
+    keywords = ["executive presence", "c-suite stakeholders", "presentation", "Python", "AWS"]
+    assert _drop_generic_soft_skill_keywords(keywords) == ["Python", "AWS"]
+
+
+def test_drop_generic_soft_skill_keywords_is_case_and_punctuation_insensitive():
+    keywords = ["Executive Presence", "C-Suite Stakeholders.", "Strong Communication Skills"]
+    assert _drop_generic_soft_skill_keywords(keywords) == []
+
+
+def test_drop_generic_soft_skill_keywords_passes_through_group_items_unchanged():
+    keywords = [{"any_of": ["Master's degree", "Bachelor's degree"]}, "executive presence"]
+    assert _drop_generic_soft_skill_keywords(keywords) == [{"any_of": ["Master's degree", "Bachelor's degree"]}]
+
+
+def test_drop_generic_soft_skill_keywords_does_not_eat_a_real_skill_containing_a_denied_phrase():
+    # Deny-list uses exact normalized equality, not skills_match's looser
+    # phrase-containment - a real, specific term that happens to CONTAIN a
+    # generic phrase as a whole word must survive.
+    keywords = ["Presentation Layer Architecture", "Executive Presence Coaching Certification"]
+    assert _drop_generic_soft_skill_keywords(keywords) == keywords
+
+
+def test_drop_generic_soft_skill_keywords_leaves_unrelated_terms_alone():
+    keywords = ["SQL", "Project Management", "PMP certification"]
+    assert _drop_generic_soft_skill_keywords(keywords) == keywords
 
 
 def test_resume_spec_conditionally_keeps_or_drops_seniority_parenthetical():

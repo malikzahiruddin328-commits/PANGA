@@ -36,7 +36,17 @@ _APOSTROPHE_RE = re.compile(r"['’]")
 _OTHER_PUNCT_RE = re.compile(r"[^\w\s]")
 
 
-def _normalize_skill_label(label: str) -> str:
+def normalize_skill_label(label: str) -> str:
+    """Case/punctuation/whitespace-insensitive normalization of a skill
+    label - the shared building block behind skills_match() below and
+    also used directly by drafting.py's generic-soft-skill deny-list
+    (2026-08-09), which needs plain normalized-equality against a curated
+    set rather than skills_match()'s looser phrase-containment (a
+    deny-list has to be exact-ish, not fuzzy - phrase-containment would
+    risk dropping a real keyword that happens to contain a denied phrase
+    as a whole word, e.g. "Presentation Layer Architecture" containing
+    "presentation"). Public (not module-private) for that reuse - was
+    private until a second real caller outside this module needed it."""
     # Apostrophes are removed outright ("Master's" -> "Masters"), not
     # replaced with a space like other punctuation - otherwise "Master's
     # Degree" and "masters degree" normalize to different token sequences
@@ -51,7 +61,7 @@ def skills_match(a: str, b: str) -> bool:
     underlying fact: normalized (case/punctuation/whitespace-insensitive)
     equality, or one being a real, word-boundary-respecting phrase within
     the other - never a bare substring."""
-    norm_a, norm_b = _normalize_skill_label(a), _normalize_skill_label(b)
+    norm_a, norm_b = normalize_skill_label(a), normalize_skill_label(b)
     if not norm_a or not norm_b:
         return False
     if norm_a == norm_b:
