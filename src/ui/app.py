@@ -1389,6 +1389,31 @@ gaps_count = len(get_applications_with_open_clarifying_questions())
 
 st.session_state.setdefault("active_tab", "cta")
 
+# --- Deep-link from the browser extension's post-capture notification
+# ("open Panga to the job I just sent" instead of making Zahir hunt for it,
+# extension session's ask 2026-08-08). ?job_url=<url-encoded posting URL>,
+# matched via the SAME normalization extension_bridge.py already uses for
+# its own capture-matching (strip query/fragment/trailing slash, lowercase)
+# - not a fresh regex, so a LinkedIn tracking-param variant or a re-visit
+# still matches the job's own stored posting_url exactly like it already
+# does for auto-fill. Consumed (query param cleared, deep_link_target
+# popped) whether or not a match is actually shown - a job that exists but
+# is currently hidden by the Results-tab filters (score threshold, hidden-
+# closed/applied) still lands cleanly on Results with nothing force-
+# selected, rather than either guessing at relaxing filters or leaving a
+# stale target lingering in session_state to surprise a much later,
+# unrelated rerun once filters happen to change. Ambiguous matches (more
+# than one job shares a normalized posting_url) also no-op rather than
+# guess which one Zahir meant.
+_job_url_param = st.query_params.get("job_url")
+if _job_url_param:
+    _normalized_target = extension_bridge._normalize_url(_job_url_param)
+    _url_matches = [j for j in jobs if extension_bridge._normalize_url(j.get("posting_url") or "") == _normalized_target] if _normalized_target else []
+    if len(_url_matches) == 1:
+        st.session_state["active_tab"] = "results"
+        st.session_state["deep_link_target"] = (_url_matches[0]["source"], _url_matches[0]["job_id"])
+    del st.query_params["job_url"]
+
 # --- Persistent alert strip: shown above the tabs on every tab, since these
 # are time-sensitive and easy to miss if buried under whichever tab happens
 # to be open (design decision 2026-07-30, see module docstring). ---
@@ -2738,6 +2763,23 @@ elif active_tab == "results":
         if cross_source_merged:
             dup_notes.append(f"{cross_source_merged} job-board posting(s) matched to this direct listing")
         dup_note = f", {'; '.join(dup_notes)}" if dup_notes else ""
+
+        # Deep-link target (see the top-of-script query-param handling) -
+        # force-open this channel's expander and select/scroll to the row
+        # the moment it's found in THIS channel's own post-filter/dedup
+        # list, before the expander below reads its expanded= state. One-
+        # shot: popped the instant it's applied so a later, unrelated
+        # rerun doesn't keep re-forcing this same job open.
+        _deep_link_target = st.session_state.get("deep_link_target")
+        if _deep_link_target and _deep_link_target[0] == channel:
+            for _idx, _job in enumerate(deduped):
+                if (_job.get("source"), _job.get("job_id")) == _deep_link_target:
+                    st.session_state[f"channel_expander_{channel}"] = True
+                    st.session_state[f"selected_idx_{channel}"] = _idx
+                    st.session_state[f"scroll_pending_{channel}"] = True
+                    st.session_state.pop("deep_link_target", None)
+                    break
+
         # Investigated a reported inconsistency (2026-08-06, relayed via
         # hub): USAJOBS seen expanded on page load while Indeed was
         # correctly collapsed. Could not reproduce with a genuinely fresh
@@ -3317,6 +3359,16 @@ elif active_tab == "results":
     pending_regen_confirm = st.session_state.get("regen_confirm_pending")
     if pending_regen_confirm:
         _confirm_regenerate_dialog(pending_regen_confirm["job"], pending_regen_confirm["cost_info"])
+
+    # A deep-link target that's still set here never matched any channel's
+    # post-filter/dedup list this pass - the job exists (it was resolved
+    # from a real posting_url match up top) but is currently hidden by the
+    # score threshold or a hidden-closed/applied filter. Cleared rather
+    # than left to linger in session_state, which would otherwise force-
+    # select it unexpectedly on some later, unrelated rerun once a filter
+    # happens to change - lands cleanly on Results with nothing selected,
+    # same as the "ambiguous match" no-op above.
+    st.session_state.pop("deep_link_target", None)
 
 elif active_tab == "prospector":
     render_feedback_widget("prospector")
