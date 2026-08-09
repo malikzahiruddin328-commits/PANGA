@@ -37,6 +37,21 @@
 // boundary-marker miss on a still-loading page is far more likely than a
 // real posting that short.
 
+// Idempotency guard (2026-08-09): popup.js can now legitimately inject
+// this script a second time into the same tab as a fallback when no
+// content script answers the first message (see popup.js's
+// ensureContentScriptAndExtract() - most likely cause is LinkedIn's
+// single-page-app navigation not triggering Chrome's normal declarative
+// injection). A second real execution of this whole file would re-declare
+// its top-level `const`s (a real SyntaxError - re-injection runs in the
+// SAME page/window, not a fresh module scope) and register a second
+// chrome.runtime.onMessage listener and MutationObserver. Wrapping
+// everything in this IIFE, gated on a flag stashed on `window`, makes a
+// second injection a harmless no-op instead of a crash or a duplicate.
+if (!window.__pangaContentScriptActive) {
+window.__pangaContentScriptActive = true;
+(function () {
+
 const MIN_DESCRIPTION_LENGTH = 200;
 
 function stripHtml(html) {
@@ -328,3 +343,6 @@ new MutationObserver(debounce(reportReadiness, 500)).observe(document.body, {
   childList: true,
   subtree: true,
 });
+
+})();
+}

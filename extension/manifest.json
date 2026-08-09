@@ -3,7 +3,7 @@
   "name": "Panga Job Capture",
   "version": "1.0.0",
   "description": "Sends the job description from an open LinkedIn or Dice job posting into Panga, so you don't have to copy-paste it.",
-  "permissions": ["activeTab", "alarms", "notifications"],
+  "permissions": ["activeTab", "alarms", "notifications", "scripting"],
   "host_permissions": [
     "http://127.0.0.1:8765/*",
     "https://www.linkedin.com/*",
@@ -16,6 +16,7 @@
     {
       "matches": [
         "https://www.linkedin.com/jobs/view/*",
+        "https://www.linkedin.com/comm/jobs/view/*",
         "https://www.dice.com/job-detail/*"
       ],
       "js": ["content.js"],
