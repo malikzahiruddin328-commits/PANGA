@@ -16,6 +16,7 @@
     {
       "matches": [
         "https://www.linkedin.com/jobs/view/*",
+        "https://www.linkedin.com/comm/jobs/view/*",
         "https://www.dice.com/job-detail/*"
       ],
       "js": ["content.js"],

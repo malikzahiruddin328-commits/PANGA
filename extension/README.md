@@ -201,28 +201,41 @@ see "A LinkedIn quirk" above. This is the correct, honest end state, not
 an interim fix waiting on more engineering.
 
 **"Couldn't read this page" - content script never injected (2026-08-09,
-FIXED):** real bug from Zahir on a real listing
-(`linkedin.com/jobs/view/4445190785/`, MBX Biosciences VP IT). The error
-message is popup.js's OWN fallback (`chrome.runtime.lastError` or no
-response at all from `chrome.tabs.sendMessage`) - a different failure
-class from content.js's two known "couldn't find a description" messages
-above, because it means content.js never got a chance to run its
-extraction logic at all. `content_scripts.matches` was already correct
-for the URL, ruling out a manifest typo. Leading hypothesis (unverified
-against this exact posting - no live LinkedIn session available to
-confirm, same limitation as elsewhere in this file): LinkedIn is a heavy
-single-page app, and clicking into a job from search results/a feed/a
-"similar jobs" list likely updates the URL via the History API without a
-real page navigation - Chrome's declarative `content_scripts` injection
-only fires on actual navigation events, not client-side route changes, so
-a tab that arrived at the job via in-page routing (rather than a fresh
-page load or a directly-pasted URL) may never get content.js injected at
-all.
+FIXED, real root cause confirmed against real data):** real bug from
+Zahir on a real listing (MBX Biosciences VP IT). The error message is
+popup.js's OWN fallback (`chrome.runtime.lastError` or no response at all
+from `chrome.tabs.sendMessage`) - a different failure class from
+content.js's two known "couldn't find a description" messages above,
+because it means content.js never got a chance to run its extraction
+logic at all.
 
-Fix: `popup.js`'s `ensureContentScriptAndExtract()` now falls back to
+First hypothesis (LinkedIn SPA client-side routing not triggering
+injection) turned out to be the wrong mechanism, caught by checking the
+job's REAL stored `posting_url` in `data/jobs/jobs.json` instead of the
+clean URL initially assumed: it was actually
+`https://www.linkedin.com/comm/jobs/view/4445190785/?trackingId=...` -
+LinkedIn's `/comm/jobs/view/...` path is an email-tracking redirect
+wrapper (this posting was originally captured via the job-alert-email
+scan, which stores whatever URL the email link actually contained,
+tracking params and all - see CLAUDE.md's "Processing job-alert emails"
+section). `content_scripts.matches` only listed
+`https://www.linkedin.com/jobs/view/*` - genuinely did NOT match this URL
+shape, so Chrome never injected content.js on it at all. Checking
+`load_jobs()` against all stored LinkedIn postings found this isn't a
+one-off: **41 of 74 (55%) already have this `/comm/jobs/view/` shape** -
+this was silently broken for the majority of LinkedIn jobs already in
+Panga, not just this one listing.
+
+Fix: added `https://www.linkedin.com/comm/jobs/view/*` to
+`content_scripts.matches` and to `popup.js`'s `isSupportedUrl()` regex.
+Verified the regex against both URL shapes plus edge cases (a `/comm/`
+path on a different domain correctly still rejected). Kept the
+on-demand-injection fallback below too, as defense in depth for whatever
+NEXT URL-shape variant LinkedIn or an email-sourced link introduces -
+`popup.js`'s `ensureContentScriptAndExtract()` falls back to
 `chrome.scripting.executeScript()` (new `scripting` permission) to inject
 `content.js` on demand, right when the user clicks the extension icon, if
-the first message attempt gets no response - fits this extension's
+the first message attempt still gets no response - fits this extension's
 existing "act on an explicit click, no background surveillance" design
 better than a persistent `chrome.webNavigation` listener watching every
 tab for SPA route changes. Since a tab can now legitimately receive
@@ -235,9 +248,12 @@ scope) and register a duplicate message listener/MutationObserver.
 three simulated injections in a Node `vm` sandbox (stubbed
 `chrome`/`document`/`MutationObserver`) - only one listener registered,
 one observer created, one message sent, no crash. **Not verified:** the
-SPA-navigation hypothesis itself against the real reported posting (needs
-a live logged-in LinkedIn session this build couldn't access) - the fix
-is a genuine improvement regardless of whether that specific hypothesis
-is exactly right (it also covers "clicked the icon before document_idle
-fired," a plain timing race), but if it doesn't fully resolve Zahir's
-case, verifying the SPA-navigation theory directly is the next step.
+`/comm/jobs/view/` page's actual DOM/extraction behavior once content.js
+runs on it (needs a live logged-in LinkedIn session this build couldn't
+access) - the URL-matching root cause is confirmed against real stored
+data, but whether the page LinkedIn serves at that path has the exact
+same shape as the plain `/jobs/view/` path (same lazy-load-on-scroll
+behavior, same lack of JSON-LD, etc.) is still an assumption. If Zahir
+hits a NEW failure on a `/comm/` URL specifically (not the generic
+"couldn't read this page" message, which this fix directly addresses),
+that's the signal this assumption needs checking.

@@ -33,7 +33,7 @@ let extracted = null;
 
 function isSupportedUrl(url) {
   return (
-    /^https:\/\/www\.linkedin\.com\/jobs\/view\//.test(url) ||
+    /^https:\/\/www\.linkedin\.com\/(comm\/)?jobs\/view\//.test(url) ||
     /^https:\/\/www\.dice\.com\/job-detail\//.test(url)
   );
 }
