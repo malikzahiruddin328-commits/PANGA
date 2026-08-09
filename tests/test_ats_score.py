@@ -450,3 +450,79 @@ def test_detect_keyword_wording_regressions_ignores_a_flat_term_moved_into_a_new
     new_required = [{"any_of": ["Information Technology", "Computer Science", "Engineering"]}]
 
     assert detect_keyword_wording_regressions(old_required, [], new_required, [], resume_text) == []
+
+
+# --- Years-of-experience / advanced-degree equivalency (2026-08-09) ---
+# Zahir's explicit design, confirmed and scoped by General: a standing,
+# candidate-level scoring-only credit for degree-TIER requirements
+# ("advanced degree", "Master's degree") the JD states with no stated
+# equivalency of its own, when the candidate has 10+ years of experience.
+# Real motivating case: Upstream Bio's "advanced degree preferred" -
+# Zahir has 25+ years, no advanced degree, JD states no equivalency.
+
+_RESUME_NO_DEGREE = "PROFESSIONAL EXPERIENCE\nEngineer.\n\nSKILLS\nPython"  # no EDUCATION section, no degree of any kind mentioned
+
+
+def test_advanced_degree_credited_via_years_equivalency_when_experienced_enough():
+    result = score_resume_against_keywords(
+        [], ["advanced degree"], _RESUME_NO_DEGREE, candidate_years_experience=25,
+    )
+    assert result["missing_preferred_keywords"] == []
+    assert result["years_experience_equivalency_explanations"] == [
+        '"advanced degree" credited via 25+ years of relevant experience equivalency '
+        "(not stated in the resume text itself, and the posting states no equivalency of its own)"
+    ]
+    assert "credited via 25+ years" in result["ats_rationale"]
+
+
+def test_advanced_degree_not_credited_below_the_years_threshold():
+    result = score_resume_against_keywords(
+        [], ["advanced degree"], _RESUME_NO_DEGREE, candidate_years_experience=9,
+    )
+    assert result["missing_preferred_keywords"] == [{"label": "advanced degree", "point_value": 75.0}]
+    assert result["years_experience_equivalency_explanations"] == []
+
+
+def test_advanced_degree_not_credited_when_years_unknown():
+    # candidate_years_experience=None (the default) - equivalency never
+    # applies, matching every pre-2026-08-09 caller's existing behavior.
+    result = score_resume_against_keywords([], ["advanced degree"], _RESUME_NO_DEGREE)
+    assert result["missing_preferred_keywords"] == [{"label": "advanced degree", "point_value": 75.0}]
+
+
+def test_baseline_bachelors_degree_is_never_credited_via_equivalency():
+    # Explicit scoping (Zahir's design): the equivalency covers degree-TIER
+    # terms only ("advanced degree", "Master's degree") - NOT the baseline
+    # "Bachelor's degree", which stays a literal, real requirement no
+    # amount of experience substitutes for.
+    result = score_resume_against_keywords(
+        ["Bachelor's degree"], [], _RESUME_NO_DEGREE, candidate_years_experience=25,
+    )
+    assert result["missing_required_keywords"] == [{"label": "Bachelor's degree", "point_value": 75.0}]
+    assert result["years_experience_equivalency_explanations"] == []
+
+
+def test_advanced_degree_inside_an_any_of_group_is_never_credited_via_equivalency():
+    # If the posting already states its own equivalency ("Master's OR
+    # Bachelor's plus 8+ years"), that's exactly what gets extracted as an
+    # any_of group in the first place - applying the years-experience
+    # credit on top would double up on an equivalency the posting already
+    # spelled out itself. A group member here ("Master's degree") should
+    # only be satisfiable by its own group's literal-match logic.
+    result = score_resume_against_keywords(
+        [{"any_of": ["Master's degree", "Bachelor's degree"]}], [], _RESUME_NO_DEGREE, candidate_years_experience=25,
+    )
+    assert result["missing_required_keywords"] == [
+        {"label": "Master's degree OR Bachelor's degree", "point_value": 75.0}
+    ]
+    assert result["years_experience_equivalency_explanations"] == []
+
+
+def test_advanced_degree_already_literally_matched_is_not_double_credited():
+    # A candidate who genuinely HAS an advanced degree should match on the
+    # real text, not the equivalency - the explanation list should stay
+    # empty since no credit was needed.
+    resume = "PROFESSIONAL EXPERIENCE\nEngineer.\n\nEDUCATION\nMaster's degree, Computer Science\n\nSKILLS\nPython"
+    result = score_resume_against_keywords([], ["Master's degree"], resume, candidate_years_experience=25)
+    assert result["missing_preferred_keywords"] == []
+    assert result["years_experience_equivalency_explanations"] == []

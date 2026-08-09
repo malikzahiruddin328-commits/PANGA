@@ -11,6 +11,7 @@ from tailoring.drafting import (
     _strip_degree_in_prefix_keywords,
     _strip_rank_prefixes,
     _suggested_answer_for_keyword_gap,
+    _total_years_of_experience,
     analyze_fit_before_drafting,
     check_regenerate_impact,
     generate_documents,
@@ -719,6 +720,53 @@ def test_merge_keyword_gap_questions_backfill_checks_preferred_keywords_too():
     assert merged[0]["point_value"] == 5.0
 
 
+def test_merge_keyword_gap_questions_generates_a_real_question_for_a_missing_preferred_keyword():
+    # Real gap General found live 2026-08-09: missing PREFERRED keywords
+    # had no question-generation path at all - only required ones did.
+    # Real case: "clinical-stage organizations" (a genuine, real fact
+    # Zahir has - Protiovant/SK Life Science Labs through its Phase 1
+    # transition) sat as passive "How to raise it" text forever with no
+    # way to actually surface it.
+    merged = _merge_keyword_gap_questions([], [], missing_preferred_keywords=_missing("clinical-stage organizations"))
+    assert len(merged) == 1
+    q = merged[0]
+    assert q["type"] == "skill_gap"
+    assert q["skill"] == "clinical-stage organizations"
+    assert "clinical-stage organizations" in q["question"]
+    assert q["point_value"] == 5.0
+    # Distinguishable from a required-keyword question so a caller (UI
+    # refinement's call) can render it with lower-urgency framing.
+    assert q["is_preferred"] is True
+
+
+def test_merge_keyword_gap_questions_required_question_is_not_marked_preferred():
+    merged = _merge_keyword_gap_questions([], _missing("Databricks"))
+    assert "is_preferred" not in merged[0]
+
+
+def test_merge_keyword_gap_questions_preferred_question_dedupes_against_existing_and_answered():
+    existing = [{"skill": "Kubernetes experience", "type": "skill_gap", "question": "?", "suggested_answer": ""}]
+    merged = _merge_keyword_gap_questions(
+        existing, [], previously_answered_skills=["Terraform"],
+        missing_preferred_keywords=_missing("Kubernetes", "Terraform", "Docker"),
+    )
+    # "Kubernetes" already has a question (backfilled, not duplicated);
+    # "Terraform" was already answered; only "Docker" is genuinely new.
+    assert len(merged) == 2  # the existing Kubernetes question + the new Docker one
+    new_questions = [q for q in merged if q.get("is_preferred")]
+    assert {q["skill"] for q in new_questions} == {"Docker"}
+
+
+def test_merge_keyword_gap_questions_preferred_does_not_duplicate_a_matching_required_gap():
+    # Defensive dedup: the same term shouldn't realistically appear in
+    # both lists, but if it somehow did, it must not generate two
+    # separate questions for the identical skill.
+    merged = _merge_keyword_gap_questions(
+        [], _missing("Kubernetes"), missing_preferred_keywords=_missing("Kubernetes"),
+    )
+    assert len(merged) == 1
+
+
 def test_merge_keyword_gap_questions_leaves_point_value_none_with_no_matching_keyword():
     # A genuinely free-standing fact (team size, budget) with no
     # corresponding extracted keyword has no deterministic value to
@@ -1285,3 +1333,48 @@ def test_reextract_ats_keywords_and_rescore_reports_unchanged_on_api_failure(mon
     # "0/1 required" proves it scored against the real 1-item old list, not
     # a wiped-to-[] "0/0 required" that would silently show zero gaps.
     assert "0/1 required" in result["ats_rationale"]
+
+
+def test_total_years_of_experience_uses_earliest_work_history_start_date():
+    # Real profile shape (Zahir's actual master_profile.json): "start" is
+    # either a bare "YYYY" or "MM/YYYY" - both must parse. Uses the
+    # EARLIEST start across every entry, not just the first one in the
+    # list, since work_history isn't guaranteed to be sorted.
+    from datetime import date
+
+    profile = {
+        "work_history": [
+            {"employer": "A", "start": "09/2010", "end": "01/2013"},
+            {"employer": "B", "start": "2001", "end": "02/2008"},  # earliest
+            {"employer": "C", "start": "01/2024", "end": "01/2026"},
+        ],
+    }
+    years = _total_years_of_experience(profile)
+    expected = (date.today() - date(2001, 1, 1)).days / 365.25
+    assert years == expected
+
+
+def test_total_years_of_experience_none_when_no_parseable_dates():
+    assert _total_years_of_experience({"work_history": []}) is None
+    assert _total_years_of_experience({"work_history": [{"employer": "A", "start": None}]}) is None
+    assert _total_years_of_experience({"work_history": [{"employer": "A", "start": "not a date"}]}) is None
+    assert _total_years_of_experience({}) is None
+
+
+def test_years_of_experience_equivalency_flows_through_rescore_against_cached_keywords():
+    # End-to-end wiring check: rescore_against_cached_keywords (the free,
+    # no-AI-call path) must actually pass the derived years-of-experience
+    # through to score_resume_against_keywords, not just have the
+    # underlying scoring function support it in isolation.
+    import tailoring.drafting as drafting
+
+    job = {"ats_required_keywords": [], "ats_preferred_keywords": ["advanced degree"]}
+    app_record = {
+        "resume_text": "PROFESSIONAL EXPERIENCE\nEngineer.\n\nSKILLS\nPython",
+        "resume_clarifying_questions": [],
+    }
+    profile = {"work_history": [{"employer": "A", "start": "1995", "end": "01/2026"}], "gap_interview_answers": []}
+
+    result = drafting.rescore_against_cached_keywords(job, app_record, profile)
+
+    assert "credited via" in result["ats_rationale"]

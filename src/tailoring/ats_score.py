@@ -28,6 +28,26 @@ Two ways to get the keyword list, both feeding the same scoring math:
 
 import re
 
+from skill_label_match import normalize_skill_label
+
+# Degree-TIER phrases eligible for the years-of-experience equivalency
+# credit below - deliberately excludes baseline "Bachelor's degree" (Zahir's
+# explicit scoping, 2026-08-09: the equivalency is specifically for
+# advanced-degree-tier requirements, not the baseline credential).
+_ADVANCED_DEGREE_TIER_PHRASES = {
+    normalize_skill_label(p) for p in (
+        "advanced degree", "master's degree", "graduate degree",
+        "doctoral degree", "doctorate", "phd",
+    )
+}
+_ADVANCED_DEGREE_EQUIVALENCY_YEARS = 10
+_YEARS_EQUIVALENCY_MARKER = "years-of-experience equivalency"
+
+
+def _is_advanced_degree_tier_keyword(label: str) -> bool:
+    return normalize_skill_label(label) in _ADVANCED_DEGREE_TIER_PHRASES
+
+
 # Generic filler/boilerplate words that show up in JD prose but are never
 # themselves a skill/keyword worth matching on - kept broad on purpose so
 # capitalized-word extraction (which catches real proper nouns like
@@ -400,6 +420,7 @@ def plateau_note_for_gaps(missing_required: list[dict], matched_group_explanatio
 
 def score_resume_against_keywords(
     required_keywords: list, preferred_keywords: list, resume_text: str,
+    candidate_years_experience: float | None = None,
 ) -> dict:
     """The real, deterministic ATS score for one drafted resume against an
     already-extracted required/preferred keyword list. Each item is either
@@ -443,13 +464,48 @@ def score_resume_against_keywords(
     drift from the real one. ats_next_actions keeps only what's genuinely
     just informational/directive (structural formatting fixes, optional
     preferred-keyword suggestions) - things there's no real fact to
-    "answer", just an edit to make."""
+    "answer", just an edit to make.
+
+    candidate_years_experience (2026-08-09, Zahir's explicit design,
+    confirmed and scoped by General): a standing, candidate-level scoring
+    policy, NOT a resume-text change - never writes anything into the
+    resume. If a flat (non-any_of) required/preferred keyword is a
+    degree-TIER phrase (see _ADVANCED_DEGREE_TIER_PHRASES - "advanced
+    degree"/"Master's degree" etc., deliberately excluding baseline
+    "Bachelor's degree") and isn't literally matched in the resume text,
+    but candidate_years_experience is at least _ADVANCED_DEGREE_EQUIVALENCY_
+    YEARS, it's credited as satisfied via this documented equivalency
+    instead. Any_of GROUP members are never eligible for this credit -
+    if the posting already states its own equivalency ("Master's OR
+    Bachelor's plus 8+ years"), that's exactly what gets extracted as an
+    any_of group in the first place, so the group's own literal-match
+    logic already covers it; applying the credit there too would double
+    up on an equivalency the posting already spelled out itself. Fully
+    transparent in ats_rationale (never silently blended in as if it
+    were a literal keyword match - this has to be auditable). Real
+    motivating case: Upstream Bio's "advanced degree preferred" (6.2 pts)
+    - Zahir has 25+ years of experience, no advanced degree, and the JD
+    states no equivalency of its own."""
     required_items = [_normalize_keyword_item(k) for k in required_keywords]
     preferred_items = [_normalize_keyword_item(k) for k in preferred_keywords]
     resume_lower = resume_text.lower()
 
     required_matches = [_match_keyword_item(item, resume_lower, resume_text) for item in required_items]
     preferred_matches = [_match_keyword_item(item, resume_lower, resume_text) for item in preferred_items]
+
+    equivalency_explanations = []
+    if candidate_years_experience is not None and candidate_years_experience >= _ADVANCED_DEGREE_EQUIVALENCY_YEARS:
+        def _apply_years_equivalency(items, matches):
+            for i, (item, match) in enumerate(zip(items, matches)):
+                if match is None and not item["is_group"] and _is_advanced_degree_tier_keyword(item["label"]):
+                    matches[i] = _YEARS_EQUIVALENCY_MARKER
+                    equivalency_explanations.append(
+                        f"\"{item['label']}\" credited via {candidate_years_experience:.0f}+ years of "
+                        "relevant experience equivalency (not stated in the resume text itself, and the "
+                        "posting states no equivalency of its own)"
+                    )
+        _apply_years_equivalency(required_items, required_matches)
+        _apply_years_equivalency(preferred_items, preferred_matches)
 
     total_required = len(required_items)
     total_preferred = len(preferred_items)
@@ -480,6 +536,8 @@ def score_resume_against_keywords(
         )
         if matched_group_explanations:
             rationale += " " + "; ".join(matched_group_explanations) + "."
+        if equivalency_explanations:
+            rationale += " " + "; ".join(equivalency_explanations) + "."
     else:
         rationale = (
             "This posting's stored text didn't have distinct extractable "
@@ -541,6 +599,7 @@ def score_resume_against_keywords(
         "missing_required_keywords": missing_required,
         "missing_preferred_keywords": missing_preferred,
         "matched_group_explanations": matched_group_explanations,
+        "years_experience_equivalency_explanations": equivalency_explanations,
         "plateau_note": plateau_note_for_gaps(missing_required, matched_group_explanations),
     }
 
