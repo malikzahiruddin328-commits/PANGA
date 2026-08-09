@@ -1,4 +1,9 @@
-from tailoring.ats_score import extract_keywords, score_resume_against_keywords, score_resume_ats
+from tailoring.ats_score import (
+    extract_keywords,
+    plateau_note_for_gaps,
+    score_resume_against_keywords,
+    score_resume_ats,
+)
 
 POSTING = (
     "Minimum Qualifications: Proficiency with Python, SQL, and AWS. "
@@ -329,3 +334,33 @@ def test_plateau_note_credits_a_satisfied_either_or_group():
     result = score_resume_against_keywords(required, [], resume)
     assert result["plateau_note"] is not None
     assert "already satisfy a different way" in result["plateau_note"]
+
+
+def test_missing_preferred_keywords_are_returned_with_point_values():
+    # 2026-08-09: previously computed internally (to build ats_next_actions
+    # text) but never handed back to the caller - drafting.py's
+    # analyze_fit_before_drafting needs these real numbers to attach a
+    # point_value to a free-form AI clarifying_question that happens to
+    # correspond to a preferred (not required) keyword.
+    result = score_resume_against_keywords(["python"], ["kubernetes"], "SKILLS\nPython\n")
+    assert result["missing_preferred_keywords"] == [
+        {"label": "kubernetes", "point_value": result["missing_preferred_keywords"][0]["point_value"]},
+    ]
+    assert result["missing_preferred_keywords"][0]["point_value"] > 0
+
+
+def test_matched_group_explanations_are_returned():
+    required = [{"any_of": ["Master's degree", "Bachelor's degree"]}]
+    resume = "EDUCATION\nBachelor of Science\n"
+    result = score_resume_against_keywords(required, [], resume)
+    assert result["matched_group_explanations"]
+
+
+def test_plateau_note_for_gaps_is_public_and_reusable():
+    # Exported (not module-private) so drafting.py's analyze_fit_before_
+    # drafting can recompute this against a narrowed missing_required list
+    # (already-confirmed-but-not-yet-drafted gaps removed) without
+    # reimplementing this exact sentence-building logic a second time.
+    assert plateau_note_for_gaps([], []) is None
+    note = plateau_note_for_gaps([{"label": "sql", "point_value": 5.0}], [])
+    assert "sql" in note

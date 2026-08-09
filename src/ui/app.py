@@ -1127,6 +1127,16 @@ def render_analyze_fit_section(job: dict, app_record: dict, analysis: dict | Non
                         st.badge("standing pref", color="gray")
                     elif q.get("point_value") is not None:
                         st.badge(f"+{q['point_value']:g} pts", color="green")
+                    else:
+                        # Real gap General caught Zahir hit live 2026-08-09:
+                        # free-form AI-generated questions (team size,
+                        # budget, product names - facts with no
+                        # corresponding extracted keyword) have no
+                        # deterministic point value to show, and silently
+                        # rendering nothing here read as broken rather than
+                        # honestly "not computable yet." Says so instead of
+                        # guessing a number.
+                        st.badge("value not yet known", color="gray")
                 with text_col:
                     st.markdown(q["question"])
                 if is_disqualifier:
@@ -3250,7 +3260,9 @@ elif active_tab == "results":
                                     st.markdown(f"**Why this score:** {app_record.get('resume_ats_rationale') or ''}")
                                     next_actions = app_record.get("resume_ats_next_actions") or []
                                     if next_actions:
-                                        st.markdown("**How to raise it:**")
+                                        st.markdown(
+                                            "**How to raise it (as of the last Generate):**"
+                                        )
                                         for action in next_actions:
                                             st.markdown(f"- {action}")
                                     # Inline here, not just a pointer to the Profile Gaps tab
