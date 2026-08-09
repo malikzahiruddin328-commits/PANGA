@@ -99,12 +99,23 @@ against these specifically, don't wait to rediscover them tab by tab:**
 3. **AI output checked by a literal/deterministic downstream rule is
    fragile without a code-level backstop.** Prompt instructions alone have
    proven unreliable multiple times this week (rank-prefix stripping,
-   BSc/bachelor's-degree synonyms, years-of-experience/title-list
+   BSc/bachelor's-degree synonyms, years-of-experience/soft-skill
    over-extraction, either/or degree requirements) - each needed real
    deterministic code, not just better prompt wording, to actually hold up
    on every run. If AI-generated text feeds a literal string/keyword check
    anywhere else in the app, don't trust the prompt alone to keep it
-   correct.
+   correct. **Caveat found by Mirror's audit (2026-08-09):** the
+   over-extraction fix only ever covered two of the three categories it
+   was reported as solving - years-of-experience (regex) and generic
+   soft-skill phrases (a curated deny-list) both have a real backstop now,
+   but alternate-title lists ("IT director, solutions architect, or
+   similar role") still rely on the prompt alone - the context that marks
+   a title as "alternate" lives in the posting's surrounding prose, which
+   is already gone by the time a keyword reaches the extracted list, so
+   there's no regex/deny-list signature left to check. Don't assume a
+   fix's own commit title or this list's summary is the full/current
+   state - verify against the actual code before repeating a "solved"
+   claim.
 4. **A feature can be fully built and merged but never actually turned
    on.** The job-alert email scan sat completely inert for a day because
    its sender allowlist was empty and its scheduled task was never

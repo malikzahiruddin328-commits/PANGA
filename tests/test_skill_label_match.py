@@ -1,4 +1,12 @@
-from skill_label_match import skills_match
+from skill_label_match import normalize_skill_label, skills_match
+
+
+def test_normalize_skill_label_is_public_and_used_by_drafting_py():
+    # Made public (was module-private) 2026-08-09 so drafting.py's
+    # generic-soft-skill deny-list can reuse the same normalization
+    # skills_match() already relies on internally, rather than a second,
+    # independently-drifting implementation.
+    assert normalize_skill_label("Master's Degree") == "masters degree"
 
 
 def test_exact_match():

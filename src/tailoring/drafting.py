@@ -21,12 +21,13 @@ from llm_client import (
     DEFAULT_MODEL,
     LLMCallFailed as DraftingFailed,
     LLMNotConfigured as DraftingNotConfigured,
+    LLMResponseTruncated,
     call_structured,
     call_with_web_search,
     get_client as _client,
     is_configured,
 )
-from skill_label_match import skills_match
+from skill_label_match import normalize_skill_label, skills_match
 from tailoring.ats_score import plateau_note_for_gaps, score_resume_against_keywords, score_resume_ats
 from tailoring.baseline_resume import select_baseline_resume_text
 
@@ -339,10 +340,56 @@ Either/or qualification groups (score-first-resume-flow spec, item 2): a JD ofte
 # number-of-years pattern, e.g. "8+ years", "10+ years IT leadership",
 # "5 years executive technology" - the tenure threshold is the entire
 # point of the string, not a discrete skill/tool/certification worth a
-# literal keyword-match check. The other two over-extraction categories
-# (alternate-title lists, generic soft-skill phrases) have no reliable
-# regex signature, so those rely on the tightened prompt above instead.
+# literal keyword-match check.
+#
+# Corrected 2026-08-09 (Mirror's audit flagged the original 2026-08-07
+# commit's title - "Stop ATS keyword extraction from pulling tenure/
+# titles/soft-skills" - as reading like all three categories got a real
+# fix, when only this one did; the code comment here was already honest
+# about the gap, but CLAUDE.md's own retrospective wasn't). Generic
+# soft-skill phrases now ALSO get a real deterministic backstop below
+# (_drop_generic_soft_skill_keywords) - a curated deny-list, not a regex,
+# since these are known fixed phrases rather than a number pattern.
+# Alternate-title lists genuinely still have none: the giveaway that
+# makes "IT director" an alternate-title mention rather than a real
+# required title ("...or similar role" trailing the list) lives in the
+# posting's surrounding prose, which no longer exists once "IT director"
+# has already been extracted as a bare string - there's nothing left in
+# the extracted keyword itself for a regex or deny-list to key off, so
+# this one category is still prompt-reliant alone, not solved.
 _YEARS_EXPERIENCE_KEYWORD_RE = re.compile(r"^\d+\+?\s*years?\b", re.IGNORECASE)
+
+# Curated, deliberately narrow deny-list for the generic-soft-skill
+# category - the exact phrases ATS_KEYWORDS_SYSTEM_PROMPT already names
+# as never-extract, plus their most common real-world variants. Matched
+# via normalize_skill_label's plain case/punctuation-insensitive equality
+# (NOT skills_match's looser phrase-containment) - a deny-list has to be
+# exact-ish, or it risks dropping a real keyword that happens to contain
+# a denied phrase as a whole word (e.g. "Presentation Layer Architecture"
+# containing "presentation").
+_GENERIC_SOFT_SKILL_PHRASES = {
+    "executive presence",
+    "presentation",
+    "presentation skills",
+    "c suite stakeholders",
+    "strong communication skills",
+    "excellent communication skills",
+    "communication skills",
+    "executive technology strategies",
+    "strategic thinking",
+    "results driven",
+    "results oriented",
+    "team player",
+    "stakeholder management",
+    "cross functional leadership",
+    "leadership skills",
+    "interpersonal skills",
+    "problem solving skills",
+    "analytical skills",
+    "attention to detail",
+    "self starter",
+    "fast paced environment",
+}
 
 
 def _drop_years_experience_keywords(keywords: list) -> list:
@@ -350,6 +397,13 @@ def _drop_years_experience_keywords(keywords: list) -> list:
     # years-of-experience threshold wouldn't sensibly appear as one side
     # of a real either/or group, and .strip() would crash on a dict.
     return [k for k in keywords if not (isinstance(k, str) and _YEARS_EXPERIENCE_KEYWORD_RE.match(k.strip()))]
+
+
+def _drop_generic_soft_skill_keywords(keywords: list) -> list:
+    return [
+        k for k in keywords
+        if not (isinstance(k, str) and normalize_skill_label(k) in _GENERIC_SOFT_SKILL_PHRASES)
+    ]
 
 
 # Anthropic's structured-output schema rejects "oneOf" (confirmed live,
@@ -441,8 +495,8 @@ def _extract_ats_keywords(client: "anthropic.Anthropic", job: dict, model: str |
     except (DraftingNotConfigured, DraftingFailed):
         return [], []
 
-    required = _drop_years_experience_keywords(data.get("required_keywords") or [])
-    preferred = _drop_years_experience_keywords(data.get("preferred_keywords") or [])
+    required = _drop_generic_soft_skill_keywords(_drop_years_experience_keywords(data.get("required_keywords") or []))
+    preferred = _drop_generic_soft_skill_keywords(_drop_years_experience_keywords(data.get("preferred_keywords") or []))
 
     from search.job_store import update_job_ats_keywords
 
@@ -512,6 +566,69 @@ def _schema(doc_keys: list[str]) -> dict:
     }
 
 
+_CLARIFYING_QUESTION_ITEM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "type": {
+            "type": "string",
+            "enum": ["skill_gap", "disqualifier_check"],
+            "description": (
+                "\"skill_gap\" (the normal case) for a missing real "
+                "fact/number/name/date that would raise the ATS "
+                "score if confirmed. \"disqualifier_check\" only "
+                "when this posting's title/domain sits right at the "
+                "edge of what the profile's real experience covers, "
+                "in a way the candidate might want to hard-exclude "
+                "going forward (not just skip this one job) - the "
+                "same kind of thing as a candidate ruling out "
+                "CISO-titled roles despite broader cybersecurity "
+                "experience. Before proposing one, check whether the "
+                "profile's gap_interview_answers already has an "
+                "is_disqualifier entry covering this same role type "
+                "- if so, don't ask again, the scoring already "
+                "applies it."
+            ),
+        },
+        "skill": {
+            "type": "string",
+            "description": "Short label for this gap or disqualifier topic (e.g. 'SK Life Science IT team size/budget', or 'CISO-titled roles'), matching the master profile's gap-tracking convention.",
+        },
+        "question": {
+            "type": "string",
+            "description": (
+                "For skill_gap: a direct, specific question whose "
+                "answer is a genuine, checkable fact (a number, a "
+                "name, a date) that would close this gap - not "
+                "vague or stylistic. For disqualifier_check: a "
+                "direct yes/no-style question asking whether this "
+                "role type is one the candidate wants excluded from "
+                "future matches, or whether their experience "
+                "actually covers it after all."
+            ),
+        },
+        "suggested_answer": {
+            "type": "string",
+            "description": (
+                "For skill_gap: a proposed starting draft for the "
+                "answer, phrased as the candidate's own words - e.g. "
+                "a plausible number/scope guess given the role and "
+                "the rest of the profile ('Roughly 8-10 engineers, "
+                "~$2M budget?'). A suggestion to edit, never a "
+                "stated fact - make that uncertainty visible in the "
+                "phrasing itself (hedge words, a trailing '?') "
+                "rather than asserting it. Leave as an empty string "
+                "if you have no reasonable basis to propose "
+                "anything. For disqualifier_check: always an empty "
+                "string - this is a genuine judgment call only the "
+                "candidate can make, never a guess."
+            ),
+        },
+    },
+    "required": ["type", "skill", "question", "suggested_answer"],
+    "additionalProperties": False,
+}
+
+
 def _resume_schema(job: dict | None = None) -> dict:
     # The resume gets a richer schema than the other doc types: alongside
     # the text itself, it carries clarifying_questions for real facts that
@@ -562,67 +679,7 @@ def _resume_schema(job: dict | None = None) -> dict:
             },
             "clarifying_questions": {
                 "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "type": {
-                            "type": "string",
-                            "enum": ["skill_gap", "disqualifier_check"],
-                            "description": (
-                                "\"skill_gap\" (the normal case) for a missing real "
-                                "fact/number/name/date that would raise the ATS "
-                                "score if confirmed. \"disqualifier_check\" only "
-                                "when this posting's title/domain sits right at the "
-                                "edge of what the profile's real experience covers, "
-                                "in a way the candidate might want to hard-exclude "
-                                "going forward (not just skip this one job) - the "
-                                "same kind of thing as a candidate ruling out "
-                                "CISO-titled roles despite broader cybersecurity "
-                                "experience. Before proposing one, check whether the "
-                                "profile's gap_interview_answers already has an "
-                                "is_disqualifier entry covering this same role type "
-                                "- if so, don't ask again, the scoring already "
-                                "applies it."
-                            ),
-                        },
-                        "skill": {
-                            "type": "string",
-                            "description": "Short label for this gap or disqualifier topic (e.g. 'SK Life Science IT team size/budget', or 'CISO-titled roles'), matching the master profile's gap-tracking convention.",
-                        },
-                        "question": {
-                            "type": "string",
-                            "description": (
-                                "For skill_gap: a direct, specific question whose "
-                                "answer is a genuine, checkable fact (a number, a "
-                                "name, a date) that would close this gap - not "
-                                "vague or stylistic. For disqualifier_check: a "
-                                "direct yes/no-style question asking whether this "
-                                "role type is one the candidate wants excluded from "
-                                "future matches, or whether their experience "
-                                "actually covers it after all."
-                            ),
-                        },
-                        "suggested_answer": {
-                            "type": "string",
-                            "description": (
-                                "For skill_gap: a proposed starting draft for the "
-                                "answer, phrased as the candidate's own words - e.g. "
-                                "a plausible number/scope guess given the role and "
-                                "the rest of the profile ('Roughly 8-10 engineers, "
-                                "~$2M budget?'). A suggestion to edit, never a "
-                                "stated fact - make that uncertainty visible in the "
-                                "phrasing itself (hedge words, a trailing '?') "
-                                "rather than asserting it. Leave as an empty string "
-                                "if you have no reasonable basis to propose "
-                                "anything. For disqualifier_check: always an empty "
-                                "string - this is a genuine judgment call only the "
-                                "candidate can make, never a guess."
-                            ),
-                        },
-                    },
-                    "required": ["type", "skill", "question", "suggested_answer"],
-                    "additionalProperties": False,
-                },
+                "items": _CLARIFYING_QUESTION_ITEM_SCHEMA,
                 "description": (
                     "3-10 specific, directly answerable questions - either real "
                     "facts this resume is currently missing that would raise the "
@@ -1172,6 +1229,163 @@ def analyze_fit_before_drafting(job: dict, profile: dict, app_record: dict) -> d
         "answer_more_exhausted_message": (
             "No more real gaps found based on your current profile." if not open_questions else None
         ),
+    }
+
+
+_ANSWER_MORE_SYSTEM_PROMPT = (
+    "You already produced an initial set of resume clarifying_questions for "
+    "this job and candidate. The candidate clicked \"Answer more questions\" "
+    "and wants to know if there is ANYTHING further genuinely worth asking, "
+    "beyond what's already been asked or is already covered by a "
+    "deterministic keyword-gap check the app runs separately.\n\n"
+    "You will be given the job posting, the candidate's full master profile "
+    "(including every fact already confirmed via gap_interview_answers), "
+    "and an ALREADY COVERED list - topics from the last drafted resume's own "
+    "clarifying_questions, from already-confirmed profile answers, and from "
+    "keyword gaps the app's own deterministic scorer already tracks and "
+    "presents on its own. Do not repeat ANY of these, even reworded or "
+    "phrased differently - if a topic is on that list, it's handled.\n\n"
+    "Return 0-10 NEW, genuinely distinct, checkable facts (skill_gap) or "
+    "borderline-fit judgment calls (disqualifier_check) that would help if "
+    "confirmed - same bar as the original set: a real fact/number/name/date, "
+    "never invented, never vague or stylistic. If there is truly nothing "
+    "further worth asking, return an EMPTY list - do not invent a low-value "
+    "question just to have something to show; an honest empty answer is "
+    "correct and expected once the real gaps are exhausted."
+)
+
+
+# Real crash found by RM's live-fire test against Zahir's actual profile
+# (2026-08-09): the prompt embeds the CANDIDATE'S MASTER PROFILE in full
+# (~98,000 characters on real data, not job-specific - every job's prompt
+# carries the same full profile), and a fixed max_tokens=3000 with no
+# retry truncated on essentially the first real call, not an edge case.
+# Same escalate-on-genuine-truncation pattern job_alert_reasoning.py's
+# extract_listings() already proved out against a comparably real-world-
+# large input (a bundled digest email) - not a per-input formula (the
+# real digests needing the most tokens weren't reliably the ones with the
+# most input either), just retry with more budget only when the response
+# actually came back cut off.
+_ANSWER_MORE_MAX_TOKENS_TIERS = [8000, 16000, 32000]
+
+
+def _answer_more_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "clarifying_questions": {
+                "type": "array",
+                "items": _CLARIFYING_QUESTION_ITEM_SCHEMA,
+                "description": (
+                    "0-10 genuinely NEW questions not already covered by the "
+                    "ALREADY COVERED list - an empty list is a valid, honest "
+                    "answer when nothing further is genuinely worth asking."
+                ),
+            },
+        },
+        "required": ["clarifying_questions"],
+        "additionalProperties": False,
+    }
+
+
+def request_additional_gap_questions(
+    job: dict, profile: dict, app_record: dict, model: str | None = None, on_progress=None,
+) -> dict:
+    """Score-first-resume-flow spec item 5: clicking "Answer more questions"
+    is supposed to trigger a real new round of AI question generation given
+    everything already asked/confirmed - not just re-show whatever
+    open_questions already happened to be. Real gap Zahir hit live
+    2026-08-09 (General, watching his session): the button was a bare
+    st.rerun() with no actual generation call behind it at all, so
+    open_questions just stayed whatever it already was, and the already-
+    built "no more real gaps found" honest message (answer_more_exhausted_
+    message above) could only ever fire from the deterministic keyword-gap
+    side happening to already be empty - never from genuinely asking the AI
+    for more and it coming back with nothing.
+
+    Returns {"added_count": int, "new_questions": [...],
+    "merged_clarifying_questions": [...]} - added_count is 0 when the AI
+    call itself legitimately found nothing further (the caller shows the
+    honest exhausted message); merged_clarifying_questions is
+    app_record's existing resume_clarifying_questions with new_questions
+    appended, ready for the caller to persist via upsert_application - this
+    function itself does not write to applications.json, matching this
+    module's existing boundary (save_gap_answers writes to the profile
+    store only; app.py owns every applications.json write).
+
+    Deduped the same non-fragile way as every other gap-question merge in
+    this module (skills_match, not a bare substring) against: this job's
+    already-stored resume_clarifying_questions, every skill already
+    confirmed anywhere in the profile, and every keyword the deterministic
+    scorer already tracks as a real gap. The AI is EXPLICITLY told not to
+    repeat any of these, but per this codebase's own established pattern
+    (CLAUDE.md known failure pattern #3 - prompt compliance alone isn't
+    trusted for anything checked downstream by a deterministic rule),
+    anything that slips through the prompt anyway is filtered out here
+    too, not just asked not to happen.
+
+    Escalates max_tokens across _ANSWER_MORE_MAX_TOKENS_TIERS if the
+    response comes back genuinely truncated (LLMResponseTruncated) - real
+    crash found by RM's live-fire test 2026-08-09: a real master profile
+    is large enough (~98,000 characters) that a fixed, low max_tokens
+    truncated on essentially the first real call, not an edge case. Raises
+    LLMCallFailed (of which LLMResponseTruncated is a subclass, so an
+    `except DraftingFailed`/`except LLMCallFailed` catches either) if even
+    the largest tier still truncates, or on any other failure - those
+    aren't retried, since a bigger token budget wouldn't fix a refusal or
+    invalid JSON."""
+    client = _client()
+    required_keywords = job.get("ats_required_keywords") or []
+    preferred_keywords = job.get("ats_preferred_keywords") or []
+    resume_text = app_record.get("resume_text") or ""
+    score_result = score_resume_against_keywords(required_keywords, preferred_keywords, resume_text)
+
+    existing_questions = app_record.get("resume_clarifying_questions") or []
+    already_covered = (
+        [q["skill"] for q in existing_questions if q.get("skill")]
+        + [a["skill"] for a in profile.get("gap_interview_answers", []) if a.get("skill")]
+        + [
+            item["label"]
+            for item in score_result["missing_required_keywords"] + score_result["missing_preferred_keywords"]
+        ]
+    )
+
+    job_key = (job["source"], job["job_id"]) if job.get("source") and job.get("job_id") else None
+    content = (
+        "JOB POSTING:\n" + json.dumps(job, indent=2, default=str) +
+        "\n\nCANDIDATE'S MASTER PROFILE:\n" + json.dumps(profile, indent=2, default=str) +
+        "\n\nALREADY COVERED (do not repeat any of these, even reworded):\n" +
+        json.dumps(sorted(set(already_covered)), indent=2)
+    )
+    for max_tokens in _ANSWER_MORE_MAX_TOKENS_TIERS:
+        try:
+            data = call_structured(
+                client,
+                system=_ANSWER_MORE_SYSTEM_PROMPT,
+                user_content=content,
+                schema=_answer_more_schema(),
+                max_tokens=max_tokens,
+                model=model,
+                effort="high",
+                on_progress=on_progress,
+                refusal_message="Claude declined to check for more questions. Try again.",
+                purpose="answer_more_gap_questions",
+                job_key=job_key,
+            )
+        except LLMResponseTruncated:
+            if max_tokens == _ANSWER_MORE_MAX_TOKENS_TIERS[-1]:
+                raise
+            continue
+        break
+
+    new_questions = [
+        q for q in data.get("clarifying_questions", [])
+        if q.get("skill") and not any(skills_match(q["skill"], covered) for covered in already_covered)
+    ]
+    return {
+        "added_count": len(new_questions),
+        "new_questions": new_questions,
+        "merged_clarifying_questions": existing_questions + new_questions,
     }
 
 

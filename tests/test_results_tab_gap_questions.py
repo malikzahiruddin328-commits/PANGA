@@ -339,6 +339,65 @@ def test_generate_shows_no_regression_warning_when_nothing_was_lost(results_app_
     assert not at.warning
 
 
+def test_answer_more_questions_shows_a_genuinely_new_question(results_app_with_gap_questions, monkeypatch):
+    # Score-first-resume-flow spec item 5: clicking "Answer more questions"
+    # must trigger a real new round of AI generation, not just re-show
+    # whatever was already there - real bug Zahir hit live 2026-08-09
+    # (the button used to be a bare st.rerun() with no generation call at
+    # all behind it, so it could never surface anything new or say so).
+    import tailoring.drafting as drafting
+
+    new_question = {
+        "type": "skill_gap", "skill": "Team size at Acme",
+        "question": "How big was the team?", "suggested_answer": "",
+    }
+    monkeypatch.setattr(
+        drafting, "request_additional_gap_questions",
+        lambda job, profile, app_record, model=None, on_progress=None: {
+            "added_count": 1, "new_questions": [new_question],
+            "merged_clarifying_questions": (app_record.get("resume_clarifying_questions") or []) + [new_question],
+        },
+    )
+
+    at = results_app_with_gap_questions
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+
+    button = next(b for b in at.button if b.key == f"answermore_Dice_job1")
+    button.click().run(timeout=30)
+
+    assert not at.exception
+    assert any("How big was the team?" in t.label for t in at.text_area)
+    app_record = get_application("Dice", "job1")
+    assert any(q.get("skill") == "Team size at Acme" for q in app_record["resume_clarifying_questions"])
+
+
+def test_answer_more_questions_shows_honest_message_when_ai_finds_nothing_new(results_app_with_gap_questions, monkeypatch):
+    import tailoring.drafting as drafting
+
+    monkeypatch.setattr(
+        drafting, "request_additional_gap_questions",
+        lambda job, profile, app_record, model=None, on_progress=None: {
+            "added_count": 0, "new_questions": [],
+            "merged_clarifying_questions": app_record.get("resume_clarifying_questions") or [],
+        },
+    )
+
+    at = results_app_with_gap_questions
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+
+    button = next(b for b in at.button if b.key == f"answermore_Dice_job1")
+    button.click().run(timeout=30)
+
+    assert not at.exception
+    # The Databricks question from before is still there (nothing new
+    # replaced it) - just a plain toast, no fabricated content.
+    assert any("Databricks" in t.label for t in at.text_area)
+
+
 def test_resume_expander_auto_expands_right_after_answering_a_gap_question(results_app_with_gap_questions, monkeypatch):
     # Zahir's explicit ask 2026-08-06: the new score/rationale/questions
     # must be part of what he sees immediately after generating - not

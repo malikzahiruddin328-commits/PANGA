@@ -1,15 +1,34 @@
-"""One-off cleanup (2026-08-06): merges duplicate Indeed/ZipRecruiter/Dice
-job records that accumulated before search/boards.py's job_id fix (see
-_stable_job_id() there) - those three sources used an unstable identifier
-as job_id (Indeed/ZipRecruiter: a redirect URL/signed token reissued on
-every search; Dice's MCP-path "guid": looked like a stable database id but
-rotated too), so the exact same real posting silently re-entered
-job_store.py as "new" on every search run. Confirmed live against
-production data 2026-08-06: 38 duplicate groups, 54 excess records (47
-Indeed, 4 ZipRecruiter, 3 Dice) - grouped by (source, normalized title +
-organization + location), not just title+organization, which overcounts
-(USAJOBS/AbbVie's apparent "duplicates" checked separately turned out to
-be mostly genuinely distinct postings at the same agency, not this bug).
+"""One-off cleanup (started 2026-08-06, scope widened as each new source hit
+the same bug): merges duplicate job records for sources whose job_id used
+to be unstable, before each got its own search/boards.py job_id fix (see
+_stable_job_id() there) - so the exact same real posting silently
+re-entered job_store.py as "new" on every search run.
+
+_AFFECTED_SOURCES history, one bug/fix per source, not all found at once:
+- Indeed/ZipRecruiter: job_id was a redirect URL/signed token, reissued on
+  every search. Confirmed live 2026-08-06: 47 Indeed + 4 ZipRecruiter
+  excess records.
+- Dice (MCP path): "guid" looked like a stable database id but rotated
+  too. Confirmed live 2026-08-06: 3 excess records. (Dice's own DIRECT-
+  scrape path, fetch_dice_jobs(), was verified separately to have an
+  actually-stable guid - unified onto the same _stable_job_id() scheme
+  anyway since both write source="Dice" and need to dedupe against each
+  other.)
+- Built In: shipped using the raw href/data-alias as job_id, same
+  unstable-identifier mistake, but NOT caught at the time (its sibling
+  fetch_simplyhired_jobs(), built same commit, got the fix and a
+  disclosure; this one didn't - genuinely missed, not a deliberate
+  exception). Found by Mirror's audit 2026-08-08, confirmed live: 1
+  excess record at the time it was caught (real duplicate under two
+  different /job/.../<id> hrefs for the same posting).
+- SimplyHired: got the _stable_job_id() fix from day one (2026-08-06) -
+  included in _AFFECTED_SOURCES defensively/for completeness, not because
+  a live duplicate was ever found for it.
+
+Grouped by (source, normalized title + organization + location), not just
+title+organization, which overcounts (USAJOBS/AbbVie's apparent
+"duplicates" checked separately turned out to be mostly genuinely distinct
+postings at the same agency, not this bug).
 
 MERGE POLICY per duplicate group:
 1. Prefer the copy that already has an application record (tailoring/
@@ -69,7 +88,7 @@ from security.crypto_store import write_json  # noqa: E402
 from security.file_lock import locked  # noqa: E402
 from tailoring import applications, dossier  # noqa: E402
 
-_AFFECTED_SOURCES = {"Indeed", "ZipRecruiter", "Dice"}
+_AFFECTED_SOURCES = {"Indeed", "ZipRecruiter", "Dice", "Built In", "SimplyHired"}
 
 
 def _log(message: str) -> None:

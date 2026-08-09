@@ -80,7 +80,7 @@ from tailoring.cta_emails import get_active_cta_emails, request_archive, request
 from tailoring.interview_prep import load_interview_prep, get_interview_prep, record_round_outcome, build_prep_context, generate_prep, start_round, save_round
 from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
 from tailoring.ats_score import detect_matched_keyword_regressions
-from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed, analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_impact as _check_regenerate_impact
+from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed, analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_impact as _check_regenerate_impact, request_additional_gap_questions as _request_additional_gap_questions
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
 from prospector.rejection_diagnosis import gather_diagnosis_input, diagnose
 from prospector.target_accounts import load_target_accounts, set_status as set_target_account_status, set_website, load_website_lookup_cost, save_website_lookup_cost, find_disqualified_with_new_activity
@@ -1116,18 +1116,38 @@ def render_analyze_fit_section(job: dict, app_record: dict, analysis: dict | Non
                 st.markdown(analysis["plateau_note"])
 
             if show_generate_actions:
+                # Real gap found live 2026-08-09 (General, watching
+                # Zahir's session): this button used to be a bare
+                # st.rerun() with no actual generation call behind it -
                 # analysis is already re-fetched fresh at the top of every
-                # render regardless of this click - per the confirmed
-                # contract, analyze_fit_before_drafting(job, profile) takes no
-                # "give me a new round" flag; calling it again after new
-                # answers were just saved naturally excludes those skills via
-                # the same profile["gap_interview_answers"] dedup
-                # _merge_keyword_gap_questions already uses today. This button
-                # exists so there's an explicit, visible action for "I've
-                # answered what's here, check for more" - not because the
-                # click itself needs to carry any extra state.
+                # render regardless, so re-rendering the same open_questions
+                # on the same underlying data just re-showed the identical
+                # questions with no explanation. Per spec item 5, clicking
+                # this must trigger a REAL new round of AI question
+                # generation given everything already asked/confirmed -
+                # see tailoring.drafting.request_additional_gap_questions().
                 if st.button("Answer more questions", key=f"answermore_{job_key}"):
-                    st.rerun()
+                    try:
+                        with st.spinner("Checking for anything else genuinely worth asking..."):
+                            result = _request_additional_gap_questions(job, profile, app_record)
+                    except (DraftingNotConfigured, DraftingFailed) as exc:
+                        st.error(str(exc))
+                    else:
+                        if result["added_count"]:
+                            upsert_application(
+                                job["source"], job["job_id"], status=app_record.get("status", "under review"),
+                                resume_clarifying_questions=result["merged_clarifying_questions"],
+                            )
+                            st.toast(
+                                f"Found {result['added_count']} more thing(s) worth asking about.",
+                                icon=":material/info:",
+                            )
+                        else:
+                            st.toast(
+                                "No more real gaps found based on your current profile.",
+                                icon=":material/task_alt:",
+                            )
+                        st.rerun()
 
                 regen_needed_confirmation = app_record.get("resume_text") is not None
                 if st.button("Generate resume", type="primary", key=f"analyzefit_generate_{job_key}"):
@@ -2946,9 +2966,12 @@ elif active_tab == "results":
             for job in deduped:
                 pay_min, pay_max = format_pay(job.get("pay_min")), format_pay(job.get("pay_max"))
                 pay = f"${pay_min or '?'}-${pay_max or '?'}" if (pay_min or pay_max) else (job.get("salary_text") or "")
+                organization_cell = job.get("organization")
+                if job.get("employer_attribution_uncertain") and organization_cell:
+                    organization_cell = f"⚠️ {organization_cell}"
                 table_rows.append({
                     "Role": job.get("title"),
-                    "Organization": job.get("organization"),
+                    "Organization": organization_cell,
                     "Pay": pay,
                     "Score": job.get("fit_score"),
                     "Status": application_status(job) or "-",
@@ -3062,6 +3085,17 @@ elif active_tab == "results":
                     st.html(f'<div id="{anchor_id}"></div>')
 
                 st.markdown(f"{job.get('location') or 'Location not listed'}")
+                if job.get("employer_attribution_uncertain"):
+                    # Real bug found 2026-08-07: an Indeed posting for a
+                    # life-sciences IT role was attributed to "Suncoast
+                    # Credit Union" - the JD body clearly named a different
+                    # real company throughout. Confirmed an Indeed-side data
+                    # issue, not a Panga parsing bug - flagged, not auto-
+                    # corrected, since a guessed replacement could itself be
+                    # wrong (see job_store.flag_employer_attribution_uncertain).
+                    likely = job.get("likely_organization")
+                    note = f"the posting text suggests **{likely}**" if likely else "the posting text suggests a different employer"
+                    st.warning(f"⚠️ Employer name may be wrong - {note}, not \"{job.get('organization')}\" as listed. Worth checking the original posting before applying.")
                 if "fit_score" in job:
                     st.markdown(job.get("fit_rationale") or "")
                 else:
