@@ -364,12 +364,22 @@ def _score_from_counts(
     return max(0.0, min(100.0, ats_score))
 
 
-def _plateau_note(missing_required: list[dict], matched_group_explanations: list[str]) -> str | None:
+def plateau_note_for_gaps(missing_required: list[dict], matched_group_explanations: list[str]) -> str | None:
     """Score-first-resume-flow spec item 2's second half: the system, not
     the user, should notice when the score has genuinely plateaued and say
     why in plain terms - rather than leaving Zahir to wonder "why did this
     go up/down/nowhere." None when there's nothing notable to explain
-    (no remaining required gaps and no either/or group worth calling out)."""
+    (no remaining required gaps and no either/or group worth calling out).
+
+    Public (not module-private) so drafting.py's analyze_fit_before_drafting
+    can recompute this against a NARROWED missing_required list - one with
+    already-answered-but-not-yet-drafted gaps removed - rather than
+    reimplementing this exact sentence-building logic a second time (real
+    gap found live 2026-08-09: the raw score_resume_against_keywords()
+    output has no notion of "answered in the profile already," so its own
+    plateau_note kept naming a gap as "real, not a phrasing issue" even
+    after the candidate had genuinely answered it - just not yet reflected
+    in a fresh draft)."""
     if not missing_required and not matched_group_explanations:
         return None
     parts = []
@@ -402,10 +412,22 @@ def score_resume_against_keywords(
     Returns {"ats_score": int 0-100, "ats_rationale": str,
     "ats_next_actions": [str, ...],
     "missing_required_keywords": [{"label": str, "point_value": float}, ...],
+    "missing_preferred_keywords": [{"label": str, "point_value": float}, ...],
+    "matched_group_explanations": [str, ...],
     "plateau_note": str | None}. Always recomputed from the actual text
     passed in - the score moves when the text does, because this is
     literal keyword-overlap arithmetic plus formatting checks, not an
     independent AI guess.
+
+    missing_preferred_keywords/matched_group_explanations (2026-08-09)
+    are the same real per-keyword numbers already computed to build
+    ats_next_actions/plateau_note internally, just also handed back to the
+    caller - drafting.py's analyze_fit_before_drafting needs them to
+    attach a real point_value to free-form AI clarifying_questions that
+    happen to correspond to a preferred (not required) keyword, and to
+    recompute an honest plateau_note once already-answered-but-not-yet-
+    drafted gaps are excluded - both reuse this module's own arithmetic
+    rather than re-deriving it.
 
     missing_required_keywords is returned separately from ats_next_actions
     (2026-08-06, real gap Zahir hit live): these are the specific,
@@ -518,7 +540,8 @@ def score_resume_against_keywords(
         "ats_next_actions": next_actions[:6],
         "missing_required_keywords": missing_required,
         "missing_preferred_keywords": missing_preferred,
-        "plateau_note": _plateau_note(missing_required, matched_group_explanations),
+        "matched_group_explanations": matched_group_explanations,
+        "plateau_note": plateau_note_for_gaps(missing_required, matched_group_explanations),
     }
 
 

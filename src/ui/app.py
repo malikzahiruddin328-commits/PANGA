@@ -83,7 +83,7 @@ from tailoring.ats_score import detect_matched_keyword_regressions
 from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed, analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_impact as _check_regenerate_impact
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
 from prospector.rejection_diagnosis import gather_diagnosis_input, diagnose
-from prospector.target_accounts import load_target_accounts, set_status as set_target_account_status, set_website, load_website_lookup_cost, save_website_lookup_cost
+from prospector.target_accounts import load_target_accounts, set_status as set_target_account_status, set_website, load_website_lookup_cost, save_website_lookup_cost, find_disqualified_with_new_activity
 from prospector.company_lookup import lookup_company_website
 from prospector.outreach import (
     add_outreach, update_status as update_outreach_status, request_draft,
@@ -1158,6 +1158,16 @@ def render_analyze_fit_section(job: dict, app_record: dict, analysis: dict | Non
                         st.badge("standing pref", color="gray")
                     elif q.get("point_value") is not None:
                         st.badge(f"+{q['point_value']:g} pts", color="green")
+                    else:
+                        # Real gap General caught Zahir hit live 2026-08-09:
+                        # free-form AI-generated questions (team size,
+                        # budget, product names - facts with no
+                        # corresponding extracted keyword) have no
+                        # deterministic point value to show, and silently
+                        # rendering nothing here read as broken rather than
+                        # honestly "not computable yet." Says so instead of
+                        # guessing a number.
+                        st.badge("value not yet known", color="gray")
                 with text_col:
                     st.markdown(q["question"])
                 if is_disqualifier:
@@ -3281,7 +3291,9 @@ elif active_tab == "results":
                                     st.markdown(f"**Why this score:** {app_record.get('resume_ats_rationale') or ''}")
                                     next_actions = app_record.get("resume_ats_next_actions") or []
                                     if next_actions:
-                                        st.markdown("**How to raise it:**")
+                                        st.markdown(
+                                            "**How to raise it (as of the last Generate):**"
+                                        )
                                         for action in next_actions:
                                             st.markdown(f"- {action}")
                                     # Inline here, not just a pointer to the Profile Gaps tab
@@ -3486,8 +3498,8 @@ elif active_tab == "prospector":
 
     st.header("Prospector")
     st.markdown(
-        "Companies worth watching before they've posted a role, outreach logging, coverage/"
-        "activity/outcome numbers, and cross-cutting insights (PRD §16/§17) from your job search."
+        "Watch companies before they post a role, log outreach, track your "
+        "coverage and results, and see what's actually working."
     )
 
     settings = load_settings()
@@ -3549,6 +3561,32 @@ elif active_tab == "prospector":
             )
             st.toast(f"Prospector Score: {result['score']}/100.", icon=":material/check_circle:")
             st.rerun()
+
+    # Real gap found live 2026-08-09: "disqualified" is sticky by design
+    # (see target_accounts.MANUAL_STATUSES) so it never silently changes on
+    # its own - but that also meant a company that picked up a real posting
+    # AFTER being disqualified (UCB Pharma, BAUSCH, BeOne Medicines USA -
+    # BeOne's is now an application under review) sat disqualified forever
+    # with nothing flagging the mismatch back. This is a deterministic,
+    # zero-cost check (not dependent on the Prospector Score's LLM
+    # reasoning noticing it in the data), so it's always visible here
+    # rather than gated behind a "Compute Prospector Score" click.
+    rereview_flags = find_disqualified_with_new_activity(jobs, applications)
+    if rereview_flags:
+        lines = [
+            f"**{len(rereview_flags)} disqualified account(s) have new activity since being "
+            "disqualified - worth a second look.** Status stays disqualified until you change "
+            "it yourself; this only flags that evidence exists now that wasn't there when you "
+            "disqualified it.",
+            "",
+        ]
+        for flag in rereview_flags:
+            job_bits = "; ".join(
+                f'"{m["title"]}" at {m["organization"]}' + (f' (application: {m["application_status"]})' if m["application_status"] else "")
+                for m in flag["matching_jobs"]
+            )
+            lines.append(f"- **{flag['company_name']}**: {job_bits}")
+        st.warning("\n".join(lines))
 
     st.subheader("Target accounts")
     st.markdown(
@@ -3804,7 +3842,7 @@ elif active_tab == "prospector":
     st.subheader("Insights (Learn Engine)")
     st.markdown(
         "Cross-cutting feedback loop over every prediction Panga makes - scoring, target-account "
-        "qualification, outreach channel, strategy tags, interview outcomes (PRD §17). "
+        "qualification, outreach channel, strategy tags, interview outcomes. "
         "Recommend-only, always - it never changes a score threshold or any setting on its own."
     )
     learn_result = st.session_state.get("learn_engine_result")
@@ -4009,7 +4047,7 @@ elif active_tab == "prep":
                 OUTCOME_OPTIONS = ["not yet", "went well", "went okay", "went poorly"]
                 current_outcome = round_.get("outcome") or "not yet"
                 new_outcome = st.selectbox(
-                    "How did it go? (PRD §17 - feeds the Learn Engine)", OUTCOME_OPTIONS,
+                    "How did it go? (feeds the Learn Engine)", OUTCOME_OPTIONS,
                     index=OUTCOME_OPTIONS.index(current_outcome) if current_outcome in OUTCOME_OPTIONS else 0,
                     key=f"outcome_{record['source']}_{record['job_id']}_{round_['round_label']}",
                 )

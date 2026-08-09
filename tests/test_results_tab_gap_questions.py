@@ -122,6 +122,57 @@ def test_skill_gap_question_shows_a_point_badge(results_app_with_gap_questions):
     assert any(f"{DATABRICKS_POINT_VALUE:g}" in b for b in badge_lines)
 
 
+def test_free_form_question_with_no_matching_keyword_shows_value_not_yet_known(results_app_with_gap_questions):
+    # Real gap General caught Zahir hit live 2026-08-09: an AI-generated
+    # free-form fact-finding question (team size, budget - no
+    # corresponding extracted keyword) used to render no badge at all,
+    # which read as broken rather than "this one genuinely has no
+    # deterministic value to show."
+    at = results_app_with_gap_questions
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    upsert_application(
+        "Dice", "job1", status="under review",
+        resume_clarifying_questions=[{
+            "type": "skill_gap", "skill": "SK Life Science IT team size",
+            "question": "How many engineers are on the SK Life Science IT team?",
+            "suggested_answer": "",
+        }],
+    )
+    at.run(timeout=30)
+
+    assert not at.exception
+    badge_lines = [m.value for m in at.markdown if "-badge[" in m.value]
+    assert any("value not yet known" in b for b in badge_lines)
+
+
+def test_projected_score_moves_after_answering_before_generating(results_app_with_gap_questions):
+    # Real bug Zahir hit live 2026-08-09: he edited a real answer, waited,
+    # and the "Projected score" metric correctly stayed flat - because it
+    # was re-scoring the SAME unchanged resume_text, not actually
+    # projecting anything. It must now genuinely move once an answer is
+    # confirmed, without ever clicking Generate.
+    at = results_app_with_gap_questions
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+
+    metric = next(m for m in at.metric if m.label == "Projected score")
+    assert metric.value == f"{INITIAL_SCORE}/100"
+
+    box = next(t for t in at.text_area if "Databricks" in t.label)
+    box.set_value("Yes, led a 2-year Databricks migration.")
+    at.run(timeout=30)  # this run saves the answer, but re-scores BEFORE that save happens
+    at.run(timeout=30)  # a plain rerun now sees the just-saved answer
+
+    assert not at.exception
+    metric = next(m for m in at.metric if m.label == "Projected score")
+    projected = int(metric.value.split("/")[0])
+    assert projected > INITIAL_SCORE
+    # Still hasn't actually regenerated anything.
+    assert get_application("Dice", "job1")["resume_ats_score"] == INITIAL_SCORE
+
+
 def test_disqualifier_question_gets_no_point_badge_and_distinct_flag_note(results_app_with_gap_questions):
     # A disqualifier_check question comes from the AI's own past drafted
     # resume_clarifying_questions (missing_required_keywords never
