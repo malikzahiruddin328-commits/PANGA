@@ -742,7 +742,23 @@ def render_jd_view_or_update_box(job: dict, key_prefix: str) -> str | None:
     proactive (before-drafting) and post-hoc (already-drafted) call sites."""
     current_text = job.get("description") or job.get("qualification_summary") or ""
     text_key = f"jd_view_{key_prefix}_{abs(hash(current_text)) % 10_000_000}"
-    with st.expander("View / update job description", expanded=False):
+    # Real bug found by Mirror's proactive sweep (2026-08-09): this box had
+    # no key= at all - not "key without on_change", genuinely no
+    # persistence mechanism, same class of bug the 2026-08-08 expander-
+    # collapse sweep fixed 4 other places (missed here since this function
+    # didn't exist yet at sweep time - added 2026-08-06 by a different
+    # commit). Editing the text_area itself triggers a rerun (any widget
+    # losing focus does), which collapsed this box mid-edit before a click
+    # ever reached "Update job description". Same robust fix as the other
+    # 4 instances: key= + on_change="rerun" + an explicit expanded= read
+    # (a bare key=+on_change alone doesn't reliably reflect a programmatic
+    # session_state write, only a real click does).
+    expander_key = f"jd_view_expander_{key_prefix}"
+    with st.expander(
+        "View / update job description",
+        expanded=st.session_state.get(expander_key, False),
+        key=expander_key, on_change="rerun",
+    ):
         updated_text = st.text_area("Job description", value=current_text, key=text_key, height=150)
         if st.button("Update job description", key=f"jd_view_save_{key_prefix}"):
             stripped = updated_text.strip()

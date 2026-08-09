@@ -345,6 +345,33 @@ def test_view_update_box_is_collapsed_by_default(results_app):
     assert all(not e.proto.expanded for e in expanders)
 
 
+def test_view_update_box_stays_open_while_editing(results_app):
+    # Real bug found by Mirror's proactive sweep (2026-08-09), same class
+    # as the 2026-08-08 expander-collapse sweep (4 other instances) -
+    # missed here since this function didn't exist yet at sweep time. The
+    # box had no key= at all, so editing the text_area (a real rerun-
+    # triggering interaction - any widget losing focus does) collapsed it
+    # before a click ever reached "Update job description".
+    at = results_app
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    # Opened by hand, matching what the widget's own key=+on_change="rerun"
+    # would persist server-side.
+    at.session_state["jd_view_expander_Dice_withjd1"] = True
+    at.run(timeout=30)
+
+    expander = next(e for e in at.expander if e.label == "View / update job description")
+    assert expander.proto.expanded
+
+    view_box = next(t for t in at.text_area if t.key.startswith("jd_view_Dice_withjd1_"))
+    view_box.set_value("Requirements: Kubernetes, still editing.")
+    at.run(timeout=30)  # the rerun the text_area's own change triggers
+
+    assert not at.exception
+    expander = next(e for e in at.expander if e.label == "View / update job description")
+    assert expander.proto.expanded
+
+
 def test_clicking_update_with_unchanged_text_shows_info_toast_and_does_not_regenerate(results_app, monkeypatch):
     import tailoring.drafting as drafting
 
