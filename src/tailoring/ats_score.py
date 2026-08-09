@@ -576,3 +576,74 @@ def detect_matched_keyword_regressions(
     old_missing = {m["label"] for m in old_result["missing_required_keywords"] + old_result["missing_preferred_keywords"]}
     new_missing = {m["label"] for m in new_result["missing_required_keywords"] + new_result["missing_preferred_keywords"]}
     return sorted(new_missing - old_missing)
+
+
+def detect_keyword_wording_regressions(
+    old_required_keywords: list, old_preferred_keywords: list,
+    new_required_keywords: list, new_preferred_keywords: list,
+    resume_text: str,
+) -> list[str]:
+    """Sibling to detect_matched_keyword_regressions() above, but for the
+    OTHER axis of the same problem (found live 2026-08-09, General
+    force-re-extracting Zahir's real Upstream Bio job to pick up the
+    2026-08-09 either/or fix): the RESUME TEXT stays exactly the same,
+    but a fresh AI re-extraction call is free to reword an EXISTING,
+    already-correct keyword slightly ("cloud-based infrastructure" ->
+    "cloud infrastructure", "AI-enabled capabilities" -> "AI-enabled
+    solutions") purely from ordinary AI non-determinism between calls.
+    Since scoring is literal phrase matching, the reworded label no
+    longer matches text that was matching fine under the old wording -
+    the resume didn't get worse and neither extraction is "wrong" in
+    isolation, but the net score silently drops with zero visible
+    explanation of why, indistinguishable from a real regression unless
+    someone diffs the two keyword lists by hand (which is exactly how
+    this was first found - General noticed a fixed bug seemingly made
+    the score go down).
+
+    Deliberately does NOT try to auto-reconcile the wording (e.g. "if the
+    new term is fuzzy-similar to an old one, keep the old spelling") -
+    "cloud-based infrastructure" -> "cloud infrastructure" and "AI-enabled
+    capabilities" -> "AI-enabled solutions" are both real examples where a
+    naive similarity heuristic can't reliably tell cosmetic rewording
+    apart from a genuine meaning change ("capabilities" vs "solutions" is
+    not obviously synonymous), and this module's whole design philosophy
+    is to never let a fuzzy judgment call silently decide what counts as
+    a real skill match - see score_resume_against_keywords' own docstring
+    and CLAUDE.md known failure pattern #3. Surfacing the change and
+    letting a human judge is the honest version of a fix here, not
+    inventing a second unreliable heuristic on top of the first.
+
+    Returns the OLD labels of any required/preferred keyword that WAS
+    matched against resume_text under the OLD keyword list and has
+    disappeared entirely from the NEW list (not just "still present but
+    now unmatched" - a genuinely brand-new keyword the re-extraction
+    added that happens to be unmatched is an honest new gap, not a
+    regression, so it's deliberately excluded here even though it also
+    lowers the score). A flat OLD keyword that reappears as a member of a
+    NEW any_of group (rather than its own flat entry) is correctly NOT
+    flagged - it hasn't disappeared, it can still match exactly as
+    before, just via a group structure instead (this matters in
+    practice: the either/or generalization fix itself moves flat
+    keywords into any_of groups on every re-extraction it touches, which
+    would otherwise falsely show up as mass "regressions" here). Only
+    OLD flat string keywords are ever reported as regressed, though -
+    reconciling identity for an OLD any_of group itself (did this exact
+    group get reworded, or genuinely change meaning?) is a fuzzier
+    problem this doesn't attempt to solve."""
+    def _all_present_labels(keywords):
+        labels = set()
+        for k in keywords:
+            if isinstance(k, str):
+                labels.add(k)
+            elif isinstance(k, dict) and k.get("any_of"):
+                labels.update(k["any_of"])
+        return labels
+
+    def _flat_labels(keywords):
+        return {k for k in keywords if isinstance(k, str)}
+
+    old_result = score_resume_against_keywords(old_required_keywords, old_preferred_keywords, resume_text)
+    old_missing = {m["label"] for m in old_result["missing_required_keywords"] + old_result["missing_preferred_keywords"]}
+    old_matched = _flat_labels(old_required_keywords + old_preferred_keywords) - old_missing
+    new_labels = _all_present_labels(new_required_keywords + new_preferred_keywords)
+    return sorted(old_matched - new_labels)

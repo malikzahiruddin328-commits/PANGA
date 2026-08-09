@@ -1221,6 +1221,37 @@ def test_reextract_ats_keywords_and_rescore_replaces_the_stale_cached_list(monke
     # "Information Technology" - the corrected any_of group must not.
     assert job["ats_required_keywords"] == [{"any_of": ["Information Technology", "Computer Science", "Engineering"]}]
     assert result["clarifying_questions"] == []  # no gap left to ask about - the field group is satisfied
+    # "Information Technology" moved from a flat OLD entry into a member
+    # of the new any_of group - it hasn't disappeared, so this must not
+    # be reported as wording drift.
+    assert result["wording_regressions"] == []
+
+
+def test_reextract_ats_keywords_and_rescore_surfaces_a_genuine_wording_regression(monkeypatch):
+    # Real gap found live 2026-08-09 (General force-re-extracting Zahir's
+    # Upstream Bio job): the same re-extraction call that fixed one bug
+    # also reworded an unrelated, already-matching keyword purely from AI
+    # non-determinism, silently costing a match. Verifies the caller can
+    # actually see this rather than just getting a lower score with no
+    # explanation.
+    import tailoring.drafting as drafting
+
+    def _fake_call_structured(client, **kwargs):
+        return {"required_keywords": ["cloud infrastructure"], "preferred_keywords": []}
+
+    monkeypatch.setattr(drafting, "_client", lambda: object())
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured)
+
+    job = {
+        "source": "linkedin", "job_id": "1", "title": "Some role", "description": "Needs cloud infra.",
+        "ats_required_keywords": ["cloud-based infrastructure"], "ats_preferred_keywords": [],
+    }
+    app_record = {"resume_text": "SKILLS\nCloud-based infrastructure\n", "resume_clarifying_questions": []}
+
+    result = drafting.reextract_ats_keywords_and_rescore(job, app_record, profile={})
+
+    assert result["changed"] is True
+    assert result["wording_regressions"] == ["cloud-based infrastructure"]
 
 
 def test_reextract_ats_keywords_and_rescore_reports_unchanged_on_api_failure(monkeypatch):
@@ -1248,6 +1279,7 @@ def test_reextract_ats_keywords_and_rescore_reports_unchanged_on_api_failure(mon
 
     assert result["changed"] is False
     assert job["ats_required_keywords"] == old_required  # untouched, not wiped to []
+    assert result["wording_regressions"] == []  # nothing to diff - the call never went through
     # Still scored against the old, real keyword list, not an empty one -
     # a wipe-to-[] would report zero gaps, silently hiding the real one.
     # "0/1 required" proves it scored against the real 1-item old list, not

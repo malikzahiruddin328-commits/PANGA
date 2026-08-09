@@ -3573,6 +3573,27 @@ elif active_tab == "results":
                                                         f"Keywords re-extracted - new ATS score {recheck['ats_score']}/100.",
                                                         icon=":material/check_circle:",
                                                     )
+                                                    if recheck["wording_regressions"]:
+                                                        # st.toast() survives the unconditional st.rerun()
+                                                        # right below (same "flash and vanish" concern as
+                                                        # regenerate_resume_and_persist's own regression
+                                                        # toast) - real gap found live 2026-08-09: a fresh
+                                                        # extraction call can reword an existing keyword
+                                                        # ("cloud-based infrastructure" -> "cloud
+                                                        # infrastructure") with the resume text completely
+                                                        # unchanged, silently costing a match and dropping
+                                                        # the score for a reason that looks like a real
+                                                        # regression but isn't.
+                                                        st.toast(
+                                                            "Some of the score change may just be re-extraction "
+                                                            "wording drift, not your resume getting worse - these "
+                                                            "previously-matched requirements don't appear at all "
+                                                            "in the new keyword list: "
+                                                            + ", ".join(f'"{label}"' for label in recheck["wording_regressions"]) +
+                                                            ". Worth checking whether the wording just changed "
+                                                            "before assuming a real gap.",
+                                                            icon=":material/warning:",
+                                                        )
                                                     st.rerun()
                                     # Inline here, not just a pointer to the Profile Gaps tab
                                     # (Zahir's correction 2026-08-06, live-testing: expanding a

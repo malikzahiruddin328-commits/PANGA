@@ -28,7 +28,7 @@ from llm_client import (
     is_configured,
 )
 from skill_label_match import normalize_skill_label, skills_match
-from tailoring.ats_score import plateau_note_for_gaps, score_resume_against_keywords, score_resume_ats
+from tailoring.ats_score import detect_keyword_wording_regressions, plateau_note_for_gaps, score_resume_against_keywords, score_resume_ats
 from tailoring.baseline_resume import select_baseline_resume_text
 
 _RESUME_SPEC_COMMON = (
@@ -671,12 +671,31 @@ def reextract_ats_keywords_and_rescore(job: dict, app_record: dict, profile: dic
     function only ever reassigns job["ats_required_keywords"] to a new
     list object on a real success) - callers should tell Zahir the
     re-check didn't go through rather than reporting a score that never
-    actually moved."""
+    actually moved.
+
+    Also returns "wording_regressions": [str, ...] - real gap found live
+    2026-08-09 (General force-re-extracting this same job for Zahir): a
+    fresh AI extraction call is free to reword an existing, already-
+    correct keyword slightly ("cloud-based infrastructure" -> "cloud
+    infrastructure") purely from ordinary non-determinism between calls -
+    the resume text is unchanged, but the reworded label no longer
+    matches it, so the net score silently drops with no visible
+    explanation. See ats_score.detect_keyword_wording_regressions() for
+    why this is surfaced rather than auto-reconciled."""
     client = _client()
     old_required, old_preferred = job.get("ats_required_keywords"), job.get("ats_preferred_keywords")
     _extract_ats_keywords(client, job, model)
     changed = job.get("ats_required_keywords") is not old_required or job.get("ats_preferred_keywords") is not old_preferred
-    return {"changed": changed, **rescore_against_cached_keywords(job, app_record, profile)}
+    wording_regressions = detect_keyword_wording_regressions(
+        old_required or [], old_preferred or [],
+        job.get("ats_required_keywords") or [], job.get("ats_preferred_keywords") or [],
+        app_record.get("resume_text") or "",
+    ) if changed else []
+    return {
+        "changed": changed,
+        "wording_regressions": wording_regressions,
+        **rescore_against_cached_keywords(job, app_record, profile),
+    }
 
 
 def _score_schema() -> dict:

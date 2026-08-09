@@ -1,4 +1,5 @@
 from tailoring.ats_score import (
+    detect_keyword_wording_regressions,
     detect_matched_keyword_regressions,
     extract_keywords,
     plateau_note_for_gaps,
@@ -399,3 +400,53 @@ def test_detect_matched_keyword_regressions_returns_nothing_with_no_prior_text()
     # A first-ever draft has nothing to regress against.
     assert detect_matched_keyword_regressions(["Python"], [], None, "SKILLS\nPython\n") == []
     assert detect_matched_keyword_regressions(["Python"], [], "", "SKILLS\nPython\n") == []
+
+
+def test_detect_keyword_wording_regressions_catches_a_reworded_keyword():
+    # Real gap found live 2026-08-09: General force-re-extracted a job to
+    # pick up the either/or degree-field fix, and the same AI call also
+    # reworded two unrelated, already-matching keywords ("cloud-based
+    # infrastructure" -> "cloud infrastructure", "AI-enabled capabilities"
+    # -> "AI-enabled solutions") purely from ordinary non-determinism - the
+    # resume text never changed, but the reworded label no longer matched
+    # it, silently dropping the net score with no visible explanation.
+    resume_text = "SKILLS\nCloud-based infrastructure, AI-enabled capabilities, Python\n"
+    old_required = ["cloud-based infrastructure", "AI-enabled capabilities", "Python"]
+    new_required = ["cloud infrastructure", "AI-enabled solutions", "Python"]
+
+    regressions = detect_keyword_wording_regressions(old_required, [], new_required, [], resume_text)
+
+    # Reports the OLD wording that vanished (matched before, gone now) -
+    # not the new unmatched wording - so Zahir has the exact phrase to
+    # search his resume for.
+    assert regressions == ["AI-enabled capabilities", "cloud-based infrastructure"]
+
+
+def test_detect_keyword_wording_regressions_empty_when_nothing_lost():
+    resume_text = "SKILLS\nPython, Databricks\n"
+    # New list drops a keyword entirely rather than reworking it, and adds
+    # a genuinely new one that was never matched before either - neither
+    # is a keyword that WAS matching and stopped, so nothing to flag.
+    assert detect_keyword_wording_regressions(["Python"], [], ["Python", "Kubernetes"], [], resume_text) == []
+
+
+def test_detect_keyword_wording_regressions_ignores_a_keyword_that_was_never_matched():
+    # A keyword missing under BOTH the old and new list isn't a regression
+    # this re-extraction caused - it was already an honest, real gap.
+    resume_text = "SKILLS\nPython\n"
+    assert detect_keyword_wording_regressions(["Python", "Rust"], [], ["Python", "Golang"], [], resume_text) == []
+
+
+def test_detect_keyword_wording_regressions_ignores_a_flat_term_moved_into_a_new_any_of_group():
+    # Real scenario this must NOT flag as a regression: a flat OLD keyword
+    # ("Information Technology") reappears as a MEMBER of a NEW any_of
+    # group rather than its own flat entry - exactly what the 2026-08-09
+    # either/or generalization fix itself does on every job it touches.
+    # It hasn't disappeared and still matches identically, just via a
+    # group structure - a false positive here would make this detector
+    # fire on the very fix it exists to protect.
+    resume_text = "Bachelor of Science in Information Technology."
+    old_required = ["Information Technology"]
+    new_required = [{"any_of": ["Information Technology", "Computer Science", "Engineering"]}]
+
+    assert detect_keyword_wording_regressions(old_required, [], new_required, [], resume_text) == []
