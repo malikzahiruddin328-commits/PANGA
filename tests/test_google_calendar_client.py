@@ -132,3 +132,88 @@ def test_using_gmail_credentials_false_when_own_creds_present(tmp_path, monkeypa
     (tmp_path / "calendar_creds.json").write_text("{}")
     (tmp_path / "gmail_creds.json").write_text("{}")
     assert gcc.using_gmail_credentials() is False
+
+
+# ---- Token-refresh locking (2026-08-08) - Mirror's audit found this
+# module still had the same unlocked load-check-refresh-save race that
+# gmail_client.py/microsoft_client.py were already fixed for (commit
+# 81259f8): Calendar is reachable from the same shared fulfillment path
+# (interview-reply calendar-slot lookups) that motivated the original
+# fix. Not a full test suite for get_credentials() (real-API-dependent) -
+# same narrow scope as test_gmail_client.py's equivalent test.
+
+class _FakeCreds:
+    def __init__(self):
+        self.valid = False
+        self.expired = True
+        self.refresh_token = "refresh-me"
+        self.refreshed = False
+
+    def refresh(self, request):
+        self.refreshed = True
+        self.valid = True
+
+    def to_json(self):
+        return "{}"
+
+
+class _RecordingLock:
+    """Stand-in for security.file_lock.locked() that records whether it
+    was held while the refresh actually happened, without touching a real
+    lock file."""
+
+    def __init__(self, calls, name):
+        self.calls = calls
+        self.name = name
+
+    def __enter__(self):
+        self.calls.append(("enter", self.name))
+        return self
+
+    def __exit__(self, *exc):
+        self.calls.append(("exit", self.name))
+        return False
+
+
+def test_get_credentials_refresh_runs_inside_the_lock(monkeypatch, tmp_path):
+    import google_calendar_client as gcc
+
+    monkeypatch.setattr(gcc, "CREDENTIALS_PATH", tmp_path / "credentials.json")
+    (tmp_path / "credentials.json").write_text("{}")  # _credentials_source_path() just checks existence
+
+    fake_creds = _FakeCreds()
+    monkeypatch.setattr(gcc, "_load_cached_credentials", lambda: fake_creds)
+
+    saved = []
+    monkeypatch.setattr(gcc, "_save_credentials", lambda creds: saved.append(creds))
+
+    calls = []
+    monkeypatch.setattr(gcc, "locked", lambda name: _RecordingLock(calls, name))
+
+    result = gcc.get_credentials()
+
+    assert result is fake_creds
+    assert fake_creds.refreshed is True
+    assert saved == [fake_creds]
+    assert calls == [("enter", "google_calendar_token"), ("exit", "google_calendar_token")]
+
+
+def test_get_credentials_uses_its_own_lock_name_not_gmails(monkeypatch, tmp_path):
+    # Calendar's token file is separate from Gmail's (different scope,
+    # independently revocable - see module docstring) - it must not share
+    # gmail_client's lock name, or an unrelated Gmail refresh could
+    # needlessly block a Calendar one and vice versa.
+    import google_calendar_client as gcc
+
+    monkeypatch.setattr(gcc, "CREDENTIALS_PATH", tmp_path / "credentials.json")
+    (tmp_path / "credentials.json").write_text("{}")
+    monkeypatch.setattr(gcc, "_load_cached_credentials", lambda: _FakeCreds())
+    monkeypatch.setattr(gcc, "_save_credentials", lambda creds: None)
+
+    calls = []
+    monkeypatch.setattr(gcc, "locked", lambda name: _RecordingLock(calls, name))
+
+    gcc.get_credentials()
+
+    lock_names = {name for _, name in calls}
+    assert lock_names == {"google_calendar_token"}
