@@ -275,6 +275,43 @@ def test_draft_one_resume_threads_unconfirmed_claims_through(monkeypatch):
     assert result["unconfirmed_claims"] == [{"skill": "Team size", "text": "Led a team of 8-10 engineers?"}]
 
 
+def test_draft_one_resume_deterministically_flags_an_unhedged_fabricated_employer(monkeypatch):
+    # Real gap General flagged live 2026-08-09: the "?" hedge only ever
+    # catches what the AI ITSELF flags as uncertain - nothing verified an
+    # UNHEDGED claim was real. _draft_one must run the deterministic
+    # verifier (claim_verification.flag_unverified_resume_claims) on the
+    # drafted text and fold what it finds into the SAME unconfirmed_claims
+    # list the AI's own self-reports feed - reusing
+    # tailoring.unconfirmed_claims.find_unconfirmed_markers()'s existing
+    # gate/UI wholesale, not a second detection surface.
+    import tailoring.drafting as drafting
+    from tailoring.unconfirmed_claims import find_unconfirmed_markers
+
+    def _fake_call_structured(client, **kwargs):
+        return {
+            "text": "PROFESSIONAL EXPERIENCE\nFabricated Startup Inc. - VP Eng  Jan 2015 - Jan 2020\n- Invented role.",
+            "target_seniority_at_least_vp": True,
+            "suggested_strategy_tag": "",
+            "clarifying_questions": [],
+            "unconfirmed_claims": [],  # the AI itself reported nothing uncertain here
+        }
+
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured)
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": [], "ats_preferred_keywords": []}
+    profile = {"work_history": [{"employer": "Real Employer Co.", "start": "2010", "end": "2020"}]}
+
+    result = _draft_one(object(), [], "resume", None, job=job, profile=profile)
+
+    assert result["text"].splitlines()[1].endswith("?")  # the fabricated line now carries the hedge marker
+    assert {"skill": None, "text": "Fabricated Startup Inc. - VP Eng  Jan 2015 - Jan 2020"} in result["unconfirmed_claims"]
+    # End-to-end proof this reuses the EXISTING gate wholesale - no new
+    # detection surface needed on the reading side.
+    app_record = {"resume_text": result["text"], "resume_unconfirmed_claims_ai_reported": result["unconfirmed_claims"]}
+    assert find_unconfirmed_markers(app_record) == [
+        {"field": "resume_text", "skill": None, "line": "Fabricated Startup Inc. - VP Eng  Jan 2015 - Jan 2020?"}
+    ]
+
+
 def test_draft_one_injects_resume_consistency_block_for_cover_letter(monkeypatch):
     # Real gap Zahir hit live 2026-08-09: cover_letter/exec_bio/leadership_
     # summary each get an independent API call sharing only the raw

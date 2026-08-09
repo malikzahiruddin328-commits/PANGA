@@ -31,6 +31,7 @@ from llm_client import (
 from skill_label_match import normalize_skill_label, skills_match
 from tailoring.ats_score import detect_keyword_wording_regressions, plateau_note_for_gaps, score_resume_against_keywords, score_resume_ats
 from tailoring.baseline_resume import select_baseline_resume_text
+from tailoring.claim_verification import flag_unverified_resume_claims
 
 _WORK_HISTORY_MONTH_YEAR_RE = re.compile(r"^(\d{1,2})/(\d{4})$")
 _WORK_HISTORY_YEAR_RE = re.compile(r"^(\d{4})$")
@@ -1313,6 +1314,16 @@ def _draft_one(
             # somehow missing, so an absent judgment fails toward leaving
             # the text untouched rather than silently mangling a title.
             resume_text = _strip_rank_prefixes(resume_text)
+        # Deterministic fact-check for UNHEDGED claims (2026-08-09, Zahir's
+        # explicit design) - the "?" hedge above only ever catches what the
+        # AI itself flagged as uncertain; this catches a confidently-stated
+        # fabrication (wrong employer, wrong dates, an invented
+        # certification) the same way, by folding it into the exact same
+        # "?" marker the AI's own hedges use - see claim_verification.py's
+        # own docstring for exactly what's checked and why it's scoped
+        # this narrowly. Runs AFTER rank-prefix stripping so the persisted
+        # resume_text is the fully-finalized text being checked.
+        resume_text, unverified_claims = flag_unverified_resume_claims(resume_text, profile or {})
         job = job or {}
         required_kw = job.get("ats_required_keywords")
         preferred_kw = job.get("ats_preferred_keywords")
@@ -1344,7 +1355,7 @@ def _draft_one(
             "ats_next_actions": ats["ats_next_actions"],
             "clarifying_questions": _questions_worth_asking(merged_questions, ats["ats_score"]),
             "ats_plateau_note": ats.get("plateau_note"),
-            "unconfirmed_claims": data.get("unconfirmed_claims", []),
+            "unconfirmed_claims": data.get("unconfirmed_claims", []) + unverified_claims,
         }
     if doc_key == "apply_answers":
         return data.get("apply_answers", [])

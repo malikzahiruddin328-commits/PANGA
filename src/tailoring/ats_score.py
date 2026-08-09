@@ -311,7 +311,12 @@ def _match_keyword_item(item: dict, text_lower: str, text_original: str) -> str 
     return None
 
 
-_STANDARD_HEADERS = (
+# Public (not module-private) - reused by tailoring.claim_verification
+# (2026-08-09) to reliably detect a section BOUNDARY (not just "any all-
+# caps line," which would misfire on an all-caps acronym-style
+# certification like "PMP") - same "make it public once a second real
+# caller needs it" precedent as skill_label_match.normalize_skill_label.
+STANDARD_HEADERS = (
     "professional experience", "experience", "work experience",
     "education", "skills", "core skills", "technical skills",
     "certifications", "summary", "professional summary",
@@ -328,7 +333,7 @@ def _structure_score(resume_text: str) -> tuple[float, list[str]]:
     text_lower = resume_text.lower()
     failed = []
 
-    has_headers = sum(1 for h in _STANDARD_HEADERS if h in text_lower) >= 2
+    has_headers = sum(1 for h in STANDARD_HEADERS if h in text_lower) >= 2
     if not has_headers:
         failed.append("headers")
 

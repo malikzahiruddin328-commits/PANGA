@@ -46,7 +46,12 @@ _DATE_TOKEN_RE = rf"(?:{_MONTH_RE})?(?:19|20)\d{{2}}"
 # YYYY - Month YYYY" format (the month name in the middle failed \s*) -
 # every date-range line in a real generated resume fell through to a
 # plain, unbolded, non-right-aligned paragraph instead of this branch.
-_DATE_RANGE_RE = re.compile(
+# Public (not module-private) - reused by tailoring.claim_verification
+# (2026-08-09) to find the same role-header lines for a different purpose
+# (deterministic fabrication check against the master profile's real
+# work_history, rather than rendering) - same "make it public once a
+# second real caller needs it" precedent as skill_label_match.
+DATE_RANGE_RE = re.compile(
     rf"(?P<start>{_DATE_TOKEN_RE})\s*(?:-|–|to)\s*(?P<end>{_DATE_TOKEN_RE}|present)\s*$",
     re.IGNORECASE,
 )
@@ -184,7 +189,7 @@ def text_to_docx_bytes(text: str, author: str | None = None, body_size_pt: float
             prev_para = p
             continue
 
-        date_match = _DATE_RANGE_RE.search(line) if len(line) < 120 else None
+        date_match = DATE_RANGE_RE.search(line) if len(line) < 120 else None
         if date_match:
             # Company/role lines carrying a date range - bold, and the date
             # itself right-aligned against the page margin regardless of
