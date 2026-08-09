@@ -16,6 +16,15 @@ have to copy-paste it into the "Paste the job description" box yourself.
 - Next time you open that same job in Panga's paste-JD box, it's already
   filled in with a badge saying "Auto-filled from browser extension" - you
   can still edit it before saving, nothing is ever saved automatically.
+- After a successful send, a real Chrome notification confirms it and its
+  "Open in Panga" button jumps straight to that job (**pending** - see
+  maintainer notes below, needs a small addition on Panga's own side
+  before the deep link actually works end-to-end).
+- The toolbar icon itself shows a colored dot so you don't have to open the
+  popup just to check: no dot on a page that isn't a LinkedIn/Dice job
+  posting, an amber dot on a job page whose description hasn't loaded yet
+  (LinkedIn before you've scrolled - see "A LinkedIn quirk" below), a green
+  dot once it's actually ready to send.
 
 ## Installing it (one-time setup)
 
@@ -47,8 +56,10 @@ running (production, at `run_app.bat` / port 8510).
    genuinely scrolled - the extension can't trigger that itself, see "A
    LinkedIn quirk" below). Dice doesn't need this.
 4. Click the extension's icon in Chrome's toolbar.
-5. If it found the job description, you'll see the title/company and a
-   "Send to Panga" button - click it.
+5. If it found the job description, you'll see the title/company, a
+   preview (character count + the first ~150 characters, in quotes) so you
+   can confirm it grabbed the right thing before sending, and a "Send to
+   Panga" button - click it.
 6. Switch to Panga, find that job (or add it manually first if it's not in
    your list yet - LinkedIn jobs need to be added once via "Add a job
    manually" with the posting URL, same as before), and its paste-JD box
@@ -92,6 +103,66 @@ little and click the button again. Dice doesn't have this issue at all.
   mixed-content blocking. Heartbeats via `chrome.alarms` (survives MV3
   service-worker suspension, unlike `setInterval`).
 - `popup.html`/`popup.js` - the toolbar popup UI.
+
+**Toolbar badge (2026-08-09):** `content.js`'s `cheapReadinessCheck()`
+reuses the same extraction functions used for the real send (JSON-LD, then
+DOM selectors, then - LinkedIn only - the innerText/marker fallback) to
+report "ready"/"loading" to the background worker via a `readinessUpdate`
+message; `background.js` turns that into a green/amber `chrome.action`
+badge for that tab. Deliberately does NOT call
+`ensureLinkedInDescriptionLoaded()` - it only reports the page's current,
+organic state, never nudges it. **Verified live 2026-08-09:** the
+readiness-detection logic itself (`extractFromJsonLd()` returning "ready"
+on a real loaded Dice page, "loading" when its JSON-LD is empty) was run
+against a real page and both states are correct. **Not yet verified: the
+actual toolbar badge color** - that needs a real loaded extension in real
+Chrome (`chrome.action.setBadgeText`/`setBadgeBackgroundColor` can't be
+exercised from a plain browser tab, only from inside an installed
+extension's own context), which this build session has no way to do. Load
+the unpacked extension and check the icon turns amber-then-green on a real
+job page before fully trusting this piece.
+
+**Popup preview (2026-08-09):** `popup.js`'s `renderPreview()` shows a
+character count + the first ~150 chars (quoted, truncated with "…") before
+the Send button - builds confidence about what's about to be sent instead
+of a black box. Uses `textContent` throughout, never `innerHTML` with the
+extracted text interpolated in, so nothing in a JD (arbitrary text from a
+third-party page) can be interpreted as markup. Verified live 2026-08-09:
+loaded `popup.html` directly and ran the render function against both a
+long sample (truncates correctly with "…") and a short one (no ellipsis,
+full text shown) - screenshot confirmed the layout renders cleanly at the
+popup's actual 300px width. The chrome.tabs/chrome.runtime-dependent parts
+of popup.js (the real extraction call, the real send) still need the same
+real-extension check as the badge above - this only verifies the preview
+rendering itself.
+
+**Post-send notification + deep link (2026-08-09, IN PROGRESS - not done
+yet):** `background.js`'s `showSentNotification()` fires a
+`chrome.notifications` popup after a successful `/capture`, with an "Open
+in Panga" button (`onButtonClicked`/`onClicked` both open the same URL,
+then clear the notification). The deep-link URL is
+`http://localhost:8510/?job_url=<url-encoded posting URL>` - matching by
+the job's own `posting_url` (normalized the same way
+`extension_bridge.py`'s `_normalize_url()` already does) rather than by
+`?job=<source>_<job_id>`, specifically to avoid duplicating Panga's
+per-source job_id derivation logic (LinkedIn: URL regex; Dice: content
+hash) inside the extension. **Two things still needed before this works
+end-to-end:**
+1. Panga's own side: `src/ui/app.py` needs to read `job_url` from
+   `st.query_params` on load, find the matching job, switch to the Results
+   tab, and set the same `selected_idx_{channel}`/`scroll_pending_{channel}`
+   session-state keys the existing Role-click handler already sets -
+   coordinated with the session that owns `app.py` generally (this
+   session only owns the auto-fill/status-indicator bits of it), not yet
+   landed.
+2. Live verification: `chrome.notifications.create()`/`chrome.tabs.create()`
+   are real-extension-only APIs, same limitation as the badge above -
+   needs a real loaded extension to confirm the notification actually
+   appears and its button actually navigates correctly.
+Manifest updated with the `notifications` permission and real icon files
+(`extension/icons/`, generated 2026-08-09 - previously the extension had
+no icons at all, which is fine for `chrome.action` but `chrome.notifications`
+requires a real `iconUrl`).
 
 **Dice: confirmed live and working end-to-end**, including a real user
 click (2026-08-08 for the extraction logic; 2026-08-09 Zahir sent a real

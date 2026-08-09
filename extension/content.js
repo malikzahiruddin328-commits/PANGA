@@ -275,3 +275,56 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // keep the message channel open for the async response above
   }
 });
+
+// Toolbar icon badge state (2026-08-09, Zahir-approved polish pass) - lets
+// the user tell at a glance whether a page is ready to send without
+// opening the popup. Deliberately does NOT call ensureLinkedInDescriptionLoaded()
+// - this only reports the page's CURRENT, organic state (has the user
+// actually scrolled yet), never forces a scroll itself. A background
+// readiness poller nudging the page on every mutation would be the same
+// automation LinkedIn's trusted-gesture gating already proved doesn't work
+// (see ensureLinkedInDescriptionLoaded's comment) - and would be actively
+// misleading here besides, since a badge that turns green on its own
+// wouldn't reflect anything the user did.
+function cheapReadinessCheck() {
+  if (extractFromJsonLd() || extractFromDom()) return "ready";
+
+  const host = hostKeyFor(location.hostname);
+  if (host === "linkedin.com") {
+    const text = document.body.innerText || "";
+    const lower = text.toLowerCase();
+    const hasMarker = LINKEDIN_START_MARKERS.some((marker) => lower.includes(marker));
+    if (hasMarker && text.length >= MIN_DESCRIPTION_LENGTH) return "ready";
+  }
+  // Matched a job-page URL pattern (content_scripts.matches) but nothing
+  // extractable yet - Dice this early is rare (server-rendered) but not
+  // impossible on a slow load; LinkedIn before scrolling is the common case.
+  return "loading";
+}
+
+function debounce(fn, ms) {
+  let timer;
+  return (...args) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), ms);
+  };
+}
+
+let lastReportedReadiness = null;
+function reportReadiness() {
+  const state = cheapReadinessCheck();
+  if (state === lastReportedReadiness) return; // don't spam identical updates
+  lastReportedReadiness = state;
+  chrome.runtime.sendMessage({ type: "readinessUpdate", state });
+}
+
+reportReadiness();
+// LinkedIn's real content arrives via a DOM mutation once the user scrolls
+// (there's no load/network event to hook - see the lazy-load comment
+// above), so a MutationObserver is the only way to notice it happened.
+// Debounced since a real content load can fire dozens of mutations in a
+// burst.
+new MutationObserver(debounce(reportReadiness, 500)).observe(document.body, {
+  childList: true,
+  subtree: true,
+});
