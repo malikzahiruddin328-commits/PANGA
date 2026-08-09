@@ -9,6 +9,7 @@ from tailoring.drafting import (
     _suggested_answer_for_keyword_gap,
     analyze_fit_before_drafting,
     check_regenerate_impact,
+    request_additional_gap_questions,
     save_gap_answers,
 )
 
@@ -585,3 +586,125 @@ def test_analyze_fit_before_drafting_plateau_note_still_names_a_genuinely_unansw
     result = analyze_fit_before_drafting(job, profile, app_record)
     assert result["plateau_note"] is not None
     assert "Databricks" in result["plateau_note"]
+
+
+def _fake_call_structured_returning(items):
+    def _fake(client, **kwargs):
+        return {"clarifying_questions": items}
+    return _fake
+
+
+def test_request_additional_gap_questions_returns_a_genuinely_new_question(monkeypatch):
+    # Score-first-resume-flow spec item 5: clicking "Answer more questions"
+    # is supposed to trigger a REAL new round of AI generation - real bug
+    # Zahir hit live 2026-08-09 (General): the button used to be a bare
+    # st.rerun(), so this never actually happened.
+    import tailoring.drafting as drafting
+
+    monkeypatch.setattr(drafting, "_client", lambda: object())
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured_returning([
+        {"type": "skill_gap", "skill": "Team size at Acme", "question": "How big was the team?", "suggested_answer": ""},
+    ]))
+
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": [], "ats_preferred_keywords": []}
+    app_record = {"resume_text": "SKILLS\nPython", "resume_clarifying_questions": []}
+    profile = {"gap_interview_answers": []}
+
+    result = request_additional_gap_questions(job, profile, app_record)
+    assert result["added_count"] == 1
+    assert result["new_questions"][0]["skill"] == "Team size at Acme"
+    assert result["merged_clarifying_questions"] == result["new_questions"]
+
+
+def test_request_additional_gap_questions_honest_empty_result(monkeypatch):
+    import tailoring.drafting as drafting
+
+    monkeypatch.setattr(drafting, "_client", lambda: object())
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured_returning([]))
+
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": [], "ats_preferred_keywords": []}
+    app_record = {"resume_text": "SKILLS\nPython", "resume_clarifying_questions": []}
+    profile = {"gap_interview_answers": []}
+
+    result = request_additional_gap_questions(job, profile, app_record)
+    assert result["added_count"] == 0
+    assert result["new_questions"] == []
+    assert result["merged_clarifying_questions"] == []
+
+
+def test_request_additional_gap_questions_filters_out_a_repeat_the_ai_shouldnt_have_returned(monkeypatch):
+    # Real gap this guards against: prompt instructions alone aren't
+    # trusted (CLAUDE.md known failure pattern #3) - if the AI ignores the
+    # "don't repeat ALREADY COVERED" instruction anyway, this must still
+    # not double up a question already asked or already confirmed.
+    import tailoring.drafting as drafting
+
+    monkeypatch.setattr(drafting, "_client", lambda: object())
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured_returning([
+        {"type": "skill_gap", "skill": "Databricks experience", "question": "?", "suggested_answer": ""},
+        {"type": "skill_gap", "skill": "Genuinely new fact", "question": "?", "suggested_answer": ""},
+    ]))
+
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": [], "ats_preferred_keywords": []}
+    app_record = {
+        "resume_text": "SKILLS\nPython",
+        "resume_clarifying_questions": [{"type": "skill_gap", "skill": "Databricks", "question": "?", "suggested_answer": ""}],
+    }
+    profile = {"gap_interview_answers": []}
+
+    result = request_additional_gap_questions(job, profile, app_record)
+    assert result["added_count"] == 1
+    assert result["new_questions"][0]["skill"] == "Genuinely new fact"
+
+
+def test_request_additional_gap_questions_filters_out_a_confirmed_profile_skill(monkeypatch):
+    import tailoring.drafting as drafting
+
+    monkeypatch.setattr(drafting, "_client", lambda: object())
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured_returning([
+        {"type": "skill_gap", "skill": "Kubernetes", "question": "?", "suggested_answer": ""},
+    ]))
+
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": [], "ats_preferred_keywords": []}
+    app_record = {"resume_text": "SKILLS\nPython", "resume_clarifying_questions": []}
+    profile = {"gap_interview_answers": [{"skill": "Kubernetes", "date_captured": "2026-08-01"}]}
+
+    result = request_additional_gap_questions(job, profile, app_record)
+    assert result["added_count"] == 0
+
+
+def test_request_additional_gap_questions_filters_out_a_deterministic_missing_keyword(monkeypatch):
+    # The AI shouldn't re-ask about a keyword gap the deterministic scorer
+    # already surfaces separately via missing_required_keywords/
+    # _merge_keyword_gap_questions.
+    import tailoring.drafting as drafting
+
+    monkeypatch.setattr(drafting, "_client", lambda: object())
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured_returning([
+        {"type": "skill_gap", "skill": "Databricks", "question": "?", "suggested_answer": ""},
+    ]))
+
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": ["Databricks"], "ats_preferred_keywords": []}
+    app_record = {"resume_text": "SKILLS\nPython", "resume_clarifying_questions": []}
+    profile = {"gap_interview_answers": []}
+
+    result = request_additional_gap_questions(job, profile, app_record)
+    assert result["added_count"] == 0
+
+
+def test_request_additional_gap_questions_preserves_existing_stored_questions(monkeypatch):
+    import tailoring.drafting as drafting
+
+    monkeypatch.setattr(drafting, "_client", lambda: object())
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured_returning([
+        {"type": "skill_gap", "skill": "New fact", "question": "?", "suggested_answer": ""},
+    ]))
+
+    existing = [{"type": "skill_gap", "skill": "Old fact", "question": "?", "suggested_answer": ""}]
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": [], "ats_preferred_keywords": []}
+    app_record = {"resume_text": "SKILLS\nPython", "resume_clarifying_questions": existing}
+    profile = {"gap_interview_answers": []}
+
+    result = request_additional_gap_questions(job, profile, app_record)
+    assert len(result["merged_clarifying_questions"]) == 2
+    assert existing[0] in result["merged_clarifying_questions"]
