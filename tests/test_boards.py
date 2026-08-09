@@ -274,7 +274,7 @@ def test_fetch_built_in_jobs_parses_card_with_salary(monkeypatch):
     assert job["location"] == "Chicago, IL, USA"
     assert job["pay_min"] == "275000"
     assert job["pay_max"] == "310000"
-    assert job["job_id"] == "/job/chief-information-officer/9053354"
+    assert job["job_id"] == boards._stable_job_id("Built In", "Chief Information Officer", "Acme Corp", "Chicago, IL, USA")
     assert job["posting_url"] == "https://builtin.com/job/chief-information-officer/9053354"
 
 
@@ -289,14 +289,36 @@ def test_fetch_built_in_jobs_handles_missing_salary(monkeypatch):
     assert jobs[0]["location"] == "Jersey City, NJ, USA"
 
 
-def test_fetch_built_in_jobs_id_stable_across_repeat_fetches(monkeypatch):
-    # data-alias is Built In's own permalink slug (live-verified stable
-    # across repeat fetches, unlike SimplyHired's href token below) - no
-    # _stable_job_id() substitution needed here.
+def test_fetch_built_in_jobs_id_is_content_based_not_the_raw_href(monkeypatch):
+    # Real bug found 2026-08-08 (Mirror's audit): this function originally
+    # used data-alias/href directly as job_id, on the assumption it was a
+    # stable permalink slug - unlike its sibling fetch_simplyhired_jobs(),
+    # shipped in the same commit, which got the _stable_job_id() fix and a
+    # disclosure explaining why. This one didn't, and it wasn't a
+    # deliberate exception - just missed. Confirmed live in production
+    # data: a real duplicate already existed ("Audit Project Manager - CIO"
+    # at US Bank under two different /job/.../<id> hrefs) - Built In's own
+    # "Reposted" labeling suggests a repost can get a genuinely new
+    # numeric ID, same failure mode as Indeed/ZipRecruiter/Dice's MCP path
+    # and SimplyHired's href token.
+    same_posting_different_href = """
+    <div data-id="job-card" id="job-card-3">
+      <div class="left-side-tile-item-2">
+        <a data-id="company-title" href="/company/acme"><span>Acme Corp</span></a>
+      </div>
+      <h2><a data-id="job-card-title" data-alias="/job/chief-information-officer/99999999" href="/job/z">Chief Information Officer</a></h2>
+      <div class="bounded-attribute-section">
+        <span class="font-barlow text-gray-04">Hybrid</span>
+        <span class="font-barlow text-gray-04">Chicago, IL, USA</span>
+      </div>
+    </div>
+    """
     monkeypatch.setattr(boards.requests, "get", lambda url, params=None, headers=None, timeout=None: _FakeResponse(_built_in_page(_BUILT_IN_CARD_WITH_SALARY)))
     job1 = boards.fetch_built_in_jobs("CIO")[0]
+    monkeypatch.setattr(boards.requests, "get", lambda url, params=None, headers=None, timeout=None: _FakeResponse(same_posting_different_href))
     job2 = boards.fetch_built_in_jobs("CIO")[0]
     assert job1["job_id"] == job2["job_id"]
+    assert job1["posting_url"] != job2["posting_url"]  # links can differ, id must not
 
 
 def test_fetch_built_in_jobs_respects_limit(monkeypatch):

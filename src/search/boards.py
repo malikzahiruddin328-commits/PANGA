@@ -267,7 +267,19 @@ def fetch_built_in_jobs(keyword: str, limit: int = 25) -> list[dict]:
     Built In actually has that data - a card missing salary just has one
     fewer span, not an empty placeholder (confirmed live across 25 real
     cards). Salary is identified by pattern-matching for a "NNNK" shape
-    rather than trusting a fixed index, since its position shifts."""
+    rather than trusting a fixed index, since its position shifts.
+
+    job_id is content-based (_stable_job_id()), NOT the raw href/data-alias
+    - a real gap caught by Mirror's audit 2026-08-08 (this function shipped
+    in the same commit as fetch_simplyhired_jobs(), which got this fix and
+    its disclosure; this one didn't, no note explaining why - it wasn't a
+    deliberate exception, just missed). Confirmed live in production data:
+    one real duplicate already existed ("Audit Project Manager - CIO" at US
+    Bank under two different /job/.../<id> hrefs, 9932864 vs 10508582) -
+    Built In's own "Reposted" labeling suggests a repost can get a genuinely
+    new numeric ID, same failure mode as Indeed/ZipRecruiter/Dice's MCP
+    path. posting_url/apply_url still use the real href, same "id is
+    stable, link is whatever's live today" split used everywhere else."""
     response = requests.get(
         "https://builtin.com/jobs", params={"search": keyword}, headers=HEADERS, timeout=20,
     )
@@ -293,13 +305,15 @@ def fetch_built_in_jobs(keyword: str, limit: int = 25) -> list[dict]:
                 pay_max = str(int(nums[1]) * 1000) if len(nums) > 1 else pay_min
                 break
 
-        job_id = title_link.get("data-alias") or title_link.get("href")
-        posting_url = f"https://builtin.com{job_id}" if job_id and job_id.startswith("/") else job_id
+        href = title_link.get("data-alias") or title_link.get("href")
+        posting_url = f"https://builtin.com{href}" if href and href.startswith("/") else href
+        title = title_link.get_text(strip=True)
+        organization = company_el.get_text(strip=True) if company_el else None
         jobs.append({
             "source": "Built In",
-            "job_id": job_id,
-            "title": title_link.get_text(strip=True),
-            "organization": company_el.get_text(strip=True) if company_el else None,
+            "job_id": _stable_job_id("Built In", title, organization, location),
+            "title": title,
+            "organization": organization,
             "location": location,
             "pay_min": pay_min,
             "pay_max": pay_max,
