@@ -3455,8 +3455,8 @@ elif active_tab == "prospector":
 
     st.header("Prospector")
     st.markdown(
-        "Companies worth watching before they've posted a role, outreach logging, coverage/"
-        "activity/outcome numbers, and cross-cutting insights (PRD §16/§17) from your job search."
+        "Watch companies before they post a role, log outreach, track your "
+        "coverage and results, and see what's actually working."
     )
 
     settings = load_settings()
@@ -3773,7 +3773,7 @@ elif active_tab == "prospector":
     st.subheader("Insights (Learn Engine)")
     st.markdown(
         "Cross-cutting feedback loop over every prediction Panga makes - scoring, target-account "
-        "qualification, outreach channel, strategy tags, interview outcomes (PRD §17). "
+        "qualification, outreach channel, strategy tags, interview outcomes. "
         "Recommend-only, always - it never changes a score threshold or any setting on its own."
     )
     learn_result = st.session_state.get("learn_engine_result")
@@ -3978,7 +3978,7 @@ elif active_tab == "prep":
                 OUTCOME_OPTIONS = ["not yet", "went well", "went okay", "went poorly"]
                 current_outcome = round_.get("outcome") or "not yet"
                 new_outcome = st.selectbox(
-                    "How did it go? (PRD §17 - feeds the Learn Engine)", OUTCOME_OPTIONS,
+                    "How did it go? (feeds the Learn Engine)", OUTCOME_OPTIONS,
                     index=OUTCOME_OPTIONS.index(current_outcome) if current_outcome in OUTCOME_OPTIONS else 0,
                     key=f"outcome_{record['source']}_{record['job_id']}_{round_['round_label']}",
                 )
