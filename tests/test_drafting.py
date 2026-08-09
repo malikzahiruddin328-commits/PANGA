@@ -8,6 +8,7 @@ from tailoring.drafting import (
     _merge_keyword_gap_questions,
     _questions_worth_asking,
     _resume_schema,
+    _strip_degree_in_prefix_keywords,
     _strip_rank_prefixes,
     _suggested_answer_for_keyword_gap,
     analyze_fit_before_drafting,
@@ -42,6 +43,76 @@ def test_ats_keywords_prompt_explains_either_or_group_extraction():
     assert "any_of" in ATS_KEYWORDS_SYSTEM_PROMPT
     assert "Either/or qualification groups" in ATS_KEYWORDS_SYSTEM_PROMPT
     assert "Master's degree, OR Bachelor's degree" in ATS_KEYWORDS_SYSTEM_PROMPT
+
+
+def test_ats_keywords_prompt_explains_degree_field_lists():
+    # Real gap Zahir hit live 2026-08-09 (Upstream Bio posting): "Bachelor's
+    # degree in Information Technology, Computer Science, Engineering, or
+    # a related field required" was extracted as 4 separate flat required
+    # keywords instead of one any_of group for the field list - he was
+    # dinged for missing "Computer Science" despite matching Information
+    # Technology and Engineering, which the posting itself treats as
+    # interchangeable.
+    assert "Degree-field lists" in ATS_KEYWORDS_SYSTEM_PROMPT
+    assert "Information Technology, Computer Science, Engineering, or a related field" in ATS_KEYWORDS_SYSTEM_PROMPT
+    assert "a related field" in ATS_KEYWORDS_SYSTEM_PROMPT
+
+
+def test_strip_degree_in_prefix_canonicalizes_a_bundled_flat_keyword():
+    # Deterministic backstop for the rule above, same "backstop, not just
+    # an instruction" bar as every other keyword-extraction fix this week:
+    # even if the model still bundles the phrase despite the prompt's
+    # instruction to keep it atomic, this canonicalizes it down to just
+    # the field name before scoring ever sees it.
+    assert _strip_degree_in_prefix_keywords(["Bachelor's degree in Computer Science"]) == ["Computer Science"]
+    assert _strip_degree_in_prefix_keywords(["Master's in Data Science"]) == ["Data Science"]
+    assert _strip_degree_in_prefix_keywords(["PhD in Chemistry"]) == ["Chemistry"]
+
+
+def test_strip_degree_in_prefix_canonicalizes_any_of_members():
+    keywords = [{"any_of": ["Bachelor's degree in Information Technology", "Bachelor's degree in Computer Science"]}]
+    assert _strip_degree_in_prefix_keywords(keywords) == [{"any_of": ["Information Technology", "Computer Science"]}]
+
+
+def test_strip_degree_in_prefix_leaves_unrelated_keywords_untouched():
+    assert _strip_degree_in_prefix_keywords(["Python", "AWS", "Bachelor's degree"]) == ["Python", "AWS", "Bachelor's degree"]
+
+
+def test_strip_degree_in_prefix_only_matches_at_the_start():
+    # A field that happens to contain "degree" or "in" elsewhere must not
+    # be mangled - only a genuine leading degree-level prefix is stripped.
+    assert _strip_degree_in_prefix_keywords(["Degree Auditing Systems"]) == ["Degree Auditing Systems"]
+
+
+def test_degree_field_group_fix_matches_the_real_upstream_bio_posting_score():
+    # Live-verified, real regression: this job's stored resume_text
+    # literally contains "Information Technology" and "Engineering" but
+    # not "Computer Science" - before this fix, the 4 flat degree-related
+    # keywords scored "Computer Science" as a real missing gap (1.9 pts)
+    # even though the posting itself says any of the three fields
+    # satisfies the requirement. Simulates the CORRECTED extraction shape
+    # (the actual live AI call can't be re-run from this environment - no
+    # API key here - so this locks in the deterministic scoring side,
+    # which is what this fix can actually guarantee) against the real
+    # resume text pulled from production data.
+    from tailoring.ats_score import score_resume_against_keywords
+
+    resume_text = (
+        "PROFESSIONAL EXPERIENCE\nLed enterprise Information Technology strategy.\n"
+        "Engineering background in systems architecture.\n"
+        "EDUCATION\nBachelor's degree\n"
+    )
+    old_required = ["Bachelor's degree", "Information Technology", "Computer Science", "Engineering"]
+    old_result = score_resume_against_keywords(old_required, [], resume_text)
+    assert "Computer Science" in [m["label"] for m in old_result["missing_required_keywords"]]
+
+    new_required = [
+        "Bachelor's degree",
+        {"any_of": ["Information Technology", "Computer Science", "Engineering"]},
+    ]
+    new_result = score_resume_against_keywords(new_required, [], resume_text)
+    assert "Computer Science" not in [m["label"] for m in new_result["missing_required_keywords"]]
+    assert new_result["ats_score"] > old_result["ats_score"]
 
 
 def test_resume_spec_explains_the_hedged_unconfirmed_claim_exception():

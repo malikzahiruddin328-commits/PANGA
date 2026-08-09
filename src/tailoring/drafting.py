@@ -373,7 +373,9 @@ Do NOT extract these three categories - a real gap caught live 2026-08-07: a can
 - Alternate-title lists. When a posting lists acceptable prior job titles (e.g. "IT director, solutions architect, technology consultant, or similar role"), that's the posting describing what kind of role the candidate should have held - not separate skills each needing individual proof. Do NOT extract "IT director", "solutions architect", or "technology consultant" as individual keywords from a title-list phrase like this.
 - Generic soft-skill/leadership phrases with no single checkable term. e.g. do NOT extract "executive presence", "presentation", "c-suite stakeholders", "strong communication skills", "executive technology strategies" - these are vague qualities almost any senior resume already demonstrates narratively; there's no literal fact to add for them.
 
-Either/or qualification groups (score-first-resume-flow spec, item 2): a JD often phrases a requirement as a substitutable alternative - e.g. "Master's degree, OR Bachelor's degree plus 8+ years of experience," or "PMP certification or equivalent project management experience." Extract this as ONE item shaped {"any_of": [alternative1, alternative2, ...]} instead of flat independent keywords for each side - a candidate who satisfies either alternative has satisfied the whole requirement, and extracting the alternatives as separate flat keywords would falsely flag a real, satisfied requirement as a missing gap the moment the candidate takes the other branch. Each alternative in any_of MUST be a single, atomic, short (1-4 word) term in the posting's own wording, same as any other keyword - e.g. "Bachelor's degree", not "Associate's or Bachelor's Degree". If one side of the posting's own either/or itself lists multiple sub-options (e.g. "Associate's or Bachelor's Degree plus experience"), split those into separate atomic members of any_of too (e.g. "Associate's degree", "Bachelor's degree") rather than bundling them into one combined alternative string - a bundled alternative can't be matched against a candidate's real, differently-worded resume text downstream. Only use this shape when the posting genuinely states an "or"/substitutable relationship between two or more concrete alternatives - not for an ordinary list of several required skills, which stays flat."""
+Either/or qualification groups (score-first-resume-flow spec, item 2): a JD often phrases a requirement as a substitutable alternative - e.g. "Master's degree, OR Bachelor's degree plus 8+ years of experience," or "PMP certification or equivalent project management experience." Extract this as ONE item shaped {"any_of": [alternative1, alternative2, ...]} instead of flat independent keywords for each side - a candidate who satisfies either alternative has satisfied the whole requirement, and extracting the alternatives as separate flat keywords would falsely flag a real, satisfied requirement as a missing gap the moment the candidate takes the other branch. Each alternative in any_of MUST be a single, atomic, short (1-4 word) term in the posting's own wording, same as any other keyword - e.g. "Bachelor's degree", not "Associate's or Bachelor's Degree". If one side of the posting's own either/or itself lists multiple sub-options (e.g. "Associate's or Bachelor's Degree plus experience"), split those into separate atomic members of any_of too (e.g. "Associate's degree", "Bachelor's degree") rather than bundling them into one combined alternative string - a bundled alternative can't be matched against a candidate's real, differently-worded resume text downstream. Only use this shape when the posting genuinely states an "or"/substitutable relationship between two or more concrete alternatives - not for an ordinary list of several required skills, which stays flat.
+
+Degree-field lists (a different shape from the either/or above, real gap caught live 2026-08-09 on a real posting): a JD often states one degree LEVEL, then lists several acceptable FIELDS of study for it, sometimes closed with an open-ended "or a related field" - e.g. "Bachelor's degree in Information Technology, Computer Science, Engineering, or a related field required." Here the degree level ("Bachelor's degree") is its own separate, ordinary required keyword, extracted normally - but the list of fields is a SEPARATE any_of group of its own, e.g. {"any_of": ["Information Technology", "Computer Science", "Engineering"]}, satisfied if the candidate's resume shows a degree in ANY ONE of the named fields. Do NOT extract each named field as its own independent flat required keyword - a candidate whose real field is Engineering must never be separately dinged for not also holding Computer Science, when the posting itself already treats them as interchangeable. Use the field name alone as each alternative (e.g. "Computer Science"), never the full "Bachelor's degree in Computer Science" phrase - a candidate's resume states a field ("B.S. Computer Science", "Computer Science") without ever literally repeating "degree in", so a bundled alternative would never match real resume wording, same reasoning as the either/or rule above. Do NOT add "a related field" itself as a literal alternative - it is an open-ended catch-all with no fixed term to ever match against real text, not a real keyword; leave it unextracted rather than fabricating a literal match for a field the posting never actually named."""
 
 
 # Deterministic backstop for the years-of-experience category above - a
@@ -449,6 +451,40 @@ def _drop_generic_soft_skill_keywords(keywords: list) -> list:
         k for k in keywords
         if not (isinstance(k, str) and normalize_skill_label(k) in _GENERIC_SOFT_SKILL_PHRASES)
     ]
+
+
+# Deterministic backstop for the degree-field-list rule above (2026-08-09,
+# real gap caught live on a real posting): even though the prompt tells
+# the model to keep each any_of alternative to the bare field name (e.g.
+# "Computer Science", not "Bachelor's degree in Computer Science" - a
+# bundled phrase like that would never match a real resume, which states
+# a field without ever literally repeating "degree in"), prompt
+# compliance alone isn't trusted for this (same "backstop, not just an
+# instruction" bar as every other keyword-extraction fix this week).
+# Strips a leading "<degree level> [degree] in " prefix from every flat
+# keyword and every any_of member, so even a bundled phrase the model
+# still emits gets canonicalized down to just the field name before
+# scoring ever sees it.
+_DEGREE_IN_PREFIX_RE = re.compile(
+    r"^(?:bachelor'?s?|master'?s?|associate'?s?|doctoral|doctorate|ph\.?d\.?)\s*(?:degree\s+)?in\s+",
+    re.IGNORECASE,
+)
+
+
+def _strip_degree_in_prefix(term: str) -> str:
+    return _DEGREE_IN_PREFIX_RE.sub("", term.strip()).strip()
+
+
+def _strip_degree_in_prefix_keywords(keywords: list) -> list:
+    result = []
+    for k in keywords:
+        if isinstance(k, str):
+            result.append(_strip_degree_in_prefix(k))
+        elif isinstance(k, dict) and k.get("any_of"):
+            result.append({"any_of": [_strip_degree_in_prefix(str(m)) for m in k["any_of"]]})
+        else:
+            result.append(k)
+    return result
 
 
 # Anthropic's structured-output schema rejects "oneOf" (confirmed live,
@@ -540,8 +576,8 @@ def _extract_ats_keywords(client: "anthropic.Anthropic", job: dict, model: str |
     except (DraftingNotConfigured, DraftingFailed):
         return [], []
 
-    required = _drop_generic_soft_skill_keywords(_drop_years_experience_keywords(data.get("required_keywords") or []))
-    preferred = _drop_generic_soft_skill_keywords(_drop_years_experience_keywords(data.get("preferred_keywords") or []))
+    required = _strip_degree_in_prefix_keywords(_drop_generic_soft_skill_keywords(_drop_years_experience_keywords(data.get("required_keywords") or [])))
+    preferred = _strip_degree_in_prefix_keywords(_drop_generic_soft_skill_keywords(_drop_years_experience_keywords(data.get("preferred_keywords") or [])))
 
     from search.job_store import update_job_ats_keywords
 
