@@ -517,5 +517,39 @@ def score_resume_against_keywords(
         "ats_rationale": rationale,
         "ats_next_actions": next_actions[:6],
         "missing_required_keywords": missing_required,
+        "missing_preferred_keywords": missing_preferred,
         "plateau_note": _plateau_note(missing_required, matched_group_explanations),
     }
+
+
+def detect_matched_keyword_regressions(
+    required_keywords: list, preferred_keywords: list, old_resume_text: str | None, new_resume_text: str,
+) -> list[str]:
+    """Real, live-reproduced instance of CLAUDE.md's known failure pattern
+    #2 (2026-08-09): every regenerate is a full rewrite of the resume
+    text, so there is no guarantee a keyword the PREVIOUS draft matched
+    survives into the new one - even when the new draft is objectively an
+    improvement overall. Confirmed live on a real job (Upstream Bio):
+    Zahir answered a gap question and clicked Generate; the net ATS score
+    stayed flat (27/30 required both times) because the regenerate fixed
+    "Engineering" while silently dropping a previously-present "life
+    sciences" mention - a real regression completely invisible from the
+    net score alone, which is exactly why net-score-only comparisons
+    (like check_regenerate_impact's estimate) can't be the only signal.
+
+    Returns the labels of any required/preferred keyword that WAS matched
+    in old_resume_text and is NOT matched in new_resume_text - i.e. a
+    keyword this rewrite specifically lost, not just one it never had.
+    Deterministic text comparison, not an AI self-assessment (same
+    "backstop, not a prompt" philosophy as every other keyword check in
+    this module) - reuses this module's own scoring arithmetic on both
+    texts rather than a separate diff heuristic. Returns [] when there's
+    no prior text to compare against (a first-ever draft can't regress
+    anything)."""
+    if not old_resume_text:
+        return []
+    old_result = score_resume_against_keywords(required_keywords, preferred_keywords, old_resume_text)
+    new_result = score_resume_against_keywords(required_keywords, preferred_keywords, new_resume_text)
+    old_missing = {m["label"] for m in old_result["missing_required_keywords"] + old_result["missing_preferred_keywords"]}
+    new_missing = {m["label"] for m in new_result["missing_required_keywords"] + new_result["missing_preferred_keywords"]}
+    return sorted(new_missing - old_missing)

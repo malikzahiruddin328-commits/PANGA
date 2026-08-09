@@ -79,6 +79,7 @@ from tailoring.applications import load_applications, upsert_application, get_ap
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
 from tailoring.interview_prep import load_interview_prep, get_interview_prep, record_round_outcome, build_prep_context, generate_prep, start_round, save_round
 from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
+from tailoring.ats_score import detect_matched_keyword_regressions
 from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed, analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_impact as _check_regenerate_impact
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
 from prospector.rejection_diagnosis import gather_diagnosis_input, diagnose
@@ -625,7 +626,18 @@ def regenerate_resume_and_persist(job: dict, on_progress, success_message: str) 
     on success (success_message gets `.format(score=...)` applied); on
     failure shows the error via st.error and returns None - the caller is
     still responsible for creating/clearing its own progress bar, since
-    that UI differs slightly between callers."""
+    that UI differs slightly between callers.
+
+    Also runs detect_matched_keyword_regressions() (2026-08-09, real bug
+    live-reproduced on the Upstream Bio job - CLAUDE.md known failure
+    pattern #2) against the PRE-regenerate resume_text: every regenerate
+    is a full rewrite, so a keyword the old draft matched can silently
+    fail to survive even when the net ATS score looks flat or improved
+    (that job's regenerate fixed "Engineering" while dropping "life
+    sciences" - 27/30 both times, invisible unless the two keyword sets
+    are actually diffed). Read BEFORE generate_documents() overwrites
+    anything, since afterward the old text is gone."""
+    old_resume_text = (get_application(job["source"], job["job_id"]) or {}).get("resume_text")
     try:
         regen = generate_documents(job, load_profile(), ["resume"], on_progress=on_progress)
     except (DraftingNotConfigured, DraftingFailed) as exc:
@@ -652,6 +664,18 @@ def regenerate_resume_and_persist(job: dict, on_progress, success_message: str) 
     # first-ever draft.
     st.session_state[f"just_drafted_resume_{job['source']}_{job['job_id']}"] = True
     st.toast(success_message.format(score=new_resume["ats_score"]), icon=":material/check_circle:")
+    regressions = detect_matched_keyword_regressions(
+        job.get("ats_required_keywords") or [], job.get("ats_preferred_keywords") or [],
+        old_resume_text, new_resume["text"],
+    )
+    if regressions:
+        st.warning(
+            "This rewrite may have traded matches: it no longer covers "
+            + ", ".join(f'"{label}"' for label in regressions) +
+            " even though the last draft did - full rewrites don't "
+            "guarantee an earlier match survives. Worth checking the new text.",
+            icon=":material/warning:",
+        )
     return new_resume
 
 
