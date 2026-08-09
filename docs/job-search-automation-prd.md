@@ -524,6 +524,40 @@ companies, all `watching` (single signal type each, as expected this
 early). Verified live in the running Streamlit session - Target accounts
 table renders with no console errors.
 
+**Real gap found live 2026-08-09 (Zahir recomputed the Prospector Score,
+which happened to mention it in that run's "how to raise it" text - not
+a reliable mechanism, see below):** sticky manual statuses (above) mean
+`disqualified` never silently changes on its own, but sticky isn't the
+same as invisible - three real accounts (UCB Pharma, BAUSCH, BeOne
+Medicines USA) were disqualified for good reasons at the time (a stale
+trial, an already-approved-drug signal), then each later picked up a real
+job posting - BeOne's is now an application under review - with nothing
+ever surfacing that mismatch back to Zahir. Fixed with
+`target_accounts.find_disqualified_with_new_activity(jobs, applications)`:
+a deterministic, zero-cost cross-reference (same normalize-and-substring
+match as `commercial_hiring.py`/`connections.py`) that flags any
+disqualified account with a real posting that wasn't part of the evidence
+that originally disqualified it - doesn't change status (manual stays
+manual), just surfaces it. Rendered as an always-visible warning box on
+the Prospector tab, above the Target accounts table, deliberately not
+gated behind "Compute Prospector Score" - a hard fact like this shouldn't
+depend on the LLM's reasoning happening to mention it that particular run
+(the same "AI output checked by a literal rule needs a code-level
+backstop" lesson as elsewhere in this project, applied to AI *surfacing*
+a fact rather than checking one). **The subtlety that made this non-trivial:**
+a naive company-name match alone re-flags a company forever on the exact
+posting that got it disqualified in the first place - found live via a
+real false positive ("Securitas", disqualified as a wrong-industry title-
+keyword coincidence, see commercial_hiring.py) before the fix excluded it.
+The real fix: only count a matching job as new evidence if its ref isn't
+already one of the account's own existing signal refs. Regression-tested
+(synthetic: new-evidence flagged, already-known-ref excluded, non-
+disqualified accounts excluded, empty input) and against real data (all 3
+real examples flagged correctly including BeOne's "under review"
+application; Securitas correctly excluded). Live-verified in an isolated
+Streamlit instance (port 8505) - warning box renders with the exact
+expected content, stopped cleanly after.
+
 ### 16b. Outreach (new funnel stage)
 
 New data model, `outreach`, linked to *either* a `job_id` or a
