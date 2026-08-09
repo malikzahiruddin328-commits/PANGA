@@ -80,7 +80,7 @@ from tailoring.cta_emails import get_active_cta_emails, request_archive, request
 from tailoring.interview_prep import load_interview_prep, get_interview_prep, record_round_outcome, build_prep_context, generate_prep, start_round, save_round
 from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
 from tailoring.ats_score import detect_matched_keyword_regressions
-from tailoring.unconfirmed_claims import find_unconfirmed_markers
+from tailoring.unconfirmed_claims import find_unconfirmed_markers, resolve_unconfirmed_claim
 from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed, analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_impact as _check_regenerate_impact, request_additional_gap_questions as _request_additional_gap_questions
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
 from prospector.rejection_diagnosis import gather_diagnosis_input, diagnose
@@ -1028,6 +1028,113 @@ def _confirm_regenerate_dialog(job: dict, cost_info: dict) -> None:
         if st.button("Cancel", key="regen_confirm_cancel"):
             st.session_state.pop("regen_confirm_pending", None)
             st.rerun()
+
+
+_UNCONFIRMED_FIELD_LABELS = {
+    "resume_text": "Resume",
+    "cover_letter_text": "Cover letter",
+    "exec_bio_text": "Executive bio",
+    "leadership_summary_text": "Leadership summary",
+}
+_UNCONFIRMED_FIELD_TO_DOC_KEY = {
+    "resume_text": "resume",
+    "cover_letter_text": "cover_letter",
+    "exec_bio_text": "exec_bio",
+    "leadership_summary_text": "leadership_summary",
+}
+
+
+def _persist_resolved_claim(job: dict, app_record: dict, result: dict) -> None:
+    """Shared save step once a single claim is resolved (either action
+    below): persists resolve_unconfirmed_claim()'s {field: new_text} into
+    applications.json - explicitly preserving the job's CURRENT status
+    (upsert_application's `status` param is unconditional, not a "leave
+    unchanged if omitted" field like every other param here - passing a
+    hardcoded status, the way the regenerate flow does, would silently
+    reset an already-"applied"/"interview scheduled" job back to "under
+    review" just from resolving a claim found later in a different
+    field). For a document field (not apply_answers, which
+    sync_workspace_documents() deliberately never touches - see its own
+    docstring), also re-syncs the workspace .docx through the exact same
+    real-filename-vs-*-DRAFT-UNCONFIRMED logic every other doc write
+    already goes through - resolving the LAST claim left in a field is
+    what turns a stray draft file back into the real one."""
+    upsert_application(job["source"], job["job_id"], status=app_record.get("status"), **result)
+    for field, new_text in result.items():
+        doc_key = _UNCONFIRMED_FIELD_TO_DOC_KEY.get(field)
+        if doc_key:
+            sync_workspace_documents(
+                job["source"], job["job_id"], [doc_key],
+                {doc_key: new_text}, load_profile(), job,
+            )
+
+
+def render_unconfirmed_claims_section(job: dict, app_record: dict) -> None:
+    """Review/resolve panel for tailoring.unconfirmed_claims.
+    find_unconfirmed_markers() - the one place a hedged "?" guess the AI
+    wrote into a document gets turned into a real, confirmed fact, one
+    claim at a time. Recomputes the flagged list fresh on every render
+    (same "never trust a stale snapshot" rule find_unconfirmed_markers
+    itself follows), so a claim resolved this run simply stops appearing
+    on the very next one - no separate "mark resolved" bookkeeping needed.
+    Renders nothing when the list is empty. Placed at the very top of a
+    job's detail view (before "Documents for this application") so it's
+    the first thing seen, not something buried below the fold - the hard
+    gates elsewhere (Apply Assist packet, "applied" status, the real
+    .docx filename) all point back here as the fix, so this needs to be
+    easy to find, not just reachable."""
+    unresolved = find_unconfirmed_markers(app_record)
+    if not unresolved:
+        return
+
+    job_key = f"{job.get('source')}_{job.get('job_id')}"
+    with st.container(border=True):
+        plural = "s" if len(unresolved) != 1 else ""
+        st.markdown(
+            f"**:material/help: {len(unresolved)} unconfirmed claim{plural} to resolve** - "
+            "the AI wrote these into your documents as plausible guesses. Confirm "
+            "each one as true, or restate it as a fact. Until then, the Apply "
+            "Assist packet stays blocked and this job can't be marked \"applied\"."
+        )
+        for idx, claim in enumerate(unresolved):
+            field = claim["field"]
+            if field.startswith("apply_answers:"):
+                label = f"Apply Assist: {field.split(':', 1)[1]}"
+            else:
+                label = _UNCONFIRMED_FIELD_LABELS.get(field, field)
+            claim_id = abs(hash(field + claim["line"])) % 10_000_000
+            claim_key = f"unconfirmedclaim_{job_key}_{idx}_{claim_id}"
+
+            with st.container(border=True):
+                skill_note = f" ({claim['skill']})" if claim.get("skill") else ""
+                st.markdown(f"*{label}{skill_note}*")
+                st.markdown(f"> {claim['line']}")
+
+                edit_key = f"{claim_key}_edittext"
+                new_text = st.text_input(
+                    "Restate as a confirmed fact (or leave as-is and click Confirm if the guess is correct)",
+                    value=claim["line"].rstrip("?").rstrip(),
+                    key=edit_key,
+                )
+
+                confirm_col, save_col = st.columns(2)
+                with confirm_col:
+                    if st.button("Confirm as true", key=f"{claim_key}_confirm"):
+                        result = resolve_unconfirmed_claim(job, app_record, claim, action="confirm")
+                        _persist_resolved_claim(job, app_record, result)
+                        st.toast("Confirmed.", icon=":material/check_circle:")
+                        st.rerun()
+                with save_col:
+                    if st.button("Save as edited", key=f"{claim_key}_save"):
+                        if not new_text.strip():
+                            st.toast("Type the confirmed fact first.", icon=":material/warning:")
+                        elif "?" in new_text:
+                            st.toast("Remove the \"?\" - this box is for stating it as a fact, not another guess.", icon=":material/warning:")
+                        else:
+                            result = resolve_unconfirmed_claim(job, app_record, claim, action="edit", new_text=new_text)
+                            _persist_resolved_claim(job, app_record, result)
+                            st.toast("Saved.", icon=":material/check_circle:")
+                            st.rerun()
 
 
 def render_analyze_fit_section(job: dict, app_record: dict, analysis: dict | None = None, show_generate_actions: bool = True) -> None:
@@ -3128,6 +3235,8 @@ elif active_tab == "results":
                 app_record = get_application(job.get("source"), job.get("job_id")) or {}
                 requested = app_record.get("documents_requested") or []
                 status = app_record.get("status")
+
+                render_unconfirmed_claims_section(job, app_record)
 
                 # Only shown before a resume exists for this job (same
                 # "resume_ats_score is not None" condition the post-hoc
