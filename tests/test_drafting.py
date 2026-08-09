@@ -7,6 +7,7 @@ from tailoring.drafting import (
     _questions_worth_asking,
     _strip_rank_prefixes,
     _suggested_answer_for_keyword_gap,
+    analyze_fit_before_drafting,
     check_regenerate_impact,
     save_gap_answers,
 )
@@ -251,7 +252,13 @@ def test_merge_keyword_gap_questions_dedupes_against_existing_question_by_skill(
     # The AI already asked about this same skill in its own words - must
     # not show up twice under two different phrasings.
     assert len(merged) == 1
-    assert merged[0] is existing[0]
+    assert merged[0]["skill"] == existing[0]["skill"]
+    # Also gets the real point_value backfilled since it genuinely
+    # corresponds to a missing required keyword - a second, deliberate
+    # effect of the same skills_match lookup, not left blank just because
+    # this question came from the AI's own wording rather than a
+    # synthesized missing_required_keywords entry.
+    assert merged[0]["point_value"] == 5.0
 
 
 def test_merge_keyword_gap_questions_does_not_bare_substring_false_match():
@@ -305,6 +312,51 @@ def test_merge_keyword_gap_questions_previously_answered_dedup_is_case_insensiti
 def test_merge_keyword_gap_questions_still_asks_about_a_different_unanswered_skill():
     merged = _merge_keyword_gap_questions([], _missing("Databricks", "Terraform"), previously_answered_skills=["Databricks"])
     assert {q["skill"] for q in merged} == {"Terraform"}
+
+
+def test_merge_keyword_gap_questions_backfills_point_value_on_a_free_form_ai_question():
+    # Real gap General caught Zahir hit live 2026-08-09: the AI's own
+    # free-form clarifying_questions (from the same drafting call as the
+    # resume text) never carried a point_value at all, so the UI's badge
+    # silently never rendered for them - only questions synthesized from
+    # missing_required_keywords got one. When a free-form question's
+    # "skill" genuinely corresponds to a missing required/preferred
+    # keyword the deterministic scorer already knows the value of, that
+    # real number should get attached, not left blank.
+    existing = [{"type": "skill_gap", "skill": "Databricks", "question": "?", "suggested_answer": ""}]
+    merged = _merge_keyword_gap_questions(existing, _missing("Databricks"))
+    assert len(merged) == 1
+    assert merged[0]["point_value"] == 5.0
+
+
+def test_merge_keyword_gap_questions_backfill_checks_preferred_keywords_too():
+    existing = [{"type": "skill_gap", "skill": "Kubernetes", "question": "?", "suggested_answer": ""}]
+    merged = _merge_keyword_gap_questions(
+        existing, [], missing_preferred_keywords=_missing("Kubernetes"),
+    )
+    assert merged[0]["point_value"] == 5.0
+
+
+def test_merge_keyword_gap_questions_leaves_point_value_none_with_no_matching_keyword():
+    # A genuinely free-standing fact (team size, budget) with no
+    # corresponding extracted keyword has no deterministic value to
+    # attach - stays None rather than a guess; the UI is expected to say
+    # so honestly (see test_results_tab_gap_questions.py) rather than
+    # silently rendering nothing.
+    existing = [{"type": "skill_gap", "skill": "SK Life Science team size", "question": "?", "suggested_answer": ""}]
+    merged = _merge_keyword_gap_questions(existing, _missing("Databricks"))
+    assert merged[0].get("point_value") is None
+
+
+def test_merge_keyword_gap_questions_does_not_overwrite_an_already_stored_point_value():
+    # A question synthesized from missing_required_keywords in an earlier
+    # draft already has its real point_value baked in when it's read back
+    # here as part of clarifying_questions on a later call - must not be
+    # clobbered by a fresh (possibly stale, if the score has since moved)
+    # backfill lookup.
+    existing = [{"type": "skill_gap", "skill": "Databricks", "question": "?", "suggested_answer": "", "point_value": 9.0}]
+    merged = _merge_keyword_gap_questions(existing, _missing("Databricks"))
+    assert merged[0]["point_value"] == 9.0
 
 
 def test_save_gap_answers_threads_the_question_text_through(isolated_data):
@@ -462,3 +514,74 @@ def test_check_regenerate_impact_treats_no_prior_draft_date_as_everything_new(is
     result = check_regenerate_impact(job, app_record, profile)
     assert result["has_new_info"] is True
     assert result["new_fact_count"] == 1
+
+
+def test_analyze_fit_before_drafting_score_does_not_move_with_no_new_answers():
+    # Baseline behavior, unchanged: with nothing confirmed since the last
+    # draft, "projected" is genuinely just the current drafted text's real
+    # score - it should NOT move on its own with no new information, same
+    # as before this fix.
+    from tailoring.ats_score import score_resume_against_keywords
+
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": ["Python", "Databricks"], "ats_preferred_keywords": []}
+    resume_text = "PROFESSIONAL EXPERIENCE\nEngineer.\n\nEDUCATION\nBS\n\nSKILLS\nPython"
+    app_record = {"resume_text": resume_text}
+    profile = {"gap_interview_answers": []}
+    baseline = score_resume_against_keywords(job["ats_required_keywords"], [], resume_text)
+
+    result = analyze_fit_before_drafting(job, profile, app_record)
+    assert result["projected_score"] == baseline["ats_score"]
+
+
+def test_analyze_fit_before_drafting_projects_a_confirmed_but_undrafted_answer():
+    # Real gap General caught Zahir hit live 2026-08-09: "Projected score"
+    # is supposed to be forward-looking, but a naive re-score of the SAME
+    # unchanged resume_text can never move no matter how many Step-1
+    # questions get answered - answering only saves the fact via
+    # save_gap_answers(), it never touches resume_text (only a real
+    # Generate does that). Once the candidate has genuinely confirmed a
+    # fact that closes a real keyword gap, the projection must fold that
+    # in as a hypothetical, using the SAME point_value arithmetic the
+    # deterministic scorer already computed - not a separate guess.
+    from tailoring.ats_score import score_resume_against_keywords
+
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": ["Python", "Databricks"], "ats_preferred_keywords": []}
+    resume_text = "PROFESSIONAL EXPERIENCE\nEngineer.\n\nEDUCATION\nBS\n\nSKILLS\nPython"
+    app_record = {"resume_text": resume_text}
+    profile = {"gap_interview_answers": [
+        {"skill": "Databricks", "date_captured": "2026-08-01", "answer": "Yes, 3 years."},
+    ]}
+    baseline = score_resume_against_keywords(job["ats_required_keywords"], [], resume_text)
+    databricks_point_value = baseline["missing_required_keywords"][0]["point_value"]
+
+    result = analyze_fit_before_drafting(job, profile, app_record)
+
+    assert result["projected_score"] > baseline["ats_score"]
+    assert result["projected_score"] == round(baseline["ats_score"] + databricks_point_value)
+    # The confirmed gap must not still be described as an open, real gap.
+    assert result["plateau_note"] is None or "Databricks" not in result["plateau_note"]
+    # And it must not still be asked about as an open question either.
+    assert not any(q.get("skill") == "Databricks" for q in result["open_questions"])
+
+
+def test_analyze_fit_before_drafting_projection_is_capped_at_100():
+    from tailoring.ats_score import score_resume_against_keywords
+
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": ["Databricks"], "ats_preferred_keywords": []}
+    resume_text = "PROFESSIONAL EXPERIENCE\nEngineer.\n\nEDUCATION\nBS"
+    app_record = {"resume_text": resume_text}
+    profile = {"gap_interview_answers": [{"skill": "Databricks", "date_captured": "2026-08-01"}]}
+
+    result = analyze_fit_before_drafting(job, profile, app_record)
+    assert result["projected_score"] <= 100
+
+
+def test_analyze_fit_before_drafting_plateau_note_still_names_a_genuinely_unanswered_gap():
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": ["Python", "Databricks"], "ats_preferred_keywords": []}
+    resume_text = "PROFESSIONAL EXPERIENCE\nEngineer.\n\nEDUCATION\nBS\n\nSKILLS\nPython"
+    app_record = {"resume_text": resume_text}
+    profile = {"gap_interview_answers": []}
+
+    result = analyze_fit_before_drafting(job, profile, app_record)
+    assert result["plateau_note"] is not None
+    assert "Databricks" in result["plateau_note"]
