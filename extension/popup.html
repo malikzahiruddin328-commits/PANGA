@@ -1,0 +1,55 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  body {
+    font-family: -apple-system, "Segoe UI", sans-serif;
+    width: 300px;
+    padding: 14px;
+    color: #1a1a1a;
+  }
+  h1 {
+    font-size: 14px;
+    margin: 0 0 10px;
+  }
+  #status {
+    font-size: 12px;
+    color: #555;
+    margin-bottom: 10px;
+  }
+  #job {
+    font-size: 12px;
+    font-weight: 600;
+    margin-bottom: 10px;
+  }
+  button {
+    width: 100%;
+    padding: 9px;
+    font-size: 13px;
+    cursor: pointer;
+    border: none;
+    border-radius: 4px;
+    background: #0a66c2;
+    color: white;
+  }
+  button:disabled {
+    background: #9bb8d3;
+    cursor: default;
+  }
+  #result {
+    font-size: 12px;
+    margin-top: 10px;
+    color: #333;
+  }
+</style>
+</head>
+<body>
+  <h1>Panga Job Capture</h1>
+  <div id="status">Checking this page...</div>
+  <div id="job"></div>
+  <button id="sendBtn" style="display: none">Send to Panga</button>
+  <div id="result"></div>
+  <script src="popup.js"></script>
+</body>
+</html>

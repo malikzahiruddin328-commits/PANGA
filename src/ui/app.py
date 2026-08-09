@@ -32,6 +32,9 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from debug_log import setup_debug_logging
 setup_debug_logging()
 
+import extension_bridge
+extension_bridge.start_server()
+
 
 def _find_bhangi_src(project_root: Path) -> Path | None:
     """Locate the sibling Bhangi checkout's src/ directory.
@@ -764,10 +767,42 @@ def render_paste_jd_prompt_before_drafting(job: dict) -> None:
     This is additive, not a replacement: the post-hoc render_paste_jd_prompt()
     stays in place too, so someone who already has a blind-drafted resume
     can still paste a JD there and get everything correctly redrafted."""
-    render_paste_jd_notice()
     job_key = f"{job.get('source')}_{job.get('job_id')}"
+
+    # Extension auto-fill (2026-08-08): matches the extension's last capture
+    # against THIS job's own posting_url (only LinkedIn/Dice jobs have one
+    # from add_manual_job()/the Dice scraper, so this is a no-op for every
+    # other source). Only ever seeds the text_area's initial value - nothing
+    # is saved/regenerated until the user clicks "Save job description"
+    # below, same as always, so there's no silent-overwrite risk even if the
+    # match is wrong. The capture's own timestamp is folded into the widget
+    # key (codemap's documented Streamlit gotcha: a bare key ignores a new
+    # value= once session_state already has that key) so a fresh capture for
+    # the same job actually replaces stale text instead of being ignored.
+    #
+    # Looked up BEFORE deciding whether to show render_paste_jd_notice()'s
+    # "we don't have this posting's full description yet" banner - Zahir
+    # caught this live 2026-08-09 (Tarkett CIO, real extension capture): with
+    # both always rendered, that banner sat directly above the auto-filled
+    # text and the "Auto-filled" badge, contradicting it ("we don't have it"
+    # right next to "here it is"). A real capture means we DO have it, so the
+    # "we don't have it" framing (and its "sites intentionally block
+    # automated access" explanation, which doesn't even apply here) no
+    # longer belongs on screen at all.
+    capture = extension_bridge.get_capture_for_url(job.get("posting_url"))
+    capture_ts = capture["ts"] if capture else "none"
+    if capture:
+        st.success(
+            f"Auto-filled from browser extension - {capture['source'].title() or 'LinkedIn/Dice'}"
+            + (f" ({capture['title']} at {capture['company']})" if capture.get("title") or capture.get("company") else ""),
+            icon=":material/extension:",
+        )
+    else:
+        render_paste_jd_notice()
+
     pasted_jd = st.text_area(
-        "Paste the job description", key=f"jd_paste_pre_{job_key}", height=120,
+        "Paste the job description", key=f"jd_paste_pre_{job_key}_{capture_ts}", height=120,
+        value=capture["description"] if capture else "",
         placeholder="Paste the full job posting text here...",
         label_visibility="collapsed",
     )
@@ -1373,6 +1408,17 @@ if pending_suggestions or outstanding_drafts:
                     st.rerun()
         if outstanding_drafts:
             st.markdown(f"{len(outstanding_drafts)} draft(s) created and waiting in Gmail for you to review and send - this clears itself once you send them.")
+
+# --- Browser extension status: always rendered, not just when something's
+# wrong - the whole point is Zahir should never have to guess/assume the
+# extension is running (Panga/CLAUDE.md's HCI standard). One compact line,
+# not a full alert box, since "extension is connected" is the common/quiet
+# case and shouldn't cost more vertical space than that. ---
+_ext_status = extension_bridge.get_heartbeat_status()
+if _ext_status["connected"]:
+    st.markdown(f":green[●] Browser extension connected - last check-in {int(_ext_status['seconds_ago'])}s ago")
+else:
+    st.markdown(":red[●] Browser extension not detected - paste job descriptions manually below")
 
 # --- Tab bar ---
 SIGNAL_TYPE_LABELS = {
