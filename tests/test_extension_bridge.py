@@ -1,13 +1,24 @@
 """Tests for extension_bridge.py's heartbeat/capture bridge (2026-08-09).
 
-Uses a dedicated test-only port (not the real default, 8765) so this suite
-never depends on - or interferes with - whatever else may already be
-listening on the real port (production, a dev instance, ...). Set BEFORE
-extension_bridge is imported, since start_server() only reads the env var
-once (the first, idempotent, call). See extension_bridge.py's own "TESTING
-GOTCHA" docstring note for why this matters - found live via exactly this
-collision (a manual verification pass briefly hit production) during this
-feature's own development.
+Uses PANGA_EXTENSION_BRIDGE_PORT="0" - an OS-assigned ephemeral port, not a
+hardcoded one - so this suite can NEVER collide with anything else, ever,
+regardless of what else happens to be running. This replaced an earlier
+version hardcoded to port 18765, after a REAL bug it caused: under
+`pytest -p randomly`, an orphaned process left over from an earlier
+interrupted test run was still listening on 18765; extension_bridge's own
+start_server() correctly detected the bind was taken and no-opped, but
+(a real gap in that function, fixed alongside this) `_server_started` was
+set True regardless of whether the bind actually succeeded, so this test
+process had no way to tell it wasn't talking to its own server - every
+POST silently landed in the STALE process's state instead of this one's,
+producing 5 confusing, order-dependent failures with no real thread-safety
+bug behind them. An ephemeral port makes the whole class of collision
+structurally impossible rather than just less likely - see
+extension_bridge.py's start_server()/get_bound_port() docstrings for the
+full account.
+
+Random-order hunting: `pytest -p randomly --randomly-seed=<N>` (plain
+`pytest` stays deterministic - see pyproject.toml's addopts).
 
 No isolated_data fixture needed (see tests/README.md) - this module has no
 on-disk store, its whole state is an in-memory dict guarded by a lock.
@@ -16,31 +27,47 @@ on-disk store, its whole state is an in-memory dict guarded by a lock.
 import os
 import time
 
-os.environ["PANGA_EXTENSION_BRIDGE_PORT"] = "18765"
+os.environ["PANGA_EXTENSION_BRIDGE_PORT"] = "0"
 
 import pytest
 import requests
 
 import extension_bridge
 
-BASE_URL = "http://127.0.0.1:18765"
+extension_bridge.start_server()
+_bound_port = extension_bridge.get_bound_port()
+if _bound_port is None:
+    # Should be structurally impossible (port 0 always finds a free port) -
+    # fail loud at collection time rather than let every test below
+    # silently misbehave the way the hardcoded-port version did.
+    raise RuntimeError(
+        "extension_bridge.start_server() did not bind an OS-assigned "
+        "ephemeral port (PANGA_EXTENSION_BRIDGE_PORT=0) - see "
+        "get_bound_port()'s docstring."
+    )
+BASE_URL = f"http://127.0.0.1:{_bound_port}"
+
+# start_server() binds synchronously (get_bound_port() is available the
+# moment it returns) but serve_forever() itself starts on a daemon thread -
+# give that thread a moment to actually be accepting connections before the
+# very first real test fires a request. One-time, at collection, not
+# per-test (the earlier version's per-test poll was needless overhead once
+# the server's been ready for a while).
+for _ in range(20):
+    try:
+        requests.options(BASE_URL + "/heartbeat", timeout=0.5)
+        break
+    except requests.ConnectionError:
+        time.sleep(0.1)
+else:
+    raise RuntimeError(f"extension_bridge's test server never became reachable at {BASE_URL}")
 
 
 @pytest.fixture(autouse=True)
-def _running_server_with_clean_state():
-    """Starts the bridge server once for the whole test session (module-
-    level globals mean a second start_server() call is a correct no-op, not
-    a fresh instance - see its own docstring), and resets in-memory state
-    before each test so tests can't see each other's heartbeats/captures."""
-    extension_bridge.start_server()
-    # start_server() is async (binds on a daemon thread) - give it a moment
-    # to actually be listening before the first test fires a real request.
-    for _ in range(20):
-        try:
-            requests.options(BASE_URL + "/heartbeat", timeout=0.5)
-            break
-        except requests.ConnectionError:
-            time.sleep(0.1)
+def _clean_state():
+    """Resets in-memory state before each test so tests can't see each
+    other's heartbeats/captures - the server itself (module-level globals,
+    see start_server()'s docstring) is started once above, not per-test."""
     with extension_bridge._lock:
         extension_bridge._state["last_heartbeat_ts"] = None
         extension_bridge._state["last_heartbeat_source"] = None

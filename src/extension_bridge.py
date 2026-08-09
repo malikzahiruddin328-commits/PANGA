@@ -60,6 +60,7 @@ _state = {
     "captures": {},  # normalized_url -> {title, company, description, source, url, ts}
 }
 _server_started = False
+_bound_port = None
 
 
 def _normalize_url(url: str) -> str:
@@ -159,8 +160,24 @@ def start_server() -> None:
     means this process runs without its own listener, and its status
     indicator will correctly show "not detected" rather than a heartbeat it
     never actually received itself. Runs the server on a daemon thread so
-    it never blocks Streamlit's own shutdown."""
-    global _server_started
+    it never blocks Streamlit's own shutdown.
+
+    PANGA_EXTENSION_BRIDGE_PORT="0" requests an OS-assigned ephemeral port
+    (standard socket behavior for port 0) instead of a fixed one - use
+    get_bound_port() afterward to find out which port was actually bound.
+    This is what this module's own test suite uses (see
+    tests/test_extension_bridge.py) - a hardcoded fixed test port turned
+    out to be a REAL bug found live 2026-08-09: under pytest-randomly, an
+    orphaned process from an earlier interrupted test run was still
+    listening on the hardcoded port, this function's bind silently failed
+    against it (correct, documented behavior above), but _server_started
+    still got set True - so a fresh test process had no way to tell it was
+    silently talking to a STALE process's state instead of its own,
+    producing 5 confusing, order-dependent failures that had nothing to do
+    with actual thread-safety inside this module. Binding to an
+    OS-assigned port per test process makes that whole class of collision
+    structurally impossible, rather than just harder to hit."""
+    global _server_started, _bound_port
     if _server_started:
         return
     _server_started = True
@@ -169,8 +186,20 @@ def start_server() -> None:
         server = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
     except OSError:
         return
+    _bound_port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True, name="panga-extension-bridge")
     thread.start()
+
+
+def get_bound_port() -> int | None:
+    """The port this process's own server actually bound, or None if it
+    never successfully bound one - either start_server() was never called,
+    or the bind failed (most likely another process already holds the
+    configured port; see that function's docstring). A caller that needs
+    to KNOW it's genuinely talking to ITS OWN in-process server (rather
+    than assuming PANGA_EXTENSION_BRIDGE_PORT unconditionally worked)
+    should check this instead of assuming."""
+    return _bound_port
 
 
 def get_heartbeat_status() -> dict:
