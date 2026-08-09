@@ -830,6 +830,24 @@ def _merge_keyword_gap_questions(
     keyword_gap_lookup = list(missing_required_keywords) + list(missing_preferred_keywords or [])
     merged = []
     for q in clarifying_questions:
+        # Real bug found live (2026-08-09, surfaced by app.py adding an
+        # st.rerun() right after save_gap_answers() - see that call site's
+        # comment): this loop passed every pre-existing clarifying_question
+        # through unconditionally, never checking previously_answered_skills
+        # - only the missing_required_keywords loop below did. That's the
+        # OPPOSITE of what render_answered_gap_questions's own docstring
+        # already claims ("_merge_keyword_gap_questions's profile-history
+        # check stop re-asking it") - a question stored on
+        # resume_clarifying_questions at draft time never actually dropped
+        # off just because it was genuinely answered afterward, only a full
+        # regenerate ever cleared it. Harmless before (the stale "still
+        # open" display just sat there until an unrelated rerun), but with
+        # the same skill re-appearing in open_questions every render, a
+        # fresh rerun right after saving re-renders the identical
+        # already-answered text_area, which still differs from its
+        # suggested_answer, saving and rerunning again forever.
+        if q.get("skill") and any(skills_match(q["skill"], s) for s in (previously_answered_skills or [])):
+            continue
         match = None
         if q.get("point_value") is None and q.get("skill"):
             match = next(

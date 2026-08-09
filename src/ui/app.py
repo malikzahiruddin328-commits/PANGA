@@ -1236,6 +1236,24 @@ def render_analyze_fit_section(job: dict, app_record: dict, analysis: dict | Non
                         "skill": q["skill"], "type": q["type"],
                         "answer": answer_value, "question": q["question"],
                     }])
+                    # Real gap Zahir hit live (2026-08-09): the save itself
+                    # genuinely worked (verified directly against his real
+                    # profile data), but the screen gave zero visible
+                    # confirmation either way - no toast, no checkmark,
+                    # nothing changed, so there was no way to tell "saved
+                    # silently" from "ignored" without checking the raw
+                    # data. Compounding it: `analysis`/open_questions is
+                    # computed once at the top of this function, before
+                    # this loop reaches the save above - without a rerun,
+                    # the just-answered question would still show as "open"
+                    # for one more render even though it's already safely
+                    # saved, since the text_area's own natural rerun-on-
+                    # commit already happened one step too early to reflect
+                    # this. st.toast (not st.success/st.info) since it's the
+                    # one that survives an immediate st.rerun() in this
+                    # codebase's established pattern.
+                    st.toast("Saved.", icon=":material/check_circle:")
+                    st.rerun()
 
 
 def render_answered_gap_questions() -> None:
