@@ -81,7 +81,7 @@ from tailoring.interview_prep import load_interview_prep, get_interview_prep, re
 from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
 from tailoring.ats_score import detect_matched_keyword_regressions
 from tailoring.unconfirmed_claims import find_unconfirmed_markers, resolve_unconfirmed_claim
-from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed, analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_impact as _check_regenerate_impact, request_additional_gap_questions as _request_additional_gap_questions
+from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed, analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_impact as _check_regenerate_impact, request_additional_gap_questions as _request_additional_gap_questions, reextract_ats_keywords_and_rescore as _reextract_ats_keywords_and_rescore, rescore_against_cached_keywords as _rescore_against_cached_keywords
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
 from prospector.rejection_diagnosis import gather_diagnosis_input, diagnose
 from prospector.target_accounts import load_target_accounts, set_status as set_target_account_status, set_website, load_website_lookup_cost, save_website_lookup_cost, find_disqualified_with_new_activity
@@ -3502,6 +3502,78 @@ elif active_tab == "results":
                                         )
                                         for action in next_actions:
                                             st.markdown(f"- {action}")
+                                    # Two separate re-check actions (2026-08-09), cheapest first -
+                                    # real case that showed both are needed: Zahir's Upstream Bio
+                                    # job's job-level keyword cache already had the corrected
+                                    # either/or degree-field group, but the STORED score (82) had
+                                    # never been recomputed to match it - a live check found the
+                                    # free rescore alone (no AI call) already fixed it (88, zero
+                                    # missing required keywords). "Re-extract keywords" (an actual
+                                    # AI call) stays available underneath for the rarer case where
+                                    # the cached list itself is still stale/buggy, not just the
+                                    # stored score. Neither redrafts the resume text itself -
+                                    # CLAUDE.md known failure pattern #2 (a full rewrite is its own
+                                    # separate regression risk neither of these needs to take).
+                                    recheck_row = st.container(horizontal=True)
+                                    with recheck_row:
+                                        if st.button(
+                                            "Refresh score", key=f"refreshscore_{job.get('source')}_{job.get('job_id')}",
+                                            help="Recomputes the ATS score from this job's already-"
+                                            "cached keyword list and the current resume text - free, "
+                                            "instant, no AI call. Fixes a stored score that's drifted "
+                                            "out of sync with the cached keywords.",
+                                        ):
+                                            refreshed = _rescore_against_cached_keywords(job, app_record, load_profile())
+                                            if refreshed["ats_score"] == current_score:
+                                                st.toast("Score already up to date with the cached keywords.", icon=":material/task_alt:")
+                                            else:
+                                                st.session_state[prev_score_key] = current_score
+                                                upsert_application(
+                                                    job["source"], job["job_id"], status=app_record.get("status", "under review"),
+                                                    resume_ats_score=refreshed["ats_score"],
+                                                    resume_ats_rationale=refreshed["ats_rationale"],
+                                                    resume_ats_next_actions=refreshed["ats_next_actions"],
+                                                    resume_clarifying_questions=refreshed["clarifying_questions"],
+                                                )
+                                                st.toast(
+                                                    f"Score refreshed - new ATS score {refreshed['ats_score']}/100.",
+                                                    icon=":material/check_circle:",
+                                                )
+                                                st.rerun()
+                                        if st.button(
+                                            "Re-extract keywords", key=f"recheckkw_{job.get('source')}_{job.get('job_id')}",
+                                            help="Re-extracts this job's required/preferred keyword "
+                                            "list from its own posting text (a real AI call) and "
+                                            "re-scores the current resume against it - use this only "
+                                            "if \"Refresh score\" didn't help, meaning the cached "
+                                            "keyword list itself is still stale.",
+                                        ):
+                                            try:
+                                                with st.spinner("Re-extracting keywords from the posting..."):
+                                                    recheck = _reextract_ats_keywords_and_rescore(job, app_record, load_profile())
+                                            except (DraftingNotConfigured, DraftingFailed) as exc:
+                                                st.error(str(exc))
+                                            else:
+                                                if not recheck["changed"]:
+                                                    st.toast(
+                                                        "Re-extraction didn't go through (API error) - "
+                                                        "the existing keyword list and score are unchanged.",
+                                                        icon=":material/warning:",
+                                                    )
+                                                else:
+                                                    st.session_state[prev_score_key] = current_score
+                                                    upsert_application(
+                                                        job["source"], job["job_id"], status=app_record.get("status", "under review"),
+                                                        resume_ats_score=recheck["ats_score"],
+                                                        resume_ats_rationale=recheck["ats_rationale"],
+                                                        resume_ats_next_actions=recheck["ats_next_actions"],
+                                                        resume_clarifying_questions=recheck["clarifying_questions"],
+                                                    )
+                                                    st.toast(
+                                                        f"Keywords re-extracted - new ATS score {recheck['ats_score']}/100.",
+                                                        icon=":material/check_circle:",
+                                                    )
+                                                    st.rerun()
                                     # Inline here, not just a pointer to the Profile Gaps tab
                                     # (Zahir's correction 2026-08-06, live-testing: expanding a
                                     # specific job's score card is a clear signal of focus on

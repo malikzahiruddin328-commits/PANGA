@@ -594,6 +594,91 @@ def _extract_ats_keywords(client: "anthropic.Anthropic", job: dict, model: str |
     return required, preferred
 
 
+def rescore_against_cached_keywords(job: dict, app_record: dict, profile: dict) -> dict:
+    """Recomputes the resume's ATS score/rationale/next_actions/clarifying_
+    questions against whatever keyword list is ALREADY cached on the job
+    record (job["ats_required_keywords"]/["ats_preferred_keywords"]) and the
+    resume text already drafted for it - no AI call at all, pure
+    deterministic re-arithmetic (ats_score.score_resume_against_keywords).
+
+    Exists because the job-level keyword cache and the application-level
+    stored score can drift apart: e.g. a job's keywords get corrected
+    (reextract_ats_keywords_and_rescore below, or any other update to
+    job["ats_required_keywords"]) but nothing re-runs the arithmetic and
+    re-persists app_record["resume_ats_score"] to match. Real case,
+    2026-08-09: Zahir's Upstream Bio job's cached keywords already had the
+    corrected either/or degree-field group (from an earlier extraction),
+    but the stored score was still 82 - live-recomputing against the exact
+    same already-cached keywords and already-drafted resume text (no new
+    AI call needed) gave 88, with the account for that gap fully
+    explained by 2 genuinely-missing preferred keywords, not a keyword-
+    extraction bug at all. Always try this cheap rescore FIRST before
+    reaching for the AI-calling reextract_ats_keywords_and_rescore - it's
+    free, instant, and fixes exactly this class of drift.
+
+    Returns the same shape as reextract_ats_keywords_and_rescore() minus
+    "changed" (there's nothing to fail here - it's arithmetic over data
+    already in memory)."""
+    required = job.get("ats_required_keywords") or []
+    preferred = job.get("ats_preferred_keywords") or []
+    resume_text = app_record.get("resume_text") or ""
+    ats = score_resume_against_keywords(required, preferred, resume_text)
+    previously_answered_skills = [a.get("skill") for a in (profile or {}).get("gap_interview_answers", [])]
+    merged_questions = _merge_keyword_gap_questions(
+        app_record.get("resume_clarifying_questions") or [], ats.get("missing_required_keywords", []),
+        previously_answered_skills, profile,
+        missing_preferred_keywords=ats.get("missing_preferred_keywords", []),
+    )
+    return {
+        "ats_score": ats["ats_score"],
+        "ats_rationale": ats["ats_rationale"],
+        "ats_next_actions": ats["ats_next_actions"],
+        "clarifying_questions": _questions_worth_asking(merged_questions, ats["ats_score"]),
+        "ats_plateau_note": ats.get("plateau_note"),
+    }
+
+
+def reextract_ats_keywords_and_rescore(job: dict, app_record: dict, profile: dict, model: str | None = None) -> dict:
+    """Forces a fresh AI re-extraction of this job's ATS keyword list, then
+    re-scores the resume text already drafted for it against the corrected
+    list - WITHOUT redrafting the resume itself (CLAUDE.md known failure
+    pattern #2: a full redraft is its own silent-regression risk, and
+    isn't needed here since only the keyword list changed, not the resume
+    prose).
+
+    generate_documents() only ever calls _extract_ats_keywords() once per
+    job (gated on job.get("ats_required_keywords") is None - see its call
+    site) so the extracted list is cached for good, on the assumption a
+    posting's own text doesn't change. That's the right call for repeat
+    regenerates of the SAME job, but it also means a job scored before an
+    extraction-PROMPT fix (e.g. the 2026-08-09 either/or generalization)
+    is stuck on its old, possibly-buggy keyword list forever unless
+    something forces a fresh call - this is that override, for exactly
+    that one-time-per-fix situation. Called from the Results tab's
+    "Re-check keywords" action.
+
+    Raises DraftingNotConfigured/DraftingFailed if the API call itself
+    can't be made at all (no key, network). A refusal/truncation inside
+    _extract_ats_keywords is swallowed there and reported here as "no
+    change" (see below) rather than raised, matching that function's own
+    documented failure mode of preferring a stale-but-real keyword list
+    over none at all.
+
+    Returns {"changed": bool, "ats_score": int, "ats_rationale": str,
+    "ats_next_actions": [...], "clarifying_questions": [...],
+    "ats_plateau_note": str | None}. "changed" is False when the AI call
+    silently failed inside _extract_ats_keywords (identity-checked: that
+    function only ever reassigns job["ats_required_keywords"] to a new
+    list object on a real success) - callers should tell Zahir the
+    re-check didn't go through rather than reporting a score that never
+    actually moved."""
+    client = _client()
+    old_required, old_preferred = job.get("ats_required_keywords"), job.get("ats_preferred_keywords")
+    _extract_ats_keywords(client, job, model)
+    changed = job.get("ats_required_keywords") is not old_required or job.get("ats_preferred_keywords") is not old_preferred
+    return {"changed": changed, **rescore_against_cached_keywords(job, app_record, profile)}
+
+
 def _score_schema() -> dict:
     return {
         "type": "object",

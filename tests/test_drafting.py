@@ -1160,3 +1160,96 @@ def test_request_additional_gap_questions_truncation_is_caught_by_the_ui_except_
     from llm_client import LLMResponseTruncated as _LLMResponseTruncated
 
     assert issubclass(_LLMResponseTruncated, DraftingFailed)
+
+
+def test_rescore_against_cached_keywords_needs_no_api_call(monkeypatch):
+    # No _client()/call_structured mock at all - proves this really is pure
+    # arithmetic over what's already cached, not a disguised AI call. Real
+    # case, 2026-08-09: Zahir's Upstream Bio job's cached keywords already
+    # had the corrected either/or degree-field group (from an earlier
+    # extraction) but the STORED score (82) hadn't been recomputed to
+    # match - this function is exactly that free, instant recompute, and a
+    # live check against his real data confirmed it (88, no missing
+    # required keywords, the gap fully explained by 2 genuinely-missing
+    # preferred keywords - not a keyword-extraction bug at all).
+    import tailoring.drafting as drafting
+
+    job = {
+        "ats_required_keywords": [{"any_of": ["Information Technology", "Computer Science", "Engineering"]}],
+        "ats_preferred_keywords": [],
+    }
+    app_record = {"resume_text": "Bachelor of Science in Information Technology.", "resume_clarifying_questions": []}
+
+    result = drafting.rescore_against_cached_keywords(job, app_record, profile={})
+
+    assert result["clarifying_questions"] == []
+    assert "changed" not in result
+
+
+def test_reextract_ats_keywords_and_rescore_replaces_the_stale_cached_list(monkeypatch):
+    # Forced AI re-extraction path, for the rarer case where the job-level
+    # keyword cache itself is still stale/buggy (not just the stored score
+    # drifted from an already-correct cache - see
+    # test_rescore_against_cached_keywords_needs_no_api_call above for
+    # that cheaper, more common case). Exercised here against a resume
+    # that only matches the CORRECTED single any_of group, not old buggy
+    # flat keywords.
+    import tailoring.drafting as drafting
+
+    def _fake_call_structured(client, **kwargs):
+        return {
+            "required_keywords": [{"any_of": ["Information Technology", "Computer Science", "Engineering"]}],
+            "preferred_keywords": [],
+        }
+
+    monkeypatch.setattr(drafting, "_client", lambda: object())
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured)
+
+    job = {
+        "source": "linkedin", "job_id": "1", "title": "Some role",
+        "description": "Bachelor's degree in Information Technology, Computer Science, Engineering, or a related field.",
+        "ats_required_keywords": ["Information Technology", "Computer Science", "Engineering"],
+        "ats_preferred_keywords": [],
+    }
+    app_record = {"resume_text": "Bachelor of Science in Information Technology.", "resume_clarifying_questions": []}
+
+    result = drafting.reextract_ats_keywords_and_rescore(job, app_record, profile={})
+
+    assert result["changed"] is True
+    # Old flat keywords would have dinged this resume for missing "Computer
+    # Science"/"Engineering" even though it satisfies the field via
+    # "Information Technology" - the corrected any_of group must not.
+    assert job["ats_required_keywords"] == [{"any_of": ["Information Technology", "Computer Science", "Engineering"]}]
+    assert result["clarifying_questions"] == []  # no gap left to ask about - the field group is satisfied
+
+
+def test_reextract_ats_keywords_and_rescore_reports_unchanged_on_api_failure(monkeypatch):
+    # A transient failure inside _extract_ats_keywords returns ([], [])
+    # without touching the job dict at all (see that function's own
+    # docstring) - the caller here must not mistake that for "genuinely no
+    # keywords" and silently wipe out a real, previously-cached list.
+    import tailoring.drafting as drafting
+    from tailoring.drafting import DraftingFailed
+
+    def _raising_call_structured(client, **kwargs):
+        raise DraftingFailed("simulated transient failure")
+
+    monkeypatch.setattr(drafting, "_client", lambda: object())
+    monkeypatch.setattr(drafting, "call_structured", _raising_call_structured)
+
+    old_required = ["Kubernetes"]  # genuinely absent from the resume below
+    job = {
+        "source": "linkedin", "job_id": "1", "title": "Some role", "description": "Needs Kubernetes.",
+        "ats_required_keywords": old_required, "ats_preferred_keywords": [],
+    }
+    app_record = {"resume_text": "I know Python.", "resume_clarifying_questions": []}
+
+    result = drafting.reextract_ats_keywords_and_rescore(job, app_record, profile={})
+
+    assert result["changed"] is False
+    assert job["ats_required_keywords"] == old_required  # untouched, not wiped to []
+    # Still scored against the old, real keyword list, not an empty one -
+    # a wipe-to-[] would report zero gaps, silently hiding the real one.
+    # "0/1 required" proves it scored against the real 1-item old list, not
+    # a wiped-to-[] "0/0 required" that would silently show zero gaps.
+    assert "0/1 required" in result["ats_rationale"]
