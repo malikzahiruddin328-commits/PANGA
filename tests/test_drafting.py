@@ -57,6 +57,25 @@ def test_resume_spec_explains_the_hedged_unconfirmed_claim_exception():
         assert "Never guess a fact with NO real basis" in spec
 
 
+def test_resume_spec_instructs_active_cross_referencing_of_profile_facts():
+    # Real gap Zahir hit live 2026-08-09: a posting's preferred term
+    # ("commercial scale readiness") was left as a passive next-action
+    # suggestion even though the profile already had a real, on-point fact
+    # supporting it (a revenue-growth story) - the drafting call has full
+    # access to the profile and should actively look for that connection
+    # before falling back to passive advice Zahir has to act on himself.
+    for spec in (RESUME_SPEC, RESUME_SPEC_USAJOBS):
+        assert "commercial scale readiness" in spec
+        assert "Actively cross-reference" in spec
+        # Must stay honest: only when a real fact genuinely supports the
+        # term, never a forced/stretched connection.
+        assert "without stretching its meaning" in spec
+        assert "leave it uncovered" in spec
+        # This is re-phrasing an ALREADY-TRUE fact, distinct from the
+        # unconfirmed-guess "?" exception right below it - no hedge needed.
+        assert "needs no '?' hedge" in spec
+
+
 def test_resume_schema_requires_unconfirmed_claims_field():
     schema = _resume_schema()
     assert "unconfirmed_claims" in schema["properties"]
