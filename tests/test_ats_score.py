@@ -1,4 +1,5 @@
 from tailoring.ats_score import (
+    detect_matched_keyword_regressions,
     extract_keywords,
     plateau_note_for_gaps,
     score_resume_against_keywords,
@@ -341,7 +342,9 @@ def test_missing_preferred_keywords_are_returned_with_point_values():
     # text) but never handed back to the caller - drafting.py's
     # analyze_fit_before_drafting needs these real numbers to attach a
     # point_value to a free-form AI clarifying_question that happens to
-    # correspond to a preferred (not required) keyword.
+    # correspond to a preferred (not required) keyword, and
+    # detect_matched_keyword_regressions() needs them to catch a dropped
+    # PREFERRED keyword too, not just required ones.
     result = score_resume_against_keywords(["python"], ["kubernetes"], "SKILLS\nPython\n")
     assert result["missing_preferred_keywords"] == [
         {"label": "kubernetes", "point_value": result["missing_preferred_keywords"][0]["point_value"]},
@@ -364,3 +367,35 @@ def test_plateau_note_for_gaps_is_public_and_reusable():
     assert plateau_note_for_gaps([], []) is None
     note = plateau_note_for_gaps([{"label": "sql", "point_value": 5.0}], [])
     assert "sql" in note
+
+
+def test_detect_matched_keyword_regressions_catches_a_dropped_required_keyword():
+    # Real bug live-reproduced 2026-08-09 (Upstream Bio job, CLAUDE.md
+    # known failure pattern #2): a regenerate fixed one required keyword
+    # ("Engineering") while silently dropping a previously-matched one
+    # ("life sciences") - net score stayed flat (27/30 both times), which
+    # is exactly why this needs a real before/after diff, not just
+    # trusting the net score didn't get worse.
+    required = ["Engineering", "life sciences"]
+    old_text = "SKILLS\nlife sciences background\n"
+    new_text = "SKILLS\nEngineering background\n"
+    assert detect_matched_keyword_regressions(required, [], old_text, new_text) == ["life sciences"]
+
+
+def test_detect_matched_keyword_regressions_empty_when_nothing_lost():
+    required = ["Python"]
+    old_text = "SKILLS\nPython\n"
+    new_text = "SKILLS\nPython, Databricks\n"  # only gained, nothing lost
+    assert detect_matched_keyword_regressions(required, [], old_text, new_text) == []
+
+
+def test_detect_matched_keyword_regressions_catches_a_dropped_preferred_keyword():
+    old_text = "SKILLS\nKubernetes, Python\n"
+    new_text = "SKILLS\nPython\n"
+    assert detect_matched_keyword_regressions(["Python"], ["Kubernetes"], old_text, new_text) == ["Kubernetes"]
+
+
+def test_detect_matched_keyword_regressions_returns_nothing_with_no_prior_text():
+    # A first-ever draft has nothing to regress against.
+    assert detect_matched_keyword_regressions(["Python"], [], None, "SKILLS\nPython\n") == []
+    assert detect_matched_keyword_regressions(["Python"], [], "", "SKILLS\nPython\n") == []

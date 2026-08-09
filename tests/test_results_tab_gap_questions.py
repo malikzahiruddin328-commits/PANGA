@@ -271,6 +271,74 @@ def test_generate_button_regenerates_using_the_confirmed_answer(results_app_with
     assert app_record["resume_ats_score"] == 95
 
 
+def _fake_generate_documents_that_drops_python(job, profile, doc_keys, on_progress=None):
+    # Simulates the real Upstream Bio regression (2026-08-09): the
+    # regenerate fixes the ORIGINAL gap (Databricks) but silently drops a
+    # keyword the previous draft had matched (Python) - net score can look
+    # fine (still 1/2 matched) while a real, specific regression happened.
+    return {"resume": {
+        "text": "PROFESSIONAL EXPERIENCE\nEngineer.\n\nSKILLS\nDatabricks",
+        "suggested_strategy_tag": "", "ats_score": 76,
+        "ats_rationale": "Matched 1/2 keywords.", "ats_next_actions": [], "clarifying_questions": [],
+    }}
+
+
+def test_generate_warns_when_a_regenerate_drops_a_previously_matched_keyword(results_app_with_gap_questions, monkeypatch):
+    # Real bug caught live 2026-08-09 (General, watching Zahir's session):
+    # a full-rewrite regenerate traded one matched keyword for another
+    # with a flat net score, completely invisible unless the old and new
+    # keyword-match sets are actually diffed - CLAUDE.md known failure
+    # pattern #2, reproduced on a real job (Upstream Bio: "Engineering"
+    # fixed, "life sciences" silently dropped).
+    import tailoring.drafting as drafting
+
+    monkeypatch.setattr(drafting, "generate_documents", _fake_generate_documents_that_drops_python)
+    monkeypatch.setattr("tailoring.dossier.sync_workspace_documents", lambda *a, **k: None)
+
+    at = results_app_with_gap_questions
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+
+    box = next(t for t in at.text_area if "Databricks" in t.label)
+    box.set_value("Yes, led a 2-year Databricks migration.")
+    at.run(timeout=30)
+
+    generate_button = next(b for b in at.button if b.key and b.key.startswith("analyzefit_generate_"))
+    generate_button.click().run(timeout=30)
+
+    assert not at.exception
+    # st.toast, not st.warning - a warning shown here would flash and
+    # vanish (both callers of regenerate_resume_and_persist st.rerun()
+    # unconditionally right after this success path), so the real
+    # implementation uses st.toast(), which survives a rerun.
+    toasts = [t.value for t in at.toast]
+    assert any("Python" in t for t in toasts)
+    assert any("no longer covers" in t for t in toasts)
+
+
+def test_generate_shows_no_regression_warning_when_nothing_was_lost(results_app_with_gap_questions, monkeypatch):
+    import tailoring.drafting as drafting
+
+    monkeypatch.setattr(drafting, "generate_documents", _fake_generate_documents)
+    monkeypatch.setattr("tailoring.dossier.sync_workspace_documents", lambda *a, **k: None)
+
+    at = results_app_with_gap_questions
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+
+    box = next(t for t in at.text_area if "Databricks" in t.label)
+    box.set_value("Yes, led a 2-year Databricks migration.")
+    at.run(timeout=30)
+
+    generate_button = next(b for b in at.button if b.key and b.key.startswith("analyzefit_generate_"))
+    generate_button.click().run(timeout=30)
+
+    assert not at.exception
+    assert not at.warning
+
+
 def test_resume_expander_auto_expands_right_after_answering_a_gap_question(results_app_with_gap_questions, monkeypatch):
     # Zahir's explicit ask 2026-08-06: the new score/rationale/questions
     # must be part of what he sees immediately after generating - not
