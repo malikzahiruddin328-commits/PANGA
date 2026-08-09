@@ -13,6 +13,7 @@ from tailoring.drafting import (
     _suggested_answer_for_keyword_gap,
     analyze_fit_before_drafting,
     check_regenerate_impact,
+    generate_documents,
     request_additional_gap_questions,
     save_gap_answers,
 )
@@ -271,6 +272,119 @@ def test_draft_one_resume_threads_unconfirmed_claims_through(monkeypatch):
 
     result = _draft_one(object(), [], "resume", None, job=job, profile={})
     assert result["unconfirmed_claims"] == [{"skill": "Team size", "text": "Led a team of 8-10 engineers?"}]
+
+
+def test_draft_one_injects_resume_consistency_block_for_cover_letter(monkeypatch):
+    # Real gap Zahir hit live 2026-08-09: cover_letter/exec_bio/leadership_
+    # summary each get an independent API call sharing only the raw
+    # job+profile context, never the resume text drafted earlier in the
+    # same batch - so a fact could be phrased or rounded differently across
+    # documents, which reads as a red-flag inconsistency to a reviewer, not
+    # cosmetic drift.
+    import tailoring.drafting as drafting
+
+    captured = {}
+
+    def _fake_call_structured(client, **kwargs):
+        captured["user_content"] = kwargs["user_content"]
+        return {"cover_letter": "Dear Hiring Team, ..."}
+
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured)
+    job = {"source": "linkedin", "job_id": "1"}
+
+    _draft_one(
+        object(), [], "cover_letter", None, job=job, profile={},
+        resume_text_for_consistency="PROFESSIONAL EXPERIENCE\nGrew revenue from $500K to $1B.\n",
+    )
+    combined_text = " ".join(b["text"] for b in captured["user_content"] if b.get("type") == "text")
+    assert "THE RESUME ALREADY WRITTEN FOR THIS CANDIDATE" in combined_text
+    assert "Grew revenue from $500K to $1B." in combined_text
+    assert "Stay factually consistent with it" in combined_text
+
+
+def test_draft_one_does_not_inject_consistency_block_when_no_resume_text_given(monkeypatch):
+    import tailoring.drafting as drafting
+
+    captured = {}
+
+    def _fake_call_structured(client, **kwargs):
+        captured["user_content"] = kwargs["user_content"]
+        return {"cover_letter": "Dear Hiring Team, ..."}
+
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured)
+    job = {"source": "linkedin", "job_id": "1"}
+
+    _draft_one(object(), [], "cover_letter", None, job=job, profile={}, resume_text_for_consistency=None)
+    combined_text = " ".join(b["text"] for b in captured["user_content"] if b.get("type") == "text")
+    assert "THE RESUME ALREADY WRITTEN" not in combined_text
+
+
+def test_draft_one_does_not_inject_consistency_block_for_resume_itself(monkeypatch):
+    # The resume is the source of truth other documents check against - it
+    # never needs to check itself.
+    import tailoring.drafting as drafting
+
+    captured = {}
+
+    def _fake_call_structured(client, **kwargs):
+        captured["user_content"] = kwargs["user_content"]
+        return {
+            "text": "SKILLS\nPython", "target_seniority_at_least_vp": False,
+            "suggested_strategy_tag": "", "clarifying_questions": [], "unconfirmed_claims": [],
+        }
+
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured)
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": [], "ats_preferred_keywords": []}
+
+    _draft_one(object(), [], "resume", None, job=job, profile={}, resume_text_for_consistency="some earlier text")
+    combined_text = " ".join(b["text"] for b in captured["user_content"] if b.get("type") == "text")
+    assert "THE RESUME ALREADY WRITTEN" not in combined_text
+
+
+def test_generate_documents_passes_the_just_drafted_resume_to_later_docs_in_the_same_batch(monkeypatch):
+    import tailoring.drafting as drafting
+
+    seen_resume_text_for = {}
+
+    def _fake_draft_one(client, shared_context, doc_key, model, on_progress=None, doc_index=1, doc_total=1, job=None, profile=None, resume_text_for_consistency=None):
+        seen_resume_text_for[doc_key] = resume_text_for_consistency
+        if doc_key == "resume":
+            return {
+                "text": "PROFESSIONAL EXPERIENCE\nReal resume text.", "ats_score": 80,
+                "ats_rationale": "", "ats_next_actions": [], "clarifying_questions": [], "unconfirmed_claims": [],
+            }
+        return "drafted text"
+
+    monkeypatch.setattr(drafting, "_client", lambda: object())
+    monkeypatch.setattr(drafting, "_draft_one", _fake_draft_one)
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": [], "ats_preferred_keywords": []}
+
+    drafting.generate_documents(job, {}, ["resume", "cover_letter", "exec_bio"])
+
+    assert seen_resume_text_for["resume"] is None  # nothing to be consistent with yet
+    assert seen_resume_text_for["cover_letter"] == "PROFESSIONAL EXPERIENCE\nReal resume text."
+    assert seen_resume_text_for["exec_bio"] == "PROFESSIONAL EXPERIENCE\nReal resume text."
+
+
+def test_generate_documents_uses_existing_resume_text_when_resume_not_in_this_batch(monkeypatch):
+    # The "redraft just the cover letter, resume unchanged" case - resume
+    # isn't in doc_keys at all, so the caller (app.py) passes the job's
+    # already-stored resume_text in explicitly.
+    import tailoring.drafting as drafting
+
+    seen_resume_text_for = {}
+
+    def _fake_draft_one(client, shared_context, doc_key, model, on_progress=None, doc_index=1, doc_total=1, job=None, profile=None, resume_text_for_consistency=None):
+        seen_resume_text_for[doc_key] = resume_text_for_consistency
+        return "drafted text"
+
+    monkeypatch.setattr(drafting, "_client", lambda: object())
+    monkeypatch.setattr(drafting, "_draft_one", _fake_draft_one)
+    job = {"source": "linkedin", "job_id": "1"}
+
+    drafting.generate_documents(job, {}, ["cover_letter"], existing_resume_text="An already-stored resume.")
+
+    assert seen_resume_text_for["cover_letter"] == "An already-stored resume."
 
 
 def test_ats_keywords_schema_supports_either_or_group_items():

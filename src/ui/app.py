@@ -3328,7 +3328,17 @@ elif active_tab == "results":
                             progress_bar.progress(((i - 1) + within_doc) / total, text=label)
 
                         try:
-                            drafted = generate_documents(job, load_profile(), selected, on_progress=_update_progress)
+                            drafted = generate_documents(
+                                job, load_profile(), selected, on_progress=_update_progress,
+                                # "resume" already-in-selected is handled
+                                # internally (the just-drafted text is used
+                                # automatically) - this only matters for
+                                # the "redraft just the other docs, resume
+                                # unchanged" case, so cover_letter/exec_bio/
+                                # leadership_summary can still be checked
+                                # for factual consistency against it.
+                                existing_resume_text=app_record.get("resume_text") if "resume" not in selected else None,
+                            )
                         except (DraftingNotConfigured, DraftingFailed) as exc:
                             progress_bar.empty()
                             st.error(str(exc))

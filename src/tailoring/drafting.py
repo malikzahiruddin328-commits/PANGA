@@ -1051,6 +1051,46 @@ def _strip_rank_prefixes(resume_text: str) -> str:
     return "\n".join(lines)
 
 
+_CROSS_DOCUMENT_CONSISTENCY_DOC_KEYS = {"cover_letter", "exec_bio", "leadership_summary"}
+
+
+def _resume_consistency_block(resume_text: str) -> dict:
+    # Real gap Zahir hit live 2026-08-09: cover_letter/exec_bio/leadership_
+    # summary each get their own independent API call sharing only the raw
+    # job+profile context, never the resume text drafted earlier in the
+    # SAME batch (or already on file for a "regenerate just this one doc"
+    # case) - so each one independently re-interprets the same profile
+    # facts with real room to phrase, round, or emphasize something
+    # differently. A reviewer who spots a number/date/achievement stated
+    # differently across two of Zahir's own documents reads that as an
+    # inconsistency (a red flag), not cosmetic drift - even though every
+    # individual document is independently accurate against the profile.
+    return {
+        "type": "text",
+        "text": (
+            "\n\nTHE RESUME ALREADY WRITTEN FOR THIS CANDIDATE FOR THIS SAME "
+            "JOB:\n" + resume_text + "\n\nStay factually consistent with it: "
+            "any concrete fact you state here (a number, a date, a company "
+            "name, a specific achievement) that's also stated in the resume "
+            "above must actually agree with it, not just coincidentally "
+            "happen to - go back and re-derive it from the resume's own "
+            "wording rather than independently re-deriving your own version "
+            "from the raw profile. This document can legitimately emphasize "
+            "different things than the resume (a different angle, a "
+            "different level of detail, facts the resume didn't have room "
+            "for) - it does not need to repeat the same facts, but whatever "
+            "facts it DOES state must not contradict what the resume "
+            "already says. If the resume text above contains a hedged, "
+            "unconfirmed guess marked with a trailing '?', do not state "
+            "that same fact here as settled/confirmed without the hedge - "
+            "either leave it out, or mark it with the same '?' if you "
+            "reference it at all. Stating a genuinely unresolved claim as "
+            "confirmed fact in a second document is a worse version of the "
+            "same inconsistency, not a safer one."
+        ),
+    }
+
+
 def _draft_one(
     client: "anthropic.Anthropic",
     shared_context: list[dict],
@@ -1061,6 +1101,7 @@ def _draft_one(
     doc_total: int = 1,
     job: dict | None = None,
     profile: dict | None = None,
+    resume_text_for_consistency: str | None = None,
 ):
     if doc_key == "resume":
         schema = _resume_schema(job)
@@ -1079,10 +1120,14 @@ def _draft_one(
             on_progress(doc_index, doc_total, doc_key, substatus)
 
     job_key = (job["source"], job["job_id"]) if job and job.get("source") and job.get("job_id") else None
+    user_content = list(shared_context)
+    if doc_key in _CROSS_DOCUMENT_CONSISTENCY_DOC_KEYS and resume_text_for_consistency:
+        user_content.append(_resume_consistency_block(resume_text_for_consistency))
+    user_content.append({"type": "text", "text": f"\n\nDraft: {doc_key}"})
     data = call_structured(
         client,
         system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
-        user_content=shared_context + [{"type": "text", "text": f"\n\nDraft: {doc_key}"}],
+        user_content=user_content,
         schema=schema,
         max_tokens=max_tokens,
         model=model,
@@ -1182,6 +1227,7 @@ def generate_documents(
     doc_keys: list[str],
     model: str | None = None,
     on_progress=None,
+    existing_resume_text: str | None = None,
 ) -> dict:
     """Drafts real, tailored document text for exactly the requested doc_keys
     (subset of "resume", "cover_letter", "exec_bio", "leadership_summary",
@@ -1225,7 +1271,18 @@ def generate_documents(
     immediately after this call returns. Never falls back to a guessed
     address - an unconfirmed lookup caches "" (searched, not found) so it
     isn't re-searched every regenerate, and docx_export.py's own
-    "[Company Address]" placeholder covers that case."""
+    "[Company Address]" placeholder covers that case.
+
+    existing_resume_text (2026-08-09): when doc_keys doesn't include
+    "resume" (a "regenerate just the other documents" case - e.g. a job
+    already has a drafted resume and only the cover letter is being
+    redrafted), pass the job's current resume_text here so cover_letter/
+    exec_bio/leadership_summary can still be checked for factual
+    consistency against it - see _resume_consistency_block(). When
+    "resume" IS in doc_keys, the freshly-drafted resume text is used
+    automatically instead (doc_keys already guarantees "resume" is
+    processed first when present - see ui/app.py's doc_types ordering),
+    so this param is only needed for the resume-not-in-this-batch case."""
     if not doc_keys:
         return {}
 
@@ -1252,10 +1309,17 @@ def generate_documents(
 
     results = {}
     total = len(doc_keys)
+    resume_text_for_consistency = existing_resume_text
     for i, doc_key in enumerate(doc_keys, start=1):
         if on_progress:
             on_progress(i, total, doc_key)
-        results[doc_key] = _draft_one(client, shared_context, doc_key, model, on_progress, i, total, job=job, profile=profile)
+        results[doc_key] = _draft_one(
+            client, shared_context, doc_key, model, on_progress, i, total,
+            job=job, profile=profile, resume_text_for_consistency=resume_text_for_consistency,
+        )
+        if doc_key == "resume":
+            fresh_resume = results["resume"]
+            resume_text_for_consistency = fresh_resume["text"] if isinstance(fresh_resume, dict) else fresh_resume
     return results
 
 
