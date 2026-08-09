@@ -1116,13 +1116,18 @@ def render_answered_gap_questions() -> None:
                 elif stripped == (entry.get("answer") or "").strip():
                     st.toast("No changes to save.", icon=":material/info:")
                 else:
-                    from datetime import date
+                    from datetime import datetime, timezone
 
                     from profile.interview import save_answer
 
+                    # UTC, not local time - must match drafting.py's
+                    # save_gap_answers() and applications.py's
+                    # documents_drafted_at (real bug found live 2026-08-08:
+                    # a local-time date here silently disagreed with the
+                    # UTC-stamped draft timestamp for part of every day).
                     save_answer(
                         skill=skill, role_context=entry.get("role_context", ""), answer=stripped,
-                        date_captured=date.today().isoformat(), question=question_text,
+                        date_captured=datetime.now(timezone.utc).date().isoformat(), question=question_text,
                         is_disqualifier=is_disqualifier,
                     )
                     st.toast("Answer updated.", icon=":material/check_circle:")

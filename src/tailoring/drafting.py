@@ -1184,12 +1184,20 @@ def save_gap_answers(job: dict, answered_questions: list[dict]) -> None:
     anything else (including missing/old-shape entries) saves as an ordinary
     skill-gap fact. Never called with an invented answer - the Results tab
     UI only calls this with what the candidate actually typed."""
-    from datetime import date
+    from datetime import datetime, timezone
 
     from profile.interview import save_answer
 
     role_context = f"{job.get('title', 'Unknown role')} at {job.get('organization', 'Unknown organization')}"
-    today = date.today().isoformat()
+    # UTC, not local time (real bug found live 2026-08-08, General): this
+    # gets compared against applications.py's documents_drafted_at, which
+    # is stamped in UTC - a local-time date here disagrees with it for
+    # part of every day (e.g. any evening in a timezone behind UTC, once
+    # UTC has already rolled to the next calendar date), making
+    # check_regenerate_impact()'s "has new info since last draft"
+    # comparison silently wrong in either direction depending on which
+    # side of midnight either clock happens to be on.
+    today = datetime.now(timezone.utc).date().isoformat()
     for q in answered_questions:
         answer = (q.get("answer") or "").strip()
         if not answer:

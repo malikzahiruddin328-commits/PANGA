@@ -362,6 +362,31 @@ def test_save_gap_answers_never_triggers_document_generation(isolated_data, monk
     assert load_profile()["gap_interview_answers"][0]["skill"] == "Databricks"
 
 
+def test_save_gap_answers_stamps_date_captured_in_utc_not_local(isolated_data, monkeypatch):
+    # Real bug found live 2026-08-08 (General): applications.py's
+    # documents_drafted_at is stamped in UTC, but this used to stamp
+    # date_captured with LOCAL date.today() - the two silently disagreed
+    # for part of every day (e.g. any evening in a timezone behind UTC,
+    # once UTC has already rolled to the next calendar date), making
+    # check_regenerate_impact()'s "has new info since last draft"
+    # comparison read backwards. Reproduces the exact real moment: local
+    # time still reads 2026-08-08 but UTC has already rolled to 2026-08-09.
+    import datetime as datetime_module
+
+    class _FixedDatetime(datetime_module.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime_module.datetime(2026, 8, 9, 2, 30, tzinfo=tz)
+
+    monkeypatch.setattr(datetime_module, "datetime", _FixedDatetime)
+
+    job = {"title": "Director", "organization": "Acme"}
+    save_gap_answers(job, [{"skill": "Databricks", "type": "skill_gap", "answer": "Yes, 3 years."}])
+
+    from profile.storage import load_profile
+    assert load_profile()["gap_interview_answers"][0]["date_captured"] == "2026-08-09"
+
+
 def test_check_regenerate_impact_no_new_info_returns_last_real_cost(isolated_data):
     # score-first-resume-flow spec item 6.
     from cost_log import log_api_cost
