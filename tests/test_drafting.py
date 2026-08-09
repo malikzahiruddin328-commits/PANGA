@@ -708,3 +708,74 @@ def test_request_additional_gap_questions_preserves_existing_stored_questions(mo
     result = request_additional_gap_questions(job, profile, app_record)
     assert len(result["merged_clarifying_questions"]) == 2
     assert existing[0] in result["merged_clarifying_questions"]
+
+
+def test_request_additional_gap_questions_escalates_max_tokens_on_a_realistically_large_profile(monkeypatch):
+    # Real crash found by RM's live-fire test against Zahir's ACTUAL
+    # profile (2026-08-09): the prompt embeds the full master profile
+    # (~98,000 characters on real data, not job-specific), and a fixed
+    # max_tokens=3000 with no retry truncated on essentially the first
+    # real call. Uses a realistically large synthetic profile (not a tiny
+    # one) - a small mocked profile would never exercise the actual
+    # token-budget problem and could let this silently regress.
+    import json
+
+    import tailoring.drafting as drafting
+
+    large_profile = {
+        "gap_interview_answers": [
+            {"skill": f"Fact {i}", "date_captured": "2026-08-01", "answer": "x" * 500}
+            for i in range(180)
+        ],
+    }
+    assert len(json.dumps(large_profile)) > 90_000  # realistically large, matching the real report
+
+    max_tokens_seen = []
+
+    def _fake(client, **kwargs):
+        max_tokens_seen.append(kwargs["max_tokens"])
+        if kwargs["max_tokens"] < drafting._ANSWER_MORE_MAX_TOKENS_TIERS[-1]:
+            raise drafting.LLMResponseTruncated("The response was cut off before finishing. Try again.")
+        return {"clarifying_questions": []}
+
+    monkeypatch.setattr(drafting, "_client", lambda: object())
+    monkeypatch.setattr(drafting, "call_structured", _fake)
+
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": [], "ats_preferred_keywords": []}
+    app_record = {"resume_text": "SKILLS\nPython", "resume_clarifying_questions": []}
+
+    result = drafting.request_additional_gap_questions(job, large_profile, app_record)
+    assert result["added_count"] == 0
+    assert max_tokens_seen == drafting._ANSWER_MORE_MAX_TOKENS_TIERS
+
+
+def test_request_additional_gap_questions_raises_if_even_the_largest_tier_truncates(monkeypatch):
+    import pytest
+
+    import tailoring.drafting as drafting
+
+    def _always_truncates(client, **kwargs):
+        raise drafting.LLMResponseTruncated("The response was cut off before finishing. Try again.")
+
+    monkeypatch.setattr(drafting, "_client", lambda: object())
+    monkeypatch.setattr(drafting, "call_structured", _always_truncates)
+
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": [], "ats_preferred_keywords": []}
+    app_record = {"resume_text": "SKILLS\nPython", "resume_clarifying_questions": []}
+    profile = {"gap_interview_answers": []}
+
+    with pytest.raises(drafting.LLMResponseTruncated):
+        drafting.request_additional_gap_questions(job, profile, app_record)
+
+
+def test_request_additional_gap_questions_truncation_is_caught_by_the_ui_except_clause():
+    # Verifies the exact claim in RM's live-fire report: app.py's button
+    # handler catches (DraftingNotConfigured, DraftingFailed).
+    # LLMResponseTruncated IS a subclass of LLMCallFailed/DraftingFailed
+    # (same class, just aliased - see llm_client.LLMResponseTruncated's
+    # own docstring), so this already catches it correctly - confirmed
+    # here so that claim doesn't get silently assumed true or false again.
+    from tailoring.drafting import DraftingFailed
+    from llm_client import LLMResponseTruncated as _LLMResponseTruncated
+
+    assert issubclass(_LLMResponseTruncated, DraftingFailed)

@@ -21,6 +21,7 @@ from llm_client import (
     DEFAULT_MODEL,
     LLMCallFailed as DraftingFailed,
     LLMNotConfigured as DraftingNotConfigured,
+    LLMResponseTruncated,
     call_structured,
     call_with_web_search,
     get_client as _client,
@@ -1201,6 +1202,20 @@ _ANSWER_MORE_SYSTEM_PROMPT = (
 )
 
 
+# Real crash found by RM's live-fire test against Zahir's actual profile
+# (2026-08-09): the prompt embeds the CANDIDATE'S MASTER PROFILE in full
+# (~98,000 characters on real data, not job-specific - every job's prompt
+# carries the same full profile), and a fixed max_tokens=3000 with no
+# retry truncated on essentially the first real call, not an edge case.
+# Same escalate-on-genuine-truncation pattern job_alert_reasoning.py's
+# extract_listings() already proved out against a comparably real-world-
+# large input (a bundled digest email) - not a per-input formula (the
+# real digests needing the most tokens weren't reliably the ones with the
+# most input either), just retry with more budget only when the response
+# actually came back cut off.
+_ANSWER_MORE_MAX_TOKENS_TIERS = [8000, 16000, 32000]
+
+
 def _answer_more_schema() -> dict:
     return {
         "type": "object",
@@ -1254,7 +1269,18 @@ def request_additional_gap_questions(
     (CLAUDE.md known failure pattern #3 - prompt compliance alone isn't
     trusted for anything checked downstream by a deterministic rule),
     anything that slips through the prompt anyway is filtered out here
-    too, not just asked not to happen."""
+    too, not just asked not to happen.
+
+    Escalates max_tokens across _ANSWER_MORE_MAX_TOKENS_TIERS if the
+    response comes back genuinely truncated (LLMResponseTruncated) - real
+    crash found by RM's live-fire test 2026-08-09: a real master profile
+    is large enough (~98,000 characters) that a fixed, low max_tokens
+    truncated on essentially the first real call, not an edge case. Raises
+    LLMCallFailed (of which LLMResponseTruncated is a subclass, so an
+    `except DraftingFailed`/`except LLMCallFailed` catches either) if even
+    the largest tier still truncates, or on any other failure - those
+    aren't retried, since a bigger token budget wouldn't fix a refusal or
+    invalid JSON."""
     client = _client()
     required_keywords = job.get("ats_required_keywords") or []
     preferred_keywords = job.get("ats_preferred_keywords") or []
@@ -1278,19 +1304,26 @@ def request_additional_gap_questions(
         "\n\nALREADY COVERED (do not repeat any of these, even reworded):\n" +
         json.dumps(sorted(set(already_covered)), indent=2)
     )
-    data = call_structured(
-        client,
-        system=_ANSWER_MORE_SYSTEM_PROMPT,
-        user_content=content,
-        schema=_answer_more_schema(),
-        max_tokens=3000,
-        model=model,
-        effort="high",
-        on_progress=on_progress,
-        refusal_message="Claude declined to check for more questions. Try again.",
-        purpose="answer_more_gap_questions",
-        job_key=job_key,
-    )
+    for max_tokens in _ANSWER_MORE_MAX_TOKENS_TIERS:
+        try:
+            data = call_structured(
+                client,
+                system=_ANSWER_MORE_SYSTEM_PROMPT,
+                user_content=content,
+                schema=_answer_more_schema(),
+                max_tokens=max_tokens,
+                model=model,
+                effort="high",
+                on_progress=on_progress,
+                refusal_message="Claude declined to check for more questions. Try again.",
+                purpose="answer_more_gap_questions",
+                job_key=job_key,
+            )
+        except LLMResponseTruncated:
+            if max_tokens == _ANSWER_MORE_MAX_TOKENS_TIERS[-1]:
+                raise
+            continue
+        break
 
     new_questions = [
         q for q in data.get("clarifying_questions", [])
