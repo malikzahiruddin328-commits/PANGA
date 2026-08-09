@@ -138,7 +138,13 @@ def test_proactive_prompt_shown_before_any_document_has_ever_been_drafted(result
     at.run(timeout=30)
 
     assert not at.exception
-    assert any(t.key == "jd_paste_pre_Indeed_nojd2" for t in at.text_area)
+    # Real key is jd_paste_pre_Indeed_nojd2_<capture_ts or "none"> - the
+    # extension auto-fill's capture-timestamp suffix (2026-08-09, folds a
+    # fresh capture's timestamp into the key so a new capture actually
+    # replaces stale text - see render_paste_jd_prompt_before_drafting's own
+    # comment). startswith rather than exact equality so a future change to
+    # how that suffix is formed doesn't require touching this test again.
+    assert any(t.key.startswith("jd_paste_pre_Indeed_nojd2") for t in at.text_area)
     assert any(b.key == "jd_paste_pre_save_Indeed_nojd2" for b in at.button)
     # Nothing's been drafted yet, so the post-hoc (already-drafted) variant
     # genuinely has nothing to attach to.
@@ -176,7 +182,9 @@ def test_proactive_save_persists_description_without_drafting_anything(results_a
     at.session_state["selected_idx_Indeed"] = 1
     at.run(timeout=30)
 
-    paste_box = next(t for t in at.text_area if t.key == "jd_paste_pre_Indeed_nojd2")
+    # See the comment on the analogous assertion above - real key has the
+    # extension auto-fill's capture-timestamp suffix.
+    paste_box = next(t for t in at.text_area if t.key.startswith("jd_paste_pre_Indeed_nojd2"))
     paste_box.set_value("Requirements: Python, AWS.")
     save_button = next(b for b in at.button if b.key == "jd_paste_pre_save_Indeed_nojd2")
     save_button.click().run(timeout=30)
