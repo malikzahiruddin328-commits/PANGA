@@ -669,7 +669,14 @@ def regenerate_resume_and_persist(job: dict, on_progress, success_message: str) 
         old_resume_text, new_resume["text"],
     )
     if regressions:
-        st.warning(
+        # st.warning() here would flash and vanish - both callers
+        # unconditionally st.rerun() right after this function returns, on
+        # the same success path that would have rendered it (the exact
+        # "flash and vanish" anti-pattern the project's own UI readability
+        # rule exists to prevent; the static per-file guard test can't
+        # catch this instance since the warning and the rerun are in two
+        # different functions). st.toast() survives a rerun - use that.
+        st.toast(
             "This rewrite may have traded matches: it no longer covers "
             + ", ".join(f'"{label}"' for label in regressions) +
             " even though the last draft did - full rewrites don't "

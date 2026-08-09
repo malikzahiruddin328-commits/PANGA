@@ -257,9 +257,13 @@ def test_generate_warns_when_a_regenerate_drops_a_previously_matched_keyword(res
     generate_button.click().run(timeout=30)
 
     assert not at.exception
-    warnings = [w.value for w in at.warning]
-    assert any("Python" in w for w in warnings)
-    assert any("no longer covers" in w for w in warnings)
+    # st.toast, not st.warning - a warning shown here would flash and
+    # vanish (both callers of regenerate_resume_and_persist st.rerun()
+    # unconditionally right after this success path), so the real
+    # implementation uses st.toast(), which survives a rerun.
+    toasts = [t.value for t in at.toast]
+    assert any("Python" in t for t in toasts)
+    assert any("no longer covers" in t for t in toasts)
 
 
 def test_generate_shows_no_regression_warning_when_nothing_was_lost(results_app_with_gap_questions, monkeypatch):
