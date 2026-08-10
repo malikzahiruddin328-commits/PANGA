@@ -6,6 +6,8 @@ from tailoring.drafting import (
     _drop_generic_soft_skill_keywords,
     _drop_years_experience_keywords,
     _merge_keyword_gap_questions,
+    _profile_narrative_units,
+    _profile_supports_skill,
     _questions_worth_asking,
     _resume_schema,
     _strip_degree_in_prefix_keywords,
@@ -784,6 +786,86 @@ def test_merge_keyword_gap_questions_still_asks_about_a_different_unanswered_ski
     assert {q["skill"] for q in merged} == {"Terraform"}
 
 
+def _sample_profile():
+    return {
+        "skills": {"Technical": ["Databricks", "Python"]},
+        "work_history": [
+            {"title": "Solutions Architect", "bullets": ["Led stakeholder engagement across 12 business units."]},
+        ],
+        "client_engagements": [
+            {"role": "Consultant", "bullets": ["Owned client engagement for a Fortune 500 rollout."]},
+        ],
+        "certifications": [{"name": "PMP"}],
+        "education": [{"degree": "BS Computer Science"}],
+    }
+
+
+def test_profile_narrative_units_flattens_every_profile_section_as_distinct_entries():
+    units = _profile_narrative_units(_sample_profile())
+    assert "Databricks" in units
+    assert "Solutions Architect" in units
+    assert "Led stakeholder engagement across 12 business units." in units
+    assert "Owned client engagement for a Fortune 500 rollout." in units
+    assert "PMP" in units
+    assert "BS Computer Science" in units
+
+
+def test_profile_narrative_units_handles_a_missing_or_empty_profile():
+    assert _profile_narrative_units(None) == []
+    assert _profile_narrative_units({}) == []
+
+
+def test_profile_supports_skill_true_for_a_literal_skills_list_entry():
+    assert _profile_supports_skill("Databricks", _sample_profile()) is True
+
+
+def test_profile_supports_skill_true_for_a_phrase_contained_in_a_bullet():
+    assert _profile_supports_skill("client engagement", _sample_profile()) is True
+
+
+def test_profile_supports_skill_false_for_a_genuinely_absent_term():
+    assert _profile_supports_skill("Kubernetes", _sample_profile()) is False
+
+
+def test_profile_supports_skill_does_not_catch_a_real_synonym_not_stated_literally():
+    # Documents the known, accepted limit of this fix (2026-08-10): skills_
+    # match() is not a semantic matcher, so a genuinely different word for
+    # the same real experience ("customer engagement" vs. the profile's own
+    # "client engagement"/"stakeholder engagement") is NOT caught here -
+    # that gap is handled by the prompt-level instruction in
+    # request_additional_gap_questions instead, not this deterministic check.
+    assert _profile_supports_skill("Customer Engagement", _sample_profile()) is False
+
+
+def test_profile_supports_skill_does_not_false_positive_across_unrelated_bullets():
+    # Real false-positive shape this function was designed to avoid: two
+    # unrelated bullets that would read as one coincidental compound phrase
+    # if ever concatenated into a single blob first.
+    profile = {
+        "work_history": [
+            {"title": "Engineer", "bullets": ["Owned system design.", "Applications for internal tooling."]},
+        ],
+    }
+    assert _profile_supports_skill("design applications", profile) is False
+
+
+def test_merge_keyword_gap_questions_does_not_ask_about_a_profile_supported_keyword():
+    merged = _merge_keyword_gap_questions([], _missing("Databricks"), profile=_sample_profile())
+    assert merged == []
+
+
+def test_merge_keyword_gap_questions_still_asks_about_a_profile_unsupported_keyword():
+    merged = _merge_keyword_gap_questions([], _missing("Databricks", "Kubernetes"), profile=_sample_profile())
+    assert {q["skill"] for q in merged} == {"Kubernetes"}
+
+
+def test_merge_keyword_gap_questions_profile_support_also_suppresses_a_preferred_keyword():
+    merged = _merge_keyword_gap_questions(
+        [], [], profile=_sample_profile(), missing_preferred_keywords=_missing("Databricks"),
+    )
+    assert merged == []
+
+
 def test_merge_keyword_gap_questions_backfills_point_value_on_a_free_form_ai_question():
     # Real gap General caught Zahir hit live 2026-08-09: the AI's own
     # free-form clarifying_questions (from the same drafting call as the
@@ -1078,6 +1160,27 @@ def test_analyze_fit_before_drafting_projects_a_confirmed_but_undrafted_answer()
     # The confirmed gap must not still be described as an open, real gap.
     assert result["plateau_note"] is None or "Databricks" not in result["plateau_note"]
     # And it must not still be asked about as an open question either.
+    assert not any(q.get("skill") == "Databricks" for q in result["open_questions"])
+
+
+def test_analyze_fit_before_drafting_credits_a_profile_supported_keyword_without_a_new_answer():
+    # 2026-08-10 fix: a keyword the candidate's own profile already
+    # substantively states (e.g. a skills-list entry) must count toward
+    # projected_score and drop off open_questions even with zero gap-
+    # interview answers - consistent with _merge_keyword_gap_questions no
+    # longer asking about it in the first place.
+    from tailoring.ats_score import score_resume_against_keywords
+
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": ["Python", "Databricks"], "ats_preferred_keywords": []}
+    resume_text = "PROFESSIONAL EXPERIENCE\nEngineer.\n\nEDUCATION\nBS\n\nSKILLS\nPython"
+    app_record = {"resume_text": resume_text}
+    profile = {"gap_interview_answers": [], "skills": {"Technical": ["Databricks"]}}
+    baseline = score_resume_against_keywords(job["ats_required_keywords"], [], resume_text)
+    databricks_point_value = baseline["missing_required_keywords"][0]["point_value"]
+
+    result = analyze_fit_before_drafting(job, profile, app_record)
+
+    assert result["projected_score"] == round(baseline["ats_score"] + databricks_point_value)
     assert not any(q.get("skill") == "Databricks" for q in result["open_questions"])
 
 

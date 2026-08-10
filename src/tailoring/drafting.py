@@ -989,6 +989,64 @@ def _apply_answers_schema() -> dict:
     }
 
 
+def _profile_narrative_units(profile: dict | None) -> list[str]:
+    """Real, distinct textual units from the candidate's structured
+    profile - skills list entries, work-history titles/bullets, client-
+    engagement roles/bullets, certification names, degree lines. Each
+    checked independently against a keyword via skills_match(), never
+    concatenated into one blob first - a real false-positive shape found
+    while designing this (2026-08-10): joining unrelated bullets into one
+    blob and then normalizing away punctuation/newlines could read one
+    bullet ending "...system design." next to another starting
+    "Applications for..." as the single phrase "design applications",
+    a coincidental compound match neither bullet actually states."""
+    units: list[str] = []
+    for category_skills in (profile or {}).get("skills", {}).values():
+        units.extend(category_skills or [])
+    for entry in (profile or {}).get("work_history") or []:
+        units.append(entry.get("title") or "")
+        units.extend(entry.get("bullets") or [])
+    for entry in (profile or {}).get("client_engagements") or []:
+        units.append(entry.get("role") or "")
+        units.extend(entry.get("bullets") or [])
+    for cert in (profile or {}).get("certifications") or []:
+        units.append(cert.get("name") or "")
+    for edu in (profile or {}).get("education") or []:
+        units.append(edu.get("degree") or "")
+    return [u for u in units if u]
+
+
+def _profile_supports_skill(term: str, profile: dict | None) -> bool:
+    """True if the candidate's structured profile - not just the resume
+    text this specific draft produced, and not just previously-answered
+    gap questions - already states this term (or a real skills_match()
+    variant of it: case/punctuation-insensitive, or a genuine word-
+    boundary-respecting phrase within a real profile entry) somewhere in
+    its own actual content.
+
+    2026-08-10, Zahir's real live case (Merck 4449005464): asked to
+    confirm "Customer Engagement" and "Design Applications" as if they
+    might be genuine unknowns after 25+ years of experience - absurd to
+    him, and the underlying gap was real: neither missing_required_
+    keywords check nor the free-form question generator ever looked
+    beyond the drafted resume text and the previously-answered-question
+    list before treating a keyword as worth asking about at all.
+
+    Deliberately does NOT attempt synonym/semantic matching -
+    skills_match() is normalization + substring containment, not a
+    meaning-aware matcher, so "Customer Engagement" vs. his real
+    "client engagement"/"stakeholder engagement" phrasing (confirmed via
+    the real profile: the literal term genuinely doesn't appear anywhere
+    in it) is NOT something this function can or will catch - that needs
+    real judgment, not string matching (see request_additional_gap_
+    questions' own prompt instruction and the resume-drafting prompt's
+    active-cross-referencing instruction for where that layer lives
+    instead). This only catches a real, if under-surfaced, literal-or-
+    near-literal match - e.g. a certification or skill-list entry that
+    states the term but never made it into this specific tailored draft."""
+    return any(skills_match(term, unit) for unit in _profile_narrative_units(profile))
+
+
 def _suggested_answer_for_keyword_gap(term: str, profile: dict | None) -> str:
     """A genuine, honest starting guess for a missing-required-keyword
     question - Zahir's explicit correction 2026-08-06: an empty box was the
@@ -1125,7 +1183,17 @@ def _merge_keyword_gap_questions(
         merged.append({**q, "point_value": match["point_value"]} if match is not None else q)
     for item in missing_required_keywords:
         term = item["label"]
-        if any(skills_match(term, skill) for skill in already_asked):
+        # 2026-08-10, real gap Zahir hit live (Merck 4449005464, "Customer
+        # Engagement"/"Design Applications"): a keyword missing from the
+        # DRAFTED RESUME isn't automatically a genuine unknown worth
+        # asking about - the candidate's own profile (skills list, work-
+        # history/client-engagement bullets, certifications, education)
+        # may already state it, just not in this specific tailored draft.
+        # See _profile_supports_skill's own docstring for exactly what
+        # this does and doesn't catch (literal/near-literal only, not
+        # genuine synonyms like "customer engagement" vs "client
+        # engagement" - that needs real judgment, not string matching).
+        if any(skills_match(term, skill) for skill in already_asked) or _profile_supports_skill(term, profile):
             continue
         merged.append({
             "type": "skill_gap",
@@ -1140,7 +1208,8 @@ def _merge_keyword_gap_questions(
         })
     for item in missing_preferred_keywords or []:
         term = item["label"]
-        if any(skills_match(term, skill) for skill in already_asked_for_preferred):
+        # Same profile-support check as the required-keyword loop above.
+        if any(skills_match(term, skill) for skill in already_asked_for_preferred) or _profile_supports_skill(term, profile):
             continue
         merged.append({
             "type": "skill_gap",
@@ -1767,7 +1836,19 @@ def analyze_fit_before_drafting(job: dict, profile: dict, app_record: dict) -> d
     previously_answered_skills = [a["skill"] for a in profile.get("gap_interview_answers", []) if a.get("skill")]
 
     def _already_confirmed(item: dict) -> bool:
-        return any(skills_match(item["label"], skill) for skill in previously_answered_skills)
+        # 2026-08-10: extended to also credit a keyword the candidate's
+        # own profile already states (see _profile_supports_skill) - not
+        # just a previously-answered gap question. Without this, _merge_
+        # keyword_gap_questions correctly stops ASKING about a profile-
+        # supported keyword (real fix, same date), but the projected
+        # score would still show it as an unclosable missing point with
+        # no visible question left to answer it through - crediting it
+        # here keeps the score and the question list consistent with
+        # each other. ats_score itself (the literal, drafted-text-based
+        # number) is deliberately untouched - this only affects the
+        # projection shown before a fresh Generate actually writes the
+        # term into the resume.
+        return any(skills_match(item["label"], skill) for skill in previously_answered_skills) or _profile_supports_skill(item["label"], profile)
 
     missing_required = score_result["missing_required_keywords"]
     missing_preferred = score_result["missing_preferred_keywords"]
@@ -1828,7 +1909,20 @@ _ANSWER_MORE_SYSTEM_PROMPT = (
     "never invented, never vague or stylistic. If there is truly nothing "
     "further worth asking, return an EMPTY list - do not invent a low-value "
     "question just to have something to show; an honest empty answer is "
-    "correct and expected once the real gaps are exhausted."
+    "correct and expected once the real gaps are exhausted.\n\n"
+    "Before proposing a question about any skill or requirement, actively "
+    "check the candidate's full profile (work history bullets, client "
+    "engagements, skills list, certifications) for real experience stated "
+    "in DIFFERENT words that substantively covers it - not just an exact "
+    "phrase match. A candidate with real \"client engagement\" or "
+    "\"stakeholder engagement\" experience genuinely has \"customer "
+    "engagement\" experience even though the posting's exact wording never "
+    "appears in the profile; asking them to confirm the obvious, just "
+    "because the words differ, reads as absurd after a long real career - "
+    "don't do it. If you find genuine, substantively-equivalent coverage "
+    "under different wording, treat that requirement as already handled "
+    "and do not ask about it at all, the same as if it were on the "
+    "ALREADY COVERED list."
 )
 
 
