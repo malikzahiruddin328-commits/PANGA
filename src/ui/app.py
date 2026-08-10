@@ -256,7 +256,18 @@ def save_settings(settings: dict) -> None:
 
 
 def application_status(job: dict) -> str | None:
-    app = get_application(job.get("source"), job.get("job_id"))
+    # Real perf bug (Zahir, live, 2026-08-10 - "the page is getting heavier
+    # and heavier"/"internal refreshes taking way too long"): this used to
+    # call get_application(), which calls load_applications() - a full
+    # disk-read + AES-GCM decrypt + json.loads of the ENTIRE applications
+    # store - on every single call. This function is called once per job
+    # across several O(n) filter passes below, so at today's real scale
+    # (2070 jobs) that was measured at 378 load_applications() calls/1.42s
+    # for just one pass through the three hide-by-default filters - a
+    # classic N+1. `applications_by_key` (built once per rerun, right after
+    # `jobs = load_jobs()` below) turns every one of those into an O(1)
+    # dict lookup against a single load instead.
+    app = applications_by_key.get((job.get("source"), job.get("job_id")))
     return app["status"] if app else None
 
 
@@ -1795,6 +1806,13 @@ if license_block is not None:
     st.stop()
 
 jobs = load_jobs()
+# Loaded once per rerun and indexed here (not per-job-lookup, see
+# application_status() above) - the real fix for the 2026-08-10 perf bug.
+# Every application-status/record lookup for the rest of this rerun reads
+# this same dict instead of re-reading+re-decrypting+re-parsing
+# applications.json per job.
+applications = load_applications()
+applications_by_key = {(a.get("source"), a.get("job_id")): a for a in applications}
 all_cta = get_active_cta_emails()
 prep_records = load_interview_prep()
 
@@ -3396,7 +3414,13 @@ elif active_tab == "results":
                         if posting.get("posting_url"):
                             st.link_button(f"Open posting ({i} of {len(postings)})", posting["posting_url"], key=f"open_{posting.get('source')}_{posting.get('job_id')}")
 
-                app_record = get_application(job.get("source"), job.get("job_id")) or {}
+                # Reuses the module-level applications_by_key index (built
+                # once per rerun right after `jobs = load_jobs()`) instead
+                # of a fresh get_application() disk-read+decrypt per
+                # rendered job - same freshness guarantee (still one read
+                # per rerun, just moved earlier), see application_status()'s
+                # docstring for the full N+1 story this closes.
+                app_record = applications_by_key.get((job.get("source"), job.get("job_id"))) or {}
                 requested = app_record.get("documents_requested") or []
                 status = app_record.get("status")
 
@@ -3999,7 +4023,8 @@ elif active_tab == "prospector":
 
     settings = load_settings()
     target_roles = settings.get("target_roles", [])
-    applications = load_applications()
+    # `applications` already loaded once, module-level, right after
+    # `jobs = load_jobs()` above - reused here rather than a second read.
     target_accounts = load_target_accounts()
     outreach_records = load_outreach()
 
