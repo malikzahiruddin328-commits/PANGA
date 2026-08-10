@@ -27,14 +27,18 @@ whether the other would also fail, so they get independent counts rather
 than sharing (and potentially prematurely exhausting) one budget.
 
 Plain JSON, not security.crypto_store - a message ref and a failure
-count aren't sensitive, same call as config/job_sources.yaml. Locked via
+count aren't sensitive, same call as config/job_sources.yaml (General
+caught this file importing crypto_store.read_json/write_json instead,
+2026-08-09 - a real docstring/code mismatch, not just a style nit: those
+DO encrypt, contradicting the "doesn't need it" reasoning stated here.
+Fixed to match what this docstring actually claims). Locked via
 security.file_lock.locked() since both scheduled scan scripts and (in
 principle) a live app session could touch this concurrently, same
 shared-store reasoning as every other store in this codebase."""
 
+import json
 from pathlib import Path
 
-from security.crypto_store import read_json, write_json
 from security.file_lock import locked
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -57,16 +61,29 @@ def _key(provider: str, account: str, ref: str) -> str:
     return f"{provider}:{account}:{ref}"
 
 
+def _read(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _write(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
 def record_failure(scan_name: str, provider: str, account: str, ref: str) -> int:
     """Increments and returns this message's failure count for this scan.
     Caller should give up (mark the message reviewed) once the returned
     count reaches MAX_ATTEMPTS."""
     path = _path(scan_name)
     with locked(f"scan_retries_{scan_name}"):
-        data = read_json(path, default={})
+        data = _read(path)
         key = _key(provider, account, ref)
         data[key] = data.get(key, 0) + 1
-        write_json(path, data)
+        _write(path, data)
         return data[key]
 
 
@@ -79,7 +96,7 @@ def clear_failure(scan_name: str, provider: str, account: str, ref: str) -> None
     path = _path(scan_name)
     key = _key(provider, account, ref)
     with locked(f"scan_retries_{scan_name}"):
-        data = read_json(path, default={})
+        data = _read(path)
         if key in data:
             del data[key]
-            write_json(path, data)
+            _write(path, data)
