@@ -21,6 +21,21 @@ alone isn't enough" - so this does two independent checks per job, not one:
    second AI read, but not this script pretending to be one) has to
    actually read the diff for the "no dropped claims" half of the bar.
 
+Also reports fit_score against a real historical baseline pulled from
+fit_score_baseline_supplement.json (2026-08-10) - General's first pointer
+(cost_log.json entries keyed by job_id/purpose='fit_score') turned out not
+to hold for these 4 specific jobs (zero matching entries, and cost_log
+entries never stored the score value itself anyway - only cost/token
+metadata) - the real historical fit_score/fit_rationale for each of the 4
+jobs actually lives on the job record itself (job["fit_score"]/
+job["fit_rationale"] in jobs.json), confirmed directly against the real
+file and captured into the supplement alongside this commit. Reported
+informationally (not gating REVIEW_NEEDED the way ats_score/keyword-loss
+do) since these are already-applied jobs - fit_score no longer drives a
+live apply/skip decision for them, so a difference here is a data point
+for judging the cheaper model's scoring judgment, not a functional
+regression the way a dropped resume keyword would be.
+
 Run after fit_score_model_test.py for a given model:
     venv\\Scripts\\python.exe scripts\\compare_to_baseline.py --model claude-sonnet-5
 """
@@ -40,6 +55,7 @@ if str(SRC) not in sys.path:
 import search.job_store as job_store  # noqa: E402
 from tailoring.ats_score import detect_matched_keyword_regressions  # noqa: E402
 
+FIT_SCORE_BASELINE_PATH = Path(__file__).resolve().parent / "fit_score_baseline_supplement.json"
 BASELINE_PATH = Path(
     r"C:\Users\User\AppData\Local\Temp\claude\C--Users-User-Desktop-Myra"
     r"\00f5af07-6bc9-422e-85c6-9a15b6411995\scratchpad\fit_score_regression_baseline.json"
@@ -71,6 +87,10 @@ def _write_diff(job_id: str, field: str, old_text: str, new_text: str, out_dir: 
 
 def compare(model: str) -> dict:
     baseline = json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
+    fit_score_baseline = (
+        json.loads(FIT_SCORE_BASELINE_PATH.read_text(encoding="utf-8"))
+        if FIT_SCORE_BASELINE_PATH.exists() else {}
+    )
     results_path = RESULTS_DIR / f"fit_score_model_test_results_{model}.json"
     if not results_path.exists():
         raise SystemExit(f"No results file at {results_path} - run fit_score_model_test.py --model {model} first.")
@@ -95,6 +115,8 @@ def compare(model: str) -> dict:
         new_ats = new.get("resume_ats_score")
         ats_ok = new_ats is not None and base_ats is not None and new_ats >= base_ats
 
+        base_fit = fit_score_baseline.get(job_id, {})
+
         diffs_written = []
         for field in TEXT_FIELDS:
             base_text = base.get(field)
@@ -109,7 +131,13 @@ def compare(model: str) -> dict:
             "baseline_ats_score": base_ats,
             "new_ats_score": new_ats,
             "ats_score_ok": ats_ok,
-            "fit_score": new.get("fit_score"),
+            # Informational only - not a gating check, see module docstring
+            # (these are already-applied jobs; fit_score no longer drives a
+            # live decision for them).
+            "baseline_fit_score": base_fit.get("fit_score"),
+            "baseline_fit_rationale": base_fit.get("fit_rationale"),
+            "new_fit_score": new.get("fit_score"),
+            "new_fit_rationale": new.get("fit_rationale"),
             "lost_keywords": lost_keywords,
             "fields_with_diffs_to_review": diffs_written,
         }
