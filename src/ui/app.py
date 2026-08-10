@@ -1050,6 +1050,19 @@ _UNCONFIRMED_FIELD_TO_DOC_KEY = {
 }
 
 
+def _escape_markdown_dollar(text: str) -> str:
+    """A flagged claim's line is arbitrary AI-generated resume/document
+    text, not app-authored UI copy - it can legitimately contain a literal
+    "$" (e.g. "$300K-500K annual savings"), which st.markdown's built-in
+    KaTeX support silently reinterprets as inline LaTeX math delimiters,
+    corrupting the display (real bug caught live 2026-08-09: the dollar
+    sign vanished and the hyphen became a minus sign). The underlying
+    stored data is never affected - only st.markdown's rendering is - so
+    escaping here, right before display, is the correct fix rather than
+    touching find_unconfirmed_markers/resolve_unconfirmed_claim."""
+    return text.replace("$", "\\$")
+
+
 def _persist_resolved_claim(job: dict, app_record: dict, result: dict) -> None:
     """Shared save step once a single claim is resolved (either action
     below): persists resolve_unconfirmed_claim()'s {field: new_text} into
@@ -1114,7 +1127,7 @@ def render_unconfirmed_claims_section(job: dict, app_record: dict) -> None:
             with st.container(border=True):
                 skill_note = f" ({claim['skill']})" if claim.get("skill") else ""
                 st.markdown(f"*{label}{skill_note}*")
-                st.markdown(f"> {claim['line']}")
+                st.markdown(f"> {_escape_markdown_dollar(claim['line'])}")
 
                 edit_key = f"{claim_key}_edittext"
                 new_text = st.text_input(
@@ -3514,7 +3527,7 @@ elif active_tab == "results":
                                         "still need resolving first:"
                                     )
                                     for c in unresolved_claims:
-                                        st.markdown(f"- {c['line']}")
+                                        st.markdown(f"- {_escape_markdown_dollar(c['line'])}")
                                 else:
                                     st.markdown(
                                         "Open the real application yourself and paste each "

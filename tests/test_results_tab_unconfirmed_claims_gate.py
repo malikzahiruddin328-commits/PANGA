@@ -95,7 +95,10 @@ def test_apply_assist_packet_is_blocked_while_an_unconfirmed_claim_remains(resul
     error_text = " ".join(e.value for e in at.error)
     assert "can't be used yet" in error_text
     markdown_text = " ".join(m.value for m in at.markdown)
-    assert "Roughly $180K?" in markdown_text
+    # "$" is escaped before hitting st.markdown (real bug 2026-08-09: raw
+    # "$...$" gets auto-interpreted as inline KaTeX and silently corrupts
+    # the display) - the flagged line still shows up, just with "\$".
+    assert "Roughly \\$180K?" in markdown_text
     # The raw packet value must not also be rendered as a usable code block
     # while blocked.
     assert not any("$180K" in c.value for c in at.code)

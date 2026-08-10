@@ -48,6 +48,42 @@ def test_panel_lists_the_flagged_claim_with_its_skill_label(results_app_with_unc
     assert "Team size" in markdown_text
 
 
+def test_dollar_amount_in_a_claim_renders_escaped_not_as_latex(isolated_data, monkeypatch):
+    # Real bug caught live 2026-08-09: st.markdown auto-interprets $...$ as
+    # inline KaTeX, so a claim like "($300K-500K annual savings)" rendered
+    # with the dollar sign gone and the hyphen turned into a minus sign.
+    # Display-only corruption - the stored text itself was always correct -
+    # but the panel must escape "$" before handing the line to st.markdown.
+    monkeypatch.setenv("PANGA_TEST_MODE", "1")
+    save_jobs([{
+        "source": "Dice", "job_id": "job1", "title": "Director, Claims", "organization": "Acme Corp",
+        "location": "Remote", "description": "Requirements: Python.",
+    }])
+    update_job_score("Dice", "job1", 85, "Strong match.")
+    upsert_application(
+        "Dice", "job1", status="under review",
+        resume_text=(
+            "PROFESSIONAL EXPERIENCE\n"
+            "Drove agent-based first-line security operations automation "
+            "($300K-500K annual savings)?\n\nEDUCATION\nBS"
+        ),
+        resume_ats_score=80, resume_ats_rationale="placeholder", resume_ats_next_actions=[],
+        resume_unconfirmed_claims_ai_reported=[{
+            "skill": "Cost savings",
+            "text": "Drove agent-based first-line security operations automation ($300K-500K annual savings)?",
+        }],
+    )
+    at = AppTest.from_file(APP_PATH)
+    _open_job(at)
+
+    assert not at.exception
+    markdown_text = " ".join(m.value for m in at.markdown)
+    assert "\\$300K-500K" in markdown_text
+    # The un-escaped form must not appear bare in any markdown element -
+    # that's exactly what triggers Streamlit's KaTeX auto-interpretation.
+    assert "> Drove agent-based first-line security operations automation ($300K-500K" not in markdown_text
+
+
 def test_panel_absent_when_job_has_no_unconfirmed_claims(isolated_data, monkeypatch):
     monkeypatch.setenv("PANGA_TEST_MODE", "1")
     save_jobs([{
