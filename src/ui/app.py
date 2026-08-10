@@ -70,8 +70,10 @@ _bhangi_src = _find_bhangi_src(PROJECT_ROOT)
 if _bhangi_src is not None:
     sys.path.insert(0, str(_bhangi_src))
 
+import altair as alt
 import pandas as pd
 import streamlit as st
+import tomllib
 import yaml
 
 from search.usajobs import search_jobs, USAJobsNotConfigured
@@ -105,6 +107,8 @@ from linkedin.ingest import extract_text_from_pdf
 from linkedin.connections import parse_connections_csv, looks_like_recruiter, cross_reference_target_accounts
 from linkedin.connections_store import load_connections_snapshot, save_connections
 from security.crypto_store import has_recovery_code, generate_recovery_code
+from cost_log import load_cost_log
+import ops_metrics
 import gmail_client
 import imap_client
 import microsoft_client
@@ -569,6 +573,27 @@ def st_markdown_raw_text(text: str, **kwargs) -> None:
     f-string, escape just the interpolated part directly instead - this
     wrapper assumes the entire string is untrusted content."""
     st.markdown(_escape_markdown_dollar(text), **kwargs)
+
+
+def active_theme_colors() -> dict:
+    """Real hex values for the currently active light/dark theme, read
+    straight from .streamlit/config.toml - not hand-duplicated constants
+    that could drift out of sync with the real theme file. Native
+    Streamlit elements (st.metric, st.area_chart) already pick up the
+    active theme automatically; this is only for the Ops tab's Altair
+    chart, which needs explicit hex values for its own color encoding
+    (a per-bar conditional highlight st.bar_chart's simple API can't
+    express) and has no other way to read the resolved theme colors -
+    st.context.theme only exposes .type (light/dark), not the actual
+    color values. st.context.theme.type can read "light" during the
+    single rerun right after a session first loads or the user just
+    flipped the setting (a documented Streamlit limitation, not
+    something this function can work around) - a harmless, self-
+    correcting one-rerun-stale chart color in that narrow window, not a
+    lasting bug."""
+    config = tomllib.loads((PROJECT_ROOT / ".streamlit" / "config.toml").read_text(encoding="utf-8"))
+    variant = "dark" if st.context.theme.type == "dark" else "light"
+    return config["theme"][variant]
 
 
 def left_aligned_columns(df: pd.DataFrame, extra: dict | None = None) -> dict:
@@ -1947,6 +1972,7 @@ TAB_ICONS = {
     "linkedin": ":material/badge:",
     "support": ":material/support_agent:",
     "settings": ":material/settings:",
+    "ops": ":material/monitoring:",
 }
 TABS = [
     ("cta", f"Call to action ({cta_count})" if cta_count else "Call to action"),
@@ -1957,6 +1983,11 @@ TABS = [
     ("linkedin", "LinkedIn"),
     ("support", "Support"),
     ("settings", "Settings"),
+    # New badge (design confirmed with Zahir, 2026-08-10) approximated via
+    # an inline Material icon rather than custom CSS/HTML for a true pill -
+    # this codebase's standing "no custom CSS for theming" rule (native
+    # Streamlit only) applies here the same as everywhere else.
+    ("ops", "Ops :material/fiber_new:"),
 ]
 tab_cols = st.columns(len(TABS))
 for col, (key, label) in zip(tab_cols, TABS):
@@ -4792,3 +4823,136 @@ elif active_tab == "support":
             ),
             project_root=PROJECT_ROOT,
         )
+
+elif active_tab == "ops":
+    # Designed with Zahir via the Panga Captain dedicated design session,
+    # 2026-08-10 - first cut, cost log only (see ops_metrics.py). Rerun
+    # timing and structured error-rate views are a deliberate fast-follow,
+    # not built here - their storage pattern isn't settled yet.
+    render_feedback_widget("ops")
+
+    header_col, period_col = st.columns([3, 2])
+    with header_col:
+        st.header("Ops")
+        st.markdown("Live spend and latency, straight from every real API call - first cut, cost log only.")
+    with period_col:
+        period = st.segmented_control(
+            "Period", ops_metrics.PERIODS, default="7 days", key="ops_period",
+            required=True, label_visibility="collapsed", width="content",
+        )
+
+    theme = active_theme_colors()
+    all_entries = load_cost_log()
+    current_entries = ops_metrics.filter_by_period(all_entries, period)
+    prior_entries = ops_metrics.prior_period(all_entries, period)
+    kpis = ops_metrics.compute_kpis(current_entries, prior_entries)
+
+    period_days = ops_metrics.PERIOD_HOURS[period] / 24
+    prior_label = {"Today": "yesterday", "7 days": "prior 7d", "30 days": "prior 30d"}[period]
+
+    kpi_cols = st.columns(4)
+    with kpi_cols[0]:
+        with st.container(border=True):
+            st.metric(f"Spend, {period.lower()}", f"${kpis['spend_usd']:.2f}")
+            st.markdown(f"≈ ${kpis['spend_usd'] / period_days:.2f} / day avg")
+    with kpi_cols[1]:
+        with st.container(border=True):
+            st.metric("API calls", f"{kpis['call_count']:,}")
+            st.markdown(f"{kpis['call_count'] / period_days:.0f} / day avg")
+    with kpi_cols[2]:
+        with st.container(border=True):
+            if kpis["avg_latency_ms"] is None:
+                st.metric("Avg latency", None)
+                st.markdown("No latency data yet")
+            else:
+                avg_s = kpis["avg_latency_ms"] / 1000
+                if kpis["avg_latency_delta_ms"] is not None:
+                    delta_s = kpis["avg_latency_delta_ms"] / 1000
+                    st.metric(
+                        "Avg latency", f"{avg_s:.1f}s",
+                        delta=f"{delta_s:+.1f}s vs. {prior_label}", delta_color="inverse",
+                    )
+                else:
+                    st.metric("Avg latency", f"{avg_s:.1f}s")
+                    st.markdown("Not enough prior-period data for a comparison yet")
+    with kpi_cols[3]:
+        with st.container(border=True):
+            if kpis["p95_latency_ms"] is None:
+                st.metric("P95 latency", None)
+                st.markdown("No latency data yet")
+            else:
+                st.metric("P95 latency", f"{kpis['p95_latency_ms'] / 1000:.1f}s")
+                # p95_note is derived from purpose strings already present
+                # in the app's own vocabulary (fit_score, web_search, etc.)
+                # - not raw AI-generated free text, so no $-escaping needed
+                # here the way st_markdown_raw_text() would apply elsewhere.
+                st.markdown(kpis["p95_note"] or "Based on this period's calls")
+
+    chart_col, purpose_col = st.columns(2)
+    with chart_col:
+        with st.container(border=True):
+            st.markdown(f"**Spend over time** &nbsp;&nbsp;·&nbsp;&nbsp; $ / day, last {period.lower()}" if period != "Today" else "**Spend over time** &nbsp;&nbsp;·&nbsp;&nbsp; $ / hour, today")
+            spend_points = ops_metrics.spend_by_day(all_entries, period)
+            spend_df = pd.DataFrame(spend_points)
+            # st.area_chart's simple x= param treats "label" as a plain
+            # nominal field and sorts it alphabetically (Fri/Mon/Sat/...) -
+            # real bug caught live 2026-08-10. spend_points is already in
+            # the correct oldest-to-newest order; alt.Chart's explicit
+            # sort= (rather than st.area_chart's simpler API) is what
+            # makes the chart actually respect that order.
+            label_order = [p["label"] for p in spend_points]
+            spend_chart = alt.Chart(spend_df).mark_area(line={"color": theme["primaryColor"]}, color=theme["primaryColor"]).encode(
+                x=alt.X("label:N", sort=label_order, title=None),
+                y=alt.Y("spend:Q", title=None),
+                tooltip=[alt.Tooltip("label:N", title="When"), alt.Tooltip("spend:Q", title="Spend", format="$.2f")],
+            )
+            st.altair_chart(spend_chart)
+    with purpose_col:
+        with st.container(border=True):
+            st.markdown("**Avg latency by purpose** &nbsp;&nbsp;·&nbsp;&nbsp; seconds")
+            latency_rows = ops_metrics.avg_latency_by_purpose(all_entries, period)
+            if not latency_rows:
+                st.markdown("No latency data yet - this fills in as new API calls are logged.")
+            else:
+                latency_df = pd.DataFrame(latency_rows)
+                latency_df["label"] = latency_df["avg_duration_s"].map(lambda s: f"{s:.1f}s")
+                bars = alt.Chart(latency_df).mark_bar().encode(
+                    x=alt.X("avg_duration_s:Q", title=None, axis=None),
+                    y=alt.Y("purpose:N", sort="-x", title=None),
+                    color=alt.condition(alt.datum.is_slow, alt.value(theme["yellowColor"]), alt.value(theme["primaryColor"])),
+                    tooltip=[alt.Tooltip("purpose:N", title="Purpose"), alt.Tooltip("label:N", title="Avg latency")],
+                )
+                labels = alt.Chart(latency_df).mark_text(align="left", dx=4).encode(
+                    x=alt.X("avg_duration_s:Q"), y=alt.Y("purpose:N", sort="-x"), text="label:N",
+                )
+                st.altair_chart(bars + labels)
+
+    with st.container(border=True):
+        st.markdown("**Recent calls** &nbsp;&nbsp;·&nbsp;&nbsp; newest first, duration is the new field")
+        calls = ops_metrics.recent_calls(all_entries, period)
+        if not calls:
+            st.markdown("No calls logged in this period yet.")
+        else:
+            calls_df = pd.DataFrame([
+                {
+                    "Time": format_timestamp(c.get("timestamp")),
+                    "Purpose": c.get("purpose") or "unspecified",
+                    "Model": c.get("model") or "-",
+                    "Tokens in / out": f"{c.get('input_tokens', 0):,} / {c.get('output_tokens', 0):,}",
+                    "Duration": f"{c['duration_ms'] / 1000:.1f}s" if c.get("duration_ms") is not None else "—",
+                    "Cost": f"${c.get('cost_usd', 0):.3f}",
+                    "_duration_ms": c.get("duration_ms"),
+                }
+                for c in calls
+            ])
+
+            def _highlight_slow_duration(row):
+                is_slow = (row["_duration_ms"] or 0) >= ops_metrics.SLOW_LATENCY_THRESHOLD_MS
+                style = f"color: {theme['yellowColor']}; font-weight: 600" if is_slow else ""
+                return ["", "", "", "", style, "", ""]
+
+            st.dataframe(
+                calls_df.style.apply(_highlight_slow_duration, axis=1),
+                hide_index=True,
+                column_config={"_duration_ms": None},
+            )

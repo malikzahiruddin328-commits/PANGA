@@ -185,11 +185,18 @@ def get_client() -> "anthropic.Anthropic":
     return anthropic.Anthropic()
 
 
-def _log_cost(response, model: str, purpose: str, job_key: tuple[str, str] | None) -> None:
+def _log_cost(
+    response, model: str, purpose: str, job_key: tuple[str, str] | None,
+    duration_ms: float | None = None,
+) -> None:
     """Logs one call's real cost (score-first-resume-flow spec item 7) -
     swallows its own failures so a logging problem never breaks the actual
     API call it's just trying to record. Runs even on a refused/truncated
-    response, since real tokens were still billed either way."""
+    response, since real tokens were still billed either way. duration_ms
+    (Ops tab, 2026-08-10) is the caller's own measured wall-clock time
+    around its _call_with_retries() call - measured by the caller, not
+    here, since only the caller knows exactly when its own attempt(s)
+    started."""
     try:
         from api_cost import estimate_response_cost
         from cost_log import log_api_cost
@@ -198,7 +205,7 @@ def _log_cost(response, model: str, purpose: str, job_key: tuple[str, str] | Non
         log_api_cost(
             purpose=purpose, model=model,
             input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens,
-            cost_usd=cost, job_key=job_key,
+            cost_usd=cost, job_key=job_key, duration_ms=duration_ms,
         )
     except Exception:
         logger.exception("Failed to log API call cost (purpose=%s) - the call itself still succeeded.", purpose)
@@ -281,6 +288,7 @@ def call_structured(
         if on_progress:
             on_progress("Claude is busy, retrying...")
 
+    call_started_at = time.perf_counter()
     try:
         response, call_model = _call_with_retries(make_request, primary_model, on_retry=report_retry)
     except anthropic.APIStatusError as exc:
@@ -288,8 +296,9 @@ def call_structured(
     except anthropic.APIConnectionError as exc:
         logger.error("Claude API connection error (purpose=%s): %s", purpose, exc)
         raise LLMCallFailed("Couldn't reach the Claude API - check your internet connection.") from exc
+    duration_ms = (time.perf_counter() - call_started_at) * 1000
 
-    _log_cost(response, call_model, purpose, job_key)
+    _log_cost(response, call_model, purpose, job_key, duration_ms=duration_ms)
 
     if response.stop_reason == "refusal":
         logger.error("Claude refused to respond (purpose=%s): %s", purpose, refusal_message)
@@ -346,6 +355,7 @@ def call_with_web_search(
             messages=[{"role": "user", "content": user_content}],
         )
 
+    call_started_at = time.perf_counter()
     try:
         response, call_model = _call_with_retries(make_request, primary_model)
     except anthropic.APIStatusError as exc:
@@ -357,8 +367,9 @@ def call_with_web_search(
     except anthropic.APIConnectionError as exc:
         logger.error("Claude web-search connection error (purpose=%s): %s", purpose, exc)
         return "", 0.0
+    duration_ms = (time.perf_counter() - call_started_at) * 1000
 
     cost = estimate_response_cost(response, call_model)
-    _log_cost(response, call_model, purpose, job_key)
+    _log_cost(response, call_model, purpose, job_key, duration_ms=duration_ms)
     text = "".join(b.text for b in response.content if b.type == "text").strip()
     return text, cost

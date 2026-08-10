@@ -27,6 +27,11 @@ def test_log_cost_persists_a_real_entry(isolated_data):
     assert entries[0]["cost_usd"] == 1000 / 1_000_000 * 5.00 + 200 / 1_000_000 * 25.00
 
 
+def test_log_cost_passes_through_duration_ms(isolated_data):
+    _log_cost(_response(), "claude-opus-5", "fit_score", None, duration_ms=842.1)
+    assert load_cost_log()[0]["duration_ms"] == 842.1
+
+
 def test_log_cost_includes_job_key_when_given(isolated_data):
     _log_cost(_response(), "claude-opus-5", "draft_resume", ("linkedin", "42"))
     entry = load_cost_log()[0]

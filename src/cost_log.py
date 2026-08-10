@@ -7,9 +7,10 @@ draft, keyword extraction), which computed nothing and logged nothing.
 
 This module persists each call's real cost instead of letting it be
 computed and discarded - one entry per call: timestamp, purpose, model,
-token counts, and dollar cost, plus an optional job_key so a later
-regenerate-confirmation prompt (item 6) can look up "what did the last
-real generation for this specific job actually cost."
+token counts, dollar cost, and (2026-08-10, Ops tab) real call duration,
+plus an optional job_key so a later regenerate-confirmation prompt (item
+6) can look up "what did the last real generation for this specific job
+actually cost."
 
 Encrypted at rest via security.crypto_store, same as every other store
 under data/ - not a cost-dashboard UI (explicitly out of scope), just a
@@ -28,12 +29,18 @@ COST_LOG_PATH = PROJECT_ROOT / "data" / "cost_log.json"
 
 def log_api_cost(
     purpose: str, model: str, input_tokens: int, output_tokens: int, cost_usd: float,
-    job_key: tuple[str, str] | None = None,
+    job_key: tuple[str, str] | None = None, duration_ms: float | None = None,
 ) -> None:
     """Appends one real, already-computed call's cost to the log. job_key
     is (source, job_id) when this call was for a specific job posting
     (resume/cover-letter drafting, keyword extraction, fit scoring) - None
-    for calls with no single job to attribute to."""
+    for calls with no single job to attribute to. duration_ms (Ops tab,
+    2026-08-10) is the real wall-clock time the caller measured around its
+    own API call, including any transient-error retries - the actual
+    end-to-end latency a real call took, not an idealized single-attempt
+    number. Optional/None for any caller that doesn't measure it (there
+    isn't one today, but this stays backward-compatible rather than
+    forcing every future caller to supply it)."""
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "purpose": purpose,
@@ -41,6 +48,7 @@ def log_api_cost(
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cost_usd": cost_usd,
+        "duration_ms": duration_ms,
     }
     if job_key:
         entry["source"], entry["job_id"] = job_key

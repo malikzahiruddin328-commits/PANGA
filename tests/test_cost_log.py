@@ -17,6 +17,18 @@ def test_log_api_cost_appends_a_real_entry(isolated_data):
     assert "job_id" not in entry
 
 
+def test_log_api_cost_stamps_duration_ms_when_given(isolated_data):
+    log_api_cost(purpose="fit_score", model="claude-opus-5", input_tokens=1000, output_tokens=200, cost_usd=0.01, duration_ms=1234.5)
+    entry = load_cost_log()[0]
+    assert entry["duration_ms"] == 1234.5
+
+
+def test_log_api_cost_duration_ms_defaults_to_none(isolated_data):
+    log_api_cost(purpose="fit_score", model="claude-opus-5", input_tokens=1000, output_tokens=200, cost_usd=0.01)
+    entry = load_cost_log()[0]
+    assert entry["duration_ms"] is None
+
+
 def test_log_api_cost_stamps_job_key_when_given(isolated_data):
     log_api_cost(
         purpose="draft_resume", model="claude-opus-5", input_tokens=5000, output_tokens=3000, cost_usd=0.1,
