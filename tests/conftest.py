@@ -73,6 +73,7 @@ def isolated_data(tmp_path, monkeypatch):
     import cost_log
     import debug_log
     import linkedin.storage as linkedin_storage
+    import prospector.prospector_score as prospector_score
 
     monkeypatch.setattr(job_store, "JOBS_PATH", tmp_path / "jobs.json")
     monkeypatch.setattr(applications, "APPLICATIONS_PATH", tmp_path / "applications.json")
@@ -118,4 +119,10 @@ def isolated_data(tmp_path, monkeypatch):
     # store above, so no test exercising it can touch the real
     # data/logs/panga_debug.log.
     monkeypatch.setattr(debug_log, "LOG_PATH", tmp_path / "panga_debug.log")
+    # Same class of gap as MASTER_PROFILE_PATH/LINKEDIN_PATH above - found
+    # 2026-08-10 while writing tests for the $-as-LaTeX escaping sweep:
+    # prospector.prospector_score.SCORE_PATH was never isolated either, so
+    # any test exercising save_prospector_score() would have silently
+    # written the real data/prospector/prospector_score.json.
+    monkeypatch.setattr(prospector_score, "SCORE_PATH", tmp_path / "prospector_score.json")
     return tmp_path
