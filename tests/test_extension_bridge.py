@@ -240,3 +240,22 @@ def test_start_server_is_idempotent():
     extension_bridge.start_server()
     resp = requests.post(BASE_URL + "/heartbeat", json={"source": "extension"}, timeout=2)
     assert resp.status_code == 200
+
+
+def test_server_does_not_allow_address_reuse():
+    # Real bug, confirmed live 2026-08-09: stdlib's ThreadingHTTPServer
+    # defaults allow_reuse_address to True, which sets SO_REUSEADDR before
+    # bind. On Windows (unlike Linux) that lets a SECOND process bind the
+    # exact same address:port a first one already holds - no OSError, both
+    # genuinely LISTENING, incoming connections routing to whichever one
+    # Windows favors. Reproduced with two real separate OS processes: this
+    # is exactly what happened when RM ran a manual live-verification
+    # Streamlit instance alongside production and captures silently
+    # started routing to RM's instance instead of always production. This
+    # whole module's design (start_server()'s docstring: "only ONE can
+    # actually hold the port... the rest fail the bind and just no-op")
+    # depends entirely on a second bind attempt failing cleanly - a plain
+    # attribute check here is cheap insurance against someone later
+    # "simplifying" _Server back to bare ThreadingHTTPServer and silently
+    # reintroducing this.
+    assert extension_bridge._Server.allow_reuse_address is False
