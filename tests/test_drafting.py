@@ -6,7 +6,10 @@ from tailoring.drafting import (
     _drop_generic_soft_skill_keywords,
     _drop_years_experience_keywords,
     _merge_keyword_gap_questions,
+    _profile_narrative_units,
+    _profile_supports_skill,
     _questions_worth_asking,
+    _render_education_section_verbatim,
     _resume_schema,
     _strip_degree_in_prefix_keywords,
     _strip_rank_prefixes,
@@ -319,6 +322,31 @@ def test_draft_one_resume_threads_unconfirmed_claims_through(monkeypatch):
 
     result = _draft_one(object(), [], "resume", None, job=job, profile={})
     assert result["unconfirmed_claims"] == [{"skill": "Team size", "text": "Led a team of 8-10 engineers?"}]
+
+
+def test_draft_one_resume_renders_education_verbatim_from_the_profile(monkeypatch):
+    # 2026-08-10 fix: _draft_one must not trust the AI's own freeform
+    # EDUCATION wording, even when the AI's motive (hitting a literal
+    # "Bachelor's degree" keyword) is legitimate - the profile's own
+    # structured fields win.
+    import tailoring.drafting as drafting
+
+    def _fake_call_structured(client, **kwargs):
+        return {
+            "text": "EDUCATION\nBachelor's degree - Bachelor of Science (BSc), Info Systems\n",
+            "target_seniority_at_least_vp": True,
+            "suggested_strategy_tag": "",
+            "clarifying_questions": [],
+            "unconfirmed_claims": [],
+        }
+
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured)
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": [], "ats_preferred_keywords": []}
+    profile = {"education": [{"degree": "Bachelor of Science, Information Systems", "institution": "Brunel University London"}]}
+
+    result = _draft_one(object(), [], "resume", None, job=job, profile=profile)
+    assert result["text"] == "EDUCATION\nBachelor of Science, Information Systems, Brunel University London"
+    assert "BSc" not in result["text"]
 
 
 def test_draft_one_resume_deterministically_flags_an_unhedged_fabricated_employer(monkeypatch):
@@ -638,6 +666,77 @@ def test_strip_rank_prefixes_only_strips_parentheticals_containing_equivalent():
     assert _strip_rank_prefixes(text) == text
 
 
+def _profile_with_education(*entries):
+    return {"education": list(entries)}
+
+
+def test_render_education_section_verbatim_replaces_a_freely_reworded_line():
+    # Real Merck 4449005464 case, 2026-08-10: the AI prepended "Bachelor's
+    # degree - " and invented "(BSc)" that appears nowhere in the real
+    # profile, flattening the original's parenthetical grouping. The
+    # verbatim render must win regardless of what the AI wrote.
+    text = (
+        "Zahir Uddin\n\nEDUCATION\n"
+        "Bachelor's degree - Bachelor of Science (BSc), Information Systems, "
+        "Artificial Intelligence major, Honours, Brunel University London, "
+        "Middlesex, UK, 1997 - 2001\n\nCERTIFICATIONS\nPMP\n"
+    )
+    profile = _profile_with_education({
+        "degree": "Bachelor of Science, Information Systems (Artificial Intelligence major, Honours)",
+        "institution": "Brunel University London",
+        "location": "Middlesex, UK",
+        "years": "1997 - 2001",
+    })
+    result = _render_education_section_verbatim(text, profile)
+    assert (
+        "Bachelor of Science, Information Systems (Artificial Intelligence major, Honours), "
+        "Brunel University London, Middlesex, UK, 1997 - 2001"
+    ) in result
+    assert "BSc" not in result
+    assert "Bachelor's degree -" not in result
+    # Content outside the EDUCATION section must survive untouched.
+    assert "Zahir Uddin" in result
+    assert "CERTIFICATIONS\nPMP" in result
+
+
+def test_render_education_section_verbatim_preserves_blank_line_spacing():
+    text = "EDUCATION\nOld reworded line.\n\nCERTIFICATIONS\nPMP\n"
+    profile = _profile_with_education({"degree": "BS", "institution": "Some University"})
+    result = _render_education_section_verbatim(text, profile)
+    assert result == "EDUCATION\nBS, Some University\n\nCERTIFICATIONS\nPMP"
+
+
+def test_render_education_section_verbatim_renders_multiple_degrees_each_on_own_line():
+    text = "EDUCATION\nSome reworded run-on line covering both degrees.\n\nSKILLS\nPython\n"
+    profile = _profile_with_education(
+        {"degree": "MBA", "institution": "LBS", "years": "2010 - 2012"},
+        {"degree": "BS", "institution": "Brunel", "years": "1997 - 2001"},
+    )
+    result = _render_education_section_verbatim(text, profile)
+    assert "MBA, LBS, 2010 - 2012\nBS, Brunel, 1997 - 2001" in result
+
+
+def test_render_education_section_verbatim_no_op_with_no_profile_education():
+    text = "EDUCATION\nSomething the AI wrote.\n\nSKILLS\nPython\n"
+    assert _render_education_section_verbatim(text, {"education": []}) == text
+    assert _render_education_section_verbatim(text, None) == text
+
+
+def test_render_education_section_verbatim_no_op_when_no_education_header_present():
+    # Fails safe toward the AI's own text rather than guessing where to
+    # insert a section that was never printed at all.
+    text = "PROFESSIONAL EXPERIENCE\nEngineer.\n"
+    profile = _profile_with_education({"degree": "BS", "institution": "Brunel"})
+    assert _render_education_section_verbatim(text, profile) == text
+
+
+def test_render_education_section_verbatim_skips_an_entry_with_no_real_fields():
+    text = "EDUCATION\nOld line.\n"
+    profile = _profile_with_education({}, {"degree": "BS", "institution": "Brunel"})
+    result = _render_education_section_verbatim(text, profile)
+    assert result == "EDUCATION\nBS, Brunel"
+
+
 def test_resume_spec_folds_target_role_alignment_into_summary_not_its_own_header():
     # Real problem Zahir hit live 2026-08-06: a job-application portal's
     # own auto-parser expected the first employer entry right after the
@@ -782,6 +881,86 @@ def test_merge_keyword_gap_questions_previously_answered_dedup_is_case_insensiti
 def test_merge_keyword_gap_questions_still_asks_about_a_different_unanswered_skill():
     merged = _merge_keyword_gap_questions([], _missing("Databricks", "Terraform"), previously_answered_skills=["Databricks"])
     assert {q["skill"] for q in merged} == {"Terraform"}
+
+
+def _sample_profile():
+    return {
+        "skills": {"Technical": ["Databricks", "Python"]},
+        "work_history": [
+            {"title": "Solutions Architect", "bullets": ["Led stakeholder engagement across 12 business units."]},
+        ],
+        "client_engagements": [
+            {"role": "Consultant", "bullets": ["Owned client engagement for a Fortune 500 rollout."]},
+        ],
+        "certifications": [{"name": "PMP"}],
+        "education": [{"degree": "BS Computer Science"}],
+    }
+
+
+def test_profile_narrative_units_flattens_every_profile_section_as_distinct_entries():
+    units = _profile_narrative_units(_sample_profile())
+    assert "Databricks" in units
+    assert "Solutions Architect" in units
+    assert "Led stakeholder engagement across 12 business units." in units
+    assert "Owned client engagement for a Fortune 500 rollout." in units
+    assert "PMP" in units
+    assert "BS Computer Science" in units
+
+
+def test_profile_narrative_units_handles_a_missing_or_empty_profile():
+    assert _profile_narrative_units(None) == []
+    assert _profile_narrative_units({}) == []
+
+
+def test_profile_supports_skill_true_for_a_literal_skills_list_entry():
+    assert _profile_supports_skill("Databricks", _sample_profile()) is True
+
+
+def test_profile_supports_skill_true_for_a_phrase_contained_in_a_bullet():
+    assert _profile_supports_skill("client engagement", _sample_profile()) is True
+
+
+def test_profile_supports_skill_false_for_a_genuinely_absent_term():
+    assert _profile_supports_skill("Kubernetes", _sample_profile()) is False
+
+
+def test_profile_supports_skill_does_not_catch_a_real_synonym_not_stated_literally():
+    # Documents the known, accepted limit of this fix (2026-08-10): skills_
+    # match() is not a semantic matcher, so a genuinely different word for
+    # the same real experience ("customer engagement" vs. the profile's own
+    # "client engagement"/"stakeholder engagement") is NOT caught here -
+    # that gap is handled by the prompt-level instruction in
+    # request_additional_gap_questions instead, not this deterministic check.
+    assert _profile_supports_skill("Customer Engagement", _sample_profile()) is False
+
+
+def test_profile_supports_skill_does_not_false_positive_across_unrelated_bullets():
+    # Real false-positive shape this function was designed to avoid: two
+    # unrelated bullets that would read as one coincidental compound phrase
+    # if ever concatenated into a single blob first.
+    profile = {
+        "work_history": [
+            {"title": "Engineer", "bullets": ["Owned system design.", "Applications for internal tooling."]},
+        ],
+    }
+    assert _profile_supports_skill("design applications", profile) is False
+
+
+def test_merge_keyword_gap_questions_does_not_ask_about_a_profile_supported_keyword():
+    merged = _merge_keyword_gap_questions([], _missing("Databricks"), profile=_sample_profile())
+    assert merged == []
+
+
+def test_merge_keyword_gap_questions_still_asks_about_a_profile_unsupported_keyword():
+    merged = _merge_keyword_gap_questions([], _missing("Databricks", "Kubernetes"), profile=_sample_profile())
+    assert {q["skill"] for q in merged} == {"Kubernetes"}
+
+
+def test_merge_keyword_gap_questions_profile_support_also_suppresses_a_preferred_keyword():
+    merged = _merge_keyword_gap_questions(
+        [], [], profile=_sample_profile(), missing_preferred_keywords=_missing("Databricks"),
+    )
+    assert merged == []
 
 
 def test_merge_keyword_gap_questions_backfills_point_value_on_a_free_form_ai_question():
@@ -1078,6 +1257,27 @@ def test_analyze_fit_before_drafting_projects_a_confirmed_but_undrafted_answer()
     # The confirmed gap must not still be described as an open, real gap.
     assert result["plateau_note"] is None or "Databricks" not in result["plateau_note"]
     # And it must not still be asked about as an open question either.
+    assert not any(q.get("skill") == "Databricks" for q in result["open_questions"])
+
+
+def test_analyze_fit_before_drafting_credits_a_profile_supported_keyword_without_a_new_answer():
+    # 2026-08-10 fix: a keyword the candidate's own profile already
+    # substantively states (e.g. a skills-list entry) must count toward
+    # projected_score and drop off open_questions even with zero gap-
+    # interview answers - consistent with _merge_keyword_gap_questions no
+    # longer asking about it in the first place.
+    from tailoring.ats_score import score_resume_against_keywords
+
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": ["Python", "Databricks"], "ats_preferred_keywords": []}
+    resume_text = "PROFESSIONAL EXPERIENCE\nEngineer.\n\nEDUCATION\nBS\n\nSKILLS\nPython"
+    app_record = {"resume_text": resume_text}
+    profile = {"gap_interview_answers": [], "skills": {"Technical": ["Databricks"]}}
+    baseline = score_resume_against_keywords(job["ats_required_keywords"], [], resume_text)
+    databricks_point_value = baseline["missing_required_keywords"][0]["point_value"]
+
+    result = analyze_fit_before_drafting(job, profile, app_record)
+
+    assert result["projected_score"] == round(baseline["ats_score"] + databricks_point_value)
     assert not any(q.get("skill") == "Databricks" for q in result["open_questions"])
 
 
