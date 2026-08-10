@@ -44,6 +44,16 @@ LinkedIn /jobs/view/<id> pattern matches, and hashing "" would collide
 every no-URL listing onto the same job_id, silently dropping all but the
 first. In practice this should be rare - a job-alert digest without a
 link to the actual posting isn't useful to Zahir either.
+
+Mark-reviewed-on-every-terminal-path (2026-08-09): real bug found by
+Backlog against the live code - extract_listings() raising skipped the
+mark_job_alert_reviewed() call entirely (it only ran on the normal
+path), so a persistently-unparseable digest retried (a real AI call)
+forever. Now uses scan_retry_tracker (shared with gmail_cta_scan.py,
+under its own scan-name namespace so the two scripts' failure counts for
+the same underlying message stay independent): a failure only gets
+marked reviewed (given up on) after MAX_ATTEMPTS consecutive failures, a
+single transient blip still retries next run same as before.
 """
 
 import sys
@@ -57,9 +67,12 @@ if str(SRC) not in sys.path:
 
 from inbox_accounts import configured_accounts  # noqa: E402
 from notifications import send_notification  # noqa: E402
+from scan_retry_tracker import MAX_ATTEMPTS, clear_failure, record_failure  # noqa: E402
 from search.job_alert_senders import load_job_alert_senders  # noqa: E402
 from search.job_store import add_manual_job  # noqa: E402
 from tailoring.job_alert_reasoning import extract_listings  # noqa: E402
+
+_SCAN_NAME = "job_alert_scan"
 
 
 def _log(message: str) -> None:
@@ -80,8 +93,18 @@ def scan_account(account, senders: list[str]) -> list[dict]:
             body = account.get_body(msg.ref)
             listings = extract_listings(msg.subject, body)
         except Exception as exc:  # noqa: BLE001 - one message's failure shouldn't stop the rest
-            _log(f"    extraction failed for {msg.subject!r}: {exc}")
+            failures = record_failure(_SCAN_NAME, account.provider, account.account, msg.ref)
+            if failures >= MAX_ATTEMPTS:
+                _log(f"    extraction failed for {msg.subject!r} {failures} times - giving up, marking job-alert-reviewed: {exc}")
+                try:
+                    account.mark_job_alert_reviewed(msg.ref)
+                except Exception as mark_exc:  # noqa: BLE001
+                    _log(f"    couldn't mark job-alert-reviewed after giving up on {msg.subject!r}: {mark_exc}")
+            else:
+                _log(f"    extraction failed for {msg.subject!r} (attempt {failures}/{MAX_ATTEMPTS}): {exc}")
             continue
+        else:
+            clear_failure(_SCAN_NAME, account.provider, account.account, msg.ref)
 
         for listing in listings:
             if not listing.get("posting_url"):

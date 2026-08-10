@@ -113,7 +113,7 @@ def test_thin_listing_missing_organization_still_saved(isolated_data, monkeypatc
     assert new_jobs[0]["organization"] == ""
 
 
-def test_extraction_failure_does_not_crash_and_still_marks_reviewed(isolated_data, monkeypatch):
+def test_extraction_failure_does_not_crash_and_does_not_mark_reviewed_on_first_attempt(isolated_data, monkeypatch):
     def failing_extract(subject, body):
         raise RuntimeError("API blip")
     monkeypatch.setattr(job_alert_scan, "extract_listings", failing_extract)
@@ -122,10 +122,54 @@ def test_extraction_failure_does_not_crash_and_still_marks_reviewed(isolated_dat
     new_jobs = job_alert_scan.scan_account(account, _SENDERS)
 
     assert new_jobs == []
-    # A failed extraction shouldn't mark the message reviewed - unlike a
-    # successful-but-empty extraction, this is a transient failure worth
-    # retrying on the next run, not a genuine "nothing here."
+    # A failed extraction shouldn't mark the message reviewed on its first
+    # failure - unlike a successful-but-empty extraction, this is a
+    # transient failure worth retrying on the next run, not a genuine
+    # "nothing here." (See the bounded-retry tests below for what happens
+    # once it fails MAX_ATTEMPTS times in a row.)
     assert account.marked == []
+
+
+# ---- Mark-reviewed-on-every-terminal-path (2026-08-09) - real bug found
+# by Backlog against the live code: extraction failures skipped
+# mark_job_alert_reviewed entirely, so a persistently-unparseable digest
+# retried (a real AI call) forever. See scripts/job_alert_scan.py's
+# module docstring.
+
+def test_extraction_failure_gives_up_and_marks_reviewed_after_max_attempts(isolated_data, monkeypatch):
+    def failing_extract(subject, body):
+        raise RuntimeError("permanently malformed digest")
+    monkeypatch.setattr(job_alert_scan, "extract_listings", failing_extract)
+
+    account = FakeAccount([FakeMessage(ref="m1")])
+    for _ in range(job_alert_scan.MAX_ATTEMPTS - 1):
+        job_alert_scan.scan_account(account, _SENDERS)
+        assert account.marked == []  # still retrying
+
+    job_alert_scan.scan_account(account, _SENDERS)
+    assert account.marked == ["m1"]  # gave up on the MAX_ATTEMPTS-th failure
+
+
+def test_extraction_success_after_a_prior_failure_clears_the_retry_count(isolated_data, monkeypatch):
+    calls = {"n": 0}
+
+    def flaky_extract(subject, body):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient blip")
+        return []
+    monkeypatch.setattr(job_alert_scan, "extract_listings", flaky_extract)
+
+    account = FakeAccount([FakeMessage(ref="m1")])
+    job_alert_scan.scan_account(account, _SENDERS)  # fails once
+    assert account.marked == []
+
+    account2 = FakeAccount([FakeMessage(ref="m1")])
+    job_alert_scan.scan_account(account2, _SENDERS)  # succeeds - clears the count
+    assert account2.marked == ["m1"]
+
+    import scan_retry_tracker
+    assert scan_retry_tracker.record_failure("job_alert_scan", "gmail", "gmail", "m1") == 1  # started over
 
 
 def test_dedup_across_two_runs_does_not_duplicate(isolated_data, monkeypatch):

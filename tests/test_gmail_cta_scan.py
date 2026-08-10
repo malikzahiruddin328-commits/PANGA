@@ -250,3 +250,66 @@ def test_application_confirmation_match_also_uses_joined_candidates(isolated_dat
     ]
     app = applications.get_application("usajobs", "j1")
     assert app["suggested_status"] == "applied"
+
+
+# ---- Mark-reviewed-on-every-terminal-path (2026-08-09) - real bug found
+# by Backlog against the live code: not_related never marked reviewed at
+# all, and a classification failure skipped marking entirely (unbounded
+# retry). See scripts/gmail_cta_scan.py's module docstring.
+
+def test_not_related_gets_marked_reviewed(isolated_data, monkeypatch):
+    monkeypatch.setattr(gmail_cta_scan, "classify_thread", lambda *a, **k: {"bucket": "not_related", "cta_category": "", "confident": True})
+
+    account = FakeAccount([FakeMessage(ref="m1")])
+    gmail_cta_scan.scan_account(account, _jobs_by_key())
+
+    assert account.marked_reviewed == ["m1"]  # the actual bug: this used to be []
+
+
+def test_classification_failure_does_not_mark_reviewed_before_max_attempts(isolated_data, monkeypatch):
+    def failing_classify(*a, **k):
+        raise RuntimeError("API blip")
+    monkeypatch.setattr(gmail_cta_scan, "classify_thread", failing_classify)
+
+    account = FakeAccount([FakeMessage(ref="m1")])
+    gmail_cta_scan.scan_account(account, _jobs_by_key())
+
+    assert account.marked_reviewed == []  # first failure - still gets a retry next run, not marked reviewed
+
+
+def test_classification_failure_gives_up_and_marks_reviewed_after_max_attempts(isolated_data, monkeypatch):
+    def failing_classify(*a, **k):
+        raise RuntimeError("permanently malformed body")
+    monkeypatch.setattr(gmail_cta_scan, "classify_thread", failing_classify)
+
+    account = FakeAccount([FakeMessage(ref="m1")])
+    for _ in range(gmail_cta_scan.MAX_ATTEMPTS - 1):
+        gmail_cta_scan.scan_account(account, _jobs_by_key())
+        assert account.marked_reviewed == []  # still retrying
+
+    gmail_cta_scan.scan_account(account, _jobs_by_key())
+    assert account.marked_reviewed == ["m1"]  # gave up on the MAX_ATTEMPTS-th failure
+
+
+def test_success_after_a_prior_failure_clears_the_retry_count(isolated_data, monkeypatch):
+    calls = {"n": 0}
+
+    def flaky_classify(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient blip")
+        return {"bucket": "passive", "cta_category": "", "confident": True}
+    monkeypatch.setattr(gmail_cta_scan, "classify_thread", flaky_classify)
+
+    account = FakeAccount([FakeMessage(ref="m1")])
+    gmail_cta_scan.scan_account(account, _jobs_by_key())  # fails once
+    assert account.marked_reviewed == []
+
+    account2 = FakeAccount([FakeMessage(ref="m1")])
+    gmail_cta_scan.scan_account(account2, _jobs_by_key())  # succeeds - clears the count
+    assert account2.marked_reviewed == ["m1"]
+
+    # A fresh failure afterward should start counting from 1 again, not
+    # continue from the earlier failure - confirms clear_failure ran.
+    import scan_retry_tracker
+    assert scan_retry_tracker.record_failure("gmail_cta_scan", "gmail", "gmail", "m1") == 1

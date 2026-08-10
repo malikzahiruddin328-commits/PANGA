@@ -74,6 +74,7 @@ def isolated_data(tmp_path, monkeypatch):
     import debug_log
     import linkedin.storage as linkedin_storage
     import prospector.prospector_score as prospector_score
+    import scan_retry_tracker
 
     monkeypatch.setattr(job_store, "JOBS_PATH", tmp_path / "jobs.json")
     monkeypatch.setattr(applications, "APPLICATIONS_PATH", tmp_path / "applications.json")
@@ -125,4 +126,8 @@ def isolated_data(tmp_path, monkeypatch):
     # any test exercising save_prospector_score() would have silently
     # written the real data/prospector/prospector_score.json.
     monkeypatch.setattr(prospector_score, "SCORE_PATH", tmp_path / "prospector_score.json")
+    # scan_retry_tracker.py (2026-08-09, the mark-reviewed-on-every-path
+    # fix) writes one JSON file per scan name under this directory -
+    # isolated for the same reason as every store above.
+    monkeypatch.setattr(scan_retry_tracker, "RETRY_DIR", tmp_path / "scan_retries")
     return tmp_path
