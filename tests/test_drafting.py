@@ -434,8 +434,12 @@ def test_generate_documents_passes_the_just_drafted_resume_to_later_docs_in_the_
         seen_resume_text_for[doc_key] = resume_text_for_consistency
         if doc_key == "resume":
             return {
-                "text": "PROFESSIONAL EXPERIENCE\nReal resume text.", "ats_score": 80,
+                # ats_score >= the self-correction target (90) so this
+                # unrelated cross-document-consistency test doesn't also
+                # exercise the self-correction retry loop.
+                "text": "PROFESSIONAL EXPERIENCE\nReal resume text.", "ats_score": 95,
                 "ats_rationale": "", "ats_next_actions": [], "clarifying_questions": [], "unconfirmed_claims": [],
+                "missing_required_keywords": [], "missing_preferred_keywords": [],
             }
         return "drafted text"
 
@@ -1461,3 +1465,213 @@ def test_years_of_experience_equivalency_flows_through_rescore_against_cached_ke
     result = drafting.rescore_against_cached_keywords(job, app_record, profile)
 
     assert "credited via" in result["ats_rationale"]
+
+
+# --- Self-correcting Generate loop (2026-08-09) ---
+# Zahir's explicit design, confirmed with General: he had to click
+# "Generate" 5 separate times for one real job to get an acceptable
+# resume. _draft_resume_with_self_correction() makes this a bounded,
+# self-correcting loop inside a single click instead - see that
+# function's own docstring for the full design (target score, stop
+# conditions, regression guard).
+
+_SELF_CORRECTION_JOB = {
+    "source": "linkedin", "job_id": "1",
+    "ats_required_keywords": ["Python", "Kubernetes"], "ats_preferred_keywords": [],
+}
+
+
+def _self_correction_response(text, unconfirmed_claims=None):
+    return {
+        "text": text, "target_seniority_at_least_vp": True, "suggested_strategy_tag": "",
+        "clarifying_questions": [], "unconfirmed_claims": unconfirmed_claims or [],
+    }
+
+
+def _full_resume(skills_line: str) -> str:
+    # Includes contact info + a date mention so structure_score hits 100%
+    # - isolates these tests to keyword coverage specifically, rather
+    # than incidentally failing on unrelated formatting checks
+    # (ats_score._structure_score also checks headers/markdown/dates/
+    # contact, not just keyword overlap). Deliberately does NOT use a
+    # role-header-shaped "Employer - Title  Date - Date" line - these
+    # tests pass an empty profile ({}), so claim_verification.py's
+    # unhedged-claim check would correctly flag any such line as an
+    # unverifiable employer claim (no work_history to trace it to),
+    # appending a "?" that would break these tests' own literal-text
+    # comparisons - a plain bullet mentioning a date avoids that
+    # entirely without weakening the structure-score check.
+    return (
+        "JANE DOE\njane@example.com\n\nPROFESSIONAL EXPERIENCE\n"
+        "Engineer\n- Built things starting Jan 2020.\n\n"
+        f"SKILLS\n{skills_line}"
+    )
+
+
+def test_self_correction_returns_immediately_when_the_first_attempt_already_hits_target(monkeypatch):
+    import tailoring.drafting as drafting
+
+    calls = []
+
+    def _fake_call_structured(client, **kwargs):
+        calls.append(kwargs)
+        return _self_correction_response(_full_resume("Python, Kubernetes"))
+
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured)
+
+    result = drafting._draft_resume_with_self_correction(
+        object(), [], None, None, 1, 1, _SELF_CORRECTION_JOB, {},
+    )
+
+    assert len(calls) == 1  # no retry needed
+    assert result["ats_score"] == 100
+    assert result["self_correction_attempts"] == 1
+    assert "self_correction_note" not in result
+
+
+def test_self_correction_retries_and_closes_a_real_gap(monkeypatch):
+    import tailoring.drafting as drafting
+
+    def _fake_call_structured(client, **kwargs):
+        user_text = " ".join(b.get("text", "") for b in kwargs["user_content"] if isinstance(b, dict))
+        if "SELF-CORRECTION PASS" in user_text:
+            return _self_correction_response(_full_resume("Python, Kubernetes"))
+        return _self_correction_response(_full_resume("Python"))
+
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured)
+
+    progress_calls = []
+    result = drafting._draft_resume_with_self_correction(
+        object(), [], None, lambda *a: progress_calls.append(a), 1, 1, _SELF_CORRECTION_JOB, {},
+    )
+
+    assert result["ats_score"] == 100
+    assert result["self_correction_attempts"] == 2
+    assert "self_correction_note" not in result
+    # Progress reporting (2026-08-09 design): a "Refining..." substatus
+    # flows through the SAME existing on_progress callback, no new UI.
+    assert any("Refining resume" in str(call) for call in progress_calls)
+
+
+def test_self_correction_stops_when_no_progress_is_made(monkeypatch):
+    # Real, permanent-looking gap (same class as "advanced degree" before
+    # the years-of-experience equivalency fix) - every retry returns the
+    # exact same text, so the missing-keyword set never changes. Must
+    # stop before the hard attempt cap, not burn every attempt pointlessly.
+    import tailoring.drafting as drafting
+
+    calls = []
+
+    def _fake_call_structured(client, **kwargs):
+        calls.append(kwargs)
+        return _self_correction_response(_full_resume("Python"))
+
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured)
+
+    result = drafting._draft_resume_with_self_correction(
+        object(), [], None, None, 1, 1, _SELF_CORRECTION_JOB, {},
+    )
+
+    assert len(calls) == 2  # initial + exactly one retry, not the full 3-attempt cap
+    assert result["ats_score"] < 90
+    assert result["self_correction_attempts"] == 2
+    assert "Kubernetes" in result["self_correction_note"]
+    assert "real ceiling" in result["self_correction_note"]
+    assert "Kubernetes" in result["ats_rationale"]  # folded in for the existing "Why this score" display
+
+
+def test_self_correction_rejects_a_retry_that_regresses_a_previously_matched_keyword(monkeypatch):
+    # Real, live-reproduced failure mode (CLAUDE.md known failure pattern
+    # #2): a redraft can fix one requirement while silently dropping
+    # another. The self-correction loop must not accept that trade - keep
+    # the previous attempt and stop, rather than risk repeating it.
+    import tailoring.drafting as drafting
+
+    def _fake_call_structured(client, **kwargs):
+        user_text = " ".join(b.get("text", "") for b in kwargs["user_content"] if isinstance(b, dict))
+        if "SELF-CORRECTION PASS" in user_text:
+            # Fixes Kubernetes but drops Python - a real regression.
+            return _self_correction_response(_full_resume("Kubernetes"))
+        return _self_correction_response(_full_resume("Python"))
+
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured)
+
+    result = drafting._draft_resume_with_self_correction(
+        object(), [], None, None, 1, 1, _SELF_CORRECTION_JOB, {},
+    )
+
+    assert result["text"] == _full_resume("Python")  # the REJECTED candidate's text must not win
+    assert result["self_correction_attempts"] == 2
+    assert "traded away" in result["self_correction_note"]
+    assert "Python" in result["self_correction_note"]
+
+
+def test_self_correction_stops_at_the_hard_attempt_cap_even_while_still_improving(monkeypatch):
+    # Progress IS being made each time (a different keyword closes per
+    # attempt), but three real requirements are missing and the cap is 3
+    # total attempts - must stop there, not loop unbounded chasing 90.
+    import tailoring.drafting as drafting
+
+    job = {
+        "source": "linkedin", "job_id": "1",
+        "ats_required_keywords": ["Python", "Kubernetes", "Terraform", "Docker"], "ats_preferred_keywords": [],
+    }
+    call_count = [0]
+
+    def _fake_call_structured(client, **kwargs):
+        call_count[0] += 1
+        # Each attempt closes exactly one more keyword than the last,
+        # never enough to reach the 90 target within the attempt cap.
+        skills = ["Python", "Kubernetes", "Terraform"][: call_count[0]]
+        return _self_correction_response(_full_resume(", ".join(skills)))
+
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured)
+
+    result = drafting._draft_resume_with_self_correction(object(), [], None, None, 1, 1, job, {})
+
+    assert call_count[0] == drafting._RESUME_SELF_CORRECTION_MAX_ATTEMPTS
+    assert result["self_correction_attempts"] == drafting._RESUME_SELF_CORRECTION_MAX_ATTEMPTS
+    assert "attempt limit" in result["self_correction_note"]
+    assert "Docker" in result["self_correction_note"]  # the one requirement never closed
+
+
+def test_self_correction_retry_prompt_includes_previous_text_and_missing_keywords_with_point_values(monkeypatch):
+    import tailoring.drafting as drafting
+
+    captured_retry_content = []
+
+    def _fake_call_structured(client, **kwargs):
+        user_text_blocks = [b.get("text", "") for b in kwargs["user_content"] if isinstance(b, dict)]
+        combined = " ".join(user_text_blocks)
+        if "SELF-CORRECTION PASS" in combined:
+            captured_retry_content.append(combined)
+            return _self_correction_response(_full_resume("Python, Kubernetes"))
+        return _self_correction_response(_full_resume("Python"))
+
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured)
+
+    drafting._draft_resume_with_self_correction(object(), [], None, None, 1, 1, _SELF_CORRECTION_JOB, {})
+
+    assert len(captured_retry_content) == 1
+    retry_text = captured_retry_content[0]
+    assert "Kubernetes" in retry_text
+    assert "PREVIOUS ATTEMPT" in retry_text
+    assert _full_resume("Python") in retry_text  # the actual previous draft, verbatim
+    assert "do not fabricate" in retry_text.lower()
+
+
+def test_generate_documents_routes_resume_through_self_correction(monkeypatch):
+    # Integration check: generate_documents() must dispatch doc_key=="resume"
+    # through the self-correction wrapper, not the plain single-shot path.
+    import tailoring.drafting as drafting
+
+    def _fake_call_structured(client, **kwargs):
+        return _self_correction_response(_full_resume("Python, Kubernetes"))
+
+    monkeypatch.setattr(drafting, "_client", lambda: object())
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured)
+
+    result = drafting.generate_documents(_SELF_CORRECTION_JOB, {}, ["resume"])
+
+    assert result["resume"]["ats_score"] == 100
+    assert "self_correction_attempts" in result["resume"]

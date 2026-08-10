@@ -29,7 +29,7 @@ from llm_client import (
     is_configured,
 )
 from skill_label_match import normalize_skill_label, skills_match
-from tailoring.ats_score import detect_keyword_wording_regressions, plateau_note_for_gaps, score_resume_against_keywords, score_resume_ats
+from tailoring.ats_score import detect_keyword_wording_regressions, detect_matched_keyword_regressions, plateau_note_for_gaps, score_resume_against_keywords, score_resume_ats
 from tailoring.baseline_resume import select_baseline_resume_text
 from tailoring.claim_verification import flag_unverified_resume_claims
 
@@ -1371,10 +1371,189 @@ def _draft_one(
             "clarifying_questions": _questions_worth_asking(merged_questions, ats["ats_score"]),
             "ats_plateau_note": ats.get("plateau_note"),
             "unconfirmed_claims": data.get("unconfirmed_claims", []) + unverified_claims,
+            # Raw missing-keyword lists (2026-08-09) - not folded into
+            # clarifying_questions here, unlike the questions above, since
+            # _draft_resume_with_self_correction() needs the exact labels/
+            # point_values themselves to build a targeted retry prompt and
+            # to detect "no progress" between attempts (identical missing
+            # set), not just a human-facing question about them.
+            "missing_required_keywords": ats.get("missing_required_keywords", []),
+            "missing_preferred_keywords": ats.get("missing_preferred_keywords", []),
         }
     if doc_key == "apply_answers":
         return data.get("apply_answers", [])
     return data.get(doc_key, "")
+
+
+_RESUME_SELF_CORRECTION_TARGET_SCORE = 90
+# Bounded (CLAUDE.md's own no-unconditional-loops rule) - 1 initial draft
+# + up to 2 targeted retries. Real cost check against actual production
+# data (2026-08-09): draft_resume calls average $0.104, so this caps a
+# single Generate click's worst case around $0.31 versus today's ~$0.10
+# single-shot - only in the case where the gap turns out to be hard to
+# close, which is also exactly the case that cost Zahir 5 manual re-
+# clicks (each themselves a full-price regenerate) before this existed.
+_RESUME_SELF_CORRECTION_MAX_ATTEMPTS = 3
+
+
+def _missing_keyword_key(draft_result: dict) -> frozenset[str]:
+    return frozenset(
+        item["label"] for item in draft_result["missing_required_keywords"] + draft_result["missing_preferred_keywords"]
+    )
+
+
+def _resume_refinement_block(previous_text: str, missing_required: list[dict], missing_preferred: list[dict]) -> dict:
+    lines = [f'- "{item["label"]}" (required, worth {item["point_value"]:g} points)' for item in missing_required]
+    lines += [f'- "{item["label"]}" (preferred, worth {item["point_value"]:g} points)' for item in missing_preferred]
+    return {
+        "type": "text",
+        "text": (
+            "\n\nSELF-CORRECTION PASS: your previous attempt at this resume "
+            "is below. It still doesn't cover these specific requirements:\n"
+            + "\n".join(lines) +
+            "\n\nLook again at the candidate's full profile (above) for genuine, "
+            "real support for each of these specific terms - something you may "
+            "have missed the first time, not something to invent. If you find "
+            "real support, rewrite the relevant part of the resume to state it "
+            "using the posting's own exact wording (ATS systems match on literal "
+            "keyword overlap, not paraphrases - the same rule as your original "
+            "instructions). If you genuinely cannot find real support for one of "
+            "these after looking again, either write a hedged guess with a "
+            "trailing '?' if it's plausible (per your unconfirmed_claims "
+            "instructions), or leave it uncovered - do not fabricate to close "
+            "the gap. Do NOT drop, reword, or weaken anything else already in "
+            "your previous draft that correctly covered a requirement - this "
+            "is a targeted correction, not a fresh rewrite. Preserve everything "
+            "that was already right.\n\nPREVIOUS ATTEMPT:\n" + previous_text
+        ),
+    }
+
+
+def _draft_resume_with_self_correction(
+    client: "anthropic.Anthropic", shared_context: list[dict], model: str | None, on_progress,
+    doc_index: int, doc_total: int, job: dict, profile: dict,
+) -> dict:
+    """Real fix for a real UX failure (2026-08-09, Zahir's explicit design,
+    confirmed with General): Zahir had to click "Generate" 5 separate
+    times for one job to get an acceptable resume - a single one-shot
+    draft-then-score call left any gap between the score and what was
+    actually written entirely up to him to notice and manually retry.
+    Makes "Generate" a bounded, self-correcting loop that happens ENTIRELY
+    within one click, aiming for _RESUME_SELF_CORRECTION_TARGET_SCORE
+    (90) without ever fabricating progress toward it.
+
+    Each retry is a TARGETED correction, not a blind regenerate: the AI
+    sees its own previous attempt verbatim plus the SPECIFIC keywords
+    still missing (with real point values, via _resume_refinement_block),
+    and is told explicitly to preserve everything already correct - the
+    same "regenerate-from-scratch is a silent regression risk" concern
+    (CLAUDE.md known failure pattern #2) a real live case already proved
+    out (a resume regenerate silently dropped "life sciences" while
+    fixing "Engineering", net score unchanged). detect_matched_keyword_
+    regressions (already trusted for the ordinary manual-regenerate path)
+    runs after every retry too - if a new attempt drops something the
+    previous one had covered, it's rejected outright, the previous
+    attempt is kept, and the loop stops rather than risking the same
+    trade-off again.
+
+    Stops (whichever comes first - never runs unbounded):
+    1. ats_score reaches the target.
+    2. _RESUME_SELF_CORRECTION_MAX_ATTEMPTS total attempts are used up.
+    3. A retry's missing-keyword set is IDENTICAL to the attempt before
+       it - no progress was made, so another identically-shaped attempt
+       would just repeat the same fruitless pass. This is the empirical,
+       self-detecting version of "this looks like a permanent gap" (the
+       same class as "advanced degree" before the years-of-experience
+       equivalency fix existed) - it doesn't need to know WHY a gap is
+       unclosable, just THAT retrying isn't moving it.
+    4. A retry regresses a previously-matched keyword (see above) - kept
+       separate from "no progress" because this is a worse outcome (an
+       actual step backward on one requirement, not just a stall) worth
+       reporting differently.
+
+    Whenever the final result is still below target, "self_correction_
+    note" explains exactly why (which requirements are still open and
+    which stop condition fired) rather than silently handing back a
+    lower score - added to the returned dict alongside the existing
+    "self_correction_attempts" count.
+
+    Progress flows through the SAME on_progress(doc_index, doc_total,
+    doc_key, substatus) callback _draft_one already threads through - a
+    "Refining resume - attempt N of M..." substatus renders via the
+    exact existing UI progress-bar code, no new UI plumbing needed.
+
+    Deliberately does NOT touch cross-document consistency - this loop
+    only ever drafts the resume; cover_letter/exec_bio/leadership_summary
+    are drafted afterward (generate_documents' existing sequencing,
+    unchanged) using whatever this function's FINAL resume text turns
+    out to be. Unhedged-claim verification (already inside _draft_one)
+    DOES run on every internal attempt, not just the final one - it's a
+    deterministic, no-AI-call check, and the "?"-marked text is exactly
+    what a later retry should see as its own "previous attempt," honest
+    hedges included, not a falsely-clean version."""
+
+    def _progress(substatus):
+        if on_progress:
+            on_progress(doc_index, doc_total, "resume", substatus)
+
+    best = _draft_one(
+        client, shared_context, "resume", model, on_progress, doc_index, doc_total,
+        job=job, profile=profile,
+    )
+    best_missing = _missing_keyword_key(best)
+    attempts = 1
+    stop_reason = None
+
+    while best["ats_score"] < _RESUME_SELF_CORRECTION_TARGET_SCORE and attempts < _RESUME_SELF_CORRECTION_MAX_ATTEMPTS:
+        _progress(f"Refining resume - attempt {attempts + 1} of {_RESUME_SELF_CORRECTION_MAX_ATTEMPTS}...")
+        retry_context = shared_context + [
+            _resume_refinement_block(best["text"], best["missing_required_keywords"], best["missing_preferred_keywords"])
+        ]
+        candidate = _draft_one(
+            client, retry_context, "resume", model, on_progress, doc_index, doc_total,
+            job=job, profile=profile,
+        )
+        attempts += 1
+
+        regressions = detect_matched_keyword_regressions(
+            job.get("ats_required_keywords") or [], job.get("ats_preferred_keywords") or [],
+            best["text"], candidate["text"],
+        )
+        if regressions:
+            stop_reason = (
+                "the last rewrite would have traded away a previously-covered "
+                f"requirement ({', '.join(regressions)}) to close another gap"
+            )
+            break
+
+        candidate_missing = _missing_keyword_key(candidate)
+        made_progress = candidate_missing != best_missing
+        best, best_missing = candidate, candidate_missing
+        if not made_progress:
+            stop_reason = (
+                "another attempt didn't uncover any new genuine support - this looks "
+                "like a real ceiling given the profile as currently recorded"
+            )
+            break
+
+    if best["ats_score"] < _RESUME_SELF_CORRECTION_TARGET_SCORE:
+        still_missing = [item["label"] for item in best["missing_required_keywords"] + best["missing_preferred_keywords"]]
+        if stop_reason is None:
+            stop_reason = f"reached the {_RESUME_SELF_CORRECTION_MAX_ATTEMPTS}-attempt limit"
+        note = f"Self-correction stopped after {attempts} attempt(s) at {best['ats_score']}/100: {stop_reason}."
+        if still_missing:
+            note += " Still open: " + ", ".join(still_missing) + "."
+        best["self_correction_note"] = note
+        # Folded into ats_rationale too (not just the standalone field
+        # above) so every existing display/persist call site - app.py's
+        # "Why this score" markdown, both resume-persist call sites -
+        # picks this up automatically with zero new UI plumbing, exactly
+        # as promised in the design report: never silently hand back a
+        # lower score with no explanation.
+        best["ats_rationale"] = f"{best['ats_rationale']} {note}".strip()
+
+    best["self_correction_attempts"] = attempts
+    return best
 
 
 def _lookup_company_address(
@@ -1502,10 +1681,21 @@ def generate_documents(
     for i, doc_key in enumerate(doc_keys, start=1):
         if on_progress:
             on_progress(i, total, doc_key)
-        results[doc_key] = _draft_one(
-            client, shared_context, doc_key, model, on_progress, i, total,
-            job=job, profile=profile, resume_text_for_consistency=resume_text_for_consistency,
-        )
+        if doc_key == "resume":
+            # Self-correcting loop (2026-08-09), not a single one-shot
+            # call - see _draft_resume_with_self_correction's own
+            # docstring. resume_text_for_consistency is deliberately not
+            # passed here: the resume is never a _CROSS_DOCUMENT_
+            # CONSISTENCY_DOC_KEYS target itself (nothing needs to stay
+            # consistent WITH it while it's still being drafted).
+            results[doc_key] = _draft_resume_with_self_correction(
+                client, shared_context, model, on_progress, i, total, job, profile,
+            )
+        else:
+            results[doc_key] = _draft_one(
+                client, shared_context, doc_key, model, on_progress, i, total,
+                job=job, profile=profile, resume_text_for_consistency=resume_text_for_consistency,
+            )
         if doc_key == "resume":
             fresh_resume = results["resume"]
             resume_text_for_consistency = fresh_resume["text"] if isinstance(fresh_resume, dict) else fresh_resume
