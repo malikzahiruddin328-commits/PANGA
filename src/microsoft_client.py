@@ -282,12 +282,18 @@ def ensure_label(name: str) -> str:
     gmail_client.py, even though (unlike Gmail) assigning an unregistered
     category name to a message would technically still work without this -
     kept for parity and so it shows up with a real color in Outlook's own
-    UI, not just as an ad hoc string."""
-    for label in list_labels():
-        if label["name"] == name:
-            return label["id"]
-    created = _post("/me/outlook/masterCategories", {"displayName": name, "color": "preset0"})
-    return created["id"]
+    UI, not just as an ad hoc string.
+
+    Locked (2026-08-09) - same check-then-act race as gmail_client.py's
+    ensure_label, same fix: see that function's docstring for the full
+    reasoning. Two Panga processes racing here would leave two Outlook
+    categories with the same display name but different ids."""
+    with locked("microsoft_categories"):
+        for label in list_labels():
+            if label["name"] == name:
+                return label["id"]
+        created = _post("/me/outlook/masterCategories", {"displayName": name, "color": "preset0"})
+        return created["id"]
 
 
 def label_thread(message_id: str, label_names: list[str]) -> None:

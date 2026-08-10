@@ -255,3 +255,35 @@ def test_get_access_token_silent_refresh_runs_inside_the_lock(monkeypatch, tmp_p
     assert len(saved) == 1
     assert calls[0] == ("enter", "microsoft_token")
     assert calls[-1] == ("exit", "microsoft_token")
+
+
+# ---- ensure_label locking (2026-08-09) - same check-then-act race
+# gmail_client.py's ensure_label had, found in this file too by Mirror's
+# audit. See that function's docstring for the full reasoning.
+
+def test_ensure_label_create_runs_inside_the_lock_when_category_missing(monkeypatch):
+    monkeypatch.setattr(microsoft_client, "list_labels", lambda: [])
+    posted = []
+    monkeypatch.setattr(microsoft_client, "_post", lambda url, body: posted.append((url, body)) or {"id": "new-id"})
+
+    calls = []
+    monkeypatch.setattr(microsoft_client, "locked", lambda name: _RecordingLock(calls, name))
+
+    result = microsoft_client.ensure_label("Panga/Reviewed")
+
+    assert result == "new-id"
+    assert len(posted) == 1
+    assert calls[0] == ("enter", "microsoft_categories")
+    assert calls[-1] == ("exit", "microsoft_categories")
+
+
+def test_ensure_label_does_not_create_when_already_present(monkeypatch):
+    monkeypatch.setattr(microsoft_client, "list_labels", lambda: [{"id": "existing-id", "name": "Panga/Reviewed"}])
+    posted = []
+    monkeypatch.setattr(microsoft_client, "_post", lambda url, body: posted.append((url, body)) or {"id": "new-id"})
+    monkeypatch.setattr(microsoft_client, "locked", lambda name: _RecordingLock([], name))
+
+    result = microsoft_client.ensure_label("Panga/Reviewed")
+
+    assert result == "existing-id"
+    assert posted == []  # never called - the whole point of checking first

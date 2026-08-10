@@ -322,11 +322,28 @@ def create_label(name: str) -> str:
 def ensure_label(name: str) -> str:
     """Returns the id of the label named `name`, creating it first if it
     doesn't exist yet - the "check with list_labels, create if missing"
-    pattern both original SKILL.md prompts used."""
-    for label in list_labels():
-        if label["name"] == name:
-            return label["id"]
-    return create_label(name)
+    pattern both original SKILL.md prompts used.
+
+    Locked (2026-08-09, Mirror's audit found this - the same class of
+    check-then-act race the token-refresh fix covered, just on a
+    different resource): the scheduled scan and a live app session (or
+    two scheduled tasks) can both call this for a not-yet-existing label
+    at close to the same moment. Without a lock, both can see "not found"
+    from list_labels() before either calls create_label(), leaving TWO
+    Gmail labels with the same display name but different ids - future
+    list_labels() calls then resolve non-deterministically to whichever
+    one comes back first, so different messages could end up labeled with
+    different underlying ids despite an identical visible name. That
+    would silently reintroduce the exact class of bug the reviewed-label
+    client-side-filtering fix closed (search_threads' docstring), via a
+    different mechanism. Locking the whole check-then-act sequence
+    serializes concurrent Panga processes so only one ever calls
+    create_label() for a given name."""
+    with locked("gmail_labels"):
+        for label in list_labels():
+            if label["name"] == name:
+                return label["id"]
+        return create_label(name)
 
 
 def label_thread(thread_id: str, label_ids: list[str]) -> None:

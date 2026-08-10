@@ -66,3 +66,35 @@ def test_get_credentials_refresh_runs_inside_the_lock(monkeypatch, tmp_path):
     # by saved already being non-empty by the time "exit" is recorded.
     assert calls[0] == ("enter", "gmail_token")
     assert calls[-1] == ("exit", "gmail_token")
+
+
+# ---- ensure_label locking (2026-08-09) - a second, different
+# check-then-act race Mirror's audit found in the same file: list-then-
+# create on Gmail labels, unlocked. See ensure_label's own docstring.
+
+def test_ensure_label_create_runs_inside_the_lock_when_label_missing(monkeypatch):
+    monkeypatch.setattr(gmail_client, "list_labels", lambda: [])
+    created = []
+    monkeypatch.setattr(gmail_client, "create_label", lambda name: created.append(name) or "new-id")
+
+    calls = []
+    monkeypatch.setattr(gmail_client, "locked", lambda name: RecordingLock(calls, name))
+
+    result = gmail_client.ensure_label("Panga/Reviewed")
+
+    assert result == "new-id"
+    assert created == ["Panga/Reviewed"]
+    assert calls[0] == ("enter", "gmail_labels")
+    assert calls[-1] == ("exit", "gmail_labels")
+
+
+def test_ensure_label_does_not_create_when_already_present(monkeypatch):
+    monkeypatch.setattr(gmail_client, "list_labels", lambda: [{"id": "existing-id", "name": "Panga/Reviewed"}])
+    created = []
+    monkeypatch.setattr(gmail_client, "create_label", lambda name: created.append(name) or "new-id")
+    monkeypatch.setattr(gmail_client, "locked", lambda name: RecordingLock([], name))
+
+    result = gmail_client.ensure_label("Panga/Reviewed")
+
+    assert result == "existing-id"
+    assert created == []  # never called - the whole point of checking first

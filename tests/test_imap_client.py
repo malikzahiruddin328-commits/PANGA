@@ -225,3 +225,66 @@ def test_list_and_remove_configured_accounts(tmp_path, monkeypatch):
     assert not imap_client.is_configured("a@yahoo.com")
 
     imap_client.remove_account("never-saved@example.com")  # no-op, must not raise
+
+
+# ---- Credential-file locking (2026-08-09, real gap found by Mirror's
+# audit): this module had NO locking at all on its credential file,
+# unlike every other store in the codebase - see save_credentials'
+# docstring for the full reasoning (crypto_store's write isn't atomic, so
+# an unlocked concurrent read during a write can see a torn file).
+
+class _RecordingLock:
+    def __init__(self, calls, name):
+        self.calls = calls
+        self.name = name
+
+    def __enter__(self):
+        self.calls.append(("enter", self.name))
+        return self
+
+    def __exit__(self, *exc):
+        self.calls.append(("exit", self.name))
+        return False
+
+
+def test_save_credentials_runs_inside_a_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr(imap_client, "IMAP_DIR", tmp_path)
+    calls = []
+    monkeypatch.setattr(imap_client, "locked", lambda name: _RecordingLock(calls, name))
+
+    imap_client.save_credentials("a@yahoo.com", "app-pw", "imap.mail.yahoo.com")
+
+    assert len(calls) == 2  # one enter, one exit
+    assert calls[0][0] == "enter" and calls[1][0] == "exit"
+    assert calls[0][1] == calls[1][1]  # same lock name both times
+
+
+def test_different_accounts_use_different_lock_names(tmp_path, monkeypatch):
+    # Locking is per-account, not one shared lock across every IMAP
+    # account - two unrelated accounts' credential writes shouldn't
+    # contend with each other.
+    monkeypatch.setattr(imap_client, "IMAP_DIR", tmp_path)
+    calls = []
+    monkeypatch.setattr(imap_client, "locked", lambda name: _RecordingLock(calls, name))
+
+    imap_client.save_credentials("a@yahoo.com", "pw1", "imap.mail.yahoo.com")
+    imap_client.save_credentials("b@btinternet.com", "pw2", "mail.btinternet.com")
+
+    lock_names = {name for _, name in calls}
+    assert len(lock_names) == 2
+
+
+def test_load_credentials_uses_the_same_lock_name_as_save(tmp_path, monkeypatch):
+    # _connect() -> _load_credentials() reads under the same lock name
+    # save_credentials() wrote under - confirms the two agree rather than
+    # each deriving their own (which would defeat the lock entirely).
+    monkeypatch.setattr(imap_client, "IMAP_DIR", tmp_path)
+    save_calls, load_calls = [], []
+
+    monkeypatch.setattr(imap_client, "locked", lambda name: _RecordingLock(save_calls, name))
+    imap_client.save_credentials("a@yahoo.com", "pw1", "imap.mail.yahoo.com")
+
+    monkeypatch.setattr(imap_client, "locked", lambda name: _RecordingLock(load_calls, name))
+    imap_client._load_credentials("a@yahoo.com")
+
+    assert save_calls[0][1] == load_calls[0][1]
