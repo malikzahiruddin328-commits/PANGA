@@ -1675,3 +1675,47 @@ def test_generate_documents_routes_resume_through_self_correction(monkeypatch):
 
     assert result["resume"]["ats_score"] == 100
     assert "self_correction_attempts" in result["resume"]
+
+
+# --- Auto-fire free-form gap scan: fingerprint helpers (2026-08-09) ---
+
+def test_gap_scan_baseline_fingerprint_uses_the_current_resume_text():
+    import tailoring.drafting as drafting
+
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": [], "ats_preferred_keywords": []}
+    fp1 = drafting.gap_scan_baseline_fingerprint(job, {"resume_text": "SKILLS\nPython"})
+    fp2 = drafting.gap_scan_baseline_fingerprint(job, {"resume_text": "SKILLS\nPython"})
+    fp3 = drafting.gap_scan_baseline_fingerprint(job, {"resume_text": "SKILLS\nRust"})
+
+    assert fp1 == fp2  # same text -> same fingerprint, deterministic
+    assert fp1 != fp3  # different text -> different fingerprint
+
+
+def test_gap_scan_baseline_fingerprint_falls_back_to_the_baseline_resume_when_no_draft_yet(monkeypatch):
+    # Matches analyze_fit_before_drafting()'s own pre-first-draft fallback
+    # - a job with no resume_text yet still gets a real, non-empty
+    # fingerprint tied to whatever baseline text would actually be
+    # compared against, not a constant "no resume" sentinel.
+    import tailoring.drafting as drafting
+
+    monkeypatch.setattr(drafting, "select_baseline_resume_text", lambda job: ("SKILLS\nJava", "a similar past resume"))
+    job = {"source": "linkedin", "job_id": "1"}
+
+    fp = drafting.gap_scan_baseline_fingerprint(job, {})
+
+    assert fp == drafting.gap_scan_baseline_fingerprint(job, {"resume_text": "SKILLS\nJava"})
+
+
+def test_gap_scan_is_current_true_only_when_the_stored_fingerprint_matches():
+    import tailoring.drafting as drafting
+
+    job = {"source": "linkedin", "job_id": "1"}
+    app_record = {"resume_text": "SKILLS\nPython"}
+
+    assert drafting.gap_scan_is_current(job, app_record) is False  # nothing stored yet
+
+    app_record["resume_gap_scan_fingerprint"] = drafting.gap_scan_baseline_fingerprint(job, app_record)
+    assert drafting.gap_scan_is_current(job, app_record) is True
+
+    app_record["resume_text"] = "SKILLS\nRust"  # a fresh Generate changed the text
+    assert drafting.gap_scan_is_current(job, app_record) is False

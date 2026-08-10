@@ -87,7 +87,7 @@ from tailoring.interview_prep import load_interview_prep, get_interview_prep, re
 from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
 from tailoring.ats_score import detect_matched_keyword_regressions
 from tailoring.unconfirmed_claims import find_unconfirmed_markers, resolve_unconfirmed_claim
-from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed, analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_impact as _check_regenerate_impact, request_additional_gap_questions as _request_additional_gap_questions, reextract_ats_keywords_and_rescore as _reextract_ats_keywords_and_rescore, rescore_against_cached_keywords as _rescore_against_cached_keywords
+from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed, analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_impact as _check_regenerate_impact, request_additional_gap_questions as _request_additional_gap_questions, reextract_ats_keywords_and_rescore as _reextract_ats_keywords_and_rescore, rescore_against_cached_keywords as _rescore_against_cached_keywords, gap_scan_is_current as _gap_scan_is_current, gap_scan_baseline_fingerprint as _gap_scan_baseline_fingerprint
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
 from prospector.rejection_diagnosis import gather_diagnosis_input, diagnose
 from prospector.target_accounts import load_target_accounts, set_status as set_target_account_status, set_website, load_website_lookup_cost, save_website_lookup_cost, find_disqualified_with_new_activity
@@ -905,7 +905,7 @@ def render_paste_jd_prompt_before_drafting(job: dict, app_record: dict) -> None:
             job["description"] = stripped
         if stripped:
             st.markdown(":material/check_circle: Saved automatically")
-            analysis = _analyze_fit_before_drafting(job, load_profile(), app_record)
+            analysis = _analyze_fit_with_auto_gap_scan(job, load_profile(), app_record)
             # show_generate_actions=False: this renders directly above the
             # "Documents for this application" checkbox+Generate flow below
             # (which already covers resume among 5 doc types for a job
@@ -1143,6 +1143,65 @@ def render_unconfirmed_claims_section(job: dict, app_record: dict) -> None:
                             st.rerun()
 
 
+def _analyze_fit_with_auto_gap_scan(job: dict, profile: dict, app_record: dict) -> dict:
+    """Auto-fires the free-form gap scan (request_additional_gap_questions)
+    once per resume version before computing Analyze Fit (2026-08-09,
+    Zahir's explicit design, confirmed with General). Real gap Zahir hit
+    live on job 4432455641: pre-generate Analyze Fit showed "No more real
+    gaps found" / 99 projected, he clicked Generate once, the self-
+    correcting loop landed cleanly at 90 - but the POST-generate Analyze
+    Fit panel then surfaced 6 brand-new free-form questions (GCP
+    experience, FDA guidance, TOGAF certification, etc.) worth enough to
+    reach ~96. Root cause (confirmed via the code): the free-form scan
+    only ever ran from the manual "Answer more questions" click - nothing
+    fired it automatically before a first Generate, so those gaps were
+    invisible until a draft already existed to compare against, forcing
+    a second manual answer-then-regenerate round trip - exactly the
+    repeated-click pain the self-correcting loop was built to eliminate,
+    just moved to a different trigger.
+
+    _gap_scan_is_current() checks a stored fingerprint of the resume text
+    this scan would run against (this job's own drafted resume, or the
+    same baseline-resume fallback analyze_fit_before_drafting itself uses
+    when there's no draft yet) - re-opening Analyze Fit for an unchanged
+    resume version never re-fires the AI call, only a genuinely new
+    version (a fresh Generate) or the first time ever for this job.
+    Fires unconditionally on a rerun after persisting (matching the
+    manual "Answer more questions" button's own pattern) rather than
+    mutating app_record in place, so the fresh clarifying_questions are
+    guaranteed to be what this render actually uses, not a stale local
+    copy.
+
+    Deliberately NOT wired into the Profile Gaps tab's bulk cross-job
+    loop, which still calls analyze_fit_before_drafting() directly -
+    firing this for every application with open questions simultaneously
+    the first time this ships would be a real, sudden cost/latency spike
+    across potentially dozens of jobs at once, not the "opened one job's
+    Analyze Fit panel" trigger Zahir and General actually described.
+
+    A transient API failure here is swallowed with a soft toast, not
+    st.error - this runs automatically, not from an explicit click, so a
+    hard error banner on an action Zahir didn't initiate would be more
+    disruptive than useful. No fingerprint is persisted on failure, so
+    the very next render simply tries again."""
+    if not _gap_scan_is_current(job, app_record):
+        try:
+            with st.spinner("Checking for anything else genuinely worth asking..."):
+                result = _request_additional_gap_questions(job, profile, app_record)
+        except (DraftingNotConfigured, DraftingFailed) as exc:
+            st.toast(f"Couldn't check for additional gaps automatically: {exc}", icon=":material/warning:")
+        else:
+            upsert_application(
+                job["source"], job["job_id"], status=app_record.get("status", "under review"),
+                resume_clarifying_questions=result["merged_clarifying_questions"],
+                resume_gap_scan_fingerprint=_gap_scan_baseline_fingerprint(job, app_record),
+            )
+            if result["added_count"]:
+                st.toast(f"Found {result['added_count']} more thing(s) worth asking about.", icon=":material/info:")
+            st.rerun()
+    return _analyze_fit_before_drafting(job, profile, app_record)
+
+
 def render_analyze_fit_section(job: dict, app_record: dict, analysis: dict | None = None, show_generate_actions: bool = True) -> None:
     """Step 1 (analyze fit, no document written) / Step 2 (generate,
     once satisfied) of the score-first resume flow
@@ -1202,7 +1261,7 @@ def render_analyze_fit_section(job: dict, app_record: dict, analysis: dict | Non
     job_key = f"{job.get('source')}_{job.get('job_id')}"
     profile = load_profile()
     if analysis is None:
-        analysis = _analyze_fit_before_drafting(job, profile, app_record)
+        analysis = _analyze_fit_with_auto_gap_scan(job, profile, app_record)
     open_questions = analysis["open_questions"]
 
     # Item 4: every answer saves immediately, regardless of whether the

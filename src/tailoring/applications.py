@@ -67,6 +67,7 @@ def upsert_application(
     skip_reason: str | None = None,
     apply_answers: list[dict] | None = None,
     resume_unconfirmed_claims_ai_reported: list[dict] | None = None,
+    resume_gap_scan_fingerprint: str | None = None,
 ) -> None:
     """Creates or updates the application record for (source, job_id).
     Fields left as None don't overwrite previously saved values -
@@ -105,7 +106,15 @@ def upsert_application(
     separately from the real strategy_tag field (set_strategy_tag()) so a
     fresh regenerate's suggestion never silently overwrites a tag Zahir
     already saved himself; the Results tab prefills the strategy-tag input
-    with this only when strategy_tag is still empty."""
+    with this only when strategy_tag is still empty. resume_gap_scan_
+    fingerprint (2026-08-09) is a stable fingerprint of whatever resume
+    text the free-form gap scan (tailoring.drafting.
+    request_additional_gap_questions) last ran against - app.py's auto-
+    fire wrapper compares this to the CURRENT baseline text's fingerprint
+    before firing again, so opening Analyze Fit repeatedly for the same
+    resume version doesn't re-trigger the AI call every render/scroll,
+    only when the resume text actually changed (a fresh Generate) or
+    this is the first time it's ever run for this job."""
     with locked("applications"):
         applications = load_applications()
         for app in applications:
@@ -142,6 +151,8 @@ def upsert_application(
                     app["apply_answers"] = apply_answers
                 if resume_unconfirmed_claims_ai_reported is not None:
                     app["resume_unconfirmed_claims_ai_reported"] = resume_unconfirmed_claims_ai_reported
+                if resume_gap_scan_fingerprint is not None:
+                    app["resume_gap_scan_fingerprint"] = resume_gap_scan_fingerprint
                 _save_all(applications)
                 _write_dossier(source, job_id)
                 return
@@ -172,6 +183,7 @@ def upsert_application(
             "skip_reason_reviewed": False if skip_reason is not None else None,
             "apply_answers": apply_answers if apply_answers is not None else [],
             "resume_unconfirmed_claims_ai_reported": resume_unconfirmed_claims_ai_reported if resume_unconfirmed_claims_ai_reported is not None else [],
+            "resume_gap_scan_fingerprint": resume_gap_scan_fingerprint,
         })
         _save_all(applications)
         _write_dossier(source, job_id)

@@ -29,7 +29,7 @@ from streamlit.testing.v1 import AppTest
 from search.job_store import save_jobs, update_job_score, load_jobs
 from tailoring.applications import upsert_application, get_application
 from tailoring.ats_score import score_resume_against_keywords
-from tailoring.drafting import save_gap_answers
+from tailoring.drafting import save_gap_answers, gap_scan_baseline_fingerprint
 
 APP_PATH = "src/ui/app.py"
 
@@ -54,11 +54,12 @@ DATABRICKS_QUESTION_TEXT = (
 def results_app_with_gap_questions(isolated_data, monkeypatch):
     monkeypatch.setenv("PANGA_TEST_MODE", "1")
 
-    save_jobs([{
+    job = {
         "source": "Dice", "job_id": "job1", "title": "Director, Gaps", "organization": "Acme Corp",
         "location": "Remote", "description": "Requirements: Python, Databricks.",
         "ats_required_keywords": REQUIRED_KEYWORDS, "ats_preferred_keywords": [],
-    }])
+    }
+    save_jobs([job])
     update_job_score("Dice", "job1", 85, "Strong match.")
     upsert_application(
         "Dice", "job1", status="under review",
@@ -76,6 +77,19 @@ def results_app_with_gap_questions(isolated_data, monkeypatch):
             "suggested_answer": "Unknown - please describe your real experience (if any) with this.",
             "point_value": DATABRICKS_POINT_VALUE,
         }],
+        # Marks the free-form gap scan as already up to date for THIS
+        # resume version (2026-08-09's auto-fire feature - see
+        # app.py's _analyze_fit_with_auto_gap_scan) - every test in this
+        # file predates and is unrelated to that feature; without this,
+        # the very first render would auto-fire request_additional_gap_
+        # questions() for real (raising DraftingNotConfigured in this
+        # test env, silently swallowed) or - worse, for the tests that DO
+        # monkeypatch it - fire it a SECOND, unintended time on top of
+        # whatever the test itself triggers, double-appending a question
+        # a test double doesn't dedupe the way the real function does.
+        # Dedicated tests for the auto-fire behavior itself deliberately
+        # build their OWN fixture without this, further down.
+        resume_gap_scan_fingerprint=gap_scan_baseline_fingerprint(job, {"resume_text": INITIAL_RESUME_TEXT}),
     )
     return AppTest.from_file(APP_PATH)
 
@@ -692,3 +706,175 @@ def test_profile_gaps_expander_count_reflects_missing_keyword_questions_too(resu
     assert not at.exception
     expander = next(e for e in at.expander if "Director, Two Gaps" in e.label)
     assert "(2 open)" in expander.label, expander.label
+
+
+# --- Auto-fire free-form gap scan (2026-08-09) ---
+# Zahir's explicit design, confirmed with General: pre-generate Analyze Fit
+# showed "No more real gaps found" on a real job, he generated once, and
+# the POST-generate panel then surfaced 6 brand-new free-form questions -
+# nothing had ever run the free-form scan (request_additional_gap_
+# questions) before that first click. app.py's _analyze_fit_with_auto_gap_
+# scan now fires it automatically, once per resume version, the first time
+# Analyze Fit is opened for that version - see that function's own
+# docstring for the full design (fingerprint-based "already scanned this
+# version" check, deliberately excluded from the Profile Gaps bulk loop).
+
+@pytest.fixture
+def results_app_before_any_gap_scan(isolated_data, monkeypatch):
+    # Deliberately does NOT set resume_gap_scan_fingerprint (unlike
+    # results_app_with_gap_questions above) - these tests exist
+    # specifically to exercise the auto-fire path that fixture is set up
+    # to suppress.
+    monkeypatch.setenv("PANGA_TEST_MODE", "1")
+    save_jobs([{
+        "source": "Dice", "job_id": "job1", "title": "Director, Gaps", "organization": "Acme Corp",
+        "location": "Remote", "description": "Requirements: Python, Databricks.",
+        "ats_required_keywords": REQUIRED_KEYWORDS, "ats_preferred_keywords": [],
+    }])
+    update_job_score("Dice", "job1", 85, "Strong match.")
+    upsert_application(
+        "Dice", "job1", status="under review",
+        resume_text=INITIAL_RESUME_TEXT,
+        resume_ats_score=INITIAL_SCORE, resume_ats_rationale=_INITIAL_SCORE_RESULT["ats_rationale"],
+        resume_ats_next_actions=[],
+        resume_clarifying_questions=[],
+    )
+    return AppTest.from_file(APP_PATH)
+
+
+def test_analyze_fit_auto_fires_the_gap_scan_on_first_open(results_app_before_any_gap_scan, monkeypatch):
+    import tailoring.drafting as drafting
+
+    call_count = [0]
+    new_question = {
+        "type": "skill_gap", "skill": "Team size at Acme",
+        "question": "How big was the team?", "suggested_answer": "",
+    }
+
+    def _fake(job, profile, app_record, model=None, on_progress=None):
+        call_count[0] += 1
+        return {
+            "added_count": 1, "new_questions": [new_question],
+            "merged_clarifying_questions": (app_record.get("resume_clarifying_questions") or []) + [new_question],
+        }
+
+    monkeypatch.setattr(drafting, "request_additional_gap_questions", _fake)
+
+    at = results_app_before_any_gap_scan
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+
+    assert not at.exception
+    assert call_count[0] == 1  # fired automatically, no button click needed
+    assert any("How big was the team?" in t.label for t in at.text_area)
+    app_record = get_application("Dice", "job1")
+    assert any(q.get("skill") == "Team size at Acme" for q in app_record["resume_clarifying_questions"])
+    assert app_record.get("resume_gap_scan_fingerprint")  # persisted so it won't re-fire
+
+
+def test_analyze_fit_does_not_refire_the_gap_scan_for_the_same_resume_version(results_app_before_any_gap_scan, monkeypatch):
+    import tailoring.drafting as drafting
+
+    call_count = [0]
+
+    def _fake(job, profile, app_record, model=None, on_progress=None):
+        call_count[0] += 1
+        return {"added_count": 0, "new_questions": [], "merged_clarifying_questions": app_record.get("resume_clarifying_questions") or []}
+
+    monkeypatch.setattr(drafting, "request_additional_gap_questions", _fake)
+
+    at = results_app_before_any_gap_scan
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+    assert call_count[0] == 1
+
+    # Re-open/re-render the SAME job with the SAME resume version - must
+    # not fire again just because the panel was opened a second time.
+    at.run(timeout=30)
+    assert call_count[0] == 1
+
+
+def test_analyze_fit_gap_scan_failure_is_swallowed_not_a_hard_error(results_app_before_any_gap_scan, monkeypatch):
+    # Fires automatically, not from an explicit click - a hard st.error
+    # banner on an action Zahir didn't initiate would be more disruptive
+    # than useful. Must degrade gracefully (soft toast, page still
+    # renders) rather than crashing Analyze Fit entirely.
+    import tailoring.drafting as drafting
+    from tailoring.drafting import DraftingNotConfigured
+
+    def _fake(job, profile, app_record, model=None, on_progress=None):
+        raise DraftingNotConfigured("no API key in this test environment")
+
+    monkeypatch.setattr(drafting, "request_additional_gap_questions", _fake)
+
+    at = results_app_before_any_gap_scan
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+
+    assert not at.exception
+    app_record = get_application("Dice", "job1")
+    assert not app_record.get("resume_gap_scan_fingerprint")  # never persisted - next render will retry
+
+
+def test_analyze_fit_refires_the_gap_scan_after_a_new_resume_version(results_app_before_any_gap_scan, monkeypatch):
+    import tailoring.drafting as drafting
+
+    call_count = [0]
+
+    def _fake(job, profile, app_record, model=None, on_progress=None):
+        call_count[0] += 1
+        return {"added_count": 0, "new_questions": [], "merged_clarifying_questions": app_record.get("resume_clarifying_questions") or []}
+
+    monkeypatch.setattr(drafting, "request_additional_gap_questions", _fake)
+
+    at = results_app_before_any_gap_scan
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+    assert call_count[0] == 1
+
+    # A fresh Generate produced a genuinely new resume version - the scan
+    # must run again for it, not stay suppressed forever.
+    upsert_application("Dice", "job1", status="under review", resume_text=REGENERATED_RESUME_TEXT)
+    at.run(timeout=30)
+    assert call_count[0] == 2
+
+
+def test_profile_gaps_tab_does_not_auto_fire_the_gap_scan(results_app_before_any_gap_scan, monkeypatch):
+    # Deliberate scope decision (2026-08-09, per the design report to
+    # General): firing this for every application with open questions
+    # simultaneously the first time this ships would be a real, sudden
+    # cost/latency spike - the Profile Gaps tab's bulk cross-job loop
+    # must keep calling analyze_fit_before_drafting() directly.
+    import tailoring.drafting as drafting
+
+    # Needs a REAL stored open question (not the fixture's empty list) so
+    # get_applications_with_open_clarifying_questions() actually surfaces
+    # this job into the Profile Gaps loop at all - otherwise the test
+    # would trivially "pass" without the loop ever running for it.
+    upsert_application(
+        "Dice", "job1", status="under review",
+        resume_clarifying_questions=[{
+            "type": "skill_gap", "skill": "Databricks", "question": DATABRICKS_QUESTION_TEXT,
+            "suggested_answer": "Unknown - please describe your real experience (if any) with this.",
+            "point_value": DATABRICKS_POINT_VALUE,
+        }],
+    )
+
+    call_count = [0]
+
+    def _fake(job, profile, app_record, model=None, on_progress=None):
+        call_count[0] += 1
+        return {"added_count": 0, "new_questions": [], "merged_clarifying_questions": []}
+
+    monkeypatch.setattr(drafting, "request_additional_gap_questions", _fake)
+
+    at = results_app_before_any_gap_scan
+    at.session_state["active_tab"] = "gaps"
+    at.run(timeout=30)
+
+    assert not at.exception
+    assert call_count[0] == 0

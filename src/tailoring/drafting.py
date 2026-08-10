@@ -1910,11 +1910,20 @@ def request_additional_gap_questions(
     `except DraftingFailed`/`except LLMCallFailed` catches either) if even
     the largest tier still truncates, or on any other failure - those
     aren't retried, since a bigger token budget wouldn't fix a refusal or
-    invalid JSON."""
+    invalid JSON.
+
+    resume_text falls back to select_baseline_resume_text() when this job
+    has no drafted resume yet (2026-08-09, needed once this got wired into
+    the pre-first-draft Analyze Fit case too - see app.py's ensure_gap_
+    scan_current()) - same fallback analyze_fit_before_drafting() already
+    uses for its own deterministic scoring, so a job with no resume yet
+    still gets a real, non-empty comparison instead of scanning against
+    an empty string (which would just report every requirement as
+    "missing" with no useful free-form gaps found)."""
     client = _client()
     required_keywords = job.get("ats_required_keywords") or []
     preferred_keywords = job.get("ats_preferred_keywords") or []
-    resume_text = app_record.get("resume_text") or ""
+    resume_text = app_record.get("resume_text") or select_baseline_resume_text(job)[0]
     score_result = score_resume_against_keywords(required_keywords, preferred_keywords, resume_text, candidate_years_experience=_total_years_of_experience(profile))
 
     existing_questions = app_record.get("resume_clarifying_questions") or []
@@ -1964,6 +1973,33 @@ def request_additional_gap_questions(
         "new_questions": new_questions,
         "merged_clarifying_questions": existing_questions + new_questions,
     }
+
+
+def gap_scan_baseline_fingerprint(job: dict, app_record: dict) -> str:
+    """A stable fingerprint of whatever resume text the free-form gap scan
+    (request_additional_gap_questions) would run against right now for
+    this job - the SAME baseline-selection logic that function itself
+    uses (app_record's own resume_text, falling back to select_baseline_
+    resume_text() when there's no draft yet), so the fingerprint always
+    matches what a fresh scan would actually see. Not cryptographic -
+    just needs to change if and only if the underlying text does, so
+    app.py's ensure_gap_scan_current() can tell "already scanned this
+    exact resume version" from "this is new" without storing the full
+    text a second time."""
+    import hashlib
+
+    resume_text = app_record.get("resume_text") or select_baseline_resume_text(job)[0]
+    return hashlib.sha256(resume_text.encode("utf-8")).hexdigest()
+
+
+def gap_scan_is_current(job: dict, app_record: dict) -> bool:
+    """True if resume_gap_scan_fingerprint already matches the CURRENT
+    baseline text - i.e. request_additional_gap_questions has already run
+    for this exact resume version, so app.py's ensure_gap_scan_current()
+    doesn't need to fire it again. Pure/no store I/O, so this is cheap to
+    call on every render (unlike the AI call itself)."""
+    stored = app_record.get("resume_gap_scan_fingerprint")
+    return stored is not None and stored == gap_scan_baseline_fingerprint(job, app_record)
 
 
 def check_regenerate_impact(job: dict, app_record: dict, profile: dict) -> dict:
