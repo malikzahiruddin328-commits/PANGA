@@ -31,6 +31,12 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from debug_log import setup_debug_logging
 setup_debug_logging()
+# Note: the always-on (no PANGA_DEBUG gate) llm_client failure logging
+# added 2026-08-09 is set up lazily inside llm_client.call_structured()/
+# call_with_web_search() themselves, not here - job_alert_scan.py and
+# other scheduled scripts call those too, entirely outside this Streamlit
+# app, and need the same protection regardless of entry point. See
+# debug_log.setup_always_on_error_logging().
 
 import extension_bridge
 extension_bridge.start_server()

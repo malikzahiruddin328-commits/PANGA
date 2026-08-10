@@ -251,6 +251,52 @@ def test_resume_schema_requires_unconfirmed_claims_field():
     assert set(item_props) == {"skill", "text"}
 
 
+def test_draft_one_escalates_max_tokens_on_a_genuine_truncation(monkeypatch):
+    # Real gap flagged live 2026-08-09 (General): verify the MAIN drafting
+    # path has the same truncation-escalation protection request_
+    # additional_gap_questions already got, not just newer code paths.
+    # This resume path's fixed 20000-token budget was already far more
+    # generous than the 3000 that caused a real crash elsewhere, but a
+    # single fixed ceiling with no escalation is still the same class of
+    # risk for a large enough profile/JD combination.
+    import tailoring.drafting as drafting
+
+    max_tokens_seen = []
+
+    def _fake_call_structured(client, **kwargs):
+        max_tokens_seen.append(kwargs["max_tokens"])
+        if kwargs["max_tokens"] < 40000:
+            raise drafting.LLMResponseTruncated("The response was cut off before finishing. Try again.")
+        return {
+            "text": "PROFESSIONAL EXPERIENCE\nReal resume text.",
+            "target_seniority_at_least_vp": True, "suggested_strategy_tag": "",
+            "clarifying_questions": [], "unconfirmed_claims": [],
+        }
+
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured)
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": [], "ats_preferred_keywords": []}
+
+    result = _draft_one(object(), [], "resume", None, job=job, profile={})
+
+    assert max_tokens_seen == [20000, 40000]
+    assert result["text"] == "PROFESSIONAL EXPERIENCE\nReal resume text."
+
+
+def test_draft_one_raises_if_even_the_largest_tier_truncates(monkeypatch):
+    import pytest
+
+    import tailoring.drafting as drafting
+
+    def _always_truncates(client, **kwargs):
+        raise drafting.LLMResponseTruncated("The response was cut off before finishing. Try again.")
+
+    monkeypatch.setattr(drafting, "call_structured", _always_truncates)
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": [], "ats_preferred_keywords": []}
+
+    with pytest.raises(drafting.LLMResponseTruncated):
+        _draft_one(object(), [], "resume", None, job=job, profile={})
+
+
 def test_draft_one_resume_threads_unconfirmed_claims_through(monkeypatch):
     # The AI's self-reported unconfirmed_claims must survive _draft_one's
     # post-processing (rank-prefix stripping, ATS rescoring, question

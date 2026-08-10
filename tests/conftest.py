@@ -36,6 +36,7 @@ def isolated_data(tmp_path, monkeypatch):
     import profile.storage as profile_storage
     import profile.ingest as profile_ingest
     import cost_log
+    import debug_log
     import linkedin.storage as linkedin_storage
 
     monkeypatch.setattr(job_store, "JOBS_PATH", tmp_path / "jobs.json")
@@ -77,4 +78,9 @@ def isolated_data(tmp_path, monkeypatch):
     # profile export - at least as sensitive as the resume text this
     # fixture already protects).
     monkeypatch.setattr(linkedin_storage, "LINKEDIN_PATH", tmp_path / "linkedin_profile.json")
+    # debug_log.py (2026-08-09's always-on error logging addition) writes
+    # to a real file path too - isolated for the same reason as every
+    # store above, so no test exercising it can touch the real
+    # data/logs/panga_debug.log.
+    monkeypatch.setattr(debug_log, "LOG_PATH", tmp_path / "panga_debug.log")
     return tmp_path

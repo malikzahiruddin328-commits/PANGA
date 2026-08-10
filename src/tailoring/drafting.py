@@ -1276,8 +1276,16 @@ def _draft_one(
     # The resume schema carries the text itself plus suggested_strategy_tag/
     # clarifying_questions, and federal-format resumes alone can run 3000+
     # tokens - give it real headroom rather than truncating (hit for real
-    # during testing at 6000 with a federal-length resume).
-    max_tokens = 20000 if doc_key == "resume" else 6000
+    # during testing at 6000 with a federal-length resume). Escalates on a
+    # genuine LLMResponseTruncated the same way request_additional_gap_
+    # questions' own _ANSWER_MORE_MAX_TOKENS_TIERS does (2026-08-09,
+    # General's ask: verify the main draft path has equivalent truncation
+    # protection to the newer gap-questions path, not just assume it
+    # does) - this path's fixed budget was already far more generous than
+    # the 3000 that caused a real truncation crash elsewhere, but a fixed
+    # ceiling with no escalation is still the same class of risk for a
+    # large enough profile/JD combination.
+    max_tokens_tiers = [20000, 40000] if doc_key == "resume" else [6000, 12000]
 
     def _progress(substatus):
         if on_progress:
@@ -1288,22 +1296,29 @@ def _draft_one(
     if doc_key in _CROSS_DOCUMENT_CONSISTENCY_DOC_KEYS and resume_text_for_consistency:
         user_content.append(_resume_consistency_block(resume_text_for_consistency))
     user_content.append({"type": "text", "text": f"\n\nDraft: {doc_key}"})
-    data = call_structured(
-        client,
-        system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
-        user_content=user_content,
-        schema=schema,
-        max_tokens=max_tokens,
-        model=model,
-        effort="high",
-        on_progress=_progress if on_progress else None,
-        refusal_message=(
-            "Claude declined to draft this document. This is unusual for resume "
-            "content - try again, or check the job posting text for anything unusual."
-        ),
-        purpose=f"draft_{doc_key}",
-        job_key=job_key,
-    )
+    for max_tokens in max_tokens_tiers:
+        try:
+            data = call_structured(
+                client,
+                system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
+                user_content=user_content,
+                schema=schema,
+                max_tokens=max_tokens,
+                model=model,
+                effort="high",
+                on_progress=_progress if on_progress else None,
+                refusal_message=(
+                    "Claude declined to draft this document. This is unusual for resume "
+                    "content - try again, or check the job posting text for anything unusual."
+                ),
+                purpose=f"draft_{doc_key}",
+                job_key=job_key,
+            )
+        except LLMResponseTruncated:
+            if max_tokens == max_tokens_tiers[-1]:
+                raise
+            continue
+        break
 
     if doc_key == "resume":
         resume_text = data.get("text", "")

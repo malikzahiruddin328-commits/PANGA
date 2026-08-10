@@ -80,20 +80,38 @@ def _is_overloaded(exc: BaseException) -> bool:
     return isinstance(exc, anthropic.OverloadedError) or _error_type(exc) == "overloaded_error"
 
 
+def _is_billing_error(exc: anthropic.APIStatusError) -> bool:
+    """Real case Zahir hit live 2026-08-09: a 400 invalid_request_error
+    with the message "Your credit balance is too low to access the
+    Anthropic API." General only found this by bypassing the app and
+    calling the API directly with a raw script - the generic catch-all
+    message gave no way to tell a billing problem apart from a rate
+    limit, an outage, or a real bug. A distinct, identifiable error
+    shape (not a guess): status 400, type invalid_request_error, and
+    Anthropic's own fixed message text for this specific case."""
+    return exc.status_code == 400 and _error_type(exc) == "invalid_request_error" and "credit balance" in exc.message.lower()
+
+
 def _clean_message_for_status_error(exc: anthropic.APIStatusError) -> str:
     """Human-readable message for an error that's reached the end of the
     line - retries and model fallback (if applicable) are already
     exhausted. The full technical detail (status code, error type,
-    request_id) is logged via the standard `logging` module - visible in
-    data/logs/panga_debug.log when PANGA_DEBUG=1 (see debug_log.py) - but
-    never put in the exception message itself, since that string is what
-    app.py's `st.error(str(exc))` shows verbatim to the end user. Zahir hit
-    the raw JSON dump live 2026-08-05 and flagged it directly: a real user
-    has no use for a JSON error blob and no way to act on it."""
+    request_id) is logged via the standard `logging` module - always
+    written to data/logs/panga_debug.log regardless of PANGA_DEBUG for
+    exactly this class of failure (see debug_log.setup_always_on_error_
+    logging(), 2026-08-09 - a real llm_client call failure is significant
+    enough that Zahir shouldn't need debug mode on to have it captured) -
+    but never put in the exception message itself, since that string is
+    what app.py's `st.error(str(exc))` shows verbatim to the end user.
+    Zahir hit the raw JSON dump live 2026-08-05 and flagged it directly:
+    a real user has no use for a JSON error blob and no way to act on
+    it."""
     logger.error(
         "Claude API call failed (status=%s type=%s request_id=%s): %s",
         exc.status_code, _error_type(exc), exc.request_id, exc.message,
     )
+    if _is_billing_error(exc):
+        return "Your Anthropic account is out of credits - add credits at console.anthropic.com/settings/billing, then try again."
     if _is_transient(exc):
         return "Claude's servers are temporarily busy - please try again in a moment."
     if exc.status_code in (401, 403):
@@ -229,6 +247,10 @@ def call_structured(
     prompt look up "what did the last real generation for this job cost."
     Logging failure never breaks the actual call - a cost-log write error
     is logged and swallowed, not raised, since it isn't the caller's job."""
+    from debug_log import setup_always_on_error_logging
+
+    setup_always_on_error_logging()
+
     primary_model = model or os.environ.get("ANTHROPIC_MODEL") or DEFAULT_MODEL
 
     def make_request(call_model):
@@ -264,23 +286,26 @@ def call_structured(
     except anthropic.APIStatusError as exc:
         raise LLMCallFailed(_clean_message_for_status_error(exc)) from exc
     except anthropic.APIConnectionError as exc:
-        logger.error("Claude API connection error: %s", exc)
+        logger.error("Claude API connection error (purpose=%s): %s", purpose, exc)
         raise LLMCallFailed("Couldn't reach the Claude API - check your internet connection.") from exc
 
     _log_cost(response, call_model, purpose, job_key)
 
     if response.stop_reason == "refusal":
+        logger.error("Claude refused to respond (purpose=%s): %s", purpose, refusal_message)
         raise LLMCallFailed(refusal_message)
     if response.stop_reason == "max_tokens":
+        logger.error("Claude response truncated at max_tokens=%s (purpose=%s)", max_tokens, purpose)
         raise LLMResponseTruncated("The response was cut off before finishing. Try again.")
 
     text_block = next((b.text for b in response.content if b.type == "text"), None)
     if not text_block:
+        logger.error("Claude returned no text content block (purpose=%s)", purpose)
         raise LLMCallFailed("Claude returned no result.")
     try:
         return json.loads(text_block)
     except json.JSONDecodeError as exc:
-        logger.error("Claude returned invalid JSON: %s | raw text: %r", exc, text_block)
+        logger.error("Claude returned invalid JSON (purpose=%s): %s | raw text: %r", purpose, exc, text_block)
         raise LLMCallFailed("Claude's response wasn't valid - try again.") from exc
 
 
@@ -306,6 +331,9 @@ def call_with_web_search(
     purpose/job_key (score-first-resume-flow spec item 7): same real-cost
     logging as call_structured() - see _log_cost()."""
     from api_cost import estimate_response_cost
+    from debug_log import setup_always_on_error_logging
+
+    setup_always_on_error_logging()
 
     primary_model = model or DEFAULT_MODEL
 
@@ -322,12 +350,12 @@ def call_with_web_search(
         response, call_model = _call_with_retries(make_request, primary_model)
     except anthropic.APIStatusError as exc:
         logger.error(
-            "Claude web-search call failed (status=%s type=%s request_id=%s): %s",
-            exc.status_code, _error_type(exc), exc.request_id, exc.message,
+            "Claude web-search call failed (purpose=%s status=%s type=%s request_id=%s): %s",
+            purpose, exc.status_code, _error_type(exc), exc.request_id, exc.message,
         )
         return "", 0.0
     except anthropic.APIConnectionError as exc:
-        logger.error("Claude web-search connection error: %s", exc)
+        logger.error("Claude web-search connection error (purpose=%s): %s", purpose, exc)
         return "", 0.0
 
     cost = estimate_response_cost(response, call_model)
