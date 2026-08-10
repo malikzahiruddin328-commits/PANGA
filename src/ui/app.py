@@ -813,14 +813,25 @@ def render_paste_jd_prompt_before_drafting(job: dict, app_record: dict) -> None:
 
     For a manually-pasted JD (no extension capture), saving does NOT
     trigger a regenerate the way the post-hoc version does - nothing has
-    been drafted yet to regenerate. It just persists the text via
+    been drafted yet to regenerate. It persists the text via
     search.job_store.update_job_description() (clears the stale empty
-    ats_required_keywords/ats_preferred_keywords cache too), so whatever
-    gets drafted next through the normal "Generate documents" button reads
-    it naturally through the same generate_documents() call every draft
-    already goes through - no new downstream code path. See the
-    extension-capture branch below for why THAT path additionally
-    auto-scores inline instead of stopping at "saved."
+    ats_required_keywords/ats_preferred_keywords cache too), then falls
+    into the SAME shared tail the capture branch already used exclusively
+    (2026-08-09, real gap Zahir hit live on a real job - Merck 4449005464,
+    LinkedIn source but no extension capture matched: text saved
+    correctly, 7,508 real chars persisted, but nothing else happened - no
+    score, no Analyze Fit, no auto-gap-scan, just a toast. "i just saved
+    the jd... and nothing happened." Root cause: this branch used to stop
+    at update_job_description() + a toast + st.rerun(), on the stated
+    original design that "the next Generate click picks it up naturally" -
+    true, but it meant a manually-pasted JD got none of the Analyze Fit
+    experience the capture path already had, and Zahir had no way to know
+    to scroll down to a separate, unlabeled Generate button. Both paths
+    now render identically once real text is saved - the only real
+    difference between them is WHETHER an explicit Save click is needed
+    at all (capture already had its human-in-the-loop moment when Zahir
+    clicked "Send to Panga" on a page he was looking at; a bare paste
+    into a text box has no such moment, so it still needs one).
 
     This is additive, not a replacement: the post-hoc render_paste_jd_prompt()
     stays in place too, so someone who already has a blind-drafted resume
@@ -905,15 +916,6 @@ def render_paste_jd_prompt_before_drafting(job: dict, app_record: dict) -> None:
             job["description"] = stripped
         if stripped:
             st.markdown(":material/check_circle: Saved automatically")
-            analysis = _analyze_fit_with_auto_gap_scan(job, load_profile(), app_record)
-            # show_generate_actions=False: this renders directly above the
-            # "Documents for this application" checkbox+Generate flow below
-            # (which already covers resume among 5 doc types for a job
-            # with no draft yet) - showing this section's OWN "Generate
-            # resume" button too would be a second, resume-only way to do
-            # the same thing one scroll away. See render_analyze_fit_section's
-            # own docstring for the full reasoning.
-            render_analyze_fit_section(job, app_record, analysis=analysis, show_generate_actions=False)
     else:
         if st.button("Save job description", key=f"jd_paste_pre_save_{job_key}"):
             if not pasted_jd.strip():
@@ -923,11 +925,46 @@ def render_paste_jd_prompt_before_drafting(job: dict, app_record: dict) -> None:
 
                 update_job_description(job["source"], job["job_id"], pasted_jd.strip())
                 job["description"] = pasted_jd.strip()
+                # Real gap fixed 2026-08-09 (see this function's own
+                # docstring - the Merck job Zahir hit live): a manually-
+                # pasted JD (no capture) never gets the extension-
+                # capture branch's own "still routes back to THIS
+                # function on the next render" advantage (that branch
+                # keeps routing here for as long as
+                # extension_bridge.get_capture_for_url() keeps matching -
+                # its own ~30-min TTL). Once this save flips
+                # _job_has_captured_jd_text() to True with no capture
+                # present, the caller's own routing condition would
+                # otherwise send the NEXT render to the plain view/
+                # update box instead, which has no Analyze Fit
+                # integration - the outer `if` a few hundred lines down
+                # checks this exact flag alongside the capture check for
+                # that reason.
+                st.session_state[f"jd_manually_saved_{job_key}"] = True
                 st.toast(
                     "Saved - whatever you generate next will be tailored against it.",
                     icon=":material/check_circle:",
                 )
-                st.rerun()
+
+    # Shared tail (2026-08-09, real gap Zahir hit live on a real job -
+    # Merck 4449005464, LinkedIn source but no extension capture matched:
+    # the text saved correctly, 7,508 real chars persisted, but nothing
+    # else happened - no score, no Analyze Fit, no auto-gap-scan, just a
+    # toast. "i just saved the jd... and nothing happened." Both the
+    # capture path above and the manual-save path now fall through to
+    # this exact same rendering once real text is actually saved, rather
+    # than the capture path getting the full Analyze Fit experience and
+    # the manual path getting nothing more than a toast.
+    if (job.get("description") or "").strip():
+        analysis = _analyze_fit_with_auto_gap_scan(job, load_profile(), app_record)
+        # show_generate_actions=False: this renders directly above the
+        # "Documents for this application" checkbox+Generate flow below
+        # (which already covers resume among 5 doc types for a job
+        # with no draft yet) - showing this section's OWN "Generate
+        # resume" button too would be a second, resume-only way to do
+        # the same thing one scroll away. See render_analyze_fit_section's
+        # own docstring for the full reasoning.
+        render_analyze_fit_section(job, app_record, analysis=analysis, show_generate_actions=False)
 
 
 def render_paste_jd_prompt(job: dict) -> None:
@@ -1050,6 +1087,19 @@ _UNCONFIRMED_FIELD_TO_DOC_KEY = {
 }
 
 
+def _escape_markdown_dollar(text: str) -> str:
+    """A flagged claim's line is arbitrary AI-generated resume/document
+    text, not app-authored UI copy - it can legitimately contain a literal
+    "$" (e.g. "$300K-500K annual savings"), which st.markdown's built-in
+    KaTeX support silently reinterprets as inline LaTeX math delimiters,
+    corrupting the display (real bug caught live 2026-08-09: the dollar
+    sign vanished and the hyphen became a minus sign). The underlying
+    stored data is never affected - only st.markdown's rendering is - so
+    escaping here, right before display, is the correct fix rather than
+    touching find_unconfirmed_markers/resolve_unconfirmed_claim."""
+    return text.replace("$", "\\$")
+
+
 def _persist_resolved_claim(job: dict, app_record: dict, result: dict) -> None:
     """Shared save step once a single claim is resolved (either action
     below): persists resolve_unconfirmed_claim()'s {field: new_text} into
@@ -1114,7 +1164,7 @@ def render_unconfirmed_claims_section(job: dict, app_record: dict) -> None:
             with st.container(border=True):
                 skill_note = f" ({claim['skill']})" if claim.get("skill") else ""
                 st.markdown(f"*{label}{skill_note}*")
-                st.markdown(f"> {claim['line']}")
+                st.markdown(f"> {_escape_markdown_dollar(claim['line'])}")
 
                 edit_key = f"{claim_key}_edittext"
                 new_text = st.text_input(
@@ -3374,7 +3424,26 @@ elif active_tab == "results":
                     # Falls back to the plain view/update box once the
                     # capture expires (extension_bridge's own 30-min TTL) or
                     # stops matching - graceful degradation, not a dead end.
-                    if extension_bridge.get_capture_for_url(job.get("posting_url")) or not _job_has_captured_jd_text(job):
+                    #
+                    # A manual (no-capture) save gets the same "keep
+                    # routing here" treatment via its own session-state
+                    # flag (2026-08-09, real gap Zahir hit live on a real
+                    # job - Merck 4449005464: the manual-save path has no
+                    # capture TTL to fall back on, so without this it
+                    # would route to the plain view/update box - no
+                    # Analyze Fit integration - on the very next render
+                    # after the save that just enabled it).
+                    # Matches the SAME job_key format render_paste_jd_
+                    # prompt_before_drafting itself uses for this flag
+                    # (not the "pre_"-prefixed one used a few lines down
+                    # for render_jd_view_or_update_box's own widget
+                    # namespacing - a different key for a different box).
+                    job_key_for_gap_scan_flag = f"{job.get('source')}_{job.get('job_id')}"
+                    if (
+                        extension_bridge.get_capture_for_url(job.get("posting_url"))
+                        or not _job_has_captured_jd_text(job)
+                        or st.session_state.get(f"jd_manually_saved_{job_key_for_gap_scan_flag}")
+                    ):
                         render_paste_jd_prompt_before_drafting(job, app_record)
                     else:
                         pre_job_key = f"pre_{job.get('source')}_{job.get('job_id')}"
@@ -3514,7 +3583,7 @@ elif active_tab == "results":
                                         "still need resolving first:"
                                     )
                                     for c in unresolved_claims:
-                                        st.markdown(f"- {c['line']}")
+                                        st.markdown(f"- {_escape_markdown_dollar(c['line'])}")
                                 else:
                                     st.markdown(
                                         "Open the real application yourself and paste each "

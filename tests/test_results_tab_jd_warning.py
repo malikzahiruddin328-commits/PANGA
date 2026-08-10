@@ -197,6 +197,62 @@ def test_proactive_save_persists_description_without_drafting_anything(results_a
     assert job["description"] == "Requirements: Python, AWS."
 
 
+def test_proactive_manual_save_renders_score_card_inline_without_generate_button(results_app):
+    # Real gap Zahir hit live 2026-08-09 on a real job (Merck 4449005464,
+    # LinkedIn source, no extension capture matched): manually pasting +
+    # saving a JD persisted the text correctly but showed nothing beyond a
+    # toast - no score, no Analyze Fit, no auto-gap-scan. "i just saved the
+    # jd... and nothing happened." The capture path already got the full
+    # Analyze Fit experience inline (see test_extension_capture_renders_
+    # score_card_inline_without_generate_button above) - the manual-save
+    # path must now match it, in the SAME render as the click, no second
+    # click or page reload needed.
+    at = results_app
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Indeed"] = 1  # "nojd2" - never drafted, no capture
+    at.run(timeout=30)
+
+    paste_box = next(t for t in at.text_area if t.key.startswith("jd_paste_pre_Indeed_nojd2"))
+    paste_box.set_value("Requirements: Python, AWS.")
+    save_button = next(b for b in at.button if b.key == "jd_paste_pre_save_Indeed_nojd2")
+    save_button.click().run(timeout=30)
+
+    assert not at.exception
+    assert any(m.label == "Projected score" for m in at.metric)
+    assert not any(b.key == "analyzefit_generate_Indeed_nojd2" for b in at.button)
+    assert not any(b.key == "answermore_Indeed_nojd2" for b in at.button)
+
+
+def test_manual_save_keeps_showing_analyze_fit_on_a_later_unrelated_rerun(results_app):
+    # The routing gap this fix specifically closes: without the session-
+    # state flag, _job_has_captured_jd_text() flips True the instant the
+    # save persists, and with no capture present the OUTER caller would
+    # route the very NEXT render to the plain view/update box instead -
+    # which has no Analyze Fit integration - even though this render
+    # itself (right after the click) looked fine. Simulates that "later,
+    # unrelated" rerun via a second at.run() after the save has already
+    # landed.
+    at = results_app
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Indeed"] = 1
+    at.run(timeout=30)
+
+    paste_box = next(t for t in at.text_area if t.key.startswith("jd_paste_pre_Indeed_nojd2"))
+    paste_box.set_value("Requirements: Python, AWS.")
+    save_button = next(b for b in at.button if b.key == "jd_paste_pre_save_Indeed_nojd2")
+    save_button.click().run(timeout=30)
+    assert any(m.label == "Projected score" for m in at.metric)
+
+    # A later, unrelated rerun (e.g. Streamlit re-executing after some
+    # other interaction elsewhere on the page) - must still show Analyze
+    # Fit, not silently fall back to the no-score view/update box.
+    at.run(timeout=30)
+
+    assert not at.exception
+    assert any(m.label == "Projected score" for m in at.metric)
+    assert not any(t.key.startswith("pre_Indeed_nojd2") for t in at.text_area)  # not the OTHER box
+
+
 def _patch_capture(monkeypatch, description, ts=1700000000.0):
     def _fake_capture(url):
         return {

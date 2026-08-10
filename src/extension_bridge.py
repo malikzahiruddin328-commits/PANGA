@@ -142,6 +142,35 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(404, {"ok": False, "error": "not found"})
 
 
+class _Server(ThreadingHTTPServer):
+    # Real Windows-specific bug, confirmed live 2026-08-09: stdlib's
+    # HTTPServer/ThreadingHTTPServer default allow_reuse_address to True,
+    # which sets SO_REUSEADDR before bind. On Linux that mostly just skips
+    # the TIME_WAIT delay when rebinding a recently-closed socket - but on
+    # Windows, SO_REUSEADDR lets a SECOND, genuinely live listener bind the
+    # exact same address:port a first one already holds, with no OSError
+    # at all. That breaks this whole module's design, which assumes a
+    # second process's bind attempt fails cleanly so it can no-op (see
+    # start_server()'s docstring) - instead both processes end up
+    # LISTENING, and incoming connections route to whichever one Windows
+    # happens to favor (observed: the most-recently-bound one),
+    # non-deterministically and invisibly to either process.
+    #
+    # Reproduced live: two separate real OS processes both showed
+    # LISTENING on the identical port via netstat simultaneously with the
+    # stdlib default, and repeated requests all silently landed on the
+    # second process - reflecting exactly what happened when RM manually
+    # ran a live-verification Streamlit instance alongside production and
+    # Zahir saw "the extension isn't working" (captures were routing to
+    # RM's ephemeral instance, not always production). With
+    # allow_reuse_address = False, the same two-process repro instead gave
+    # the second process a real OSError ([WinError 10048] Only one usage
+    # of each socket address...) - restoring the "only one real holder,
+    # everyone else gets a clean, catchable failure" guarantee the rest of
+    # this module already assumes.
+    allow_reuse_address = False
+
+
 def _prune_captures_locked() -> None:
     """Caller must already hold _lock. Bounds memory for a Panga process
     left running for days - captures are cheap but not free, and nothing
@@ -183,7 +212,7 @@ def start_server() -> None:
     _server_started = True
     port = int(os.environ.get("PANGA_EXTENSION_BRIDGE_PORT", DEFAULT_PORT))
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
+        server = _Server(("127.0.0.1", port), _Handler)
     except OSError:
         return
     _bound_port = server.server_address[1]

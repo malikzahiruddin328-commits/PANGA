@@ -29,7 +29,7 @@ from llm_client import (
     is_configured,
 )
 from skill_label_match import normalize_skill_label, skills_match
-from tailoring.ats_score import detect_keyword_wording_regressions, detect_matched_keyword_regressions, plateau_note_for_gaps, score_resume_against_keywords, score_resume_ats
+from tailoring.ats_score import STANDARD_HEADERS, detect_keyword_wording_regressions, detect_matched_keyword_regressions, plateau_note_for_gaps, score_resume_against_keywords, score_resume_ats
 from tailoring.baseline_resume import select_baseline_resume_text
 from tailoring.claim_verification import flag_unverified_resume_claims
 
@@ -1266,6 +1266,73 @@ _RANK_PREFIX_RE = re.compile(
 _SENIORITY_PARENTHETICAL_RE = re.compile(r"\s*\([^)]*\bequivalent\b[^)]*\)", re.IGNORECASE)
 
 
+def _format_education_entry(entry: dict) -> str:
+    parts = [entry.get("degree"), entry.get("institution"), entry.get("location"), entry.get("years")]
+    return ", ".join(p for p in parts if p)
+
+
+def _render_education_section_verbatim(resume_text: str, profile: dict | None) -> str:
+    """Deterministic safety net for the EDUCATION section, same philosophy
+    as _strip_rank_prefixes/flag_unverified_resume_claims: unlike a role's
+    employer/dates (checked, not rewritten) or a certification (checked
+    against real acronym/phrase overlap), nothing previously stopped the
+    AI from freely rephrasing an academic credential's own wording each
+    draft - real gap Zahir hit live 2026-08-10 (Merck 4449005464): his real
+    profile.education[0] reads degree="Bachelor of Science, Information
+    Systems (Artificial Intelligence major, Honours)", but the drafted
+    resume printed "Bachelor's degree - Bachelor of Science (BSc),
+    Information Systems, Artificial Intelligence major, Honours, ..." -
+    a prepended "Bachelor's degree -" prefix (presumably to literally hit a
+    JD's "Bachelor's degree" keyword), an invented "(BSc)" that appears
+    nowhere in the real profile, and the original's parenthetical grouping
+    flattened into a run-on. The prefix wasn't even necessary for scoring:
+    ats_score.py's own _KEYWORD_EQUIVALENCE_GROUPS already treats "bachelor
+    of science" as satisfying a "bachelor's degree" requirement, confirmed
+    directly against score_resume_against_keywords() - so this renders the
+    EDUCATION section verbatim from profile.education's structured fields
+    with no added prefix at all, the same "as it is in the resume" standard
+    Zahir asked for, rather than adding a controlled code-level prefix that
+    scoring never actually needed.
+
+    Replaces every line between an "EDUCATION" header (matched against the
+    same STANDARD_HEADERS set ats_score.py's own structure check and
+    claim_verification.py's section-boundary walk both already use, so all
+    three stay in sync by construction) and the next standard section
+    header with one line per profile.education entry, in the profile's own
+    stored order - blank lines already present in that span are preserved
+    so section spacing looks the same as any other AI-authored resume.
+    Leaves resume_text completely untouched if there's no real
+    profile.education to render from, or no EDUCATION header is found at
+    all - fails toward the AI's own text rather than guessing or dropping
+    content it can't confidently replace."""
+    education = (profile or {}).get("education") or []
+    rendered_lines = [_format_education_entry(entry) for entry in education]
+    rendered_lines = [line for line in rendered_lines if line]
+    if not rendered_lines:
+        return resume_text
+    rendered = "\n".join(rendered_lines)
+
+    out_lines = []
+    in_education = False
+    replaced = False
+    for line in resume_text.splitlines():
+        stripped_lower = line.strip().lower()
+        if stripped_lower in STANDARD_HEADERS:
+            in_education = stripped_lower == "education"
+            out_lines.append(line)
+            if in_education:
+                out_lines.append(rendered)
+                replaced = True
+            continue
+        if in_education:
+            if not line.strip():
+                out_lines.append(line)  # preserve original inter-section blank-line spacing
+            continue
+        out_lines.append(line)
+
+    return "\n".join(out_lines) if replaced else resume_text
+
+
 def _strip_rank_prefixes(resume_text: str) -> str:
     """Deterministic safety net for a below-VP target posting: strips a
     leading rank-prefix from any line that starts with one, and any
@@ -1398,6 +1465,12 @@ def _draft_one(
             # somehow missing, so an absent judgment fails toward leaving
             # the text untouched rather than silently mangling a title.
             resume_text = _strip_rank_prefixes(resume_text)
+        # Deterministic safety net (2026-08-10) - see this function's own
+        # docstring for the real Merck case that motivated it. Runs before
+        # the unhedged-claims check below so that check (which already
+        # skips the EDUCATION section entirely - see claim_verification.py's
+        # module docstring) always sees the final, rendered text.
+        resume_text = _render_education_section_verbatim(resume_text, profile)
         # Deterministic fact-check for UNHEDGED claims (2026-08-09, Zahir's
         # explicit design) - the "?" hedge above only ever catches what the
         # AI itself flagged as uncertain; this catches a confidently-stated
