@@ -58,6 +58,7 @@ from pathlib import Path
 from typing import Optional
 
 from security.crypto_store import read_json, write_json
+from security.file_lock import locked
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 IMAP_DIR = PROJECT_ROOT / "data" / "imap"
@@ -84,6 +85,17 @@ def _account_path(email: str) -> Path:
     return IMAP_DIR / f"{safe}.json"
 
 
+def _lock_name(email: str) -> str:
+    # Per-account, not one shared lock across every IMAP account - two
+    # different accounts' credential files are unrelated, and locking one
+    # while the other is being read would just be needless contention
+    # (IMAP is multi-account by construction, see module docstring).
+    # Reuses _account_path's sanitization so save/remove/load and
+    # list_configured_accounts() below all agree on the same lock name
+    # for a given email, regardless of entry point.
+    return _account_path(email).stem
+
+
 def is_configured(email: str) -> bool:
     return _account_path(email).exists()
 
@@ -93,12 +105,21 @@ def list_configured_accounts() -> list[str]:
     account-setup wizard's "already connected" display and for
     inbox_accounts.py's account discovery - IMAP is multi-account by
     construction (see module docstring), unlike Gmail/Microsoft's
-    single-account modules."""
+    single-account modules.
+
+    Each file's read is locked individually (2026-08-09, Mirror's audit
+    found this whole module had no locking at all, unlike every other
+    store in the codebase - see save_credentials' docstring for the full
+    reasoning) rather than one lock around the whole directory scan, so
+    discovering N accounts never blocks on an unrelated account's
+    in-progress write for longer than that one file's own critical
+    section."""
     if not IMAP_DIR.is_dir():
         return []
     accounts = []
     for path in sorted(IMAP_DIR.glob("*.json")):
-        creds = read_json(path, default=None)
+        with locked(path.stem):
+            creds = read_json(path, default=None)
         if creds and "email" in creds:
             accounts.append(creds["email"])
     return accounts
@@ -107,24 +128,38 @@ def list_configured_accounts() -> list[str]:
 def remove_account(email: str) -> None:
     """Deletes this account's saved credentials - the wizard's
     "disconnect" action. No-op if nothing was saved for this email."""
-    _account_path(email).unlink(missing_ok=True)
+    with locked(_lock_name(email)):
+        _account_path(email).unlink(missing_ok=True)
 
 
 def save_credentials(email: str, app_password: str, host: str, port: int = 993) -> None:
     """Stores this account's IMAP login, encrypted at rest. Called by the
     wizard after email_providers.detect_imap_settings() has resolved (or
-    the user has manually confirmed) host/port."""
-    IMAP_DIR.mkdir(parents=True, exist_ok=True)
-    write_json(_account_path(email), {
-        "email": email,
-        "app_password": app_password,
-        "host": host,
-        "port": port,
-    })
+    the user has manually confirmed) host/port.
+
+    Locked (2026-08-09, real gap found by Mirror's audit - this module
+    was the one credential store in the codebase with no locking at all):
+    security.crypto_store.write_bytes() does a direct path.write_bytes(),
+    not an atomic temp-file-then-rename, so a concurrent read of this same
+    file mid-write (e.g. the wizard saving a reconfigured account at the
+    exact moment a scheduled scan reads it) could see a torn/partial file
+    and raise a decrypt error that reads as "corrupted" when it's actually
+    just a race - self-heals on the next run (the caller's own per-account
+    try/except catches and skips it), but the error message would be
+    misleading in the meantime. Locking the write closes the window."""
+    with locked(_lock_name(email)):
+        IMAP_DIR.mkdir(parents=True, exist_ok=True)
+        write_json(_account_path(email), {
+            "email": email,
+            "app_password": app_password,
+            "host": host,
+            "port": port,
+        })
 
 
 def _load_credentials(email: str) -> dict:
-    creds = read_json(_account_path(email), default=None)
+    with locked(_lock_name(email)):
+        creds = read_json(_account_path(email), default=None)
     if creds is None:
         raise ImapNotConfigured(
             f"No IMAP credentials saved for {email} - run the account-setup "

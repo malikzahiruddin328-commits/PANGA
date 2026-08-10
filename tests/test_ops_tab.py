@@ -73,6 +73,35 @@ def test_ops_tab_period_selector_defaults_to_7_days(ops_app):
     assert period_control.value == "7 days"
 
 
+def test_ops_tab_period_selection_survives_an_unrelated_rerun(ops_app):
+    # State-handling audit (2026-08-10): the documented st.expander bug
+    # (CLAUDE.md known failure pattern #1) is that a widget's own
+    # expanded=/default= argument can silently win over session_state on
+    # EVERY rerun, not just the first. Confirmed via this test that
+    # st.segmented_control does NOT share that bug class - its default=
+    # is genuinely "initial value only" - by picking "Today", then
+    # triggering a rerun that has nothing to do with the period control
+    # (typing into the point-and-talk feedback box on this same screen),
+    # and checking the selection is still "Today", not silently reverted
+    # back to the default="7 days".
+    at = ops_app
+    at.session_state["active_tab"] = "ops"
+    at.run(timeout=30)
+
+    period_control = next(c for c in at.segmented_control if c.key == "ops_period")
+    period_control.set_value("Today")
+    at.run(timeout=30)
+    period_control = next(c for c in at.segmented_control if c.key == "ops_period")
+    assert period_control.value == "Today"
+
+    feedback_box = next(t for t in at.text_area if t.key and t.key.startswith("fb_text_"))
+    feedback_box.set_value("unrelated note - just triggering a rerun").run(timeout=30)
+
+    assert not at.exception
+    period_control = next(c for c in at.segmented_control if c.key == "ops_period")
+    assert period_control.value == "Today"
+
+
 def test_ops_tab_switching_to_today_excludes_older_calls(ops_app):
     from datetime import datetime, timedelta, timezone
 
