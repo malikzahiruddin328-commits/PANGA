@@ -712,7 +712,8 @@ def regenerate_resume_and_persist(job: dict, on_progress, success_message: str) 
     sciences" - 27/30 both times, invisible unless the two keyword sets
     are actually diffed). Read BEFORE generate_documents() overwrites
     anything, since afterward the old text is gone."""
-    old_resume_text = (get_application(job["source"], job["job_id"]) or {}).get("resume_text")
+    existing_app = get_application(job["source"], job["job_id"]) or {}
+    old_resume_text = existing_app.get("resume_text")
     try:
         regen = generate_documents(job, load_profile(), ["resume"], on_progress=on_progress)
     except (DraftingNotConfigured, DraftingFailed) as exc:
@@ -720,7 +721,13 @@ def regenerate_resume_and_persist(job: dict, on_progress, success_message: str) 
         return None
     new_resume = regen["resume"]
     upsert_application(
-        job["source"], job["job_id"], status="under review",
+        # Real bug (state-handling audit, 2026-08-10): this used to
+        # hardcode status="under review" unconditionally - regenerating a
+        # resume for a job already marked "applied"/"interview scheduled"/
+        # etc. silently reverted its status with zero warning. Preserves
+        # the existing status instead, same as every write path added
+        # since (e.g. _persist_resolved_claim).
+        job["source"], job["job_id"], status=existing_app.get("status", "under review"),
         resume_text=new_resume["text"],
         resume_ats_score=new_resume["ats_score"],
         resume_ats_rationale=new_resume["ats_rationale"],
@@ -1339,6 +1346,15 @@ def _analyze_fit_with_auto_gap_scan(job: dict, profile: dict, app_record: dict) 
                 if result["added_count"]:
                     st.toast(f"Found {result['added_count']} more thing(s) worth asking about.", icon=":material/info:")
                     st.rerun()
+    # Fragile invariant (state-handling audit, 2026-08-10): when
+    # added_count == 0 above, this passes the pre-write app_record - it
+    # still has the OLD resume_gap_scan_fingerprint/resume_clarifying_
+    # questions, not what was just persisted. Safe today only because
+    # that branch's own comment guarantees merged_clarifying_questions is
+    # byte-identical to what app_record already had. If that guarantee
+    # ever stops holding, or if this function (or anything it calls)
+    # starts reading resume_gap_scan_fingerprint from app_record, this
+    # would silently use stale data for the rest of this render.
     return _analyze_fit_before_drafting(job, profile, app_record)
 
 
@@ -3569,7 +3585,10 @@ elif active_tab == "results":
                     if not selected:
                         st.toast("Check at least one document type first.", icon=":material/warning:")
                     elif not drafting_is_configured():
-                        upsert_application(job["source"], job["job_id"], status="under review", documents_requested=selected)
+                        # Preserves current status (state-handling audit,
+                        # 2026-08-10) - see regenerate_resume_and_persist's
+                        # matching fix for the full story.
+                        upsert_application(job["source"], job["job_id"], status=app_record.get("status", "under review"), documents_requested=selected)
                         st.toast("Saved your selection - add an API key to actually draft the documents.", icon=":material/info:")
                         st.rerun()
                     else:
@@ -3603,8 +3622,14 @@ elif active_tab == "results":
                             progress_bar.progress(1.0, text=":material/check_circle: Done.")
                             resume_draft = drafted.get("resume")
                             resume_is_scored = isinstance(resume_draft, dict)
+                            # Real bug (state-handling audit, 2026-08-10):
+                            # this used to hardcode status="under review" -
+                            # clicking "Generate documents" again on a job
+                            # already marked applied/interview scheduled/
+                            # etc. (e.g. to refresh a cover letter) silently
+                            # reverted its status with zero warning.
                             upsert_application(
-                                job["source"], job["job_id"], status="under review",
+                                job["source"], job["job_id"], status=app_record.get("status", "under review"),
                                 documents_requested=selected,
                                 resume_text=resume_draft["text"] if resume_is_scored else resume_draft,
                                 resume_ats_score=resume_draft["ats_score"] if resume_is_scored else None,
