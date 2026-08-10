@@ -38,10 +38,6 @@ setup_debug_logging()
 # app, and need the same protection regardless of entry point. See
 # debug_log.setup_always_on_error_logging().
 
-import extension_bridge
-extension_bridge.start_server()
-
-
 def _find_bhangi_src(project_root: Path) -> Path | None:
     """Locate the sibling Bhangi checkout's src/ directory.
 
@@ -879,150 +875,62 @@ def render_paste_jd_prompt_before_drafting(job: dict, app_record: dict) -> None:
     resume - is already tailored against the real JD rather than drafted
     blind and fixed up after the fact.
 
-    For a manually-pasted JD (no extension capture), saving does NOT
-    trigger a regenerate the way the post-hoc version does - nothing has
-    been drafted yet to regenerate. It persists the text via
-    search.job_store.update_job_description() (clears the stale empty
-    ats_required_keywords/ats_preferred_keywords cache too), then falls
-    into the SAME shared tail the capture branch already used exclusively
-    (2026-08-09, real gap Zahir hit live on a real job - Merck 4449005464,
-    LinkedIn source but no extension capture matched: text saved
-    correctly, 7,508 real chars persisted, but nothing else happened - no
-    score, no Analyze Fit, no auto-gap-scan, just a toast. "i just saved
-    the jd... and nothing happened." Root cause: this branch used to stop
-    at update_job_description() + a toast + st.rerun(), on the stated
-    original design that "the next Generate click picks it up naturally" -
-    true, but it meant a manually-pasted JD got none of the Analyze Fit
-    experience the capture path already had, and Zahir had no way to know
-    to scroll down to a separate, unlabeled Generate button. Both paths
-    now render identically once real text is saved - the only real
-    difference between them is WHETHER an explicit Save click is needed
-    at all (capture already had its human-in-the-loop moment when Zahir
-    clicked "Send to Panga" on a page he was looking at; a bare paste
-    into a text box has no such moment, so it still needs one).
+    Saving does NOT trigger a regenerate the way the post-hoc version
+    does - nothing has been drafted yet to regenerate. It persists the
+    text via search.job_store.update_job_description() (clears the stale
+    empty ats_required_keywords/ats_preferred_keywords cache too), then
+    falls into the same tail below that renders the Analyze Fit score
+    card/open-questions display (2026-08-09, real gap Zahir hit live on a
+    real job - Merck 4449005464: text saved correctly, 7,508 real chars
+    persisted, but nothing else happened - no score, no Analyze Fit, no
+    auto-gap-scan, just a toast. "i just saved the jd... and nothing
+    happened." Root cause: this used to stop at update_job_description()
+    + a toast + st.rerun(), on the stated original design that "the next
+    Generate click picks it up naturally" - true, but Zahir had no way to
+    know to scroll down to a separate, unlabeled Generate button).
 
     This is additive, not a replacement: the post-hoc render_paste_jd_prompt()
     stays in place too, so someone who already has a blind-drafted resume
     can still paste a JD there and get everything correctly redrafted.
 
     app_record: needed (not looked up here) because the caller already has
-    it and the extension-capture branch below passes it straight into
-    render_analyze_fit_section() - avoids a second get_application() read
-    for the same job in the same render."""
+    it and gets passed straight into render_analyze_fit_section() - avoids
+    a second get_application() read for the same job in the same render."""
     job_key = f"{job.get('source')}_{job.get('job_id')}"
 
-    # Extension auto-fill (2026-08-08): matches the extension's last capture
-    # against THIS job's own posting_url (only LinkedIn/Dice jobs have one
-    # from add_manual_job()/the Dice scraper, so this is a no-op for every
-    # other source). Only ever seeds the text_area's initial value - actual
-    # persistence happens below, either automatically (a real capture
-    # exists) or via the explicit Save button (manual paste, no capture).
-    # The capture's own timestamp is folded into the widget key (codemap's
-    # documented Streamlit gotcha: a bare key ignores a new value= once
-    # session_state already has that key) so a fresh capture for the same
-    # job actually replaces stale text instead of being ignored.
-    #
-    # Looked up BEFORE deciding whether to show render_paste_jd_notice()'s
-    # "we don't have this posting's full description yet" banner - Zahir
-    # caught this live 2026-08-09 (Tarkett CIO, real extension capture): with
-    # both always rendered, that banner sat directly above the auto-filled
-    # text and the "Auto-filled" badge, contradicting it ("we don't have it"
-    # right next to "here it is"). A real capture means we DO have it, so the
-    # "we don't have it" framing (and its "sites intentionally block
-    # automated access" explanation, which doesn't even apply here) no
-    # longer belongs on screen at all.
-    capture = extension_bridge.get_capture_for_url(job.get("posting_url"))
-    capture_ts = capture["ts"] if capture else "none"
-    if capture:
-        st.success(
-            f"Auto-filled from browser extension - {capture['source'].title() or 'LinkedIn/Dice'}"
-            + (f" ({capture['title']} at {capture['company']})" if capture.get("title") or capture.get("company") else ""),
-            icon=":material/extension:",
-        )
-    else:
-        render_paste_jd_notice()
+    render_paste_jd_notice()
 
     pasted_jd = st.text_area(
-        "Paste the job description", key=f"jd_paste_pre_{job_key}_{capture_ts}", height=120,
-        value=capture["description"] if capture else "",
+        "Paste the job description", key=f"jd_paste_pre_{job_key}", height=120,
         placeholder="Paste the full job posting text here...",
         label_visibility="collapsed",
     )
 
-    if capture:
-        # Auto-save + auto-score (2026-08-09, Zahir-approved polish pass -
-        # see the hub session's own reasoning, carried into this comment
-        # since it explains a real behavior change, not just what the code
-        # does): the real human-in-the-loop moment already happened when
-        # the user clicked "Send to Panga" on a page they were actually
-        # looking at - a second manual "Save" click here is friction
-        # nobody actually uses, not real verification. Not a one-time
-        # auto-action either: this re-saves and re-scores on every render
-        # where the box's CURRENT text differs from what's already
-        # persisted, so a later manual edit to this same box goes through
-        # the identical auto-save+auto-score path, synchronously, rather
-        # than leaving a stale score on screen until some other click
-        # happens to trigger a refresh.
-        #
-        # Cheap enough to not need a stronger change-detection guard than
-        # a plain string comparison against job["description"] - matches
-        # analyze_fit_before_drafting() itself already being "recomputed
-        # fresh at the top of every render" elsewhere in this file, and
-        # update_job_description() is a single small locked JSON write,
-        # not an AI call (the score is deterministic keyword-overlap
-        # arithmetic - ats_score.py's score_resume_against_keywords() -
-        # not a fresh AI extraction; a job with no ats_required_keywords
-        # cached yet, i.e. never drafted before, scores honestly against
-        # "no extractable requirements yet, formatting only" rather than a
-        # misleading 100%, so this is safe to show immediately even before
-        # any AI call has ever run for this job).
-        stripped = pasted_jd.strip()
-        if stripped and stripped != (job.get("description") or ""):
+    if st.button("Save job description", key=f"jd_paste_pre_save_{job_key}"):
+        if not pasted_jd.strip():
+            st.toast("Paste the job description text first.", icon=":material/warning:")
+        else:
             from search.job_store import update_job_description
 
-            update_job_description(job["source"], job["job_id"], stripped)
-            job["description"] = stripped
-        if stripped:
-            st.markdown(":material/check_circle: Saved automatically")
-    else:
-        if st.button("Save job description", key=f"jd_paste_pre_save_{job_key}"):
-            if not pasted_jd.strip():
-                st.toast("Paste the job description text first.", icon=":material/warning:")
-            else:
-                from search.job_store import update_job_description
+            update_job_description(job["source"], job["job_id"], pasted_jd.strip())
+            job["description"] = pasted_jd.strip()
+            # Real gap fixed 2026-08-09 (see this function's own
+            # docstring - the Merck job Zahir hit live): once this save
+            # flips _job_has_captured_jd_text() to True, the caller's own
+            # routing condition would otherwise send the NEXT render to
+            # the plain view/update box instead, which has no Analyze Fit
+            # integration - the outer `if` a few hundred lines down
+            # checks this exact flag for that reason.
+            st.session_state[f"jd_manually_saved_{job_key}"] = True
+            st.toast(
+                "Saved - whatever you generate next will be tailored against it.",
+                icon=":material/check_circle:",
+            )
 
-                update_job_description(job["source"], job["job_id"], pasted_jd.strip())
-                job["description"] = pasted_jd.strip()
-                # Real gap fixed 2026-08-09 (see this function's own
-                # docstring - the Merck job Zahir hit live): a manually-
-                # pasted JD (no capture) never gets the extension-
-                # capture branch's own "still routes back to THIS
-                # function on the next render" advantage (that branch
-                # keeps routing here for as long as
-                # extension_bridge.get_capture_for_url() keeps matching -
-                # its own ~30-min TTL). Once this save flips
-                # _job_has_captured_jd_text() to True with no capture
-                # present, the caller's own routing condition would
-                # otherwise send the NEXT render to the plain view/
-                # update box instead, which has no Analyze Fit
-                # integration - the outer `if` a few hundred lines down
-                # checks this exact flag alongside the capture check for
-                # that reason.
-                st.session_state[f"jd_manually_saved_{job_key}"] = True
-                st.toast(
-                    "Saved - whatever you generate next will be tailored against it.",
-                    icon=":material/check_circle:",
-                )
-
-    # Shared tail (2026-08-09, real gap Zahir hit live on a real job -
-    # Merck 4449005464, LinkedIn source but no extension capture matched:
-    # the text saved correctly, 7,508 real chars persisted, but nothing
-    # else happened - no score, no Analyze Fit, no auto-gap-scan, just a
-    # toast. "i just saved the jd... and nothing happened." Both the
-    # capture path above and the manual-save path now fall through to
-    # this exact same rendering once real text is actually saved, rather
-    # than the capture path getting the full Analyze Fit experience and
-    # the manual path getting nothing more than a toast.
+    # Real gap fixed 2026-08-09 (see this function's own docstring - the
+    # Merck job Zahir hit live): once real text is saved, render the same
+    # Analyze Fit score card/open-questions display shown elsewhere in the
+    # app, rather than leaving the user with nothing but a toast.
     if (job.get("description") or "").strip():
         analysis = _analyze_fit_with_auto_gap_scan(job, load_profile(), app_record)
         # show_generate_actions=False: this renders directly above the
@@ -1386,7 +1294,7 @@ def render_analyze_fit_section(job: dict, app_record: dict, analysis: dict | Non
     scoring/keyword-merge pass twice per job. Computed fresh here when not
     given (the Results-tab call site, which doesn't need it beforehand).
 
-    show_generate_actions: False for the extension auto-save/auto-score
+    show_generate_actions: False for the paste-JD-before-drafting
     integration (render_paste_jd_prompt_before_drafting, 2026-08-09) -
     that call site sits directly above the existing "Documents for this
     application" checkbox+Generate flow (which already covers resume among
@@ -1887,31 +1795,6 @@ gaps_count = len(get_applications_with_open_clarifying_questions())
 
 st.session_state.setdefault("active_tab", "cta")
 
-# --- Deep-link from the browser extension's post-capture notification
-# ("open Panga to the job I just sent" instead of making Zahir hunt for it,
-# extension session's ask 2026-08-08). ?job_url=<url-encoded posting URL>,
-# matched via the SAME normalization extension_bridge.py already uses for
-# its own capture-matching (strip query/fragment/trailing slash, lowercase)
-# - not a fresh regex, so a LinkedIn tracking-param variant or a re-visit
-# still matches the job's own stored posting_url exactly like it already
-# does for auto-fill. Consumed (query param cleared, deep_link_target
-# popped) whether or not a match is actually shown - a job that exists but
-# is currently hidden by the Results-tab filters (score threshold, hidden-
-# closed/applied) still lands cleanly on Results with nothing force-
-# selected, rather than either guessing at relaxing filters or leaving a
-# stale target lingering in session_state to surprise a much later,
-# unrelated rerun once filters happen to change. Ambiguous matches (more
-# than one job shares a normalized posting_url) also no-op rather than
-# guess which one Zahir meant.
-_job_url_param = st.query_params.get("job_url")
-if _job_url_param:
-    _normalized_target = extension_bridge._normalize_url(_job_url_param)
-    _url_matches = [j for j in jobs if extension_bridge._normalize_url(j.get("posting_url") or "") == _normalized_target] if _normalized_target else []
-    if len(_url_matches) == 1:
-        st.session_state["active_tab"] = "results"
-        st.session_state["deep_link_target"] = (_url_matches[0]["source"], _url_matches[0]["job_id"])
-    del st.query_params["job_url"]
-
 # --- Persistent alert strip: shown above the tabs on every tab, since these
 # are time-sensitive and easy to miss if buried under whichever tab happens
 # to be open (design decision 2026-07-30, see module docstring). ---
@@ -1936,17 +1819,6 @@ if pending_suggestions or outstanding_drafts:
                     st.rerun()
         if outstanding_drafts:
             st.markdown(f"{len(outstanding_drafts)} draft(s) created and waiting in Gmail for you to review and send - this clears itself once you send them.")
-
-# --- Browser extension status: always rendered, not just when something's
-# wrong - the whole point is Zahir should never have to guess/assume the
-# extension is running (Panga/CLAUDE.md's HCI standard). One compact line,
-# not a full alert box, since "extension is connected" is the common/quiet
-# case and shouldn't cost more vertical space than that. ---
-_ext_status = extension_bridge.get_heartbeat_status()
-if _ext_status["connected"]:
-    st.markdown(f":green[●] Browser extension connected - last check-in {int(_ext_status['seconds_ago'])}s ago")
-else:
-    st.markdown(":red[●] Browser extension not detected - paste job descriptions manually below")
 
 # --- Tab bar ---
 SIGNAL_TYPE_LABELS = {
@@ -3268,22 +3140,6 @@ elif active_tab == "results":
             dup_notes.append(f"{cross_source_merged} job-board posting(s) matched to this direct listing")
         dup_note = f", {'; '.join(dup_notes)}" if dup_notes else ""
 
-        # Deep-link target (see the top-of-script query-param handling) -
-        # force-open this channel's expander and select/scroll to the row
-        # the moment it's found in THIS channel's own post-filter/dedup
-        # list, before the expander below reads its expanded= state. One-
-        # shot: popped the instant it's applied so a later, unrelated
-        # rerun doesn't keep re-forcing this same job open.
-        _deep_link_target = st.session_state.get("deep_link_target")
-        if _deep_link_target and _deep_link_target[0] == channel:
-            for _idx, _job in enumerate(deduped):
-                if (_job.get("source"), _job.get("job_id")) == _deep_link_target:
-                    st.session_state[f"channel_expander_{channel}"] = True
-                    st.session_state[f"selected_idx_{channel}"] = _idx
-                    st.session_state[f"scroll_pending_{channel}"] = True
-                    st.session_state.pop("deep_link_target", None)
-                    break
-
         # Investigated a reported inconsistency (2026-08-06, relayed via
         # hub): USAJOBS seen expanded on page load while Indeed was
         # correctly collapsed. Could not reproduce with a genuinely fresh
@@ -3486,25 +3342,11 @@ elif active_tab == "results":
                 # moot once a draft exists - the post-hoc one takes over
                 # from there, same as it already did before this box existed.
                 if app_record.get("resume_ats_score") is None:
-                    # A live extension capture routes here EVEN when the job
-                    # already has saved JD text (real gap found live
-                    # 2026-08-09 building this: the very first auto-save
-                    # flips _job_has_captured_jd_text() to True, which would
-                    # otherwise fall through to the plain view/update-box
-                    # branch below on the VERY NEXT rerun - that box has no
-                    # auto-score integration and requires an explicit
-                    # "Update" click, directly contradicting "not a one-time
-                    # auto-action that then locks into a static gate."
-                    # Falls back to the plain view/update box once the
-                    # capture expires (extension_bridge's own 30-min TTL) or
-                    # stops matching - graceful degradation, not a dead end.
-                    #
-                    # A manual (no-capture) save gets the same "keep
-                    # routing here" treatment via its own session-state
-                    # flag (2026-08-09, real gap Zahir hit live on a real
-                    # job - Merck 4449005464: the manual-save path has no
-                    # capture TTL to fall back on, so without this it
-                    # would route to the plain view/update box - no
+                    # A manual save keeps routing back to the paste-before-
+                    # drafting box on the VERY NEXT rerun via its own
+                    # session-state flag (2026-08-09, real gap Zahir hit
+                    # live on a real job - Merck 4449005464: without this
+                    # it would route to the plain view/update box - no
                     # Analyze Fit integration - on the very next render
                     # after the save that just enabled it).
                     # Matches the SAME job_key format render_paste_jd_
@@ -3514,8 +3356,7 @@ elif active_tab == "results":
                     # namespacing - a different key for a different box).
                     job_key_for_gap_scan_flag = f"{job.get('source')}_{job.get('job_id')}"
                     if (
-                        extension_bridge.get_capture_for_url(job.get("posting_url"))
-                        or not _job_has_captured_jd_text(job)
+                        not _job_has_captured_jd_text(job)
                         or st.session_state.get(f"jd_manually_saved_{job_key_for_gap_scan_flag}")
                     ):
                         render_paste_jd_prompt_before_drafting(job, app_record)
@@ -4051,16 +3892,6 @@ elif active_tab == "results":
     pending_regen_confirm = st.session_state.get("regen_confirm_pending")
     if pending_regen_confirm:
         _confirm_regenerate_dialog(pending_regen_confirm["job"], pending_regen_confirm["cost_info"])
-
-    # A deep-link target that's still set here never matched any channel's
-    # post-filter/dedup list this pass - the job exists (it was resolved
-    # from a real posting_url match up top) but is currently hidden by the
-    # score threshold or a hidden-closed/applied filter. Cleared rather
-    # than left to linger in session_state, which would otherwise force-
-    # select it unexpectedly on some later, unrelated rerun once a filter
-    # happens to change - lands cleanly on Results with nothing selected,
-    # same as the "ambiguous match" no-op above.
-    st.session_state.pop("deep_link_target", None)
 
 elif active_tab == "prospector":
     render_feedback_widget("prospector")
