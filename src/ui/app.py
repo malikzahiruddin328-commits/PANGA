@@ -1182,23 +1182,49 @@ def _analyze_fit_with_auto_gap_scan(job: dict, profile: dict, app_record: dict) 
     A transient API failure here is swallowed with a soft toast, not
     st.error - this runs automatically, not from an explicit click, so a
     hard error banner on an action Zahir didn't initiate would be more
-    disruptive than useful. No fingerprint is persisted on failure, so
-    the very next render simply tries again."""
+    disruptive than useful. No fingerprint is persisted on failure, so a
+    genuinely new resume version still gets scanned normally next time.
+
+    Per-session failure guard (2026-08-09, General's real concern given
+    the SAME day's actual billing-exhaustion incident): without this, a
+    failed call would retry on literally every rerun of the page - not
+    just re-opening Analyze Fit, but ANY unrelated widget interaction
+    elsewhere that triggers a Streamlit rerun - hammering the API on
+    every render instead of failing once and backing off, unlike the
+    manual "Answer more questions" button (only ever fires on an
+    explicit click). st.session_state[failed_key], keyed by job AND the
+    specific resume-version fingerprint, suppresses further auto-fire
+    attempts for THAT version once it's failed once - clears naturally
+    once the version actually changes (a new fingerprint means a new,
+    unseen key), and never blocks the manual button, which still fires
+    unconditionally on click and clears the guard + persists the
+    fingerprint on success so a forced retry actually counts as done."""
+    job_key = f"{job.get('source')}_{job.get('job_id')}"
     if not _gap_scan_is_current(job, app_record):
-        try:
-            with st.spinner("Checking for anything else genuinely worth asking..."):
-                result = _request_additional_gap_questions(job, profile, app_record)
-        except (DraftingNotConfigured, DraftingFailed) as exc:
-            st.toast(f"Couldn't check for additional gaps automatically: {exc}", icon=":material/warning:")
-        else:
-            upsert_application(
-                job["source"], job["job_id"], status=app_record.get("status", "under review"),
-                resume_clarifying_questions=result["merged_clarifying_questions"],
-                resume_gap_scan_fingerprint=_gap_scan_baseline_fingerprint(job, app_record),
-            )
-            if result["added_count"]:
-                st.toast(f"Found {result['added_count']} more thing(s) worth asking about.", icon=":material/info:")
-            st.rerun()
+        fingerprint = _gap_scan_baseline_fingerprint(job, app_record)
+        failed_key = f"gapscan_failed_{job_key}_{fingerprint}"
+        if not st.session_state.get(failed_key):
+            try:
+                with st.spinner("Checking for anything else genuinely worth asking..."):
+                    result = _request_additional_gap_questions(job, profile, app_record)
+            except (DraftingNotConfigured, DraftingFailed) as exc:
+                # No rerun here (unlike the success branch below) -
+                # there's nothing new to reflect, and re-executing the
+                # page immediately after a failure that changed nothing
+                # is pure overhead, not a UX improvement. The toast
+                # itself renders fine within this same pass.
+                st.session_state[failed_key] = True
+                st.toast(f"Couldn't check for additional gaps automatically: {exc}", icon=":material/warning:")
+            else:
+                st.session_state.pop(failed_key, None)
+                upsert_application(
+                    job["source"], job["job_id"], status=app_record.get("status", "under review"),
+                    resume_clarifying_questions=result["merged_clarifying_questions"],
+                    resume_gap_scan_fingerprint=fingerprint,
+                )
+                if result["added_count"]:
+                    st.toast(f"Found {result['added_count']} more thing(s) worth asking about.", icon=":material/info:")
+                st.rerun()
     return _analyze_fit_before_drafting(job, profile, app_record)
 
 
@@ -1307,11 +1333,25 @@ def render_analyze_fit_section(job: dict, app_record: dict, analysis: dict | Non
                     except (DraftingNotConfigured, DraftingFailed) as exc:
                         st.error(str(exc))
                     else:
+                        # Persists the fingerprint (and clears any auto-
+                        # fire failure guard) regardless of added_count -
+                        # 2026-08-09: a manual click that genuinely finds
+                        # nothing new is still a real, completed scan of
+                        # THIS resume version, same as the auto-fire's own
+                        # success path - without this, a "nothing found"
+                        # manual click would leave the version looking
+                        # never-scanned, and _analyze_fit_with_auto_gap_
+                        # scan would immediately re-fire on the very next
+                        # Analyze Fit open, right after Zahir just asked
+                        # for exactly this check himself.
+                        fingerprint = _gap_scan_baseline_fingerprint(job, app_record)
+                        st.session_state.pop(f"gapscan_failed_{job_key}_{fingerprint}", None)
+                        upsert_application(
+                            job["source"], job["job_id"], status=app_record.get("status", "under review"),
+                            resume_clarifying_questions=result["merged_clarifying_questions"],
+                            resume_gap_scan_fingerprint=fingerprint,
+                        )
                         if result["added_count"]:
-                            upsert_application(
-                                job["source"], job["job_id"], status=app_record.get("status", "under review"),
-                                resume_clarifying_questions=result["merged_clarifying_questions"],
-                            )
                             st.toast(
                                 f"Found {result['added_count']} more thing(s) worth asking about.",
                                 icon=":material/info:",

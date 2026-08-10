@@ -819,6 +819,86 @@ def test_analyze_fit_gap_scan_failure_is_swallowed_not_a_hard_error(results_app_
     assert not app_record.get("resume_gap_scan_fingerprint")  # never persisted - next render will retry
 
 
+def test_analyze_fit_gap_scan_does_not_retry_every_rerun_after_a_failure(results_app_before_any_gap_scan, monkeypatch):
+    # Real concern General raised the same day as an actual billing-
+    # exhaustion incident: without a per-session guard, a failed call
+    # would retry on literally EVERY rerun of the page - not just
+    # re-opening Analyze Fit, but any unrelated widget interaction
+    # elsewhere that triggers a Streamlit rerun - hammering the API
+    # instead of failing once and backing off.
+    import tailoring.drafting as drafting
+    from tailoring.drafting import DraftingFailed
+
+    call_count = [0]
+
+    def _fake(job, profile, app_record, model=None, on_progress=None):
+        call_count[0] += 1
+        raise DraftingFailed("simulated billing exhaustion")
+
+    monkeypatch.setattr(drafting, "request_additional_gap_questions", _fake)
+
+    at = results_app_before_any_gap_scan
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+    assert call_count[0] == 1
+
+    # Simulates an unrelated rerun (typing in an adjacent box, toggling
+    # something nearby) - must NOT retry the failed scan again.
+    at.run(timeout=30)
+    at.run(timeout=30)
+    assert call_count[0] == 1
+
+
+def test_manual_answer_more_questions_can_still_force_a_retry_after_an_auto_fire_failure(results_app_before_any_gap_scan, monkeypatch):
+    # The per-session failure guard must never block the EXPLICIT manual
+    # button - Zahir should still be able to force a retry sooner than
+    # waiting for a new resume version, and a successful manual retry
+    # should count as a real scan (fingerprint persisted, guard cleared)
+    # so it doesn't immediately auto-fire again right after.
+    import tailoring.drafting as drafting
+    from tailoring.drafting import DraftingFailed
+
+    call_count = [0]
+    should_fail = [True]
+    new_question = {
+        "type": "skill_gap", "skill": "Team size at Acme",
+        "question": "How big was the team?", "suggested_answer": "",
+    }
+
+    def _fake(job, profile, app_record, model=None, on_progress=None):
+        call_count[0] += 1
+        if should_fail[0]:
+            raise DraftingFailed("simulated billing exhaustion")
+        return {
+            "added_count": 1, "new_questions": [new_question],
+            "merged_clarifying_questions": (app_record.get("resume_clarifying_questions") or []) + [new_question],
+        }
+
+    monkeypatch.setattr(drafting, "request_additional_gap_questions", _fake)
+
+    at = results_app_before_any_gap_scan
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+    assert call_count[0] == 1  # auto-fire failed and set the guard
+
+    should_fail[0] = False
+    button = next(b for b in at.button if b.key == "answermore_Dice_job1")
+    button.click().run(timeout=30)
+
+    assert not at.exception
+    assert call_count[0] == 2  # the manual click fired despite the guard
+    app_record = get_application("Dice", "job1")
+    assert app_record.get("resume_gap_scan_fingerprint")  # the successful manual retry counts as a real scan
+    assert any(q.get("skill") == "Team size at Acme" for q in app_record["resume_clarifying_questions"])
+
+    # A further unrelated rerun must not auto-fire again now that this
+    # version has a real, successful scan on record.
+    at.run(timeout=30)
+    assert call_count[0] == 2
+
+
 def test_analyze_fit_refires_the_gap_scan_after_a_new_resume_version(results_app_before_any_gap_scan, monkeypatch):
     import tailoring.drafting as drafting
 
