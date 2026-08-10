@@ -7,6 +7,7 @@ from tailoring.drafting import (
     _drop_years_experience_keywords,
     _merge_keyword_gap_questions,
     _questions_worth_asking,
+    _render_education_section_verbatim,
     _resume_schema,
     _strip_degree_in_prefix_keywords,
     _strip_rank_prefixes,
@@ -319,6 +320,31 @@ def test_draft_one_resume_threads_unconfirmed_claims_through(monkeypatch):
 
     result = _draft_one(object(), [], "resume", None, job=job, profile={})
     assert result["unconfirmed_claims"] == [{"skill": "Team size", "text": "Led a team of 8-10 engineers?"}]
+
+
+def test_draft_one_resume_renders_education_verbatim_from_the_profile(monkeypatch):
+    # 2026-08-10 fix: _draft_one must not trust the AI's own freeform
+    # EDUCATION wording, even when the AI's motive (hitting a literal
+    # "Bachelor's degree" keyword) is legitimate - the profile's own
+    # structured fields win.
+    import tailoring.drafting as drafting
+
+    def _fake_call_structured(client, **kwargs):
+        return {
+            "text": "EDUCATION\nBachelor's degree - Bachelor of Science (BSc), Info Systems\n",
+            "target_seniority_at_least_vp": True,
+            "suggested_strategy_tag": "",
+            "clarifying_questions": [],
+            "unconfirmed_claims": [],
+        }
+
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured)
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": [], "ats_preferred_keywords": []}
+    profile = {"education": [{"degree": "Bachelor of Science, Information Systems", "institution": "Brunel University London"}]}
+
+    result = _draft_one(object(), [], "resume", None, job=job, profile=profile)
+    assert result["text"] == "EDUCATION\nBachelor of Science, Information Systems, Brunel University London"
+    assert "BSc" not in result["text"]
 
 
 def test_draft_one_resume_deterministically_flags_an_unhedged_fabricated_employer(monkeypatch):
@@ -636,6 +662,77 @@ def test_strip_rank_prefixes_only_strips_parentheticals_containing_equivalent():
     # Narrow on purpose - must not eat an unrelated parenthetical.
     text = "Head of IT (Paramus, NJ)\nJanuary 2024 - January 2026\n"
     assert _strip_rank_prefixes(text) == text
+
+
+def _profile_with_education(*entries):
+    return {"education": list(entries)}
+
+
+def test_render_education_section_verbatim_replaces_a_freely_reworded_line():
+    # Real Merck 4449005464 case, 2026-08-10: the AI prepended "Bachelor's
+    # degree - " and invented "(BSc)" that appears nowhere in the real
+    # profile, flattening the original's parenthetical grouping. The
+    # verbatim render must win regardless of what the AI wrote.
+    text = (
+        "Zahir Uddin\n\nEDUCATION\n"
+        "Bachelor's degree - Bachelor of Science (BSc), Information Systems, "
+        "Artificial Intelligence major, Honours, Brunel University London, "
+        "Middlesex, UK, 1997 - 2001\n\nCERTIFICATIONS\nPMP\n"
+    )
+    profile = _profile_with_education({
+        "degree": "Bachelor of Science, Information Systems (Artificial Intelligence major, Honours)",
+        "institution": "Brunel University London",
+        "location": "Middlesex, UK",
+        "years": "1997 - 2001",
+    })
+    result = _render_education_section_verbatim(text, profile)
+    assert (
+        "Bachelor of Science, Information Systems (Artificial Intelligence major, Honours), "
+        "Brunel University London, Middlesex, UK, 1997 - 2001"
+    ) in result
+    assert "BSc" not in result
+    assert "Bachelor's degree -" not in result
+    # Content outside the EDUCATION section must survive untouched.
+    assert "Zahir Uddin" in result
+    assert "CERTIFICATIONS\nPMP" in result
+
+
+def test_render_education_section_verbatim_preserves_blank_line_spacing():
+    text = "EDUCATION\nOld reworded line.\n\nCERTIFICATIONS\nPMP\n"
+    profile = _profile_with_education({"degree": "BS", "institution": "Some University"})
+    result = _render_education_section_verbatim(text, profile)
+    assert result == "EDUCATION\nBS, Some University\n\nCERTIFICATIONS\nPMP"
+
+
+def test_render_education_section_verbatim_renders_multiple_degrees_each_on_own_line():
+    text = "EDUCATION\nSome reworded run-on line covering both degrees.\n\nSKILLS\nPython\n"
+    profile = _profile_with_education(
+        {"degree": "MBA", "institution": "LBS", "years": "2010 - 2012"},
+        {"degree": "BS", "institution": "Brunel", "years": "1997 - 2001"},
+    )
+    result = _render_education_section_verbatim(text, profile)
+    assert "MBA, LBS, 2010 - 2012\nBS, Brunel, 1997 - 2001" in result
+
+
+def test_render_education_section_verbatim_no_op_with_no_profile_education():
+    text = "EDUCATION\nSomething the AI wrote.\n\nSKILLS\nPython\n"
+    assert _render_education_section_verbatim(text, {"education": []}) == text
+    assert _render_education_section_verbatim(text, None) == text
+
+
+def test_render_education_section_verbatim_no_op_when_no_education_header_present():
+    # Fails safe toward the AI's own text rather than guessing where to
+    # insert a section that was never printed at all.
+    text = "PROFESSIONAL EXPERIENCE\nEngineer.\n"
+    profile = _profile_with_education({"degree": "BS", "institution": "Brunel"})
+    assert _render_education_section_verbatim(text, profile) == text
+
+
+def test_render_education_section_verbatim_skips_an_entry_with_no_real_fields():
+    text = "EDUCATION\nOld line.\n"
+    profile = _profile_with_education({}, {"degree": "BS", "institution": "Brunel"})
+    result = _render_education_section_verbatim(text, profile)
+    assert result == "EDUCATION\nBS, Brunel"
 
 
 def test_resume_spec_folds_target_role_alignment_into_summary_not_its_own_header():
