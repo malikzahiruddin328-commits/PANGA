@@ -9,12 +9,26 @@ AND a regulatory filing), not just 2 instances of the same type (two Phase
 "watching". Manual states ("contacted", "stale", "disqualified") are
 sticky - a new signal arriving later never silently overwrites a status
 Zahir set himself; that's his call, not automation's.
+
+Every read-modify-write function below runs inside security.file_lock.
+locked() (found missing 2026-08-09 - same audit lens as the outreach.json
+fix, commit 57d94ee, just not caught in the first pass since it's a
+different file). Real concurrent-writer exposure here: add_signal() gets
+called from live Claude Code reasoning sessions populating signals from
+ClinicalTrials.gov/openFDA/etc. while the Streamlit dashboard - which
+Zahir routinely has open at the same time - can call set_status()/
+set_website() from his own clicks. TARGET_ACCOUNTS_PATH writes use the
+"target_accounts" lock name; WEBSITE_LOOKUP_COST_PATH writes (a genuinely
+separate file) get their own "website_lookup_cost" lock name rather than
+sharing one - see security/file_lock.py's docstring on why each store
+gets its own lock file.
 """
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 
 from security.crypto_store import read_json, write_json
+from security.file_lock import locked
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 TARGET_ACCOUNTS_PATH = PROJECT_ROOT / "data" / "target_accounts" / "target_accounts.json"
@@ -59,48 +73,50 @@ def add_signal(
     an NCT ID - else by (signal_type, source, detail)) and recomputes
     status. date_observed defaults to now if not given."""
     date_observed = date_observed or datetime.now(timezone.utc).isoformat()
-    accounts = load_target_accounts()
+    with locked("target_accounts"):
+        accounts = load_target_accounts()
 
-    account = next((a for a in accounts if a["company_name"].lower() == company_name.lower()), None)
-    if account is None:
-        account = {
-            "company_name": company_name,
-            "industry": industry,
-            "status": "watching",
-            "signals": [],
-            "notes": None,
-        }
-        accounts.append(account)
+        account = next((a for a in accounts if a["company_name"].lower() == company_name.lower()), None)
+        if account is None:
+            account = {
+                "company_name": company_name,
+                "industry": industry,
+                "status": "watching",
+                "signals": [],
+                "notes": None,
+            }
+            accounts.append(account)
 
-    dedupe_key = (signal_type, source, ref) if ref else (signal_type, source, detail)
-    already_present = any(
-        (s["signal_type"], s["source"], s.get("ref") or s["detail"]) == dedupe_key
-        for s in account["signals"]
-    )
-    if not already_present:
-        account["signals"].append({
-            "signal_type": signal_type,
-            "source": source,
-            "detail": detail,
-            "date_observed": date_observed,
-            "ref": ref,
-        })
-        _recompute_status(account)
+        dedupe_key = (signal_type, source, ref) if ref else (signal_type, source, detail)
+        already_present = any(
+            (s["signal_type"], s["source"], s.get("ref") or s["detail"]) == dedupe_key
+            for s in account["signals"]
+        )
+        if not already_present:
+            account["signals"].append({
+                "signal_type": signal_type,
+                "source": source,
+                "detail": detail,
+                "date_observed": date_observed,
+                "ref": ref,
+            })
+            _recompute_status(account)
 
-    _save_all(accounts)
+        _save_all(accounts)
 
 
 def set_status(company_name: str, status: str, notes: str | None = None) -> None:
     """Manual override - Zahir marking a company contacted/stale/disqualified
     himself (or reverting one back to watching/qualified)."""
-    accounts = load_target_accounts()
-    for acc in accounts:
-        if acc["company_name"].lower() == company_name.lower():
-            acc["status"] = status
-            if notes is not None:
-                acc["notes"] = notes
-            _save_all(accounts)
-            return
+    with locked("target_accounts"):
+        accounts = load_target_accounts()
+        for acc in accounts:
+            if acc["company_name"].lower() == company_name.lower():
+                acc["status"] = status
+                if notes is not None:
+                    acc["notes"] = notes
+                _save_all(accounts)
+                return
 
 
 def load_website_lookup_cost() -> dict:
@@ -112,11 +128,12 @@ def load_website_lookup_cost() -> dict:
 
 
 def save_website_lookup_cost(cost: float, count: int) -> None:
-    write_json(WEBSITE_LOOKUP_COST_PATH, {
-        "cost": cost,
-        "count": count,
-        "at": datetime.now(timezone.utc).isoformat(),
-    })
+    with locked("website_lookup_cost"):
+        write_json(WEBSITE_LOOKUP_COST_PATH, {
+            "cost": cost,
+            "count": count,
+            "at": datetime.now(timezone.utc).isoformat(),
+        })
 
 
 def set_website(company_name: str, website: str) -> None:
@@ -125,12 +142,13 @@ def set_website(company_name: str, website: str) -> None:
     distinct from the "website" key being absent entirely (never searched
     yet). See prospector.company_lookup.lookup_company_website() for the
     actual search."""
-    accounts = load_target_accounts()
-    for acc in accounts:
-        if acc["company_name"].lower() == company_name.lower():
-            acc["website"] = website
-            _save_all(accounts)
-            return
+    with locked("target_accounts"):
+        accounts = load_target_accounts()
+        for acc in accounts:
+            if acc["company_name"].lower() == company_name.lower():
+                acc["website"] = website
+                _save_all(accounts)
+                return
 
 
 def _normalize_company(name: str) -> str:
