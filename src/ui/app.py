@@ -528,6 +528,38 @@ def format_timestamp(value: str | None) -> str:
     return dt.strftime("%b %-d, %Y at %-I:%M %p") if sys.platform != "win32" else dt.strftime("%b %#d, %Y at %#I:%M %p")
 
 
+def _escape_markdown_dollar(text: str) -> str:
+    """Any raw AI-generated or user-free-text content (a resume bullet, an
+    email snippet, an AI rationale/narrative, an interview talking point -
+    anything that isn't app-authored UI copy) can legitimately contain a
+    literal "$" (e.g. "$300K-500K annual savings"), which st.markdown's
+    built-in KaTeX support silently reinterprets as inline LaTeX math
+    delimiters, corrupting the display (real bug caught live 2026-08-09,
+    unconfirmed-claims panel: the dollar sign vanished and the hyphen
+    became a minus sign). The underlying stored data is never affected -
+    only st.markdown's rendering is - so escaping here, right before
+    display, is the correct fix; nothing upstream needs to change. Call
+    this (or st_markdown_raw_text() below, for the common case where the
+    whole st.markdown() call is just this one string) on any such content
+    before it reaches st.markdown - app-authored copy (a fixed instruction
+    string this codebase itself wrote) never needs it."""
+    return text.replace("$", "\\$")
+
+
+def st_markdown_raw_text(text: str, **kwargs) -> None:
+    """st.markdown(), pre-escaped via _escape_markdown_dollar() - the
+    correct default for rendering a whole raw AI-generated/free-text
+    string with no other app-authored formatting mixed in (a rationale,
+    a narrative, a question, an email snippet). Routing through this
+    instead of a bare st.markdown() call is what keeps a future call site
+    from reintroducing the $-as-LaTeX bug one spot at a time (found
+    2026-08-10: roughly two dozen pre-existing call sites had it). For a
+    call that mixes static app copy with interpolated raw text in one
+    f-string, escape just the interpolated part directly instead - this
+    wrapper assumes the entire string is untrusted content."""
+    st.markdown(_escape_markdown_dollar(text), **kwargs)
+
+
 def left_aligned_columns(df: pd.DataFrame, extra: dict | None = None) -> dict:
     """Column config that left-aligns every column of a dataframe (Streamlit
     right-aligns numeric columns by default) and leaves width unset so each
@@ -558,8 +590,8 @@ def render_outreach_section(key_prefix: str, target_account_name: str | None = N
     existing = get_outreach_for_target_account(target_account_name) if target_account_name else get_outreach_for_job(job_source, job_id)
     st.markdown("**Outreach**")
     for o in existing:
-        label = o["contact_name"] + (f", {o['contact_title']}" if o.get("contact_title") else "")
-        st.markdown(f"{label} — {o['channel']}" + (f" — {o['notes']}" if o.get("notes") else ""))
+        label = _escape_markdown_dollar(o["contact_name"]) + (f", {_escape_markdown_dollar(o['contact_title'])}" if o.get("contact_title") else "")
+        st.markdown(f"{label} — {o['channel']}" + (f" — {_escape_markdown_dollar(o['notes'])}" if o.get("notes") else ""))
         oc1, oc2, oc3 = st.columns([2, 2, 1])
         with oc1:
             new_o_status = st.selectbox(
@@ -1087,19 +1119,6 @@ _UNCONFIRMED_FIELD_TO_DOC_KEY = {
 }
 
 
-def _escape_markdown_dollar(text: str) -> str:
-    """A flagged claim's line is arbitrary AI-generated resume/document
-    text, not app-authored UI copy - it can legitimately contain a literal
-    "$" (e.g. "$300K-500K annual savings"), which st.markdown's built-in
-    KaTeX support silently reinterprets as inline LaTeX math delimiters,
-    corrupting the display (real bug caught live 2026-08-09: the dollar
-    sign vanished and the hyphen became a minus sign). The underlying
-    stored data is never affected - only st.markdown's rendering is - so
-    escaping here, right before display, is the correct fix rather than
-    touching find_unconfirmed_markers/resolve_unconfirmed_claim."""
-    return text.replace("$", "\\$")
-
-
 def _persist_resolved_claim(job: dict, app_record: dict, result: dict) -> None:
     """Shared save step once a single claim is resolved (either action
     below): persists resolve_unconfirmed_claim()'s {field: new_text} into
@@ -1369,10 +1388,10 @@ def render_analyze_fit_section(job: dict, app_record: dict, analysis: dict | Non
             score = analysis["projected_score"]
             st.metric("Projected score", f"{score}/100")
             if analysis.get("projected_rationale"):
-                st.markdown(analysis["projected_rationale"])
+                st_markdown_raw_text(analysis["projected_rationale"])
             st.markdown(f"Scored against: {analysis['baseline_source']}")
             if analysis.get("plateau_note"):
-                st.markdown(analysis["plateau_note"])
+                st_markdown_raw_text(analysis["plateau_note"])
 
             if show_generate_actions:
                 # Real gap found live 2026-08-09 (General, watching
@@ -1478,7 +1497,7 @@ def render_analyze_fit_section(job: dict, app_record: dict, analysis: dict | Non
                         # guessing a number.
                         st.badge("value not yet known", color="gray")
                 with text_col:
-                    st.markdown(q["question"])
+                    st_markdown_raw_text(q["question"])
                 if is_disqualifier:
                     st.markdown(
                         ":material/flag: This answer applies to every "
@@ -1575,7 +1594,7 @@ def render_answered_gap_questions() -> None:
 
             if is_disqualifier:
                 st.markdown(":material/flag: Applies to every future job match, not just one.")
-            st.markdown(f"Confirmed {entry.get('date_captured', 'date unknown')} - {entry.get('role_context', '')}")
+            st.markdown(f"Confirmed {entry.get('date_captured', 'date unknown')} - {_escape_markdown_dollar(entry.get('role_context', ''))}")
             new_answer = st.text_area(
                 question_text, value=entry.get("answer", ""),
                 key=f"answered_edit_{entry_key}", height=68,
@@ -1862,7 +1881,7 @@ if pending_suggestions or outstanding_drafts:
             job = next((j for j in jobs if j["source"] == sugg["source"] and j["job_id"] == sugg["job_id"]), None)
             label = job_label(job) if job else f"{sugg['source']} {sugg['job_id']}"
             st.markdown(f"Inbox match: mark **{label}** as \"{sugg['suggested_status']}\"?")
-            st.markdown(sugg.get("suggested_status_reason") or "")
+            st_markdown_raw_text(sugg.get("suggested_status_reason") or "")
             s1, s2, _ = st.columns([1, 1, 6])
             with s1:
                 if st.button("Confirm", key=f"confirm_{sugg['source']}_{sugg['job_id']}"):
@@ -2703,7 +2722,7 @@ if active_tab == "settings":
             fc1, fc2 = st.columns([5, 1])
             with fc1:
                 st.markdown(f"**{fb['section']}** — {format_timestamp(fb['created_at'])}")
-                st.markdown(fb["note"])
+                st_markdown_raw_text(fb["note"])
             with fc2:
                 if st.button("Mark reviewed", key=f"fb_resolve_{fb['id']}"):
                     mark_resolved(fb["id"])
@@ -2859,10 +2878,10 @@ elif active_tab == "cta":
         st.badge(CATEGORY_URGENCY[cat], color=CATEGORY_COLORS[cat])
         st.subheader(CATEGORY_LABELS[cat])
         for email in cat_emails:
-            st.markdown(f"**{email.get('subject')}**")
-            st.markdown(f"{email.get('sender')} - {email.get('date')}")
+            st.markdown(f"**{_escape_markdown_dollar(email.get('subject') or '')}**")
+            st.markdown(f"{_escape_markdown_dollar(email.get('sender') or '')} - {email.get('date')}")
             if email.get("snippet"):
-                st.markdown(email["snippet"])
+                st_markdown_raw_text(email["snippet"])
 
             # "web_link" is the current field name; "gmail_link" is read as a
             # fallback for records written before multi-provider support
@@ -3388,7 +3407,7 @@ elif active_tab == "results":
                     note = f"the posting text suggests **{likely}**" if likely else "the posting text suggests a different employer"
                     st.warning(f"⚠️ Employer name may be wrong - {note}, not \"{job.get('organization')}\" as listed. Worth checking the original posting before applying.")
                 if "fit_score" in job:
-                    st.markdown(job.get("fit_rationale") or "")
+                    st_markdown_raw_text(job.get("fit_rationale") or "")
                 else:
                     st.markdown("Compatibility: not yet scored")
                 if len(postings) > 1:
@@ -3677,14 +3696,14 @@ elif active_tab == "results":
                                         if prev_score is not None and prev_score != current_score:
                                             score_delta = current_score - prev_score
                                     st.metric("ATS compatibility score", f"{current_score}/100", delta=score_delta)
-                                    st.markdown(f"**Why this score:** {app_record.get('resume_ats_rationale') or ''}")
+                                    st.markdown(f"**Why this score:** {_escape_markdown_dollar(app_record.get('resume_ats_rationale') or '')}")
                                     next_actions = app_record.get("resume_ats_next_actions") or []
                                     if next_actions:
                                         st.markdown(
                                             "**How to raise it (as of the last Generate):**"
                                         )
                                         for action in next_actions:
-                                            st.markdown(f"- {action}")
+                                            st.markdown(f"- {_escape_markdown_dollar(action)}")
                                     # Two separate re-check actions (2026-08-09), cheapest first -
                                     # real case that showed both are needed: Zahir's Upstream Bio
                                     # job's job-level keyword cache already had the corrected
@@ -4018,11 +4037,11 @@ elif active_tab == "prospector":
         else:
             st.metric("Prospector Score", f"{prospector_score['score']}/100")
             st.markdown("**Why this score:**")
-            st.markdown(prospector_score["rationale"])
+            st_markdown_raw_text(prospector_score["rationale"])
             if prospector_score.get("next_actions"):
                 st.markdown("**How to raise it:**")
                 for action in prospector_score["next_actions"]:
-                    st.markdown(f"- {action}")
+                    st.markdown(f"- {_escape_markdown_dollar(action)}")
             st.markdown(f"Based on {prospector_score['data_points']} real outcome data point(s) as of {format_timestamp(prospector_score['computed_at'])} - recompute anytime, it re-reads your actual data fresh so real progress is reflected automatically.")
     # Computes for real on click (Zahir's explicit ask 2026-07-31: the old
     # two-step "Prepare data" -> "go ask Claude Code" flow was the exact
@@ -4213,9 +4232,9 @@ elif active_tab == "prospector":
             st.markdown(f"**{acc['company_name']}**")
             for sig in acc["signals"]:
                 sig_label = SIGNAL_TYPE_LABELS.get(sig["signal_type"], sig["signal_type"])
-                st.markdown(f"[{sig_label}, {sig['source']}] {sig['detail']} (observed {sig['date_observed'][:10]})")
+                st.markdown(f"[{sig_label}, {sig['source']}] {_escape_markdown_dollar(sig['detail'])} (observed {sig['date_observed'][:10]})")
             if acc.get("notes"):
-                st.markdown(f"Notes: {acc['notes']}")
+                st.markdown(f"Notes: {_escape_markdown_dollar(acc['notes'])}")
             new_ta_status = st.selectbox(
                 "Status", ["watching", "qualified", "contacted", "stale", "disqualified"],
                 index=["watching", "qualified", "contacted", "stale", "disqualified"].index(acc["status"]),
@@ -4307,11 +4326,11 @@ elif active_tab == "prospector":
     diagnosis_result = st.session_state.get("diagnosis_result")
     if diagnosis_result:
         with st.container(border=True):
-            st.markdown(diagnosis_result["narrative"])
+            st_markdown_raw_text(diagnosis_result["narrative"])
             if diagnosis_result["recommendations"]:
                 st.markdown("**Worth trying:**")
                 for rec in diagnosis_result["recommendations"]:
-                    st.markdown(f"- {rec}")
+                    st.markdown(f"- {_escape_markdown_dollar(rec)}")
     if st.button("Run rejection-pattern diagnosis", type="primary"):
         diagnosis_input = gather_diagnosis_input(applications, jobs)
         if diagnosis_input["rejected_count"] == 0 and diagnosis_input["not_interested_with_reason_count"] == 0:
@@ -4343,13 +4362,13 @@ elif active_tab == "prospector":
     learn_result = st.session_state.get("learn_engine_result")
     if learn_result:
         with st.container(border=True):
-            st.markdown(learn_result["narrative"])
+            st_markdown_raw_text(learn_result["narrative"])
             if learn_result["recommendations"]:
                 st.markdown("**Worth considering:**")
                 for rec in learn_result["recommendations"]:
-                    st.markdown(f"- {rec}")
+                    st.markdown(f"- {_escape_markdown_dollar(rec)}")
             for gap in learn_result.get("known_gaps", []):
-                st.markdown(f"**Known gap:** {gap}")
+                st.markdown(f"**Known gap:** {_escape_markdown_dollar(gap)}")
     if st.button("Run Learn Engine analysis", type="primary"):
         learn_input = gather_learn_engine_input(applications, jobs, target_accounts, outreach_records, prep_records)
         total_inputs = sum(len(learn_input[k]) for k in ("scoring_vs_outcome", "target_account_vs_outcome", "outreach_vs_outcome", "interview_outcomes"))
@@ -4387,7 +4406,7 @@ elif active_tab == "prep":
                 target_job = next((j for j in jobs if j["source"] == prep_target["source"] and j["job_id"] == prep_target["job_id"]), None)
                 st.markdown(f"**Ready to prep: {prep_target['job_label']}**")
             else:
-                st.markdown(f"**Ready to prep: \"{prep_target['subject']}\"** from {prep_target['sender']}")
+                st.markdown(f"**Ready to prep: \"{_escape_markdown_dollar(prep_target['subject'])}\"** from {_escape_markdown_dollar(prep_target['sender'])}")
                 if prep_target.get("web_link") or prep_target.get("gmail_link"):
                     st.markdown(f"[Open in inbox]({prep_target.get('web_link') or prep_target.get('gmail_link')})")
                 job_options = {job_label(j): j for j in jobs}
@@ -4507,36 +4526,36 @@ elif active_tab == "prep":
             ):
                 logistics = " - ".join(v for v in [round_.get("date"), round_.get("format")] if v)
                 if logistics:
-                    st.markdown(logistics)
+                    st_markdown_raw_text(logistics)
 
                 if round_.get("interviewers"):
                     for person in round_["interviewers"]:
                         st.markdown(f"**{person.get('name')}**" + (f", {person.get('title')}" if person.get("title") else ""))
                         if person.get("research_summary"):
-                            st.markdown(person["research_summary"])
+                            st_markdown_raw_text(person["research_summary"])
                         if person.get("persona"):
-                            st.markdown(f"_Likely focus:_ {person['persona']}")
+                            st.markdown(f"_Likely focus:_ {_escape_markdown_dollar(person['persona'])}")
                         for link in person.get("research_links") or []:
                             st.markdown(link)
 
                 if round_.get("company_snapshot"):
-                    st.markdown(f"**Company snapshot:** {round_['company_snapshot']}")
+                    st.markdown(f"**Company snapshot:** {_escape_markdown_dollar(round_['company_snapshot'])}")
 
                 if round_.get("likely_questions"):
                     st.markdown("**Likely questions**")
                     for q in round_["likely_questions"]:
                         asked_by = f" ({q['asked_by']})" if q.get("asked_by") else ""
-                        st.markdown(f"- {q.get('question')}{asked_by}")
+                        st.markdown(f"- {_escape_markdown_dollar(q.get('question') or '')}{asked_by}")
                         if q.get("why"):
-                            st.markdown(q["why"])
+                            st_markdown_raw_text(q["why"])
                         if q.get("talking_point"):
-                            st.markdown(f"  > {q['talking_point']}")
+                            st.markdown(f"  > {_escape_markdown_dollar(q['talking_point'])}")
 
                 if round_.get("questions_to_ask"):
                     st.markdown("**Questions to ask them**")
                     for q in round_["questions_to_ask"]:
                         best_for = f" (best for {q['best_for']})" if q.get("best_for") else ""
-                        st.markdown(f"- {q.get('question')}{best_for}")
+                        st.markdown(f"- {_escape_markdown_dollar(q.get('question') or '')}{best_for}")
 
                 st.divider()
                 OUTCOME_OPTIONS = ["not yet", "went well", "went okay", "went poorly"]
@@ -4674,7 +4693,7 @@ elif active_tab == "linkedin":
                 st.metric("Profile strength", f"{score}/100")
                 if linkedin_data.get("profile_strength_rationale"):
                     st.markdown("**Why this score, and what would improve it:**")
-                    st.markdown(linkedin_data["profile_strength_rationale"])
+                    st_markdown_raw_text(linkedin_data["profile_strength_rationale"])
         st.markdown(f"Last analyzed: {linkedin_data['last_analyzed']}")
 
         active_suggestions = get_active_suggestions()
@@ -4687,7 +4706,7 @@ elif active_tab == "linkedin":
             st.subheader(LINKEDIN_SECTION_LABELS[section])
             for s in section_suggestions:
                 if s.get("rationale"):
-                    st.markdown(s["rationale"])
+                    st_markdown_raw_text(s["rationale"])
                 st.markdown("**Suggested text (copy this into LinkedIn):**")
                 st.code(s["suggested_text"], language=None, wrap_lines=True)
                 b1, b2 = st.columns([1, 1])
