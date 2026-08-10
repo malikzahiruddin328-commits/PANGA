@@ -1222,9 +1222,18 @@ def _analyze_fit_with_auto_gap_scan(job: dict, profile: dict, app_record: dict) 
                     resume_clarifying_questions=result["merged_clarifying_questions"],
                     resume_gap_scan_fingerprint=fingerprint,
                 )
+                # Real regression caught by the existing suite (2026-08-09,
+                # RM): rerunning unconditionally here - even when
+                # added_count is 0 - shifted how many internal reruns an
+                # unrelated test's score-delta-after-regenerate assertion
+                # depended on. When nothing was actually added,
+                # merged_clarifying_questions is identical to what
+                # app_record already had, so there's nothing new for this
+                # render to pick up - only rerun when something genuinely
+                # changed worth immediately reflecting.
                 if result["added_count"]:
                     st.toast(f"Found {result['added_count']} more thing(s) worth asking about.", icon=":material/info:")
-                st.rerun()
+                    st.rerun()
     return _analyze_fit_before_drafting(job, profile, app_record)
 
 

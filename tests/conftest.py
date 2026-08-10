@@ -17,6 +17,41 @@ real encrypt/decrypt round-trip is itself worth having in the suite.
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _no_real_anthropic_api_calls(monkeypatch):
+    """Real gap found live 2026-08-09 (RM, running the full suite from the
+    root checkout - the normal environment for any merge check, with a
+    real .env/API key present): two AppTest-based UI tests in
+    test_results_tab_gap_questions.py mutated resume_text mid-test
+    without keeping the new auto-fire feature's resume_gap_scan_
+    fingerprint in sync, so llm_client.is_configured() being True (a real
+    key present) let the auto-fire's request_additional_gap_questions()
+    actually reach the network - a genuine, non-deterministic live API
+    call mid-test, silently corrupting both tests' assertions and
+    burning real cost. It only went unnoticed in ATS Engine's own
+    worktree because that worktree has no .env at all, so
+    is_configured() was accidentally False there and the call harmlessly
+    short-circuited into a caught DraftingNotConfigured - the worktree
+    environment was masking the bug, not proving its absence.
+
+    Unsetting ANTHROPIC_API_KEY for every test, unconditionally, closes
+    the entire class of gap at its root rather than chasing individual
+    fixtures that forget to keep a fingerprint/mock in sync (that will
+    keep happening as new tests get added) - no test in this suite
+    references ANTHROPIC_API_KEY or relies on is_configured() returning
+    True, so this has zero effect on any test's actual behavior other
+    than guaranteeing DraftingNotConfigured (not a real network call)
+    for anything that reaches llm_client.get_client() unmocked. Tests
+    that DO want to exercise a specific mocked outcome (most of
+    test_drafting.py) already bypass this entirely by mocking _client()/
+    call_structured()/the target function directly, so they're
+    unaffected either way. Runs before isolated_data below (declared
+    first, and autouse fixtures with no dependency between them resolve
+    in declaration order) so a real .env's key is never visible during
+    any test's setup or body."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+
 @pytest.fixture
 def isolated_data(tmp_path, monkeypatch):
     """Redirects every store this suite touches to tmp_path. Import the

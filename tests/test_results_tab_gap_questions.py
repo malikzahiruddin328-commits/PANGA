@@ -50,9 +50,38 @@ DATABRICKS_QUESTION_TEXT = (
 )
 
 
+def _safe_no_op_gap_scan(job, profile, app_record, model=None, on_progress=None):
+    # Real bug RM caught 2026-08-09, root-caused directly (not guessed):
+    # ATS Engine's own worktree has no .env, so is_configured() was False
+    # there and the auto-fire's DraftingNotConfigured was silently
+    # swallowed - masking that neither test_score_delta_shown_after_
+    # regenerating nor test_no_open_questions_shows_the_exhausted_message
+    # keeps resume_gap_scan_fingerprint in sync when they mutate
+    # resume_text mid-test, so _gap_scan_is_current() correctly reports
+    # False and the auto-fire tries to run for real. From the ROOT
+    # checkout (real .env, real API key - the normal environment for any
+    # merge check), that's a genuine live API call mid-test, non-
+    # deterministically corrupting whatever the test was actually
+    # checking and burning real cost on every future run.
+    #
+    # Applied as the DEFAULT in both shared fixtures below (not just
+    # patched onto the 2 tests that happened to get caught) - no test in
+    # this file is meant to exercise a real or even a fully-controlled
+    # fake gap-scan call unless it explicitly says so via its OWN
+    # monkeypatch.setattr(drafting, "request_additional_gap_questions",
+    # ...) AFTER fixture setup, which correctly overrides this default
+    # (the dedicated auto-fire tests further down all do exactly that).
+    # This closes the whole class of gap - any CURRENT or FUTURE test
+    # that mutates resume_text mid-test without touching the fingerprint
+    # is safe by construction, not by remembering to patch it too.
+    return {"added_count": 0, "new_questions": [], "merged_clarifying_questions": app_record.get("resume_clarifying_questions") or []}
+
+
 @pytest.fixture
 def results_app_with_gap_questions(isolated_data, monkeypatch):
     monkeypatch.setenv("PANGA_TEST_MODE", "1")
+    import tailoring.drafting as drafting
+    monkeypatch.setattr(drafting, "request_additional_gap_questions", _safe_no_op_gap_scan)
 
     job = {
         "source": "Dice", "job_id": "job1", "title": "Director, Gaps", "organization": "Acme Corp",
@@ -724,8 +753,15 @@ def results_app_before_any_gap_scan(isolated_data, monkeypatch):
     # Deliberately does NOT set resume_gap_scan_fingerprint (unlike
     # results_app_with_gap_questions above) - these tests exist
     # specifically to exercise the auto-fire path that fixture is set up
-    # to suppress.
+    # to suppress. Still defaults request_additional_gap_questions to the
+    # safe no-op (every existing test using this fixture already
+    # overrides it with its own monkeypatch.setattr AFTER fixture setup,
+    # which takes precedence) - defensive against a FUTURE test added
+    # here forgetting to mock it and making a real call from the root
+    # checkout, same reasoning as results_app_with_gap_questions above.
     monkeypatch.setenv("PANGA_TEST_MODE", "1")
+    import tailoring.drafting as drafting
+    monkeypatch.setattr(drafting, "request_additional_gap_questions", _safe_no_op_gap_scan)
     save_jobs([{
         "source": "Dice", "job_id": "job1", "title": "Director, Gaps", "organization": "Acme Corp",
         "location": "Remote", "description": "Requirements: Python, Databricks.",
