@@ -141,16 +141,6 @@ zombie instances on ports nobody had reserved). `panga-ui-rm-verify`
 (8509) is reserved exclusively for Release Manager's merge-verification -
 no other session should use it.
 
-**Browser-extension bridge port (2026-08-08):** the Chrome extension
-(`extension/`, `src/extension_bridge.py`) talks to Panga over a fixed local
-HTTP port, **8765** - separate from the Streamlit 8501-8510 range above
-since it isn't a Streamlit dev server, so it's not in `.claude/launch.json`.
-Don't reuse 8765 for anything else. Every Streamlit process that imports
-`extension_bridge` tries to bind it; only one can hold it at a time (see
-that module's docstring for why that's intentional, not a bug) - in
-practice this means the extension only ever really talks to whichever
-Panga process (normally production, 8510) happened to grab the port first.
-
 **Testing a worktree's own unmerged code, not the main checkout:** the
 named slots in `.claude/launch.json` (via the Browser tool's `preview_start`)
 always run from the main checkout's directory, regardless of which worktree
