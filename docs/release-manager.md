@@ -106,6 +106,13 @@ inline - same rule Bhangi follows for its own scope
 9. **Report back**: commit hashes on both branches, test results, what was
    verified live, and confirmation the target checkout's pre-existing
    uncommitted state was left alone.
+9a. **If the merged branch touched any `docs/*.md` file (or `README.md`/
+   `CLAUDE.md`)**, notify Panga-Documentor (session ID in
+   `session-map.md`) with the branch name and which doc(s) changed, so
+   they can reconcile it against the BRD/PRD/codemap - Documentor owns
+   doc-vs-code drift for the whole project, and a merge is the only point
+   where a doc change stops sitting in a worktree and becomes real.
+   Confirmed with Zahir via the hub, 2026-08-11.
 10. **Clean up** the now-merged worktree and branch
     (`git worktree remove`, `git branch -d`) once `master` has the work -
     a merged worktree just sitting there is one more thing to keep track
