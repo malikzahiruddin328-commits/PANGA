@@ -53,5 +53,6 @@ def draft_outreach_email(contact_name: str, contact_title: str | None, context: 
         effort="medium",
         thinking=False,
         refusal_message="Claude declined to draft an outreach email.",
+        purpose="outreach_draft_email",
     )
     return data["email_body"]

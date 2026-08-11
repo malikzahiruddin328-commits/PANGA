@@ -137,4 +137,5 @@ def analyze(learn_input: dict, on_progress=None) -> dict:
         thinking=False,
         on_progress=on_progress,
         refusal_message="Claude declined to run the analysis. Try again.",
+        purpose="learn_engine_analyze",
     )
