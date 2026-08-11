@@ -1700,13 +1700,21 @@ def _draft_resume_with_self_correction(
 
 def _lookup_company_address(
     client: "anthropic.Anthropic", organization: str, location: str | None,
-    job_key: tuple[str, str] | None = None,
+    job_key: tuple[str, str] | None = None, model: str | None = None,
 ) -> str | None:
     """Looks up an organization's real mailing/headquarters address via the
     Claude API's server-side web search tool, for the cover letter's
     recipient block - never guessed, only used if a real source turns up.
     Returns None on no confident match (docx_export.py's existing
-    "[Company Address]" placeholder is the fallback for that case)."""
+    "[Company Address]" placeholder is the fallback for that case).
+
+    model (2026-08-11, real gap found during the fit_score cheaper-model
+    test): this call previously never received generate_documents' own
+    `model` override at all, so it silently ran on call_with_web_search's
+    default (DEFAULT_MODEL/claude-opus-5) regardless of what the caller
+    actually requested - every cost figure measured for a non-default-model
+    test run was wrong by however much this one call cost. Threaded through
+    like every other model-dispatching call in this module."""
     location_hint = f" (job is located in {location})" if location else ""
     text, _cost = call_with_web_search(
         client,
@@ -1723,6 +1731,7 @@ def _lookup_company_address(
         user_content=f"Company: {organization}{location_hint}",
         max_tokens=300,
         max_uses=3,
+        model=model,
         purpose="company_address_lookup",
         job_key=job_key,
     )
@@ -1801,7 +1810,7 @@ def generate_documents(
     if "cover_letter" in doc_keys and "organization_address" not in job and job.get("organization"):
         from search.job_store import update_job_address
 
-        address = _lookup_company_address(client, job["organization"], job.get("location"), job_key) or ""
+        address = _lookup_company_address(client, job["organization"], job.get("location"), job_key, model) or ""
         job["organization_address"] = address
         update_job_address(job.get("source"), job.get("job_id"), address)
 

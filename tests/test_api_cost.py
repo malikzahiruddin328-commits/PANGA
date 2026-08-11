@@ -38,6 +38,12 @@ def test_zero_usage_and_no_searches_is_zero_cost():
 
 
 def test_unpriced_model_raises_instead_of_silently_underreporting():
+    # A genuinely nonexistent model string, not a real Panga-supported one -
+    # 2026-08-11: this used "claude-haiku-4-5" as the unpriced example, but
+    # that model gained real pricing in the same commit that fixed the real
+    # gap this test guards against (sonnet/haiku calls silently failing to
+    # log cost during the fit_score model test) - RM caught the test had
+    # gone stale in the same commit that fixed the bug it tests for.
     response = _response(input_tokens=1000, output_tokens=100)
     with pytest.raises(KeyError):
-        estimate_response_cost(response, "claude-haiku-4-5")
+        estimate_response_cost(response, "claude-nonexistent-model-9")

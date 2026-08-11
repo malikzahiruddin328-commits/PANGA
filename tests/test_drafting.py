@@ -503,6 +503,32 @@ def test_generate_documents_uses_existing_resume_text_when_resume_not_in_this_ba
     assert seen_resume_text_for["cover_letter"] == "An already-stored resume."
 
 
+def test_generate_documents_threads_the_model_override_into_the_address_lookup(monkeypatch):
+    # Real gap found 2026-08-11 (fit_score cheaper-model test): this call
+    # never received generate_documents' own `model` override at all, so it
+    # silently ran on call_with_web_search's default model regardless of
+    # what the caller requested - every cost figure measured for a
+    # non-default-model test run was wrong by however much this one call
+    # actually cost, on whatever model it silently used instead.
+    import tailoring.drafting as drafting
+
+    captured = {}
+
+    def _fake_call_with_web_search(client, **kwargs):
+        captured["model"] = kwargs.get("model")
+        return "123 Main St; Springfield, IL 62701", 0.01
+
+    monkeypatch.setattr(drafting, "_client", lambda: object())
+    monkeypatch.setattr(drafting, "_draft_one", lambda *a, **kw: "drafted text")
+    monkeypatch.setattr(drafting, "call_with_web_search", _fake_call_with_web_search)
+    monkeypatch.setattr("search.job_store.update_job_address", lambda *a, **kw: None)
+    job = {"source": "linkedin", "job_id": "1", "organization": "Acme Corp"}
+
+    drafting.generate_documents(job, {}, ["cover_letter"], model="claude-sonnet-5")
+
+    assert captured["model"] == "claude-sonnet-5"
+
+
 def test_ats_keywords_schema_supports_either_or_group_items():
     # Anthropic's structured-output schema rejects "oneOf" (confirmed
     # live, 2026-08-08) - "anyOf" is the supported equivalent, used here.
