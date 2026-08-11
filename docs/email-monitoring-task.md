@@ -8,9 +8,23 @@ live Claude session, the same constraint documented for boards.py (build step
 | | Scan | Fulfillment |
 |---|---|---|
 | **Task ID** | `panga-gmail-cta-scan` | `panga-cta-fulfillment` |
-| **Schedule** | 4x/day - 8am, 12pm, 4pm, 8pm local (`7 8,12,16,20 * * *`) | every 10 minutes (`*/10 * * * *`) |
+| **Schedule** | 3x/day - 8am, 12pm, 4pm local (`7 8,12,16 * * *`) | 2x/day - 8am, 4pm local (`0 8,16 * * *`) |
 | **Job** | Find NEW inbox emails, classify, label, mirror call-to-action emails onto the dashboard, detect application confirmations | Execute what Zahir clicked on the dashboard (Dismiss / Draft reply), and notice when he's sent a draft himself |
 | **Task file** | `C:\Users\User\.claude\scheduled-tasks\panga-gmail-cta-scan\SKILL.md` | `C:\Users\User\.claude\scheduled-tasks\panga-cta-fulfillment\SKILL.md` |
+
+**Correction, 2026-08-11 (Panga-Documentor, caught during a BRD/FRS DOCX
+export — this doc had gone stale, not the schedule itself):** both cadences
+above are the real, current schedule, verified directly against
+`list_scheduled_tasks`. This table and most of the prose below originally
+described the schedule as first built — 4x/day (8am/12pm/4pm/8pm) for the
+scan, every 10 minutes for fulfillment — but `panga-cta-fulfillment` was
+throttled down to 2x/day on 2026-08-05 for cost reasons (see
+`src/fulfillment.py`'s own module docstring), and the scan's 8pm run was
+dropped at some point without this doc being updated to match. The
+"every 10 minutes" design-rationale prose further down is kept as
+historical context for *why* it was originally built that way — a manual
+"Send and receive" button on the dashboard now covers the gap between the
+2x/day scheduled runs.
 
 Both need Zahir to click **Run now** once each so unattended runs can use the
 Gmail connector without pausing on a permission prompt.
