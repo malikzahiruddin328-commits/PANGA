@@ -103,6 +103,50 @@ inline - same rule Bhangi follows for its own scope
    \|^class " <file> | sed -E 's/.*(def|class) ([A-Za-z_0-9]+).*/\2/' |
    sort | uniq -d` - anything it prints is a real problem, not a style
    nit.
+8c. **Standing-principle closeout check**, added 2026-08-11 after a real
+   incident: `CLAUDE.md`'s cost-blast-radius principle had explicitly
+   named prompt caching as required for content that repeats across paid
+   calls, but `fit_score` never implemented it - nobody's closeout ever
+   cross-checked the diff against `CLAUDE.md`'s own text, only against
+   the branch's own stated scope, so the gap sat there until a real cost
+   crisis forced the audit. Steps 1-9 verify a branch does what it
+   claims and doesn't regress; this step is deliberately independent of
+   that - the question isn't "does this do what the commit message
+   says," it's "does this diff, read cold against `CLAUDE.md`'s actual
+   bullets, violate something already written down that nobody thought
+   to check because it wasn't the literal ask." Applicability-scoped,
+   same pattern as 8a (not a flat checklist walked identically on every
+   merge):
+   - **Diff adds or modifies a call site to a paid AI model**: check
+     against cost-blast-radius's own text line by line - per-call
+     cost/volume estimated? cheapest model that meets the bar? a
+     free/cheap pre-filter before the expensive call where one is
+     possible? **prompt caching for content that repeats across calls**
+     (the exact clause that was silently unmet in `fit_score`)? If this
+     is an automated/scheduled path, does it have an enforced runtime
+     circuit breaker, not just development-time discipline?
+   - **Diff touches shared state multiple processes/threads can hit
+     concurrently** (JSON stores, files, Gmail labels): race conditions,
+     locking errors (deadlock/starvation, an unhandled exception that
+     could leave a lock held).
+   - **Diff adds a loop bound by an external condition** (an API, a
+     file, a label change): a real max-iteration/timeout bound present,
+     not an unconditional `while True`.
+   - **Diff touches a hot path** (something that runs 4x/day, every 10
+     minutes, or against a growing store): O(n²) scans, unnecessary
+     full-file rewrites/reloads.
+   - **Any diff, always**: a quick pattern-match against `CLAUDE.md`'s 4
+     documented known-failure-patterns (Streamlit expander state,
+     regenerate-is-a-regression-risk, AI-output-needs-a-deterministic-
+     backstop, feature-built-but-never-turned-on) - does this diff's
+     shape match one of these four known traps, not a deep re-audit of
+     each one every time.
+   UI/HCI stays inside step 8a as it already is - not duplicated here.
+   Joint responsibility with Panga-Documentor (Zahir's explicit
+   instruction): this step is the diff-level technical check on every
+   merge; Documentor's side is whether a found gap actually gets logged
+   and whether `CLAUDE.md` itself stays accurate, not a second pass over
+   the same diff.
 9. **Report back**: commit hashes on both branches, test results, what was
    verified live, and confirmation the target checkout's pre-existing
    uncommitted state was left alone.
