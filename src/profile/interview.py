@@ -13,7 +13,8 @@ from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from skills.lookup import skills_for  # noqa: E402
-from profile.storage import MASTER_PROFILE_PATH, load_profile, save_profile  # noqa: E402
+from skills.canonical_taxonomy import add_canonical_entry, find_canonical_id, load_taxonomy, save_taxonomy  # noqa: E402
+from profile.storage import load_profile, save_profile  # noqa: E402
 from profile.ingest import resume_text as _shared_resume_text  # noqa: E402
 from security.file_lock import locked  # noqa: E402
 from skill_label_match import skills_match  # noqa: E402
@@ -27,10 +28,57 @@ def _resume_text() -> str:
 
 
 def _already_answered(skill: str) -> bool:
-    if not MASTER_PROFILE_PATH.exists():
-        return False
+    # Real bug found + fixed 2026-08-11 while wiring in the canonical
+    # taxonomy: this used to early-return via `MASTER_PROFILE_PATH.exists()`,
+    # a name bound at THIS module's import time via `from profile.storage
+    # import MASTER_PROFILE_PATH` - stale the moment profile_storage.
+    # MASTER_PROFILE_PATH is reassigned afterward (e.g. tests/conftest.py's
+    # isolated_data fixture), since that only patches profile_storage's own
+    # attribute, not this module's already-bound copy of it. Silently
+    # always returned False under test isolation as a result - no earlier
+    # test happened to call _already_answered() directly to catch it.
+    # load_profile() already returns a safe {} default for a missing file
+    # (security.crypto_store.read_json's own default=), so the explicit
+    # existence check was redundant even before it went stale - removed
+    # rather than "fixed" to a fresh re-read of the constant.
     profile = load_profile()
-    return any(skills_match(a["skill"], skill) for a in profile.get("gap_interview_answers", []))
+    answers = profile.get("gap_interview_answers", [])
+
+    # Canonical-id match first (2026-08-11) - catches real same-fact
+    # matches skills_match() alone can't, e.g. "CSAT/NPS numeric scores on
+    # consulting engagements" vs "Customer satisfaction scores on
+    # consulting engagements" (no shared vocabulary, confirmed live during
+    # the real taxonomy audit) - as long as the taxonomy already knows
+    # both are aliases of the same canonical entry, which
+    # skills_match()'s pairwise word-boundary check never could on its
+    # own. Falls back to skills_match() for legacy entries that predate
+    # migration and have no canonical_skill_id yet, or when the query
+    # skill itself isn't in the taxonomy at all - real coverage never
+    # narrows versus before, only widens.
+    taxonomy = load_taxonomy()
+    query_canonical_id = find_canonical_id(skill, taxonomy)
+    for a in answers:
+        if query_canonical_id is not None and a.get("canonical_skill_id") == query_canonical_id:
+            return True
+        if skills_match(a["skill"], skill):
+            return True
+    return False
+
+
+def _canonical_id_for(skill: str) -> str:
+    """Deterministic, no AI call - resolves `skill` against the shared
+    canonical taxonomy (skills/canonical_skills.json), creating a fresh
+    entry under "Uncategorized" if nothing existing covers it yet (same
+    "grows over time, never loses a real answer" guarantee as the bulk
+    migration in tailoring.taxonomy_migration). Persists any newly
+    created entry immediately so the next save_answer()/_already_answered()
+    call sees it."""
+    taxonomy = load_taxonomy()
+    canonical_id = find_canonical_id(skill, taxonomy)
+    if canonical_id is None:
+        canonical_id = add_canonical_entry(taxonomy, "Uncategorized", skill, aliases=[])
+        save_taxonomy(taxonomy)
+    return canonical_id
 
 
 def detect_gaps(industry: str, role: str) -> list[dict]:
@@ -78,6 +126,12 @@ def save_answer(
     (this function, profile/storage.py's update_profile_field()), a real
     read-modify-write race this fixes while already in this exact
     function, not a new one introduced by it."""
+    # Resolved before acquiring the lock - _canonical_id_for() does its
+    # own real work (a taxonomy lookup, and possibly a taxonomy write) and
+    # doesn't touch master_profile.json, so it doesn't need to happen
+    # inside this function's own critical section.
+    canonical_skill_id = _canonical_id_for(skill)
+
     with locked("master_profile"):
         profile = load_profile()
         answers = profile.setdefault("gap_interview_answers", [])
@@ -87,6 +141,7 @@ def save_answer(
                 entry["answer"] = answer
                 entry["date_captured"] = date_captured
                 entry["is_disqualifier"] = is_disqualifier
+                entry["canonical_skill_id"] = canonical_skill_id
                 if question:
                     entry["question"] = question
                 save_profile(profile)
@@ -98,6 +153,7 @@ def save_answer(
             "date_captured": date_captured,
             "is_disqualifier": is_disqualifier,
             "question": question,
+            "canonical_skill_id": canonical_skill_id,
         })
         save_profile(profile)
 

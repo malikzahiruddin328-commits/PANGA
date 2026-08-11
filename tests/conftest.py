@@ -78,6 +78,7 @@ def isolated_data(tmp_path, monkeypatch):
     import scan_retry_tracker
     import search.freshness_check as freshness_check
     import tailoring.fit_score_prefilter as fit_score_prefilter
+    import skills.canonical_taxonomy as canonical_taxonomy
 
     monkeypatch.setattr(job_store, "JOBS_PATH", tmp_path / "jobs.json")
     monkeypatch.setattr(applications, "APPLICATIONS_PATH", tmp_path / "applications.json")
@@ -157,4 +158,10 @@ def isolated_data(tmp_path, monkeypatch):
     # log_prefilter_skip() can't touch the real
     # data/jobs/prefilter_log.json spot-check log.
     monkeypatch.setattr(fit_score_prefilter, "PREFILTER_LOG_PATH", tmp_path / "prefilter_log.json")
+    # canonical_taxonomy.py (2026-08-11, the skill-taxonomy build) - this
+    # store is now genuinely mutable (profile/interview.py's save_answer()
+    # writes to it), same class of gap as every store above - isolated so
+    # a test exercising save_answer()/_canonical_id_for() can't touch the
+    # real src/skills/canonical_skills.json.
+    monkeypatch.setattr(canonical_taxonomy, "TAXONOMY_PATH", tmp_path / "canonical_skills.json")
     return tmp_path

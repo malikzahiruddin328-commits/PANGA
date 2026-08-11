@@ -1214,6 +1214,28 @@ def _merge_keyword_gap_questions(
     onto a matching AI free-form question (described below) still
     happens too, for whichever preferred gaps the AI's own wording beats
     this function's generated phrasing to first."""
+    # Canonical-taxonomy-aware same-skill check (2026-08-11, Zahir's "know
+    # your enemy" foundation) - skills_match() alone only catches a
+    # normalized-equality or word-boundary substring relationship, which
+    # real audit data confirmed misses genuine same-fact pairs worded too
+    # differently to share vocabulary (e.g. "CSAT/NPS numeric scores on
+    # consulting engagements" vs "Customer satisfaction scores on
+    # consulting engagements") - exactly the repeat-question problem Zahir
+    # hit across 8 real days of use. Falls back to plain skills_match()
+    # whenever the taxonomy doesn't (yet) know either label as a canonical
+    # entry, so this can only ADD matches skills_match() would have missed
+    # on its own, never remove one it already caught - existing callers/
+    # tests that never touch the taxonomy see byte-identical behavior.
+    from skills.canonical_taxonomy import find_canonical_id, load_taxonomy
+
+    _taxonomy = load_taxonomy()
+
+    def _same_skill(a: str, b: str) -> bool:
+        if skills_match(a, b):
+            return True
+        id_a, id_b = find_canonical_id(a, _taxonomy), find_canonical_id(b, _taxonomy)
+        return id_a is not None and id_a == id_b
+
     already_asked = [q.get("skill") or "" for q in clarifying_questions if q.get("skill")]
     already_asked += [s for s in (previously_answered_skills or []) if s]
     already_asked_for_preferred = already_asked + [item["label"] for item in missing_required_keywords]
@@ -1236,7 +1258,7 @@ def _merge_keyword_gap_questions(
         # fresh rerun right after saving re-renders the identical
         # already-answered text_area, which still differs from its
         # suggested_answer, saving and rerunning again forever.
-        if q.get("skill") and any(skills_match(q["skill"], s) for s in (previously_answered_skills or [])):
+        if q.get("skill") and any(_same_skill(q["skill"], s) for s in (previously_answered_skills or [])):
             continue
         match = None
         if q.get("point_value") is None and q.get("skill"):
@@ -1262,7 +1284,7 @@ def _merge_keyword_gap_questions(
         # this does and doesn't catch (literal/near-literal only, not
         # genuine synonyms like "customer engagement" vs "client
         # engagement" - that needs real judgment, not string matching).
-        if any(skills_match(term, skill) for skill in already_asked) or _profile_supports_skill(term, profile):
+        if any(_same_skill(term, skill) for skill in already_asked) or _profile_supports_skill(term, profile):
             continue
         merged.append({
             "type": "skill_gap",
@@ -1278,7 +1300,7 @@ def _merge_keyword_gap_questions(
     for item in missing_preferred_keywords or []:
         term = item["label"]
         # Same profile-support check as the required-keyword loop above.
-        if any(skills_match(term, skill) for skill in already_asked_for_preferred) or _profile_supports_skill(term, profile):
+        if any(_same_skill(term, skill) for skill in already_asked_for_preferred) or _profile_supports_skill(term, profile):
             continue
         merged.append({
             "type": "skill_gap",
