@@ -812,16 +812,36 @@ def score_job(job: dict, profile: dict, model: str | None = None, on_progress=No
     / "writing... (N characters so far)" status as the response streams in -
     same real-progress mechanism as _draft_one()'s document generation
     (Zahir's explicit ask 2026-07-31: no spinner anywhere should be opaque
-    when the underlying call can report real progress instead)."""
+    when the underlying call can report real progress instead).
+
+    Prompt-caches the profile (2026-08-11, Zahir's cost-review directive):
+    real measurement via Anthropic's token-counting endpoint showed the
+    profile JSON + this function's system prompt totals 60,336 tokens -
+    ~99.6% of every real fit_score call's input, confirmed against real
+    cost_log data (455 real production calls averaging 61,159 input
+    tokens). None of that was cached before this fix - every call re-sent
+    it in full at full price. The profile is now its own system content
+    block marked cache_control: ephemeral, so it's billed once per 5-
+    minute cache window (a write, 1.25x input rate) and reused at 0.1x
+    input rate on every call within that window - the daily scheduled
+    batch scores hundreds of jobs back-to-back, well within one window
+    once it's warm. Only the job posting (genuinely different every call)
+    stays in user_content. See api_cost.estimate_response_cost for the
+    real pricing math this relies on."""
     client = _client()
-    content = (
-        "JOB POSTING:\n" + json.dumps(job, indent=2, default=str) +
-        "\n\nCANDIDATE'S MASTER PROFILE:\n" + json.dumps(profile, indent=2, default=str)
-    )
+    system = [
+        {"type": "text", "text": SCORE_SYSTEM_PROMPT},
+        {
+            "type": "text",
+            "text": "CANDIDATE'S MASTER PROFILE:\n" + json.dumps(profile, indent=2, default=str),
+            "cache_control": {"type": "ephemeral"},
+        },
+    ]
+    content = "JOB POSTING:\n" + json.dumps(job, indent=2, default=str)
     job_key = (job["source"], job["job_id"]) if job.get("source") and job.get("job_id") else None
     data = call_structured(
         client,
-        system=SCORE_SYSTEM_PROMPT,
+        system=system,
         user_content=content,
         schema=_score_schema(),
         max_tokens=2000,

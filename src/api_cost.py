@@ -32,6 +32,19 @@ _TOKEN_PRICING_PER_MTOK = {
 }
 _WEB_SEARCH_PER_SEARCH = 10.00 / 1000
 
+# Anthropic's documented ephemeral (5-minute TTL) prompt-caching multipliers
+# on the model's base input rate - a cache write costs MORE than a normal
+# input token (you're paying to populate the cache), a cache read costs
+# far LESS (2026-08-11, tailoring.drafting.score_job's fit_score prompt-
+# caching fix: real measured data showed the 60,336-token profile+system
+# prompt was ~99.6% of every fit_score call's input, repeated byte-for-byte
+# on every call with no caching at all - see that commit for the real
+# before/after numbers). Only the ephemeral/5-min tier is used anywhere in
+# Panga today - update this if a 1-hour-TTL cache_control block is ever
+# added (that tier has its own, higher write multiplier).
+_CACHE_WRITE_MULTIPLIER = 1.25
+_CACHE_READ_MULTIPLIER = 0.10
+
 
 def estimate_response_cost(response, model: str) -> float:
     """Real dollar cost of one Anthropic API response: input + output
@@ -39,10 +52,23 @@ def estimate_response_cost(response, model: str) -> float:
     web_search the model actually ran (the server tool bills separately
     from tokens). Raises KeyError if `model` isn't in the pricing table -
     fail loudly rather than silently under-reporting cost for an unpriced
-    model."""
+    model.
+
+    Prices cache_creation_input_tokens/cache_read_input_tokens separately
+    from plain input_tokens (2026-08-11 gap found while building fit_score
+    prompt caching: before this, a cached call's real savings would have
+    happened on Anthropic's side but this function would keep pricing
+    every token at the full input rate, silently over-reporting cost and
+    hiding the fix's real effect from cost_log). Anthropic's Python SDK
+    Usage object omits these fields entirely on a response that used no
+    caching at all, so both are read defensively via getattr."""
     pricing = _TOKEN_PRICING_PER_MTOK[model]
+    cache_write_tokens = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+    cache_read_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0
     token_cost = (
         response.usage.input_tokens / 1_000_000 * pricing["input"]
+        + cache_write_tokens / 1_000_000 * pricing["input"] * _CACHE_WRITE_MULTIPLIER
+        + cache_read_tokens / 1_000_000 * pricing["input"] * _CACHE_READ_MULTIPLIER
         + response.usage.output_tokens / 1_000_000 * pricing["output"]
     )
     searches_run = sum(1 for b in response.content if b.type == "web_search_tool_result")

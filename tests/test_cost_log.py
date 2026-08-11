@@ -39,6 +39,37 @@ def test_log_api_cost_stamps_job_key_when_given(isolated_data):
     assert entry["job_id"] == "12345"
 
 
+def test_log_api_cost_stamps_cache_tokens_when_given(isolated_data):
+    # 2026-08-11 fit_score prompt-caching fix - the real per-call cache
+    # breakdown needs to be independently verifiable in this log, not just
+    # inferred from a lower cost_usd.
+    log_api_cost(
+        purpose="fit_score", model="claude-opus-5", input_tokens=100, output_tokens=50, cost_usd=0.01,
+        cache_creation_input_tokens=60_000, cache_read_input_tokens=None,
+    )
+    entry = load_cost_log()[0]
+    assert entry["cache_creation_input_tokens"] == 60_000
+    assert "cache_read_input_tokens" not in entry
+
+
+def test_log_api_cost_omits_cache_fields_by_default(isolated_data):
+    log_api_cost(purpose="fit_score", model="claude-opus-5", input_tokens=1000, output_tokens=200, cost_usd=0.01)
+    entry = load_cost_log()[0]
+    assert "cache_creation_input_tokens" not in entry
+    assert "cache_read_input_tokens" not in entry
+
+
+def test_log_api_cost_stamps_a_real_cache_read_hit(isolated_data):
+    # This is exactly what tonight's live validation needs to show: the
+    # SECOND call in a sequence logging a real cache-read hit.
+    log_api_cost(
+        purpose="fit_score", model="claude-opus-5", input_tokens=300, output_tokens=150, cost_usd=0.03,
+        cache_read_input_tokens=60_336,
+    )
+    entry = load_cost_log()[0]
+    assert entry["cache_read_input_tokens"] == 60_336
+
+
 def test_log_api_cost_appends_without_clobbering_prior_entries(isolated_data):
     log_api_cost(purpose="a", model="claude-opus-5", input_tokens=1, output_tokens=1, cost_usd=0.001)
     log_api_cost(purpose="b", model="claude-opus-5", input_tokens=2, output_tokens=2, cost_usd=0.002)

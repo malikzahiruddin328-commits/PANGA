@@ -39,6 +39,21 @@ def test_log_cost_includes_job_key_when_given(isolated_data):
     assert entry["job_id"] == "42"
 
 
+def test_log_cost_passes_through_real_cache_token_counts(isolated_data):
+    # 2026-08-11 fit_score prompt-caching fix - _log_cost must forward the
+    # real cache_creation_input_tokens/cache_read_input_tokens from the
+    # response into the persisted log entry, not just compute cost from
+    # them and discard the breakdown.
+    response = SimpleNamespace(
+        usage=SimpleNamespace(input_tokens=300, output_tokens=150, cache_read_input_tokens=60_336),
+        content=[SimpleNamespace(type="text")],
+    )
+    _log_cost(response, "claude-opus-5", "fit_score", None)
+    entry = load_cost_log()[0]
+    assert entry["cache_read_input_tokens"] == 60_336
+    assert "cache_creation_input_tokens" not in entry
+
+
 def test_log_cost_never_raises_on_an_unpriced_model(isolated_data):
     # estimate_response_cost() raises KeyError for a model not in the
     # pricing table - _log_cost() must swallow that (logging a cost is
