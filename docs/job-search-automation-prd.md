@@ -226,7 +226,7 @@ Not a script — a simple results-driven interface (built with Streamlit, opens 
 | Prospector — Learn Engine's "nothing to analyze yet" gate is softly broken, can no longer fire with 78 accounts already populated | Low | None | Not started | 0% | Added 2026-08-10, same audit. One Learn Engine input list populates unconditionally per target account regardless of real outcome data behind it — so the zero-input gate meant to hold off analysis until real signal exists can never fire again now that 78 real accounts already populate that list. Doesn't crash or corrupt anything, just silently defeats the gate's original intent. **Held, not routed** — batch authorization. |
 | UI refinement — a status-selectbox widget key can retain a stale unsaved selection across a hide/reshow filter cycle | Low | None — distinct from the separately-dispatched status-preservation fix already in flight; flagged for UI refinement to confirm no overlap when picked up | Not started | 0% | Added 2026-08-10, UI refinement's own self-audit. Reported trigger: a job gets temporarily filtered out of view, a selection is registered against its selectbox key, and when a further filter change brings the job back into view, the stale selection still displays instead of the job's real current stored status. Needs an in-between filter change to trigger, not a simple single hide/reshow — narrow but real. **Held, not routed** — batch authorization. |
 | Release Manager — process gaps found in its own conduct audit (4 sub-findings) | Low | None | Not started | 0% | Added 2026-08-10, Release Manager's own self-audit of its own process, not code. (1) Used `git worktree remove --force` once tonight without a preceding `git status` check — no harm resulted, but the habit gap is real. (2) No standing step catches a same-named-function-shadowing collision across branches being merged (retroactively checked tonight, none currently exists, but nothing documented would catch one). (3) Doc-only backlog commits currently skip the full test suite by undocumented tribal judgment, not a written exception in `docs/release-manager.md`. (4) The "only I push to master" assumption is unverified with no documented fallback for a push rejection. Process/documentation fixes, not code. **Held, not routed** — batch authorization. |
-| Prospector — src/linkedin/connections_store.py and src/linkedin/storage.py also have zero file locking, same class as the target_accounts fix | Low | None technical — needs a session assigned once authorized; LinkedIn storage layer currently has no clear owner | Not started | 0% | Added 2026-08-10, Prospector's own self-audit, found while fixing target_accounts.py's own locking (that fix is already dispatched/in-flight, not duplicated here). Same unlocked read-modify-write race exists in `src/linkedin/connections_store.py` and `src/linkedin/storage.py`, explicitly flagged by Prospector as out of its own scope. No session currently owns "LinkedIn storage layer" as a named area. **Held, not routed** — batch authorization, and will need an owner assigned when authorized, not just a build-go-ahead. |
+| Prospector — src/linkedin/connections_store.py and src/linkedin/storage.py also have zero file locking, same class as the target_accounts fix | Low | None | Built | 100% | Added 2026-08-10, Prospector's own self-audit, found while fixing target_accounts.py's own locking. Same unlocked read-modify-write race existed in `src/linkedin/connections_store.py` and `src/linkedin/storage.py`. Ownership ambiguity (originally flagged by Prospector as out of its own scope) resolved 2026-08-11 — confirmed as Prospector's own domain. Built and merged: `feature/linkedin-storage-file-lock`, commit `a4620d9` on master (verified directly against both local and `origin/master` after a fresh fetch — an initial check read stale local git state as "not merged" before the fetch). Full suite 908/908 passing both pre- and post-merge, per Release Manager. |
 | llm_client — failed/exhausted API calls are never logged to cost_log at all | High | Same file as the row below, same audit | Not started | 0% | Added 2026-08-10, addendum to tonight's audit broadcast. `_log_cost` only runs after a successful return; an exception raises before it's ever called, so a failed or fully-exhausted call leaves zero trace in `cost_log`. Real consequence: during an actual Claude outage, the new Ops tab shows FEWER calls and normal-looking latency (pure survivorship bias) instead of surfacing the incident — exactly backwards from what an ops view most needs to show when it actually matters. **Held, not routed** — Zahir's instruction, batch build-authorization later. |
 | llm_client — the Anthropic SDK's own hidden built-in retry is still active underneath our custom bounded retry logic | High | Same file as the row above, same audit | Not started | 0% | Added 2026-08-10, same addendum. The SDK's default `max_retries=2` (up to 3 real HTTP attempts per logical call) is still fully active underneath our own `_call_with_retries` (3 bounded attempts) — empirically verified: a fully-exhausted call made 12 real HTTP requests over 8.7s wall-clock, 4x what `_MAX_ATTEMPTS = 3  # bounded` implies, against a model we're specifically trying not to hammer during overload. Concrete fix already identified: `anthropic.Anthropic(max_retries=0)` in `get_client()` — our own retry logic is already strictly more correct (it catches a mid-stream failure case the SDK's own status-code check can't see), so this doesn't lose any retry coverage, just removes the hidden duplication. **Held, not routed** — batch authorization. |
 | llm_client — duration_ms in the Ops tab includes our own hard-coded backoff sleep time, not just real network/model time | Medium | Related to the two llm_client rows above, same audit | Not started | 0% | Added 2026-08-10, same addendum. A retried call's logged `duration_ms` includes our own 1s-then-2s backoff sleeps between attempts, not just real network/model latency — a retried call shows ≥3s "slow" in the Ops tab from artificial sleep alone. During real transient overload, the Ops tab's "slow calls" list would misleadingly fill with calls whose actual model latency was fine, obscuring which calls were genuinely slow. Consider excluding backoff sleep from the metric, or flagging retried calls distinctly in the recent-calls table. **Held, not routed** — batch authorization. |
@@ -569,7 +569,8 @@ Medicines USA) were disqualified for good reasons at the time (a stale
 trial, an already-approved-drug signal), then each later picked up a real
 job posting - BeOne's is now an application under review - with nothing
 ever surfacing that mismatch back to Zahir. Fixed with
-`target_accounts.find_disqualified_with_new_activity(jobs, applications)`:
+`target_accounts.find_disqualified_with_new_activity(jobs, applications)`
+(renamed 2026-08-10, see below):
 a deterministic, zero-cost cross-reference (same normalize-and-substring
 match as `commercial_hiring.py`/`connections.py`) that flags any
 disqualified account with a real posting that wasn't part of the evidence
@@ -593,6 +594,60 @@ real examples flagged correctly including BeOne's "under review"
 application; Securitas correctly excluded). Live-verified in an isolated
 Streamlit instance (port 8505) - warning box renders with the exact
 expected content, stopped cleanly after.
+
+**Hardened 2026-08-10 (Zahir's whole-codebase adversarial self-audit
+request, items #10/#15/#16/#20):** four real gaps in the fix above, found
+by re-examining it under the same "what's the sibling scenario" lens that
+built it in the first place.
+- **#20 - added `status_updated_at`** to every target account, bumped on
+  any real status change (manual `set_status()` or automatic
+  qualified/watching recomputation), same rule as `applications.py`'s
+  `status_updated_at`. Prerequisite for the two gaps below - without a
+  "when did Zahir make this call" timestamp, there's no way to tell
+  evidence that existed *before* a status decision from evidence that
+  arrived genuinely *after* it. Records whose status hasn't changed since
+  before this field existed don't have it - excluded from the two checks
+  below, not backfilled or guessed at, same convention as every other
+  "added on date X" field in this codebase.
+- **#15 - new signals on an already-paused account.** The original fix
+  only checked for a real job posting appearing later - a signal added
+  via `add_signal()` directly to an already-disqualified/stale account
+  (e.g. a fresh ClinicalTrials.gov trial found by a live Claude Code
+  session) was silently absorbed into `signals` with nothing surfaced,
+  even though it's the exact same "new evidence, sticky status" shape.
+  Now compares each signal's `date_observed` against `status_updated_at`.
+- **#16 - "stale" had zero coverage.** The original fix checked
+  `status == "disqualified"` only; "stale" accounts (also a manual,
+  sticky, "stopped watching this" status) got nothing. 0 stale accounts
+  exist in real data today so this was unreproduced live, but zero
+  protection the moment Zahir marks anything stale. `"contacted"` is
+  deliberately still excluded - that status means active engagement, not
+  a pause, a genuinely different situation.
+- **#10 - real O(paused accounts x jobs) performance cost**, ~675ms
+  unconditionally on every single Prospector tab render (Streamlit reruns
+  the whole script on any widget interaction anywhere in the app, not
+  just Prospector-tab ones) - projected ~1.3s at 5K jobs, ~2.6s at 10K,
+  reachable within 2-3 months at real ~1200 jobs/week growth. Fixed two
+  ways: (1) each job's normalized organization name is computed ONCE up
+  front instead of being re-normalized per paused account (the actual
+  dominant cost, not the substring check itself), (2) the UI call site
+  wraps the whole function in `st.cache_data` so a rerun that doesn't
+  change `target_accounts`/`jobs`/`applications` is a cache hit instead
+  of a full recompute. Required changing the function's own signature to
+  accept `target_accounts` as a real parameter instead of self-loading it
+  internally - the self-load was fine before caching existed, but would
+  have made `st.cache_data` silently ignore target_accounts changes
+  (stale cache hits on a status Zahir had literally just changed) had it
+  stayed hidden inside the function body.
+
+Renamed `find_disqualified_with_new_activity` -> `find_paused_accounts_with_
+new_activity` to match the now-broader disqualified+stale scope (new
+`PAUSED_STATUSES` constant). Regression-tested: lock-verification tests
+carried over unchanged, new tests for the timestamp bump (manual and
+automatic transitions), the new-signal-since-status-change check
+(including the "no status_updated_at yet" gap case), the stale-status
+case, and a real perf measurement against production-scale synthetic data
+confirming the precompute-once change actually reduces wall-clock time.
 
 ### 16b. Outreach (new funnel stage)
 
@@ -686,6 +741,27 @@ suspect a stale cached module in whichever session owns the long-running
 port-8501 server before assuming the code is broken** - the fix is
 restarting that process (e.g. Zahir relaunching via the desktop shortcut),
 not editing already-correct code.
+
+**Hardened 2026-08-10 (Zahir's adversarial self-audit request, #21):**
+the "Log new outreach" form had no dedup check and didn't clear itself
+after a successful submit - the same filled-in values just sat there, so
+an accidental double-click, or a confused re-click on a form that still
+visibly showed the same values, created a duplicate outreach record.
+Zero real outreach records existed at the time this was found, but a real
+risk once Zahir starts logging real outreach. Fixed two ways: (1) every
+form field key now carries a "generation" suffix that bumps on a
+successful submit, forcing Streamlit to instantiate fresh, empty widgets
+next render (can't clear a widget's own session_state key in place after
+it's already been instantiated the same run - this sidesteps that
+restriction entirely); (2) `_is_likely_duplicate_outreach_submit()`
+skips creating a second record only when the same contact/channel/notes
+was logged within the last 10 seconds - deliberately narrow, so a genuine
+follow-up to the same contact next week is never silently blocked, only
+the same-moment accident is. Tested via `streamlit.testing.v1.AppTest`
+driving the real form end to end: a normal submit creates one record and
+visibly clears the field; an immediate resubmit of the same values
+creates nothing extra; a genuinely different contact submitted right
+after still creates its own record (the guard doesn't overreach).
 
 ### 16c. KPI Layer + Rejection-Pattern Diagnosis (Outcome stage)
 
@@ -922,6 +998,34 @@ tool rather than something used moment-to-moment.
 **Build sequencing:** last, by construction — it needs real outcome
 history from scoring, target accounts, and outreach to have anything to
 say. Folded into build step 8 above, not a separate step.
+
+**Fixed 2026-08-10 (Zahir's adversarial self-audit request, #22):** the
+"nothing to analyze yet" gate on the "Run Learn Engine analysis" button
+summed raw list lengths across all four `learn_input` categories, but
+`target_account_vs_outcome` appends ONE ENTRY PER TARGET ACCOUNT
+UNCONDITIONALLY, not just ones with a real correlatable outcome - with 78
+real target accounts already in the store, that one list alone always
+pushed the sum well past zero regardless of whether `scoring_vs_outcome`/
+`outreach_vs_outcome`/`interview_outcomes` had anything real in them. The
+gate could never correctly say "nothing to analyze yet" again once
+Prospector had been used at all. Fixed with
+`_count_analyzeable_learn_inputs()` in `src/ui/app.py`: only a
+`target_account_vs_outcome` entry with `real_posting_appeared_since=True`
+counts - a "still watching, nothing has happened yet" account genuinely
+has no outcome to correlate its qualification against. The other three
+categories are left as raw counts, since each is already conditionally
+populated in `learn_engine.py` (same "meaningful count, not raw list
+length" fix as the sibling rejection-diagnosis gate above it, which
+already used explicit `rejected_count`/`not_interested_with_reason_count`
+rather than a bare `len()`). Checked against real production data: today
+the gate happens to still pass either way (49 scored applications alone
+clear zero), so this wasn't visibly broken yet - but the raw-`len()`
+version would have silently defeated the gate the moment scoring/
+outreach/interview data went back to zero (a fresh install, or historical
+data cleanup), which is exactly the scenario regression-tested here (78
+synthetic target accounts, zero everything else, gate correctly reports
+nothing analyzeable). Tests: `tests/test_learn_engine_gate.py`, 5 cases
+including the real 78-account reproduction. Full suite: 816 passed.
 
 ## 18. Applications Pivot Table (Designed 2026-07-30, not yet built)
 

@@ -1,4 +1,4 @@
-from ranking.prioritize import dedupe_across_sources, weight_for
+from ranking.prioritize import dedupe_across_sources, find_freshness_downgrade_targets, weight_for
 
 
 def test_weight_for_matches_case_insensitively():
@@ -46,3 +46,55 @@ def test_dedupe_no_company_site_postings_returns_input_unchanged():
         {"source": "Dice", "organization": "Acme", "title": "Engineer"},
     ]
     assert dedupe_across_sources(jobs) == jobs
+
+
+# --- find_freshness_downgrade_targets (2026-08-10, Zahir's product call
+# on #14 from Mirror's audit) ---
+
+def test_find_freshness_downgrade_targets_includes_the_removed_companys_own_postings():
+    jobs = [{"source": "Eisai", "organization": "Eisai", "title": "Director", "job_id": "/job/1"}]
+    targets = find_freshness_downgrade_targets(jobs, "Eisai")
+    assert targets == [("Eisai", "/job/1")]
+
+
+def test_find_freshness_downgrade_targets_includes_known_cross_source_duplicates():
+    # Zahir's explicit scoping: not just the company's own postings - also
+    # whatever dedupe_across_sources() would fold into them as the same
+    # real opening, found via a different board.
+    jobs = [
+        {"source": "Eisai", "organization": "Eisai", "title": "Director", "job_id": "/job/1"},
+        {"source": "Adzuna", "organization": "Eisai", "title": "Director", "job_id": "adzuna-1"},
+    ]
+    targets = find_freshness_downgrade_targets(jobs, "Eisai")
+    assert set(targets) == {("Eisai", "/job/1"), ("Adzuna", "adzuna-1")}
+
+
+def test_find_freshness_downgrade_targets_excludes_unrelated_jobs():
+    # Not a blanket downgrade - a different company's postings, and a
+    # different (non-matching) posting from the removed company's own
+    # board, are both left alone.
+    jobs = [
+        {"source": "Eisai", "organization": "Eisai", "title": "Director", "job_id": "/job/1"},
+        {"source": "IQVIA", "organization": "IQVIA", "title": "Director", "job_id": "/job/2"},
+        {"source": "Adzuna", "organization": "Acme Corp", "title": "VP Engineering", "job_id": "adzuna-2"},
+    ]
+    targets = find_freshness_downgrade_targets(jobs, "Eisai")
+    assert targets == [("Eisai", "/job/1")]
+
+
+def test_find_freshness_downgrade_targets_empty_when_company_has_no_stored_jobs():
+    jobs = [{"source": "IQVIA", "organization": "IQVIA", "title": "Director", "job_id": "/job/1"}]
+    assert find_freshness_downgrade_targets(jobs, "Eisai") == []
+
+
+def test_find_freshness_downgrade_targets_does_not_mutate_caller_list_identity():
+    # dedupe_across_sources() mutates job dicts in place (attaches
+    # _cross_source_duplicates) - this must operate on a copy of the list
+    # so the caller's own list object isn't the one iterated internally,
+    # even though the dict objects themselves are shared (same as every
+    # other dedupe_across_sources() call site in this codebase).
+    jobs = [{"source": "Eisai", "organization": "Eisai", "title": "Director", "job_id": "/job/1"}]
+    original_list_id = id(jobs)
+    find_freshness_downgrade_targets(jobs, "Eisai")
+    assert id(jobs) == original_list_id
+    assert len(jobs) == 1  # not appended/removed from in place

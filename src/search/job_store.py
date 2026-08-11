@@ -120,7 +120,10 @@ def update_job_address(source: str, job_id: str, address: str) -> None:
         write_json(JOBS_PATH, jobs)
 
 
-def update_job_ats_keywords(source: str, job_id: str, required_keywords: list[str], preferred_keywords: list[str]) -> None:
+def update_job_ats_keywords(
+    source: str, job_id: str, required_keywords: list[str], preferred_keywords: list[str],
+    extractor_version: int | None = None,
+) -> None:
     """Caches the AI-extracted required/preferred ATS keyword list for this
     job (tailoring/drafting.py's _extract_ats_keywords - one real-NLP-
     judgment call over the posting's own text) so the same posting always
@@ -130,13 +133,23 @@ def update_job_ats_keywords(source: str, job_id: str, required_keywords: list[st
     a valid cached value meaning "extracted, genuinely no such keywords" -
     tailoring/drafting.py only calls this on a successful extraction, never
     on a failed/unconfigured API call, so a transient failure doesn't
-    permanently freeze a job at "no keywords found"."""
+    permanently freeze a job at "no keywords found".
+
+    extractor_version (2026-08-10) - tailoring.drafting.ATS_KEYWORDS_
+    EXTRACTOR_VERSION at the time of this extraction, stamped alongside the
+    keywords so a later caller can tell "extracted, but under an older,
+    possibly-corrected extraction/cleanup pipeline" apart from "extracted
+    under the current one" (see tailoring.drafting.is_ats_keywords_stale) -
+    optional/None stays backward-compatible with any caller that doesn't
+    supply one, rather than forcing every call site to know about this."""
     with locked("jobs"):
         jobs = load_jobs()
         for job in jobs:
             if job.get("source") == source and job.get("job_id") == job_id:
                 job["ats_required_keywords"] = required_keywords
                 job["ats_preferred_keywords"] = preferred_keywords
+                if extractor_version is not None:
+                    job["ats_keywords_extractor_version"] = extractor_version
                 break
         write_json(JOBS_PATH, jobs)
 
@@ -188,6 +201,42 @@ def flag_employer_attribution_uncertain(source: str, job_id: str, likely_organiz
                 job["likely_organization"] = likely_organization
                 break
         write_json(JOBS_PATH, jobs)
+
+
+def flag_freshness_check_downgraded(targets: list[tuple[str, str]], reason: str) -> int:
+    """Marks freshness_check_downgraded=True + freshness_check_downgrade_reason
+    on every (source, job_id) pair in `targets` - one locked read-modify-
+    write for the whole batch, not one per job (avoid an O(n) full-file
+    rewrite per flag on what can be a multi-job batch - see CLAUDE.md's
+    performance check). Returns how many were actually found and flagged
+    (targets naming a job that's since been removed/never existed are
+    silently skipped, not an error).
+
+    Used when a company is removed from job_sources.yaml (2026-08-10,
+    Zahir's explicit product call on a real gap found in Mirror's audit):
+    the company's own postings lose their fast/reliable platform-API
+    freshness check the moment it leaves the config (see
+    freshness_check.py's build_api_source_lookup()) and fall back to a
+    generic page-fetch check - that already happened implicitly with no
+    visible signal to Zahir. This makes it explicit and visible (a Results
+    tab caution, same pattern as flag_employer_attribution_uncertain()
+    above) for exactly the affected set - see
+    ranking.prioritize.find_freshness_downgrade_targets() for how that set
+    is computed (the company's postings AND their known cross-source
+    duplicates, not a blanket downgrade of everything associated with the
+    company)."""
+    with locked("jobs"):
+        jobs = load_jobs()
+        target_set = set(targets)
+        flagged = 0
+        for job in jobs:
+            key = (job.get("source"), job.get("job_id"))
+            if key in target_set:
+                job["freshness_check_downgraded"] = True
+                job["freshness_check_downgrade_reason"] = reason
+                flagged += 1
+        write_json(JOBS_PATH, jobs)
+    return flagged
 
 
 def update_job_score(source: str, job_id: str, fit_score: int, fit_rationale: str) -> None:

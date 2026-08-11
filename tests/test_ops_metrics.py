@@ -158,3 +158,74 @@ def test_recent_calls_excludes_calls_outside_the_selected_period():
 
 def test_slow_latency_threshold_is_3_seconds():
     assert ops_metrics.SLOW_LATENCY_THRESHOLD_MS == 3000.0
+
+
+# 2026-08-10 audit fix #26: failed calls (success=False) are now logged to
+# cost_log, but every EXISTING view must keep its exact current meaning -
+# spend/call-count/latency/recent-calls should reflect successful calls
+# only, the same as before this field existed (legacy entries have no
+# "success" key at all and must default to True, unaffected).
+
+def test_compute_kpis_excludes_failed_calls_from_spend_and_call_count():
+    current = [
+        _entry(1, cost_usd=1.5),
+        _entry(2, cost_usd=2.5),
+        _entry(3, cost_usd=0.0, success=False),
+    ]
+    kpis = ops_metrics.compute_kpis(current, [])
+    assert kpis["spend_usd"] == 4.0
+    assert kpis["call_count"] == 2
+
+
+def test_compute_kpis_reports_failed_call_count():
+    current = [_entry(1), _entry(2, success=False), _entry(3, success=False)]
+    kpis = ops_metrics.compute_kpis(current, [])
+    assert kpis["failed_call_count"] == 2
+
+
+def test_compute_kpis_failed_call_count_is_zero_with_no_failures():
+    current = [_entry(1), _entry(2)]
+    kpis = ops_metrics.compute_kpis(current, [])
+    assert kpis["failed_call_count"] == 0
+
+
+def test_compute_kpis_excludes_failed_calls_from_latency_stats():
+    current = [
+        _entry(1, duration_ms=1000),
+        _entry(2, duration_ms=9000, success=False),  # a slow failure shouldn't skew avg latency
+    ]
+    kpis = ops_metrics.compute_kpis(current, [])
+    assert kpis["avg_latency_ms"] == 1000
+
+
+def test_spend_by_day_excludes_failed_calls():
+    entries = [_entry(1, cost_usd=1.0), _entry(1, cost_usd=99.0, success=False)]
+    points = ops_metrics.spend_by_day(entries, "Today")
+    assert round(sum(p["spend"] for p in points), 4) == 1.0
+
+
+def test_avg_latency_by_purpose_excludes_failed_calls():
+    entries = [
+        _entry(1, purpose="job_score", duration_ms=1000),
+        _entry(1, purpose="job_score", duration_ms=9000, success=False),
+    ]
+    rows = ops_metrics.avg_latency_by_purpose(entries, "7 days")
+    assert len(rows) == 1
+    assert rows[0]["avg_duration_s"] == 1.0
+
+
+def test_recent_calls_excludes_failed_calls():
+    entries = [_entry(1, purpose="a"), _entry(2, purpose="b", success=False)]
+    calls = ops_metrics.recent_calls(entries, "7 days")
+    assert [c["purpose"] for c in calls] == ["a"]
+
+
+def test_legacy_entries_with_no_success_field_are_treated_as_successful():
+    # _entry() doesn't set a "success" key unless explicitly passed - this
+    # is exactly what every real entry logged before 2026-08-10 looks
+    # like. Must not be silently dropped or miscounted as a failure.
+    entries = [_entry(1)]
+    assert "success" not in entries[0]
+    kpis = ops_metrics.compute_kpis(entries, [])
+    assert kpis["call_count"] == 1
+    assert kpis["failed_call_count"] == 0

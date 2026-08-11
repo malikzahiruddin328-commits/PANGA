@@ -54,6 +54,24 @@ now. jobs_by_key is built once per run() call, not once per email -
 search.job_store.load_jobs() is a 1600+-record store, and this script
 can check several emails per run (see CLAUDE.md's "avoid O(n^2) scans
 over growing stores").
+
+Mark-reviewed-on-every-terminal-path (2026-08-09): real bug found by
+Backlog against the live code, not a hypothetical - two separate gaps,
+both fixed here:
+1. classify_thread() raising skipped any mark-reviewed call entirely, so
+   a persistently-unparseable message retried (a real AI call) forever.
+   Now uses scan_retry_tracker: a failure only gets marked reviewed
+   (given up on) after MAX_ATTEMPTS consecutive failures, not the first
+   one - a single transient blip still gets retried next run, same as
+   before, but a message that will never succeed eventually stops
+   costing real money.
+2. bucket == "not_related" - a clean, SUCCESSFUL classification, no
+   error at all - simply never called mark_reviewed(), unlike its
+   sibling "passive" bucket right below it which always did. This was
+   the common case, not an edge case: most inbox traffic classifies as
+   not_related, and every one of those messages was being reclassified
+   (again, a real AI call) on every single run. Fixed to mark reviewed
+   the same way "passive" already does.
 """
 
 import sys
@@ -72,10 +90,13 @@ if str(SRC) not in sys.path:
 
 from inbox_accounts import configured_accounts  # noqa: E402
 from notifications import send_notification  # noqa: E402
+from scan_retry_tracker import MAX_ATTEMPTS, clear_failure, record_failure  # noqa: E402
 from search.job_store import load_jobs  # noqa: E402
 from tailoring.applications import load_applications, suggest_status  # noqa: E402
 from tailoring.cta_emails import add_cta_email  # noqa: E402
 from tailoring.cta_reasoning import classify_thread, match_application_confirmation, match_cta_application  # noqa: E402
+
+_SCAN_NAME = "gmail_cta_scan"
 
 # Which cta_category values represent a real application-status
 # transition, and what status to suggest for each - only these 3 of the 5
@@ -147,11 +168,26 @@ def scan_account(account, jobs_by_key: dict) -> tuple[list[dict], int]:
             if not result["confident"]:
                 result = classify_thread(thread_summary, full_body=account.get_body(msg.ref))
         except Exception as exc:  # noqa: BLE001 - one message's failure shouldn't stop the rest
-            _log(f"    classification failed for {msg.subject!r}: {exc}")
+            failures = record_failure(_SCAN_NAME, account.provider, account.account, msg.ref)
+            if failures >= MAX_ATTEMPTS:
+                _log(f"    classification failed for {msg.subject!r} {failures} times - giving up, marking reviewed: {exc}")
+                try:
+                    account.mark_reviewed(msg.ref)
+                except Exception as mark_exc:  # noqa: BLE001
+                    _log(f"    couldn't mark reviewed after giving up on {msg.subject!r}: {mark_exc}")
+            else:
+                _log(f"    classification failed for {msg.subject!r} (attempt {failures}/{MAX_ATTEMPTS}): {exc}")
             continue
+        else:
+            clear_failure(_SCAN_NAME, account.provider, account.account, msg.ref)
 
         bucket = result["bucket"]
         if bucket == "not_related":
+            try:
+                account.mark_reviewed(msg.ref)
+            except Exception as exc:  # noqa: BLE001 - best-effort marking (e.g. an IMAP
+                # server that rejects custom keyword flags)
+                _log(f"    couldn't mark reviewed for {msg.subject!r}: {exc}")
             continue
 
         if bucket == "passive":

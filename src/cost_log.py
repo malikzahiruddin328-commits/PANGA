@@ -30,17 +30,34 @@ COST_LOG_PATH = PROJECT_ROOT / "data" / "cost_log.json"
 def log_api_cost(
     purpose: str, model: str, input_tokens: int, output_tokens: int, cost_usd: float,
     job_key: tuple[str, str] | None = None, duration_ms: float | None = None,
+    success: bool = True, error_type: str | None = None,
+    attempt_count: int | None = None, models_tried: list[str] | None = None,
 ) -> None:
     """Appends one real, already-computed call's cost to the log. job_key
     is (source, job_id) when this call was for a specific job posting
     (resume/cover-letter drafting, keyword extraction, fit scoring) - None
-    for calls with no single job to attribute to. duration_ms (Ops tab,
-    2026-08-10) is the real wall-clock time the caller measured around its
-    own API call, including any transient-error retries - the actual
-    end-to-end latency a real call took, not an idealized single-attempt
-    number. Optional/None for any caller that doesn't measure it (there
-    isn't one today, but this stays backward-compatible rather than
-    forcing every future caller to supply it)."""
+    for calls with no single job to attribute to. duration_ms is the real
+    SUM of per-attempt request time the caller measured around
+    llm_client._call_with_retries() - every attempt's own real API time,
+    added together, but NOT the artificial backoff-sleep wait between
+    attempts (2026-08-10 audit finding: including sleep time inflated
+    every retried call's latency past the Ops tab's 3.0s "slow call"
+    threshold regardless of how fast the model itself actually responded -
+    see llm_client._RetryResult). Optional/None for any caller that
+    doesn't measure it.
+
+    success/error_type/attempt_count/models_tried (2026-08-10 audit
+    finding #26): before this, only calls that eventually succeeded ever
+    reached this function - a call that exhausted retries and model
+    fallback without ever getting a response was silently invisible to
+    every cost/ops analysis, even though it consumed real attempts and
+    real wall-clock time. success=False records exactly that case -
+    cost_usd/token counts are 0 (no generation was billed for a genuine
+    pre-generation API error, the only kind that reaches here), but
+    duration_ms/error_type/attempt_count/models_tried preserve what
+    actually happened. success defaults True so every existing caller
+    (which never had a reason to think about failure logging) keeps
+    working unchanged."""
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "purpose": purpose,
@@ -49,7 +66,12 @@ def log_api_cost(
         "output_tokens": output_tokens,
         "cost_usd": cost_usd,
         "duration_ms": duration_ms,
+        "success": success,
     }
+    if not success:
+        entry["error_type"] = error_type
+        entry["attempt_count"] = attempt_count
+        entry["models_tried"] = models_tried
     if job_key:
         entry["source"], entry["job_id"] = job_key
     with locked("cost_log"):

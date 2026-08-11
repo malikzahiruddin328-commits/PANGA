@@ -69,3 +69,42 @@ def dedupe_across_sources(jobs: list[dict]) -> list[dict]:
         else:
             result.append(job)
     return result
+
+
+def find_freshness_downgrade_targets(jobs: list[dict], removed_company_name: str) -> list[tuple[str, str]]:
+    """Given the full job list and a company just removed from
+    config/job_sources.yaml (see search/job_sources.py), returns the
+    (source, job_id) pairs whose freshness-check precision should be
+    explicitly downgraded - Zahir's explicit product call (2026-08-10):
+    the removed company's own postings, AND any board postings
+    dedupe_across_sources() above would fold into them as the same real
+    opening - not a blanket downgrade of everything ever associated with
+    the company, and not left untouched either. Scoped precisely to
+    postings whose freshness signal actually depended on this company
+    still being tracked (its own company-site postings, whose fast/
+    reliable API check disappears the moment the company leaves
+    job_sources.yaml - see freshness_check.py's build_api_source_lookup())
+    - a cross-source duplicate found via a still-tracked board keeps
+    getting checked through that board same as always, but is included
+    here too since freshness_check.py evaluates every stored job record
+    independently, not the deduped view the Results tab shows, so an
+    unflagged duplicate would otherwise carry no visible signal that its
+    matched primary's freshness got less reliable.
+
+    Takes a copy of `jobs` internally before calling dedupe_across_sources()
+    (which mutates job dicts in place, attaching _cross_source_duplicates)
+    - the caller's own list objects aren't touched, only read from, and the
+    transient _cross_source_duplicates attribute is never itself persisted
+    by this function (only the (source, job_id) pairs it points to are
+    returned)."""
+    deduped = dedupe_across_sources(list(jobs))
+    targets = []
+    for job in deduped:
+        if job.get("source") != removed_company_name:
+            continue
+        if job.get("job_id"):
+            targets.append((job["source"], job["job_id"]))
+        for dup in job.get("_cross_source_duplicates", []):
+            if dup.get("source") and dup.get("job_id"):
+                targets.append((dup["source"], dup["job_id"]))
+    return targets

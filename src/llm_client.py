@@ -21,12 +21,42 @@ and at Claude's normal uptime that residual risk doesn't justify the extra
 engineering and quality compromise a non-Claude fallback would mean. Revisit
 only if a real sustained outage is actually observed - don't rebuild this
 analysis from scratch first.
+
+2026-08-10 adversarial self-audit (real findings, not reassurance) fixed
+four gaps in the above:
+1. get_client() now passes max_retries=0 - the Anthropic SDK has its OWN
+   built-in retry (default max_retries=2, i.e. 3 real HTTP attempts per
+   call) that was still silently active underneath _call_with_retries.
+   Empirically confirmed (mock transport, real request count): one
+   "exhausted" call made 12 real HTTP requests, not the ~4 _MAX_ATTEMPTS
+   implies, with the SDK's own backoff compounding on top of ours -
+   directly undermining Tier 2's whole point (stop hammering an
+   overloaded model). The SDK's status-code-only retry check also can't
+   see the mid-stream .type-based failures this module already had to
+   special-case, so disabling it loses nothing.
+2. _call_with_retries now measures request_ms as the SUM of each real
+   attempt's own duration, excluding the artificial time.sleep() backoff
+   between attempts - the old wall-clock-since-call-started measurement
+   counted backoff sleep as "latency," so any call needing 2+ retries
+   would cross the Ops tab's 3.0s "slow call" flag from pure wait time
+   alone, regardless of real model speed.
+3. A call that exhausts retries and fallback without ever getting a
+   response now gets its own cost_log entry (success=False, $0 cost,
+   real duration/attempt_count/models_tried) via _log_failed_call -
+   before this, only successful calls ever reached cost_log, so real
+   failed-call volume was invisible to every cost/ops analysis, and
+   would look like reduced traffic (not a problem) during a real outage.
+4. The final failure's log line now includes attempt_count and
+   models_tried, not just the last exception's own status/type/
+   request_id - previously indistinguishable from a first-attempt-only
+   failure when reading panga_debug.log after the fact.
 """
 
 import json
 import logging
 import os
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import anthropic
@@ -105,9 +135,14 @@ def _clean_message_for_status_error(exc: anthropic.APIStatusError) -> str:
     what app.py's `st.error(str(exc))` shows verbatim to the end user.
     Zahir hit the raw JSON dump live 2026-08-05 and flagged it directly:
     a real user has no use for a JSON error blob and no way to act on
-    it."""
+    it. attempt_count/models_tried (2026-08-10 audit finding #29) - without
+    these, this log line was indistinguishable from a first-attempt-only
+    failure, even when it actually followed a full retry+fallback
+    exhaustion; a real incident read from panga_debug.log couldn't tell
+    the two apart after the fact."""
     logger.error(
-        "Claude API call failed (status=%s type=%s request_id=%s): %s",
+        "Claude API call failed after %s attempt(s), models tried=%s (status=%s type=%s request_id=%s): %s",
+        getattr(exc, "_panga_attempt_count", 1), getattr(exc, "_panga_models_tried", None),
         exc.status_code, _error_type(exc), exc.request_id, exc.message,
     )
     if _is_billing_error(exc):
@@ -142,31 +177,90 @@ class LLMResponseTruncated(LLMCallFailed):
     pass
 
 
-def _call_with_retries(make_request, primary_model: str, on_retry=None):
+@dataclass
+class _RetryResult:
+    """What _call_with_retries actually did, not just what it returned -
+    request_ms/attempt_count/models_tried let a caller log a genuinely
+    honest record (real API time only, real attempt history) instead of
+    just the response object."""
+    response: object
+    model: str
+    request_ms: float
+    attempt_count: int
+    models_tried: list = field(default_factory=list)
+
+
+def _attach_attempt_info(exc: BaseException, attempt_count: int, models_tried: list, request_ms: float) -> None:
+    """Stamps the real attempt history onto an exhausted-failure exception
+    before it's raised, so callers can log an honest failed-call record
+    (_log_failed_call) and an honest log line (_clean_message_for_status_
+    error) - both need to know this was attempt N of models [...], not
+    just the last exception's own status/type. Setting arbitrary attributes
+    on an exception instance is safe (Python doesn't restrict it) and
+    avoids wrapping in a new exception type, which would break the
+    `except anthropic.APIStatusError`/`except anthropic.APIConnectionError`
+    catches every caller already has."""
+    exc._panga_attempt_count = attempt_count
+    exc._panga_models_tried = list(models_tried)
+    exc._panga_request_ms = request_ms
+
+
+def _call_with_retries(make_request, primary_model: str, on_retry=None) -> _RetryResult:
     """Runs make_request(model) against `primary_model`, retrying up to
     _MAX_ATTEMPTS total attempts (with exponential backoff) on transient
     errors only. If the primary model is still specifically overloaded once
     retries are exhausted, makes one further attempt against FALLBACK_MODEL
     instead of continuing to hammer the same overloaded model. Non-transient
-    errors and a failed fallback attempt propagate to the caller unchanged.
+    errors and a failed fallback attempt propagate to the caller unchanged -
+    but first get the real attempt history stamped on via
+    _attach_attempt_info, so even a failure carries honest diagnostics.
 
-    Returns (response, model_actually_used).
+    request_ms sums each real attempt's own duration only - NOT the
+    time.sleep() backoff between attempts, which is artificial wait, not
+    real API latency (2026-08-10 audit finding: the old wall-clock
+    measurement counted that sleep as "latency," inflating every retried
+    call's reported duration regardless of real model speed).
+
+    Returns a _RetryResult on success.
     """
     last_exc = None
+    request_ms = 0.0
+    models_tried = []
+    attempt_count = 0
     for attempt in range(_MAX_ATTEMPTS):
+        attempt_count += 1
+        models_tried.append(primary_model)
+        started_at = time.perf_counter()
         try:
-            return make_request(primary_model), primary_model
+            response = make_request(primary_model)
         except anthropic.AnthropicError as exc:
+            request_ms += (time.perf_counter() - started_at) * 1000
             if not _is_transient(exc):
+                _attach_attempt_info(exc, attempt_count, models_tried, request_ms)
                 raise
             last_exc = exc
             if attempt < _MAX_ATTEMPTS - 1:
                 if on_retry:
                     on_retry(attempt + 1)
                 time.sleep(_BACKOFF_BASE_SECONDS * (2**attempt))
+            continue
+        request_ms += (time.perf_counter() - started_at) * 1000
+        return _RetryResult(response, primary_model, request_ms, attempt_count, models_tried)
 
     if _is_overloaded(last_exc) and FALLBACK_MODEL != primary_model:
-        return make_request(FALLBACK_MODEL), FALLBACK_MODEL
+        attempt_count += 1
+        models_tried.append(FALLBACK_MODEL)
+        started_at = time.perf_counter()
+        try:
+            response = make_request(FALLBACK_MODEL)
+        except anthropic.AnthropicError as exc:
+            request_ms += (time.perf_counter() - started_at) * 1000
+            _attach_attempt_info(exc, attempt_count, models_tried, request_ms)
+            raise
+        request_ms += (time.perf_counter() - started_at) * 1000
+        return _RetryResult(response, FALLBACK_MODEL, request_ms, attempt_count, models_tried)
+
+    _attach_attempt_info(last_exc, attempt_count, models_tried, request_ms)
     raise last_exc
 
 
@@ -182,7 +276,17 @@ def get_client() -> "anthropic.Anthropic":
             "file in the Panga folder (copy the same line USAJOBS_API_KEY "
             "uses) and restart the app."
         )
-    return anthropic.Anthropic()
+    # max_retries=0 (2026-08-10 audit finding #27): the Anthropic SDK's own
+    # default retry (max_retries=2, i.e. 3 real HTTP attempts per call) was
+    # otherwise still active underneath _call_with_retries, stacking with
+    # it - empirically confirmed to turn one "exhausted" call into 12 real
+    # HTTP requests, not the ~4 _MAX_ATTEMPTS implies. _call_with_retries
+    # already owns retry/backoff/fallback policy end-to-end, including the
+    # mid-stream .type-based detection the SDK's own status-code-only
+    # check can't do - the SDK's hidden retry is redundant at best here,
+    # counterproductive (extra hammering of an already-overloaded model)
+    # at worst.
+    return anthropic.Anthropic(max_retries=0)
 
 
 def _log_cost(
@@ -193,10 +297,9 @@ def _log_cost(
     swallows its own failures so a logging problem never breaks the actual
     API call it's just trying to record. Runs even on a refused/truncated
     response, since real tokens were still billed either way. duration_ms
-    (Ops tab, 2026-08-10) is the caller's own measured wall-clock time
-    around its _call_with_retries() call - measured by the caller, not
-    here, since only the caller knows exactly when its own attempt(s)
-    started."""
+    is _call_with_retries' request_ms (2026-08-10 audit fix) - the SUM of
+    each real attempt's own duration, excluding backoff-sleep wait between
+    attempts, passed through by the caller from its _RetryResult."""
     try:
         from api_cost import estimate_response_cost
         from cost_log import log_api_cost
@@ -209,6 +312,32 @@ def _log_cost(
         )
     except Exception:
         logger.exception("Failed to log API call cost (purpose=%s) - the call itself still succeeded.", purpose)
+
+
+def _log_failed_call(exc: BaseException, purpose: str, job_key: tuple[str, str] | None) -> None:
+    """Logs a call that never got a response - retries and model fallback
+    (if applicable) exhausted, or a non-transient error on the first
+    attempt (2026-08-10, audit finding #26). Before this, _log_cost only
+    ran on success, so a failed call's real attempt volume and elapsed
+    time were completely invisible to cost_log/the Ops tab - during an
+    actual outage the dashboard would show reduced call volume, not the
+    failures actually happening. cost_usd/token counts are 0: a genuine
+    pre-generation API error (the only kind that reaches here) has no
+    billed generation. Swallows its own failures same as _log_cost - a
+    logging problem must never mask or replace the real error already in
+    flight to the caller."""
+    try:
+        from cost_log import log_api_cost
+
+        models_tried = getattr(exc, "_panga_models_tried", None) or ["unknown"]
+        log_api_cost(
+            purpose=purpose, model=models_tried[-1], input_tokens=0, output_tokens=0, cost_usd=0.0,
+            job_key=job_key, duration_ms=getattr(exc, "_panga_request_ms", None),
+            success=False, error_type=_error_type(exc) or type(exc).__name__,
+            attempt_count=getattr(exc, "_panga_attempt_count", 1), models_tried=models_tried,
+        )
+    except Exception:
+        logger.exception("Failed to log failed-call record (purpose=%s) - the original error still propagates.", purpose)
 
 
 def call_structured(
@@ -288,17 +417,21 @@ def call_structured(
         if on_progress:
             on_progress("Claude is busy, retrying...")
 
-    call_started_at = time.perf_counter()
     try:
-        response, call_model = _call_with_retries(make_request, primary_model, on_retry=report_retry)
+        result = _call_with_retries(make_request, primary_model, on_retry=report_retry)
     except anthropic.APIStatusError as exc:
+        _log_failed_call(exc, purpose, job_key)
         raise LLMCallFailed(_clean_message_for_status_error(exc)) from exc
     except anthropic.APIConnectionError as exc:
-        logger.error("Claude API connection error (purpose=%s): %s", purpose, exc)
+        logger.error(
+            "Claude API connection error after %s attempt(s), models tried=%s (purpose=%s): %s",
+            getattr(exc, "_panga_attempt_count", 1), getattr(exc, "_panga_models_tried", None), purpose, exc,
+        )
+        _log_failed_call(exc, purpose, job_key)
         raise LLMCallFailed("Couldn't reach the Claude API - check your internet connection.") from exc
-    duration_ms = (time.perf_counter() - call_started_at) * 1000
+    response, call_model = result.response, result.model
 
-    _log_cost(response, call_model, purpose, job_key, duration_ms=duration_ms)
+    _log_cost(response, call_model, purpose, job_key, duration_ms=result.request_ms)
 
     if response.stop_reason == "refusal":
         logger.error("Claude refused to respond (purpose=%s): %s", purpose, refusal_message)
@@ -355,21 +488,26 @@ def call_with_web_search(
             messages=[{"role": "user", "content": user_content}],
         )
 
-    call_started_at = time.perf_counter()
     try:
-        response, call_model = _call_with_retries(make_request, primary_model)
+        result = _call_with_retries(make_request, primary_model)
     except anthropic.APIStatusError as exc:
         logger.error(
-            "Claude web-search call failed (purpose=%s status=%s type=%s request_id=%s): %s",
+            "Claude web-search call failed after %s attempt(s), models tried=%s (purpose=%s status=%s type=%s request_id=%s): %s",
+            getattr(exc, "_panga_attempt_count", 1), getattr(exc, "_panga_models_tried", None),
             purpose, exc.status_code, _error_type(exc), exc.request_id, exc.message,
         )
+        _log_failed_call(exc, purpose, job_key)
         return "", 0.0
     except anthropic.APIConnectionError as exc:
-        logger.error("Claude web-search connection error (purpose=%s): %s", purpose, exc)
+        logger.error(
+            "Claude web-search connection error after %s attempt(s), models tried=%s (purpose=%s): %s",
+            getattr(exc, "_panga_attempt_count", 1), getattr(exc, "_panga_models_tried", None), purpose, exc,
+        )
+        _log_failed_call(exc, purpose, job_key)
         return "", 0.0
-    duration_ms = (time.perf_counter() - call_started_at) * 1000
+    response, call_model = result.response, result.model
 
     cost = estimate_response_cost(response, call_model)
-    _log_cost(response, call_model, purpose, job_key, duration_ms=duration_ms)
+    _log_cost(response, call_model, purpose, job_key, duration_ms=result.request_ms)
     text = "".join(b.text for b in response.content if b.type == "text").strip()
     return text, cost

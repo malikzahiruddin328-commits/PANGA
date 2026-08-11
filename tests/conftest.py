@@ -73,7 +73,10 @@ def isolated_data(tmp_path, monkeypatch):
     import cost_log
     import debug_log
     import linkedin.storage as linkedin_storage
+    import linkedin.connections_store as connections_store
     import prospector.prospector_score as prospector_score
+    import scan_retry_tracker
+    import search.freshness_check as freshness_check
 
     monkeypatch.setattr(job_store, "JOBS_PATH", tmp_path / "jobs.json")
     monkeypatch.setattr(applications, "APPLICATIONS_PATH", tmp_path / "applications.json")
@@ -114,6 +117,14 @@ def isolated_data(tmp_path, monkeypatch):
     # profile export - at least as sensitive as the resume text this
     # fixture already protects).
     monkeypatch.setattr(linkedin_storage, "LINKEDIN_PATH", tmp_path / "linkedin_profile.json")
+    # Same class of gap as LINKEDIN_PATH immediately above, found live
+    # 2026-08-10 while writing tests for the file-locking fix on this same
+    # module's sibling: linkedin.connections_store.CONNECTIONS_PATH was
+    # never isolated either, so any test exercising save_connections()
+    # would have silently written the real data/linkedin/connections.json
+    # - PII about Zahir's real professional contacts, not just his own
+    # data.
+    monkeypatch.setattr(connections_store, "CONNECTIONS_PATH", tmp_path / "connections.json")
     # debug_log.py (2026-08-09's always-on error logging addition) writes
     # to a real file path too - isolated for the same reason as every
     # store above, so no test exercising it can touch the real
@@ -125,4 +136,14 @@ def isolated_data(tmp_path, monkeypatch):
     # any test exercising save_prospector_score() would have silently
     # written the real data/prospector/prospector_score.json.
     monkeypatch.setattr(prospector_score, "SCORE_PATH", tmp_path / "prospector_score.json")
+    # scan_retry_tracker.py (2026-08-09, the mark-reviewed-on-every-path
+    # fix) writes one JSON file per scan name under this directory -
+    # isolated for the same reason as every store above.
+    monkeypatch.setattr(scan_retry_tracker, "RETRY_DIR", tmp_path / "scan_retries")
+    # freshness_check.py's own small state store (2026-08-11, the closed-
+    # posting recheck/two-observation fix) - same class of gap as every
+    # store above, isolated here so a test exercising
+    # check_and_mark_closed_postings() can't touch the real
+    # data/jobs/freshness_check_state.json.
+    monkeypatch.setattr(freshness_check, "_STATE_PATH", tmp_path / "freshness_check_state.json")
     return tmp_path

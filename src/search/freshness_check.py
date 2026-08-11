@@ -25,13 +25,41 @@ unrecognized site, or - per industry_boards.py's IChemE note - a WAF quietly
 blocking `requests` specifically). Only a confirmed False marks a job
 closed; None is treated as still-open (fail-safe against hiding a real
 posting on a flaky check) and simply left alone until tomorrow's run.
+
+TWO-OBSERVATION CONFIRMATION + PERIODIC RECHECK (added 2026-08-11, Mirror's
+audit findings #6/#7): a single False from check_posting_open() is exactly
+the kind of signal a transient blip (server hiccup, a maintenance window, a
+site returning 404 instead of 429 while rate-limiting) can produce
+indistinguishably from a real closure, and there's no in-request retry - so
+a lone False only STAGES a pending-closed flag (data/jobs/
+freshness_check_state.json, its own small lock-guarded store, kept separate
+from applications.json rather than bolting more fields onto
+upsert_application - see that function's docstring, it has no "leave status
+untouched" mode, every call sets status). It takes a second, separate
+day's run also reporting False before status actually becomes "closed by
+employer". A job already marked closed is no longer skipped forever either
+- it's re-verified every RECHECK_CLOSED_AFTER_DAYS (one extra request per
+already-closed job per that window - negligible added volume even against
+a large closed backlog, see CLAUDE.md's cost-blast-radius principle). If a
+recheck finds it genuinely open again (e.g. a Workday requisition or
+SmartRecruiters posting paused for a budget/headcount freeze and later
+republished under the SAME id - a real ATS state, not a hypothetical),
+status is restored to whatever it was before this automation ever touched
+it (captured at the moment the pending flag was first staged), or "under
+review" if there was none - there's no supported blank-status write path
+here either, and "under review" (PRD: "the app has no way to know a job
+was actually submitted") is the closest honest equivalent to "untouched".
 """
 
 import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import requests
 
 from search import company_sites, job_sources, job_store, usajobs
+from security.crypto_store import read_json, write_json
+from security.file_lock import locked
 from tailoring import applications
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
@@ -46,10 +74,18 @@ SCRAPE_CHECK_DELAY_SECONDS = 2.5
 MIN_FIT_SCORE = 70
 CLOSED_STATUS = "closed by employer"
 
-# Statuses that already reflect a real decision (Zahir's own, or a prior
-# freshness-check run) - never overwritten by this automation.
+RECHECK_CLOSED_AFTER_DAYS = 14
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_STATE_PATH = PROJECT_ROOT / "data" / "jobs" / "freshness_check_state.json"
+_STATE_LOCK_NAME = "freshness_check_state"
+
+# Statuses that already reflect a real decision Zahir made (never
+# overwritten by this automation). CLOSED_STATUS is deliberately NOT in
+# here - see the two-observation/recheck design above; a closed job is
+# handled by its own recheck-due gate in check_and_mark_closed_postings(),
+# not blanket-skipped like a genuine decision would be.
 _SKIP_STATUSES = {
-    CLOSED_STATUS,
     "not interested",
     "not-interested",
     "applied",
@@ -177,22 +213,103 @@ def check_posting_open(job: dict, api_sources: dict) -> bool | None:
     return _check_via_page_text(job)
 
 
-def check_and_mark_closed_postings(min_fit_score: int = MIN_FIT_SCORE) -> tuple[int, int]:
-    """Returns (checked, marked_closed). Iterates a fixed snapshot of the
-    >=min_fit_score jobs taken once at the start - not O(n^2), and immune to
-    the store growing mid-run since save_jobs() only appends."""
+def _load_state() -> list[dict]:
+    return read_json(_STATE_PATH, default=[])
+
+
+def _find_state_entry(state: list[dict], source: str, job_id: str) -> dict | None:
+    for entry in state:
+        if entry.get("source") == source and entry.get("job_id") == job_id:
+            return entry
+    return None
+
+
+def _stage_pending_closed(source: str, job_id: str, prior_status: str | None) -> None:
+    """First observed-closed for this posting - record it without touching
+    the real status yet (see module docstring)."""
+    with locked(_STATE_LOCK_NAME):
+        state = _load_state()
+        if _find_state_entry(state, source, job_id) is None:
+            state.append({
+                "source": source,
+                "job_id": job_id,
+                "pending_since": datetime.now(timezone.utc).isoformat(),
+                "prior_status": prior_status,
+                "closed_confirmed_at": None,
+            })
+            write_json(_STATE_PATH, state)
+        # else: a pending entry already exists (shouldn't normally happen -
+        # this only runs once/day and a pending entry always resolves the
+        # same run it's created - but leave the original prior_status/
+        # pending_since alone rather than overwrite them if it does).
+
+
+def _commit_closed(source: str, job_id: str) -> None:
+    """Marks the state entry closed-as-of-now - used both the first time a
+    posting is confirmed closed (second consecutive observation) and every
+    later recheck that still finds it closed (refreshes the recheck clock
+    without re-touching applications.json, since it's already the right
+    status)."""
+    with locked(_STATE_LOCK_NAME):
+        state = _load_state()
+        entry = _find_state_entry(state, source, job_id)
+        if entry is None:
+            entry = {"source": source, "job_id": job_id, "prior_status": None}
+            state.append(entry)
+        entry["pending_since"] = None
+        entry["closed_confirmed_at"] = datetime.now(timezone.utc).isoformat()
+        write_json(_STATE_PATH, state)
+
+
+def _clear_state(source: str, job_id: str) -> None:
+    with locked(_STATE_LOCK_NAME):
+        state = _load_state()
+        filtered = [e for e in state if not (e.get("source") == source and e.get("job_id") == job_id)]
+        if len(filtered) != len(state):
+            write_json(_STATE_PATH, filtered)
+
+
+def _due_for_recheck(closed_confirmed_at: str | None) -> bool:
+    """No/unparseable timestamp (e.g. a job closed by the pre-2026-08-11
+    version of this module, before recheck tracking existed) is treated as
+    due - fail toward rechecking a job we have no record of, not toward
+    leaving it permanently skipped, which is the exact bug being fixed."""
+    if not closed_confirmed_at:
+        return True
+    try:
+        closed_at = datetime.fromisoformat(closed_confirmed_at)
+    except ValueError:
+        return True
+    return datetime.now(timezone.utc) - closed_at >= timedelta(days=RECHECK_CLOSED_AFTER_DAYS)
+
+
+def check_and_mark_closed_postings(min_fit_score: int = MIN_FIT_SCORE) -> tuple[int, int, int, int]:
+    """Returns (checked, marked_closed, newly_pending, reopened). Iterates a
+    fixed snapshot of the >=min_fit_score jobs taken once at the start - not
+    O(n^2), and immune to the store growing mid-run since save_jobs() only
+    appends."""
     candidates = [j for j in job_store.load_jobs() if (j.get("fit_score") or 0) >= min_fit_score]
     api_sources = build_api_source_lookup()
+    state = _load_state()
 
     checked = 0
     marked = 0
+    newly_pending = 0
+    reopened = 0
     for job in candidates:
         source, job_id = job.get("source"), job.get("job_id")
         if not source or not job_id:
             continue
         current = applications.get_application(source, job_id)
-        if current and current.get("status") in _SKIP_STATUSES:
-            continue
+        current_status = (current or {}).get("status")
+        is_currently_closed = current_status == CLOSED_STATUS
+
+        if current_status in _SKIP_STATUSES:
+            continue  # a real decision Zahir made - never second-guess it
+
+        state_entry = _find_state_entry(state, source, job_id)
+        if is_currently_closed and not _due_for_recheck((state_entry or {}).get("closed_confirmed_at")):
+            continue  # already closed, not due for its periodic re-verify yet
 
         checked += 1
         is_api_source = source == "USAJOBS" or source in api_sources
@@ -203,7 +320,23 @@ def check_and_mark_closed_postings(min_fit_score: int = MIN_FIT_SCORE) -> tuple[
         time.sleep(API_CHECK_DELAY_SECONDS if is_api_source else SCRAPE_CHECK_DELAY_SECONDS)
 
         if is_open is False:
-            applications.upsert_application(source, job_id, status=CLOSED_STATUS)
-            marked += 1
+            if is_currently_closed:
+                _commit_closed(source, job_id)  # still closed on recheck - just refresh the clock
+            elif state_entry is not None and state_entry.get("pending_since"):
+                _commit_closed(source, job_id)  # second consecutive observation - commit for real
+                applications.upsert_application(source, job_id, status=CLOSED_STATUS)
+                marked += 1
+            else:
+                _stage_pending_closed(source, job_id, prior_status=current_status)
+                newly_pending += 1
+        elif is_open is True:
+            if is_currently_closed:
+                restore_status = (state_entry or {}).get("prior_status") or "under review"
+                applications.upsert_application(source, job_id, status=restore_status)
+                _clear_state(source, job_id)
+                reopened += 1
+            elif state_entry is not None:
+                _clear_state(source, job_id)  # false alarm - status was never actually changed
+        # is_open is None: ambiguous - leave everything exactly as-is (existing fail-safe)
 
-    return checked, marked
+    return checked, marked, newly_pending, reopened

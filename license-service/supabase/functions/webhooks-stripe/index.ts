@@ -61,7 +61,20 @@ Deno.serve(async (req) => {
           .select("id")
           .eq("stripe_customer_id", sub.customer as string)
           .maybeSingle();
-        if (!customer) break; // checkout.session.completed hasn't landed yet — a later retry/update will reconcile
+        if (!customer) {
+          // Stripe does not guarantee event ordering - checkout.session.completed
+          // (which sets stripe_customer_id) can arrive after this event, not just
+          // before. The old `break` here returned 200 regardless, which told
+          // Stripe delivery succeeded and it would never retry - if this really
+          // was an ordering race, the subscription sync was silently lost
+          // forever (found in adversarial review 2026-08-10). Throwing instead
+          // routes through the catch block below, which un-logs the idempotency
+          // row and returns a retryable 5xx, so Stripe's own retry schedule
+          // gives checkout.session.completed a chance to land first.
+          throw new Error(
+            `No customer found for stripe_customer_id=${sub.customer} - checkout.session.completed may not have landed yet`,
+          );
+        }
         await db.from("subscriptions").upsert(
           {
             customer_id: customer.id,
