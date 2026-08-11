@@ -613,6 +613,39 @@ def left_aligned_columns(df: pd.DataFrame, extra: dict | None = None) -> dict:
 OUTREACH_STATUSES = ["planned", "drafted", "sent", "responded", "no_response"]
 
 
+_DUPLICATE_OUTREACH_WINDOW_SECONDS = 10
+
+
+def _is_likely_duplicate_outreach_submit(existing: list[dict], contact_name: str, channel: str, notes: str | None) -> bool:
+    """PRD S16b, 2026-08-10: the "Log outreach" form had no dedup check and
+    (before this fix) didn't clear itself after a successful submit, so an
+    accidental double-click - or a confused re-click on a form that still
+    visibly showed the same filled-in values - created a second identical
+    outreach record. Only guards against a genuine accidental re-submit
+    (same contact/channel/notes, created within the last
+    _DUPLICATE_OUTREACH_WINDOW_SECONDS) - deliberately narrow so a real
+    follow-up outreach to the same contact days or weeks later is never
+    silently blocked, only the same-moment accident is."""
+    now = datetime.now(timezone.utc)
+    for o in existing:
+        if o["contact_name"].strip().lower() != contact_name.strip().lower():
+            continue
+        if o["channel"] != channel:
+            continue
+        if (o.get("notes") or "") != (notes or ""):
+            continue
+        created = o.get("created_at")
+        if not created:
+            continue
+        try:
+            age_seconds = (now - datetime.fromisoformat(created)).total_seconds()
+        except (ValueError, TypeError):
+            continue
+        if 0 <= age_seconds <= _DUPLICATE_OUTREACH_WINDOW_SECONDS:
+            return True
+    return False
+
+
 def render_outreach_section(key_prefix: str, target_account_name: str | None = None, job_source: str | None = None, job_id: str | None = None) -> None:
     """Shared outreach UI (PRD §16b) - called from both the target-account
     detail panel and a job's detail panel, since outreach anchors to
@@ -670,19 +703,35 @@ def render_outreach_section(key_prefix: str, target_account_name: str | None = N
     # found live while testing this exact fix, 2026-08-08).
     log_outreach_key = f"{key_prefix}_log_outreach_expander"
     with st.expander("Log new outreach", expanded=st.session_state.get(log_outreach_key, False), key=log_outreach_key, on_change="rerun"):
-        oc_name = st.text_input("Contact name", key=f"{key_prefix}_new_contact_name")
-        oc_title = st.text_input("Contact title (optional)", key=f"{key_prefix}_new_contact_title")
-        oc_channel = st.selectbox("Channel", ["email", "linkedin", "phone", "in_person"], key=f"{key_prefix}_new_channel")
-        oc_email = st.text_input("Contact email (optional, needed to request a drafted email)", key=f"{key_prefix}_new_email") if oc_channel == "email" else None
-        oc_notes = st.text_area("Notes (optional)", key=f"{key_prefix}_new_notes")
+        # Real gap found 2026-08-10 (Zahir's adversarial self-audit): this
+        # form had no dedup check and didn't clear after a successful
+        # submit - the same filled-in values just sat there, inviting an
+        # accidental double-click/re-click to create a duplicate record.
+        # Streamlit forbids writing to a widget's session_state key after
+        # it's already been instantiated this run, so the fields can't
+        # just be reset in place - instead every field key carries a
+        # "generation" suffix that bumps on successful submit, which makes
+        # Streamlit instantiate genuinely NEW (empty) widgets next render,
+        # same pattern Streamlit's own docs recommend for clearing a form.
+        form_gen_key = f"{key_prefix}_log_outreach_gen"
+        gen = st.session_state.get(form_gen_key, 0)
+        oc_name = st.text_input("Contact name", key=f"{key_prefix}_new_contact_name_{gen}")
+        oc_title = st.text_input("Contact title (optional)", key=f"{key_prefix}_new_contact_title_{gen}")
+        oc_channel = st.selectbox("Channel", ["email", "linkedin", "phone", "in_person"], key=f"{key_prefix}_new_channel_{gen}")
+        oc_email = st.text_input("Contact email (optional, needed to request a drafted email)", key=f"{key_prefix}_new_email_{gen}") if oc_channel == "email" else None
+        oc_notes = st.text_area("Notes (optional)", key=f"{key_prefix}_new_notes_{gen}")
         if st.button("Log outreach", key=f"{key_prefix}_new_save"):
             if oc_name:
-                add_outreach(
-                    oc_name, oc_channel, job_source=job_source, job_id=job_id,
-                    target_account_name=target_account_name, contact_title=oc_title or None,
-                    contact_email=oc_email or None, notes=oc_notes or None,
-                )
-                st.toast("Logged.", icon=":material/check_circle:")
+                if _is_likely_duplicate_outreach_submit(existing, oc_name, oc_channel, oc_notes):
+                    st.toast("Already logged just now - not creating a duplicate.", icon=":material/info:")
+                else:
+                    add_outreach(
+                        oc_name, oc_channel, job_source=job_source, job_id=job_id,
+                        target_account_name=target_account_name, contact_title=oc_title or None,
+                        contact_email=oc_email or None, notes=oc_notes or None,
+                    )
+                    st.toast("Logged.", icon=":material/check_circle:")
+                st.session_state[form_gen_key] = gen + 1
                 st.rerun()
             else:
                 st.warning("Contact name is required.")

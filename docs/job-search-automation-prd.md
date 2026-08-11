@@ -687,6 +687,27 @@ port-8501 server before assuming the code is broken** - the fix is
 restarting that process (e.g. Zahir relaunching via the desktop shortcut),
 not editing already-correct code.
 
+**Hardened 2026-08-10 (Zahir's adversarial self-audit request, #21):**
+the "Log new outreach" form had no dedup check and didn't clear itself
+after a successful submit - the same filled-in values just sat there, so
+an accidental double-click, or a confused re-click on a form that still
+visibly showed the same values, created a duplicate outreach record.
+Zero real outreach records existed at the time this was found, but a real
+risk once Zahir starts logging real outreach. Fixed two ways: (1) every
+form field key now carries a "generation" suffix that bumps on a
+successful submit, forcing Streamlit to instantiate fresh, empty widgets
+next render (can't clear a widget's own session_state key in place after
+it's already been instantiated the same run - this sidesteps that
+restriction entirely); (2) `_is_likely_duplicate_outreach_submit()`
+skips creating a second record only when the same contact/channel/notes
+was logged within the last 10 seconds - deliberately narrow, so a genuine
+follow-up to the same contact next week is never silently blocked, only
+the same-moment accident is. Tested via `streamlit.testing.v1.AppTest`
+driving the real form end to end: a normal submit creates one record and
+visibly clears the field; an immediate resubmit of the same values
+creates nothing extra; a genuinely different contact submitted right
+after still creates its own record (the guard doesn't overreach).
+
 ### 16c. KPI Layer + Rejection-Pattern Diagnosis (Outcome stage)
 
 Both read existing data — no new store beyond §16a/§16b's additions.
