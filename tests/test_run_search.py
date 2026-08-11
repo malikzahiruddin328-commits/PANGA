@@ -203,6 +203,20 @@ def test_search_company_sites_does_not_crash_on_a_malformed_entry(isolated_run_s
     assert list(data.keys()) == ["Eisai"]  # Broken Co never reached the stats dict either
 
 
+def test_search_company_sites_does_not_crash_on_syntactically_invalid_yaml(isolated_run_search, monkeypatch):
+    # Real bug found 2026-08-11 (Mirror/Documentor, live-reproducible even
+    # with the 2026-08-10 malformed-entry fix in place): a syntax-broken
+    # config/job_sources.yaml (stray tab, unterminated bracket) crashed
+    # yaml.safe_load() itself inside load_job_sources() - before any
+    # per-entry filtering ever got a chance to run - taking down the whole
+    # daily search run past this point, not just company-site search.
+    job_sources.JOB_SOURCES_PATH.write_text(
+        "workday:\n  - company_name: Acme\n\ttenant: acme\n  bad: [unterminated\n", encoding="utf-8",
+    )
+    added = run_search.search_company_sites([{"name": "CIO"}])  # must not raise
+    assert added == 0  # nothing configured (file treated as empty), not a crash
+
+
 def test_search_ats_boards_records_greenhouse_and_lever_companies_independently(isolated_run_search, monkeypatch):
     job_sources.save_job_sources({
         "workday": [], "smartrecruiters": [],

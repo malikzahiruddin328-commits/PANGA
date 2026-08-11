@@ -29,6 +29,16 @@ JOB_SOURCES_PATH = PROJECT_ROOT / "config" / "job_sources.yaml"
 
 PLATFORMS = ["workday", "smartrecruiters", "greenhouse", "lever"]
 
+# Numeric fields every fetch function passes straight into a request
+# param/body or a list slice (company_sites.py's search_workday_jobs()
+# `limit`, search_greenhouse_jobs()/search_lever_jobs()'s `postings[:limit]`
+# etc.) - a non-numeric value here doesn't fail the presence check below
+# (it's non-empty) but still crashes downstream the moment that company is
+# actually searched, e.g. `list[:"15"]` raises TypeError. bool is
+# deliberately excluded even though it's technically an int subclass in
+# Python - "wd_number: true" is a YAML typo, not a real number.
+_NUMERIC_FIELDS = {"wd_number", "limit"}
+
 # Fields every caller indexes directly (company["company_name"], etc. -
 # see scripts/run_search.py, freshness_check.py's build_api_source_lookup(),
 # ui/app.py's "Manage companies" table population) with no .get() fallback
@@ -42,28 +52,59 @@ _REQUIRED_FIELDS = {
 }
 
 
+def _log(message: str) -> None:
+    # Same print(..., flush=True) convention as run_search.py's/
+    # dedupe_boards_jobs.py's own _log() - this module is imported by both
+    # the scheduled script (whose stdout gets captured/reported) and the
+    # Streamlit app (whose stdout lands in its own console) - either way,
+    # a dropped row should never be silent. Real gap found 2026-08-11
+    # (Mirror/Documentor): the filtering this module already does was
+    # completely unlogged - a dropped row vanished with no trace anywhere,
+    # which is exactly the "silently drop" pattern CLAUDE.md's job-alert-
+    # scan section says to avoid.
+    print(f"[job_sources] {message}", flush=True)
+
+
 def _empty() -> dict:
     return {platform: [] for platform in PLATFORMS}
 
 
-def _is_valid_entry(platform: str, entry) -> bool:
-    """True only if `entry` is a dict with every field its platform's
-    consumers index directly, non-empty. Real bug found 2026-08-10
-    (Mirror's audit): every caller of load_job_sources() does
-    company["company_name"] etc. with no .get() fallback - one malformed
-    row (a hand-edited YAML typo, or a Settings-tab save that slipped past
-    validation before this fix) raised a bare KeyError/TypeError with no
-    surrounding try/except anywhere in the call chain, crashing the whole
-    scheduled search run past whichever step hit it - not just skipping
-    that one company. Filtering here is the backstop that protects every
-    caller at once, since they all funnel through this one function."""
+def _entry_problem(platform: str, entry) -> str | None:
+    """Returns a human-readable reason `entry` is invalid, or None if it's
+    fine. Real bug found 2026-08-10 (Mirror's audit): every caller of
+    load_job_sources() does company["company_name"] etc. with no .get()
+    fallback - one malformed row (a hand-edited YAML typo, or a Settings-
+    tab save that slipped past validation before this fix) raised a bare
+    KeyError/TypeError with no surrounding try/except anywhere in the call
+    chain, crashing the whole scheduled search run past whichever step hit
+    it - not just skipping that one company. Filtering here is the
+    backstop that protects every caller at once, since they all funnel
+    through this one function.
+
+    Widened 2026-08-11 (Mirror/Documentor, live bug still reproducible
+    even with the above fix in place): this only ever checked field
+    *presence*, not *type* - a row with every required field non-empty but
+    a non-numeric wd_number/limit (e.g. a hand-quoted "15" or a typo)
+    passed this check fine, then crashed for real the moment that specific
+    company was actually searched (`postings[:limit]` raises TypeError on
+    a non-int limit) - later and further from the cause than this
+    function, but still a whole-run crash, just deferred rather than
+    prevented."""
     if not isinstance(entry, dict):
-        return False
+        return "not a dict"
     for field in _REQUIRED_FIELDS[platform]:
         value = entry.get(field)
         if value is None or value == "":
-            return False
-    return True
+            return f"missing/empty required field {field!r}"
+    for field in _NUMERIC_FIELDS & _REQUIRED_FIELDS[platform]:
+        value = entry[field]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return f"field {field!r} must be a number, got {value!r}"
+    return None
+
+
+def _is_valid_entry(platform: str, entry) -> bool:
+    return _entry_problem(platform, entry) is None
 
 
 def load_job_sources() -> dict:
@@ -94,19 +135,48 @@ def load_job_sources() -> dict:
         if not JOB_SOURCES_PATH.exists():
             return _empty()
         with open(JOB_SOURCES_PATH, encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
+            try:
+                data = yaml.safe_load(f) or {}
+            except yaml.YAMLError as exc:
+                # Real, currently-reproducible crash (2026-08-11,
+                # Mirror/Documentor): a syntactically broken YAML file
+                # (bad indentation, a stray tab, an unterminated bracket)
+                # raised straight out of this function with no handling
+                # anywhere in the call chain - unlike the row-level
+                # filtering below, a parse failure happens before any
+                # single row can even be inspected, so it took down every
+                # company on every platform at once, not just one. Fail
+                # open to "no sources configured" (same as a missing file)
+                # rather than crash the whole scheduled run over a file
+                # that's still recoverable by re-saving from Settings.
+                _log(f"config/job_sources.yaml is not valid YAML - treating as empty: {exc}")
+                return _empty()
+    if not isinstance(data, dict):
+        # Real, currently-reproducible crash: a structurally wrong file
+        # (e.g. a bare YAML list at the top level instead of a mapping)
+        # parses without error, but every platform lookup below assumes
+        # `data` is a dict and calling .get() on anything else raises
+        # AttributeError - same whole-run blast radius as the syntax-error
+        # case above, just one step later.
+        _log(f"config/job_sources.yaml's top level is a {type(data).__name__}, not a mapping - treating as empty")
+        return _empty()
     result = _empty()
     seen_names = set()
     for platform in PLATFORMS:
         raw_entries = data.get(platform) or []
         if not isinstance(raw_entries, list):
+            _log(f"{platform!r} value is a {type(raw_entries).__name__}, not a list - skipping this platform")
             continue
         valid_entries = []
         for entry in raw_entries:
-            if not _is_valid_entry(platform, entry):
+            problem = _entry_problem(platform, entry)
+            if problem is not None:
+                label = entry.get("company_name") if isinstance(entry, dict) else entry
+                _log(f"dropped a {platform!r} entry ({label!r}): {problem}")
                 continue
             name = entry["company_name"]
             if name in seen_names:
+                _log(f"dropped a {platform!r} entry: company_name {name!r} is already used by another entry")
                 continue
             seen_names.add(name)
             valid_entries.append(entry)
