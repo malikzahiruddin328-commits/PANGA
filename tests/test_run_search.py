@@ -88,6 +88,34 @@ def test_search_company_sites_records_error_only_if_every_role_failed(isolated_r
     assert data["Eisai"][0]["had_error"] is False
 
 
+def test_search_company_sites_does_not_crash_on_a_malformed_entry(isolated_run_search, monkeypatch):
+    # Real bug found 2026-08-10 (Mirror's audit): a company entry missing a
+    # required field used to raise a bare KeyError with no surrounding
+    # try/except anywhere in this call chain, crashing the whole daily
+    # search run past this point, not just skipping the one bad company.
+    # job_sources.load_job_sources() now filters malformed entries out
+    # before this function (or anything else) ever sees them - this proves
+    # the fix end to end, not just at the load_job_sources() unit level.
+    job_sources.save_job_sources({
+        "workday": [
+            {"company_name": "Eisai", "tenant": "eisai", "site": "eisai", "wd_number": 5, "limit": 15},
+            {"company_name": "Broken Co", "tenant": "broken"},  # missing site/wd_number/limit
+        ],
+        "smartrecruiters": [], "greenhouse": [], "lever": [],
+    })
+    monkeypatch.setattr(
+        company_sites, "search_workday_jobs",
+        lambda company_name, tenant, site, wd_number, keyword, limit, applied_facets=None: [
+            {"source": company_name, "job_id": f"/job/{keyword}", "title": "Director"},
+        ],
+    )
+    added = run_search.search_company_sites([{"name": "CIO"}])  # must not raise
+    assert added == 1  # only Eisai searched - Broken Co silently dropped, not crashed on
+
+    data = source_activity._load()
+    assert list(data.keys()) == ["Eisai"]  # Broken Co never reached the stats dict either
+
+
 def test_search_ats_boards_records_greenhouse_and_lever_companies_independently(isolated_run_search, monkeypatch):
     job_sources.save_job_sources({
         "workday": [], "smartrecruiters": [],
