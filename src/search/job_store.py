@@ -203,6 +203,42 @@ def flag_employer_attribution_uncertain(source: str, job_id: str, likely_organiz
         write_json(JOBS_PATH, jobs)
 
 
+def flag_freshness_check_downgraded(targets: list[tuple[str, str]], reason: str) -> int:
+    """Marks freshness_check_downgraded=True + freshness_check_downgrade_reason
+    on every (source, job_id) pair in `targets` - one locked read-modify-
+    write for the whole batch, not one per job (avoid an O(n) full-file
+    rewrite per flag on what can be a multi-job batch - see CLAUDE.md's
+    performance check). Returns how many were actually found and flagged
+    (targets naming a job that's since been removed/never existed are
+    silently skipped, not an error).
+
+    Used when a company is removed from job_sources.yaml (2026-08-10,
+    Zahir's explicit product call on a real gap found in Mirror's audit):
+    the company's own postings lose their fast/reliable platform-API
+    freshness check the moment it leaves the config (see
+    freshness_check.py's build_api_source_lookup()) and fall back to a
+    generic page-fetch check - that already happened implicitly with no
+    visible signal to Zahir. This makes it explicit and visible (a Results
+    tab caution, same pattern as flag_employer_attribution_uncertain()
+    above) for exactly the affected set - see
+    ranking.prioritize.find_freshness_downgrade_targets() for how that set
+    is computed (the company's postings AND their known cross-source
+    duplicates, not a blanket downgrade of everything associated with the
+    company)."""
+    with locked("jobs"):
+        jobs = load_jobs()
+        target_set = set(targets)
+        flagged = 0
+        for job in jobs:
+            key = (job.get("source"), job.get("job_id"))
+            if key in target_set:
+                job["freshness_check_downgraded"] = True
+                job["freshness_check_downgrade_reason"] = reason
+                flagged += 1
+        write_json(JOBS_PATH, jobs)
+    return flagged
+
+
 def update_job_score(source: str, job_id: str, fit_score: int, fit_rationale: str) -> None:
     """fit_score is 0-100: how well this job matches the master profile,
     per PRD §3 "Fit + Tailoring". Computed by Claude reasoning over the job

@@ -73,12 +73,12 @@ import tomllib
 import yaml
 
 from search.usajobs import search_jobs, USAJobsNotConfigured
-from search.job_store import load_jobs
+from search.job_store import load_jobs, flag_freshness_check_downgraded
 from search.job_sources import load_job_sources, save_job_sources
 from search.job_alert_senders import load_job_alert_senders, save_job_alert_senders
 from search.aggregators import ADZUNA_COUNTRIES, is_configured as adzuna_is_configured
 from search.source_activity import all_tracked_sources, is_source_stale
-from ranking.prioritize import weight_for, dedupe_across_sources
+from ranking.prioritize import weight_for, dedupe_across_sources, find_freshness_downgrade_targets
 from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion, set_strategy_tag, needs_edit_review, record_document_edit_review, get_applications_with_open_clarifying_questions
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
 from tailoring.interview_prep import load_interview_prep, get_interview_prep, record_round_outcome, build_prep_context, generate_prep, start_round, save_round
@@ -2313,7 +2313,41 @@ if active_tab == "settings":
                 except Exception as exc:
                     st.error(f"Failed to save job-board sources: {exc}")
                 else:
-                    st.toast("Saved job-board sources.", icon=":material/check_circle:")
+                    # Explicit freshness-check downgrade for any company
+                    # just removed (2026-08-10, Zahir's product call on a
+                    # real gap found in Mirror's audit): a removed
+                    # company's postings silently lose their fast/reliable
+                    # platform-API freshness check the moment they leave
+                    # this config - that already happened with no visible
+                    # signal, this makes it explicit and scoped precisely
+                    # to the postings actually affected (the company's own
+                    # + known cross-source duplicates), not a blanket
+                    # downgrade of anything else associated with it. Old
+                    # names come from job_sources_data (loaded before this
+                    # rerun's edits); new names from what was just saved.
+                    old_names = {c["company_name"] for c in (
+                        job_sources_data["workday"] + job_sources_data["smartrecruiters"]
+                        + job_sources_data["greenhouse"] + job_sources_data["lever"]
+                    )}
+                    new_names = {c["company_name"] for c in (new_workday + new_smartrecruiters + new_greenhouse + new_lever)}
+                    removed_names = old_names - new_names
+                    downgraded_count = 0
+                    if removed_names:
+                        all_jobs = load_jobs()
+                        for removed_name in removed_names:
+                            targets = find_freshness_downgrade_targets(all_jobs, removed_name)
+                            if targets:
+                                downgraded_count += flag_freshness_check_downgraded(
+                                    targets, reason=f"\"{removed_name}\" was removed from job-board sources",
+                                )
+                    if downgraded_count:
+                        st.toast(
+                            f"Saved job-board sources. Flagged {downgraded_count} existing job(s) for lower "
+                            "freshness-check confidence, since their source was just removed.",
+                            icon=":material/check_circle:",
+                        )
+                    else:
+                        st.toast("Saved job-board sources.", icon=":material/check_circle:")
                     st.rerun()
 
     st.subheader("Job-alert email senders")
@@ -3354,12 +3388,15 @@ elif active_tab == "results":
                 organization_cell = job.get("organization")
                 if job.get("employer_attribution_uncertain") and organization_cell:
                     organization_cell = f"⚠️ {organization_cell}"
+                status_cell = application_status(job) or "-"
+                if job.get("freshness_check_downgraded"):
+                    status_cell = f"ℹ️ {status_cell}"
                 table_rows.append({
                     "Role": job.get("title"),
                     "Organization": organization_cell,
                     "Pay": pay,
                     "Score": job.get("fit_score"),
-                    "Status": application_status(job) or "-",
+                    "Status": status_cell,
                     "JD": "✓" if _job_has_captured_jd_text(job) else "–",
                     "Posting": job.get("posting_url"),
                     "Pass": "Pass",  # ButtonColumn's label comes from the cell value itself - same word every row on purpose
@@ -3481,6 +3518,15 @@ elif active_tab == "results":
                     likely = job.get("likely_organization")
                     note = f"the posting text suggests **{likely}**" if likely else "the posting text suggests a different employer"
                     st.warning(f"⚠️ Employer name may be wrong - {note}, not \"{job.get('organization')}\" as listed. Worth checking the original posting before applying.")
+                if job.get("freshness_check_downgraded"):
+                    # 2026-08-10, Zahir's product call: when a company is
+                    # removed from job-board sources, its postings (and
+                    # known cross-source duplicates) lose the fast/
+                    # reliable platform-API freshness check and fall back
+                    # to a generic page-fetch check - flagged explicitly
+                    # rather than left as a silent, invisible change (see
+                    # job_store.flag_freshness_check_downgraded()).
+                    st.info(f"ℹ️ Freshness-check confidence lowered - {job.get('freshness_check_downgrade_reason') or 'its source is no longer actively tracked'}. Its open/closed status here may be less reliable than usual.")
                 if "fit_score" in job:
                     st_markdown_raw_text(job.get("fit_rationale") or "")
                 else:
