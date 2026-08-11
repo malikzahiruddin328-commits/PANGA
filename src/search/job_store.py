@@ -120,7 +120,10 @@ def update_job_address(source: str, job_id: str, address: str) -> None:
         write_json(JOBS_PATH, jobs)
 
 
-def update_job_ats_keywords(source: str, job_id: str, required_keywords: list[str], preferred_keywords: list[str]) -> None:
+def update_job_ats_keywords(
+    source: str, job_id: str, required_keywords: list[str], preferred_keywords: list[str],
+    extractor_version: int | None = None,
+) -> None:
     """Caches the AI-extracted required/preferred ATS keyword list for this
     job (tailoring/drafting.py's _extract_ats_keywords - one real-NLP-
     judgment call over the posting's own text) so the same posting always
@@ -130,13 +133,23 @@ def update_job_ats_keywords(source: str, job_id: str, required_keywords: list[st
     a valid cached value meaning "extracted, genuinely no such keywords" -
     tailoring/drafting.py only calls this on a successful extraction, never
     on a failed/unconfigured API call, so a transient failure doesn't
-    permanently freeze a job at "no keywords found"."""
+    permanently freeze a job at "no keywords found".
+
+    extractor_version (2026-08-10) - tailoring.drafting.ATS_KEYWORDS_
+    EXTRACTOR_VERSION at the time of this extraction, stamped alongside the
+    keywords so a later caller can tell "extracted, but under an older,
+    possibly-corrected extraction/cleanup pipeline" apart from "extracted
+    under the current one" (see tailoring.drafting.is_ats_keywords_stale) -
+    optional/None stays backward-compatible with any caller that doesn't
+    supply one, rather than forcing every call site to know about this."""
     with locked("jobs"):
         jobs = load_jobs()
         for job in jobs:
             if job.get("source") == source and job.get("job_id") == job_id:
                 job["ats_required_keywords"] = required_keywords
                 job["ats_preferred_keywords"] = preferred_keywords
+                if extractor_version is not None:
+                    job["ats_keywords_extractor_version"] = extractor_version
                 break
         write_json(JOBS_PATH, jobs)
 

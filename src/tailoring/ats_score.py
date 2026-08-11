@@ -229,8 +229,24 @@ _KEYWORD_EQUIVALENCE_GROUPS = [
     {
         "master's degree", "masters degree", "master degree", "graduate degree",
         "master of science", "master of arts", "master of business administration",
-        "msc", "m.sc", "m.sc.", "ma", "m.a", "m.a.", "ms", "m.s", "m.s.",
+        "msc", "m.sc", "m.sc.",
         "mba", "m.b.a", "m.b.a.",
+        # Deliberately NOT "ma"/"m.a"/"ms"/"m.s" (2026-08-10, real gap found
+        # live: Zahir's own profile has "Burlington, MA"/"Waltham, MA" as
+        # real US-state location text, and "MS Copilot"/"MS Office" as real
+        # tool mentions - both realistically appear CAPITALIZED in ordinary
+        # resume prose, unlike "it", so the same case-sensitive-acronym
+        # backstop that fixed the "IT" bug (2026-08-07) doesn't protect
+        # here; a real "Burlington, MA" or "MS Copilot" line silently
+        # satisfied an unmet "Master's degree"/"MBA" requirement with no
+        # gap question ever surfacing. "msc"/"m.sc" are kept - three-letter/
+        # punctuated forms don't collide with a common two-letter US-state
+        # or product-name abbreviation the same way. A candidate whose
+        # resume states only a bare "MA"/"MS" (never "Master of Arts/
+        # Science" or "Master's degree") no longer gets automatic credit -
+        # accepted tradeoff, the same direction CLAUDE.md's own doctrine
+        # prefers (a missed match a human can correct beats a silent false
+        # match nobody ever sees).
     },
     {"doctorate", "doctoral degree", "phd", "ph.d", "ph.d."},
     {"information technology", "it"},
@@ -257,7 +273,7 @@ for _group in _KEYWORD_EQUIVALENCE_GROUPS:
 # uppercase there, the way a real acronym would. Multi-word aliases
 # ("information technology", "bachelor's degree") stay case-insensitive -
 # they're unambiguous, no common English phrase collides with them.
-_CASE_SENSITIVE_ALIASES = {"it", "cs", "bsc", "ba", "bs", "ms", "ma", "mba", "phd"}
+_CASE_SENSITIVE_ALIASES = {"it", "cs", "bsc", "ba", "bs", "mba", "phd"}
 
 
 def _literal_phrase_in_text(phrase: str, text_lower: str, text_original: str) -> bool:
@@ -296,15 +312,49 @@ def _phrase_in_text(phrase: str, text_lower: str, text_original: str) -> bool:
 # plain string (unchanged behavior) or {"any_of": [alt1, alt2, ...]} - a
 # single satisfiable group, matched if ANY alternative matches.
 def _normalize_keyword_item(item) -> dict:
-    if isinstance(item, dict) and item.get("any_of"):
-        members = [str(m) for m in item["any_of"]]
-        return {"label": " OR ".join(members), "members": members, "is_group": True}
-    return {"label": str(item), "members": [str(item)], "is_group": False}
+    if isinstance(item, dict) and "any_of" in item:
+        raw_members = item.get("any_of")
+        if not isinstance(raw_members, list):
+            # Malformed shape (2026-08-10, real gap found): a non-list
+            # any_of value used to be iterated character-by-character
+            # (Python iterates a bare string one letter at a time), turning
+            # e.g. {"any_of": "Bachelor's degree"} into a 17-member group of
+            # single letters that trivially matched almost any resume text -
+            # a required item silently reading as satisfied when it may not
+            # have been at all. The live schema-validated extraction call
+            # can't produce this (any_of is typed as a JSON array there) -
+            # this only guards a stale cached job record or a manual data
+            # edit that predates that enforcement. Treated as invalid,
+            # excluded from scoring entirely (see the is_invalid filter in
+            # score_resume_against_keywords) rather than guessing whether
+            # "satisfied" or "missing" is the safer direction to fabricate.
+            return {"label": None, "members": [], "is_group": True, "is_invalid": True}
+        # Real gap found the same pass: item.get("any_of") used to be
+        # checked for TRUTHINESS, not presence - a schema-valid (no
+        # minItems declared) but empty {"any_of": []} is falsy, so this
+        # silently fell through to the plain-string branch below and
+        # rendered as the literal Python repr "{'any_of': []}" in
+        # missing_required_keywords, visible to Zahir as if it were a real
+        # skill to confirm. An any_of group with zero named alternatives
+        # has nothing to fail against, so it's vacuously satisfied instead
+        # (see the empty-members short-circuit in _match_keyword_item).
+        members = [str(m) for m in raw_members]
+        label = " OR ".join(members) if members else "(any_of group with no alternatives - vacuously satisfied)"
+        return {"label": label, "members": members, "is_group": True, "is_invalid": False}
+    return {"label": str(item), "members": [str(item)], "is_group": False, "is_invalid": False}
+
+
+_VACUOUS_GROUP_MATCH = "(no alternatives specified)"
 
 
 def _match_keyword_item(item: dict, text_lower: str, text_original: str) -> str | None:
     """Returns the specific member that satisfied this item (itself, for a
-    plain string), or None if nothing in it matched."""
+    plain string), or None if nothing in it matched. An any_of group with
+    zero real members (see _normalize_keyword_item) has nothing to fail
+    against - vacuously satisfied rather than treated as an unmet
+    requirement."""
+    if item["is_group"] and not item["members"]:
+        return _VACUOUS_GROUP_MATCH
     for member in item["members"]:
         if _phrase_in_text(member.lower(), text_lower, text_original):
             return member
@@ -423,6 +473,35 @@ def plateau_note_for_gaps(missing_required: list[dict], matched_group_explanatio
     return " ".join(parts)
 
 
+def _dedupe_flat_items(items) -> list[dict]:
+    """Collapses exact-duplicate FLAT keywords within one tier (2026-08-10,
+    real gap found: an accidental duplicate extraction of the same plain
+    keyword - not the documented legitimate case below - quietly dilutes
+    point_value for every OTHER missing keyword, since each copy counts
+    independently toward total_required/total_preferred; quantified on a
+    synthetic 5-keyword set, an accidental duplicate inflated the score
+    from 66 to 69 and understated a real gap's point_value from 15.0 to
+    12.5). Deliberately does NOT touch any_of GROUPS, and does NOT dedupe a
+    flat keyword against a same-named any_of GROUP MEMBER - the resume-
+    drafting prompt has an explicit, legitimate rule for a term needing
+    extraction in both roles at once (e.g. "Supply Chain Management" as
+    both an acceptable degree field AND its own substantive-experience
+    requirement) - those are two genuinely different requirements sharing
+    a label, not a duplicate of the same one, and only two IDENTICAL flat
+    strings can never represent two distinct requirements the way a
+    flat-vs-group-member pair legitimately can."""
+    seen = set()
+    deduped = []
+    for item in items:
+        if not item["is_group"]:
+            key = normalize_skill_label(item["label"])
+            if key in seen:
+                continue
+            seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
 def score_resume_against_keywords(
     required_keywords: list, preferred_keywords: list, resume_text: str,
     candidate_years_experience: float | None = None,
@@ -491,8 +570,13 @@ def score_resume_against_keywords(
     motivating case: Upstream Bio's "advanced degree preferred" (6.2 pts)
     - Zahir has 25+ years of experience, no advanced degree, and the JD
     states no equivalency of its own."""
-    required_items = [_normalize_keyword_item(k) for k in required_keywords]
-    preferred_items = [_normalize_keyword_item(k) for k in preferred_keywords]
+    # Malformed items (see _normalize_keyword_item - a non-list any_of,
+    # reachable only via a stale cached job record, never the live
+    # schema-validated extraction call) are excluded entirely rather than
+    # scored as satisfied or missing - there's no safe way to guess which
+    # direction a genuinely invalid entry "should" count.
+    required_items = _dedupe_flat_items(i for i in (_normalize_keyword_item(k) for k in required_keywords) if not i["is_invalid"])
+    preferred_items = _dedupe_flat_items(i for i in (_normalize_keyword_item(k) for k in preferred_keywords) if not i["is_invalid"])
     resume_lower = resume_text.lower()
 
     required_matches = [_match_keyword_item(item, resume_lower, resume_text) for item in required_items]

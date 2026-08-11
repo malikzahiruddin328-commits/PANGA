@@ -99,6 +99,23 @@ def test_update_job_ats_keywords_caches_empty_lists_as_a_real_value(isolated_dat
     assert job["ats_preferred_keywords"] == []
 
 
+def test_update_job_ats_keywords_stamps_extractor_version_when_given(isolated_data):
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}])
+    job_store.update_job_ats_keywords("Dice", "1", ["python"], [], extractor_version=3)
+    job = job_store.load_jobs()[0]
+    assert job["ats_keywords_extractor_version"] == 3
+
+
+def test_update_job_ats_keywords_extractor_version_stays_backward_compatible(isolated_data):
+    # A caller that doesn't know about extractor_version (existing tests
+    # above, any future caller) must not be forced to supply one or have
+    # it default to something misleading.
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}])
+    job_store.update_job_ats_keywords("Dice", "1", ["python"], [])
+    job = job_store.load_jobs()[0]
+    assert "ats_keywords_extractor_version" not in job
+
+
 def test_update_job_description_sets_description(isolated_data):
     job_store.save_jobs([{"source": "Eisai", "job_id": "1", "title": "Director"}])
     job_store.update_job_description("Eisai", "1", "Real JD text.")

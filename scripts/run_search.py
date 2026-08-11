@@ -389,8 +389,9 @@ def run() -> None:
     notify(strong_matches, len(unreviewed))
 
     _log("STEP 8 - Freshness check")
-    checked, marked = freshness_check.check_and_mark_closed_postings()
-    _log(f"  checked {checked} job(s), marked {marked} closed")
+    checked, marked, newly_pending, reopened = freshness_check.check_and_mark_closed_postings()
+    _log(f"  checked {checked} job(s), marked {marked} closed, {newly_pending} newly pending "
+         f"(needs a second day's confirmation), {reopened} reopened")
 
     _log("Done.")
 

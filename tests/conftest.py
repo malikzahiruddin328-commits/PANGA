@@ -75,6 +75,7 @@ def isolated_data(tmp_path, monkeypatch):
     import linkedin.storage as linkedin_storage
     import prospector.prospector_score as prospector_score
     import scan_retry_tracker
+    import search.freshness_check as freshness_check
 
     monkeypatch.setattr(job_store, "JOBS_PATH", tmp_path / "jobs.json")
     monkeypatch.setattr(applications, "APPLICATIONS_PATH", tmp_path / "applications.json")
@@ -130,4 +131,10 @@ def isolated_data(tmp_path, monkeypatch):
     # fix) writes one JSON file per scan name under this directory -
     # isolated for the same reason as every store above.
     monkeypatch.setattr(scan_retry_tracker, "RETRY_DIR", tmp_path / "scan_retries")
+    # freshness_check.py's own small state store (2026-08-11, the closed-
+    # posting recheck/two-observation fix) - same class of gap as every
+    # store above, isolated here so a test exercising
+    # check_and_mark_closed_postings() can't touch the real
+    # data/jobs/freshness_check_state.json.
+    monkeypatch.setattr(freshness_check, "_STATE_PATH", tmp_path / "freshness_check_state.json")
     return tmp_path
