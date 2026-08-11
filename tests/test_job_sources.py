@@ -107,6 +107,27 @@ def test_load_drops_duplicate_company_name_within_one_platform(isolated_job_sour
     assert result["workday"][0]["tenant"] == "eisai"  # first occurrence kept
 
 
+def test_load_logs_a_dropped_duplicate_company_name_instead_of_silently_dropping_it(isolated_job_sources, capsys):
+    # Real gap found 2026-08-10 (backlog-log.md): two entries sharing a
+    # company_name used to silently collapse activity-tracking stats onto
+    # whichever was processed last, with the other's real config/tracked
+    # activity lost and no signal anywhere that it happened. The dedup
+    # itself (keep-first-occurrence) already existed - what was missing is
+    # this: the drop needs to be visible, not silent, same "never silently
+    # drop, always log" discipline as every other filtering path in this
+    # module.
+    job_sources.save_job_sources({
+        "workday": [
+            {"company_name": "Eisai", "tenant": "eisai", "site": "eisai", "wd_number": 5, "limit": 15},
+            {"company_name": "Eisai", "tenant": "eisai-uk", "site": "eisai-uk", "wd_number": 2, "limit": 15},
+        ],
+        "smartrecruiters": [], "greenhouse": [], "lever": [],
+    })
+    job_sources.load_job_sources()
+    out = capsys.readouterr().out
+    assert "Eisai" in out and "already used" in out
+
+
 def test_load_drops_duplicate_company_name_across_different_platforms(isolated_job_sources):
     # Real bug found 2026-08-10: freshness_check.py's build_api_source_lookup()
     # keys ONE dict by company_name across all 4 platforms combined - a name
@@ -129,3 +150,72 @@ def test_load_handles_a_platform_value_that_is_not_a_list(isolated_job_sources):
     )
     result = job_sources.load_job_sources()
     assert result["workday"] == []
+
+
+# --- Structural/type-level crashes (2026-08-11, Mirror/Documentor) ---
+# Real bug: the 2026-08-10 fix above only checked field *presence*, not
+# whether the whole file was even parseable, or whether a present field
+# had a type downstream fetch code could actually use - both still
+# crashed load_job_sources() (or a real search call further downstream)
+# with no handling anywhere in the call chain, live-reproduced 2026-08-11.
+
+def test_load_survives_syntactically_invalid_yaml(isolated_job_sources, capsys):
+    # A stray tab in an indented block is invalid YAML - yaml.safe_load()
+    # used to raise ScannerError straight out of this function.
+    isolated_job_sources.joinpath("job_sources.yaml").write_text(
+        "workday:\n  - company_name: Acme\n\ttenant: acme\n  bad: [unterminated\n", encoding="utf-8",
+    )
+    result = job_sources.load_job_sources()
+    assert result == {"workday": [], "smartrecruiters": [], "greenhouse": [], "lever": []}
+    assert "not valid YAML" in capsys.readouterr().out
+
+
+def test_load_survives_non_mapping_top_level(isolated_job_sources, capsys):
+    # Valid YAML, but a bare list at the top level instead of a mapping -
+    # data.get(platform) used to raise AttributeError since a list has no
+    # .get().
+    isolated_job_sources.joinpath("job_sources.yaml").write_text("- workday\n- smartrecruiters\n", encoding="utf-8")
+    result = job_sources.load_job_sources()
+    assert result == {"workday": [], "smartrecruiters": [], "greenhouse": [], "lever": []}
+    assert "not a mapping" in capsys.readouterr().out
+
+
+def test_load_drops_entry_with_non_numeric_wd_number(isolated_job_sources, capsys):
+    # Present and non-empty (passes the old presence-only check) but not a
+    # real number - company_sites.search_workday_jobs() would still crash
+    # the moment this specific company was actually searched.
+    isolated_job_sources.joinpath("job_sources.yaml").write_text(
+        "workday:\n"
+        "  - company_name: Broken Co\n    tenant: broken\n    site: broken\n    wd_number: not-a-number\n    limit: 15\n"
+        "  - company_name: Eisai\n    tenant: eisai\n    site: eisai\n    wd_number: 5\n    limit: 15\n"
+        "smartrecruiters: []\ngreenhouse: []\nlever: []\n",
+        encoding="utf-8",
+    )
+    result = job_sources.load_job_sources()
+    assert [c["company_name"] for c in result["workday"]] == ["Eisai"]
+    assert "Broken Co" in capsys.readouterr().out
+
+
+def test_load_drops_entry_with_non_numeric_limit(isolated_job_sources):
+    # Same crash mode as wd_number, but for a field every platform shares
+    # (search_greenhouse_jobs()/search_lever_jobs() slice postings[:limit]
+    # - a non-int limit raises TypeError on the slice).
+    isolated_job_sources.joinpath("job_sources.yaml").write_text(
+        "workday: []\nsmartrecruiters: []\n"
+        "greenhouse:\n  - company_name: Stripe\n    board_token: stripe\n    limit: '10'\n"
+        "lever: []\n",
+        encoding="utf-8",
+    )
+    result = job_sources.load_job_sources()
+    assert result["greenhouse"] == []
+
+
+def test_load_accepts_a_real_int_limit_and_wd_number(isolated_job_sources):
+    # Sanity check the type check above isn't overly strict about the
+    # normal, valid case.
+    job_sources.save_job_sources({
+        "workday": [{"company_name": "Eisai", "tenant": "eisai", "site": "eisai", "wd_number": 5, "limit": 15}],
+        "smartrecruiters": [], "greenhouse": [], "lever": [],
+    })
+    result = job_sources.load_job_sources()
+    assert len(result["workday"]) == 1
