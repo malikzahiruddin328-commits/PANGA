@@ -1,13 +1,13 @@
 # Encryption at rest for data/
 
-Implements PRD §7 / §15. Covers everything under `data/`: master profile
+Implements `docs/frs.md` §7 / §15. Covers everything under `data/`: master profile
 (`profile/structured/master_profile.json`), raw resume text
 (`profile/raw/*.txt`, `profile/raw/manifest_result.json`), job history
 (`jobs/jobs.json`), applications (`applications/applications.json`), and
 CTA emails (`cta_emails/cta_emails.json`). `data/` stays local-only and
 gitignored on top of this, unchanged from before.
 
-## Why not a typed passphrase (PRD §7's original plan)
+## Why not a typed passphrase (`docs/frs.md` §7's original plan)
 
 §7 originally called for the user to set a passphrase at first setup as
 "the only key." That was written before the scheduled tasks in §13/§14
@@ -26,15 +26,15 @@ the same level as what's built below anyway, with more moving parts.
 - **Key:** a random 256-bit value, generated once on first use.
 - **Key storage:** the OS credential store, via the `keyring` Python
   library - Windows Credential Manager (DPAPI-backed) on this machine,
-  Keychain if this ever runs on a Mac (see PRD §5), Secret Service on
+  Keychain if this ever runs on a Mac (see `docs/business-requirements-document.md` §5a), Secret Service on
   Linux. Same code path on every OS. No passphrase exists anywhere in this
   design.
 - **Service/username used for the credential entry:** `Panga` /
   `data-encryption-key`.
 - **Why keyring over calling DPAPI directly:** raw DPAPI (`CryptProtectData`)
   is Windows-only. `keyring` gets the same "auto-unlocks for this OS
-  login, no passphrase" behavior while also covering the Mac port PRD §5
-  already plans for, at no extra cost.
+  login, no passphrase" behavior while also covering the Mac port the
+  BRD's §5a already plans for, at no extra cost.
 
 **What this protects against:** the files being copied off this machine,
 or the disk being stolen/imaged - useless ciphertext without this specific
@@ -65,7 +65,7 @@ keeps this single-machine/single-user - revisit if that changes.
     content - used by the migration script below so it's safe to re-run.
   - A failed decrypt (wrong key / corrupted file) raises a `ValueError`
     with a plain-language message rather than surfacing a raw
-    `InvalidTag` traceback, since PRD §6 rules out anything Zahir would
+    `InvalidTag` traceback, since `docs/frs.md` §6 rules out anything Zahir would
     need to debug himself.
 - **Store modules updated to call it** (interface unchanged - only the
   read/write internals moved): `profile/storage.py`, `search/job_store.py`,

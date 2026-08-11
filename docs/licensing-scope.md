@@ -3,7 +3,7 @@
 Branch: `feature/licensing`. Started 2026-07-31, split out of the "General"
 brainstorming session into its own dedicated chat per Zahir's usual
 one-session-per-purpose pattern. Full backlog context:
-`docs/job-search-automation-prd.md` §13 — "Licensing / subscription +
+`docs/backlog-log.md` §13 — "Licensing / subscription +
 per-user API key handling for a sold product" row.
 
 ## Goal
@@ -17,10 +17,10 @@ layer that makes that a real product rather than a copy-and-share `.exe`.
 ### Pricing and refund policy (confirmed 2026-07-31)
 - **$200/year**, deliberately a placeholder — not a final number. The real
   price should come out of the "Realistic cost evaluator" backlog item
-  (PRD §13, not yet built) once real infra/Stripe/support costs are known;
+  (`docs/backlog-log.md` §13, not yet built) once real infra/Stripe/support costs are known;
   don't treat $200 as validated economics.
 - **No refunds (US).** Simple, final — feeds into the Terms of Service/
-  EULA legal-docs gap (also not yet drafted, see PRD §13) once that's
+  EULA legal-docs gap (also not yet drafted, see `docs/backlog-log.md` §13) once that's
   picked up.
 
 ### Business model

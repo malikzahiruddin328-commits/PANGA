@@ -189,6 +189,87 @@ def upsert_application(
         _write_dossier(source, job_id)
 
 
+# Concurrent-Generate guard (2026-08-11, PRD §13 gap flagged by Panga-
+# Documentor): two Generate clicks on the SAME job close together - two
+# browser tabs open on the same Results page, or a fast double-click - are
+# a real, reachable race, not just theoretical. Reviewed the actual damage
+# first: upsert_application()'s own read-modify-write is already safe
+# against file corruption (it re-reads applications.json fresh under
+# locked("applications") right before merging), so two concurrent
+# generate_documents() calls can't corrupt the store. The real damage is
+# semantic: two independent AI drafts for the same doc type race to be
+# "the" saved version - whichever upsert_application() call happens to run
+# last silently wins, with no error, no warning, and the OTHER draft's real
+# API cost spent for nothing (worse for "resume" specifically, since
+# generate_documents' self-correction loop can itself burn 3 real calls
+# for a single request that then gets silently discarded). Held for the
+# realistic duration of a real draft (a multi-doc Generate with self-
+# correction retries can run several minutes) rather than the short
+# critical sections security.file_lock.locked() is designed for -
+# try_acquire_generation_lock() is deliberately try-once, not blocking:
+# a second click should be told immediately, not left waiting on a lock
+# that could hold for minutes.
+_GENERATION_LOCK_STALE_AFTER_MINUTES = 20
+
+
+def try_acquire_generation_lock(source: str, job_id: str) -> bool:
+    """True if this call acquired the lock (safe to proceed with
+    generate_documents()); False if another Generate is already genuinely
+    in progress for this exact job. Always pair with release_generation_
+    lock() in a try/finally - see that function's docstring for why a
+    stuck lock isn't fatal even if the caller crashes before releasing."""
+    now = datetime.now(timezone.utc)
+    with locked("applications"):
+        applications = load_applications()
+        for app in applications:
+            if app["source"] == source and app["job_id"] == job_id:
+                held_since = app.get("generation_lock_acquired_at")
+                if held_since:
+                    held_at = datetime.fromisoformat(held_since)
+                    age_minutes = (now - held_at).total_seconds() / 60
+                    if age_minutes < _GENERATION_LOCK_STALE_AFTER_MINUTES:
+                        return False
+                    # Stale - the process that acquired this almost
+                    # certainly crashed, was killed, or lost its
+                    # connection before reaching the release_generation_
+                    # lock() in its own finally block (CLAUDE.md's own
+                    # "check for locking errors...unhandled exceptions
+                    # that could leave a lock held" concern, applied here)
+                    # - treat it as abandoned rather than blocking Generate
+                    # on this job forever.
+                app["generation_lock_acquired_at"] = now.isoformat()
+                _save_all(applications)
+                return True
+        # No application record yet for this job - create one holding the
+        # lock, same "under review" default upsert_application() itself
+        # uses for a brand-new record.
+        applications.append({
+            "source": source,
+            "job_id": job_id,
+            "status": "under review",
+            "created_at": now.isoformat(),
+            "status_updated_at": now.isoformat(),
+            "generation_lock_acquired_at": now.isoformat(),
+        })
+        _save_all(applications)
+        return True
+
+
+def release_generation_lock(source: str, job_id: str) -> None:
+    """Always call from a finally block around the generate_documents()
+    call the matching try_acquire_generation_lock() guarded - on success
+    AND on failure, so a real drafting error never leaves this job
+    permanently locked out of Generate until the 20-minute staleness
+    ceiling above kicks in."""
+    with locked("applications"):
+        applications = load_applications()
+        for app in applications:
+            if app["source"] == source and app["job_id"] == job_id:
+                app.pop("generation_lock_acquired_at", None)
+                _save_all(applications)
+                return
+
+
 def record_document_edit_review(source: str, job_id: str, documents: dict, reason: str) -> None:
     """"Apply Assist edit review" (Zahir's request 2026-07-31): once he's
     opened a drafted document's real .docx file (dossier.sync_workspace_

@@ -2,7 +2,7 @@
 
 Not a Python build step - runs as a Claude scheduled task (like the Gmail
 call-to-action monitor), since scoring requires genuine reasoning against
-the master profile, not a keyword heuristic (per PRD §11 LLM architecture).
+the master profile, not a keyword heuristic (per `docs/frs.md` §11 LLM architecture).
 
 - **Task ID:** `panga-daily-job-search`
 - **Schedule:** once daily, 7:26am local
@@ -99,7 +99,7 @@ qualifications those roles require. This is saved as a
 referenced explicitly in the scheduled task's scoring instructions - score
 these low regardless of subject-matter proximity.
 
-## "Not interested" feedback loop (PRD §13, built 2026-07-29)
+## "Not interested" feedback loop (`docs/backlog-log.md` §13, built 2026-07-29)
 
 Marking a job "not interested" in the app hides it from the Results screen
 immediately (there's a checkbox to unhide - nothing is deleted). If Zahir

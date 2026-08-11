@@ -79,7 +79,7 @@ from search.job_alert_senders import load_job_alert_senders, save_job_alert_send
 from search.aggregators import ADZUNA_COUNTRIES, is_configured as adzuna_is_configured
 from search.source_activity import all_tracked_sources, is_source_stale
 from ranking.prioritize import weight_for, dedupe_across_sources, find_freshness_downgrade_targets
-from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion, set_strategy_tag, needs_edit_review, record_document_edit_review, get_applications_with_open_clarifying_questions
+from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion, set_strategy_tag, needs_edit_review, record_document_edit_review, get_applications_with_open_clarifying_questions, try_acquire_generation_lock, release_generation_lock
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
 from tailoring.interview_prep import load_interview_prep, get_interview_prep, record_round_outcome, build_prep_context, generate_prep, start_round, save_round
 from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
@@ -759,6 +759,15 @@ def regenerate_resume_and_persist(job: dict, on_progress, success_message: str) 
     anything, since afterward the old text is gone."""
     existing_app = get_application(job["source"], job["job_id"]) or {}
     old_resume_text = existing_app.get("resume_text")
+    # Concurrent-Generate guard (2026-08-11): two tabs on the same job's
+    # Results page, or a fast double-click, both regenerating the resume
+    # at once - whichever finishes last would otherwise silently overwrite
+    # the other, discarding a real, already-paid-for draft with no
+    # warning. See applications.try_acquire_generation_lock's own
+    # docstring for the full reasoning.
+    if not try_acquire_generation_lock(job["source"], job["job_id"]):
+        st.error("A generation is already in progress for this job (another tab or a recent click) - wait for it to finish before trying again.")
+        return None
     try:
         regen = generate_documents(job, load_profile(), ["resume"], on_progress=on_progress)
     except (DraftingNotConfigured, DraftingFailed) as exc:
@@ -775,6 +784,8 @@ def regenerate_resume_and_persist(job: dict, on_progress, success_message: str) 
         _report_drafting_failure(job, "resume", exc)
         st.error("Something went wrong while regenerating this resume. It's been logged - try again in a moment.")
         return None
+    finally:
+        release_generation_lock(job["source"], job["job_id"])
     new_resume = regen["resume"]
     upsert_application(
         # Real bug (state-handling audit, 2026-08-10): this used to
@@ -3650,6 +3661,27 @@ elif active_tab == "results":
                         upsert_application(job["source"], job["job_id"], status=app_record.get("status", "under review"), documents_requested=selected)
                         st.toast("Saved your selection - add an API key to actually draft the documents.", icon=":material/info:")
                         st.rerun()
+                    elif not try_acquire_generation_lock(job["source"], job["job_id"]):
+                        # Concurrent-Generate guard (2026-08-11): two tabs on
+                        # the same job's Results page, or a fast double-click,
+                        # both drafting at once - whichever upsert_
+                        # application() call finishes last would otherwise
+                        # silently win, discarding a real, already-paid-for
+                        # draft with no warning (worse for "resume" since its
+                        # self-correction loop alone can burn 3 real API
+                        # calls for a request that then gets thrown away).
+                        # A sibling elif, not a nested check inside the else
+                        # below, so a collision doesn't halt the whole page
+                        # render (st.stop() would) - just this one section
+                        # quietly declines to start a second draft. See
+                        # applications.try_acquire_generation_lock's own
+                        # docstring for the full reasoning. try_acquire_
+                        # generation_lock() has a side effect: when it
+                        # returns True this elif condition is False, so
+                        # control falls through to the final else below -
+                        # which therefore always starts with the lock
+                        # already held, never needing to acquire it itself.
+                        st.error("A generation is already in progress for this job (another tab or a recent click) - wait for it to finish before trying again.")
                     else:
                         doc_labels = dict(doc_types)
                         with st.container(key="draft_progress_bar"):
@@ -3755,6 +3787,8 @@ elif active_tab == "results":
                                 # so nothing failed-looking should linger.
                                 st.session_state.pop(drafting_errors_key, None)
                             st.rerun()
+                        finally:
+                            release_generation_lock(job["source"], job["job_id"])
 
                 doc_field_map = {
                     "resume": "resume_text",

@@ -10,7 +10,7 @@ Optional FDA_API_KEY in .env raises the rate limit; unset works fine for
 periodic runs.
 
 PubMed (author/institution affiliations) was considered as a second company
-source per the PRD, but openFDA's sponsor_name field is a much cleaner
+source per `docs/prospector-spec.md`, but openFDA's sponsor_name field is a much cleaner
 signal - revisit PubMed only if openFDA coverage proves too narrow.
 
 COMPANY-SITE JOB SEARCH (added 2026-07-29): rather than scraping each

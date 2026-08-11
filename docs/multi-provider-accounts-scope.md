@@ -4,7 +4,7 @@ Branch: `feature/multi-provider-accounts`. Started 2026-08-04, split into its
 own dedicated worktree per Zahir's usual one-branch-per-purpose pattern -
 requested directly in the native-packaging-phase2 session, which then set
 this branch up rather than doing the work itself. Two related PRD backlog
-items (see `docs/job-search-automation-prd.md` §13, being added by the
+items (see `docs/backlog-log.md` §13, being added by the
 Backlog session as of this writing - not yet landed in this branch, which
 started from master before that add).
 
@@ -176,14 +176,14 @@ the right order, not that a real mailbox produces the expected result.
   plug into lives conceptually in that branch's Phase 2 scope
   (`docs/native-packaging-scope.md`). Check its current wizard shape
   before merging rather than assuming.
-- **Backlog**: two PRD §13 rows for this work were handed to the Backlog
+- **Backlog**: two `docs/backlog-log.md` §13 rows for this work were handed to the Backlog
   session 2026-08-04 (multi-provider email, calendar-aware CTA
   availability) - check they landed with the framing above before this
   branch reports "done."
 
 ## A note on shared files
 
-`src/ui/app.py`, `docs/job-search-automation-prd.md`, and similar files
+`src/ui/app.py`, `docs/backlog-log.md`, and similar files
 have a history of being touched by multiple concurrent sessions at once
 (see the `project-panga-job-search-tool` memory, "Concurrent sessions"
 entry, and native-packaging-scope.md's own version of this note). Check

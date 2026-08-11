@@ -23,7 +23,7 @@ Status matching (2026-08-06): a classified rejection/interview_request/
 offer email is also matched against every non-terminal application and,
 if confidently matched, suggests the corresponding status
 (_CTA_STATUS_BY_CATEGORY below) - closing a real gap Mirror's PRD-vs-code
-audit found (the PRD had marked this Done since 2026-07-30, but the
+audit found (the backlog log had marked this Done since 2026-07-30, but the
 call_to_action bucket only ever stored the email, never called
 suggest_status; the only real matching that existed was the older
 "applied" match on confirmation emails below). assessment_request/

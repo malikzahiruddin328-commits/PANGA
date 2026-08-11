@@ -7,7 +7,7 @@ meant to be the one place a skeptical friend-tester (or later, a buyer) can
 read to find out exactly what Panga does with their data — everything here
 should be checkable against the code, not just asserted.
 
-Source backlog item: `docs/job-search-automation-prd.md` §13, "Privacy/trust
+Source backlog item: `docs/backlog-log.md` §13, "Privacy/trust
 model — precise data-flow claim + published doc" row (added 2026-08-01).
 
 ---
