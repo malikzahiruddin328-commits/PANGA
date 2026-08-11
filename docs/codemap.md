@@ -2,7 +2,7 @@
 
 Read this first, before grepping/exploring `src/` from scratch. It's a
 navigation aid, not documentation of behavior - for the "why" behind a
-feature, see `docs/job-search-automation-prd.md` §13 (backlog log, most
+feature, see `docs/backlog-log.md` §13 (backlog log, most
 recent entries at the bottom) or the module's own docstring.
 
 ## Data flow, top to bottom
@@ -101,7 +101,7 @@ flowchart TD
 | Application status / gates on marking "applied" | `tailoring/applications.py` (`needs_edit_review`) |
 | Outreach / target accounts / Prospector Score | `prospector/` |
 | Encryption questions | `security/crypto_store.py` - note `tailoring/dossier.py` is the one deliberate exception |
-| "Is this already built?" | `docs/job-search-automation-prd.md` §13, bottom rows are most recent |
+| "Is this already built?" | `docs/backlog-log.md` §13, bottom rows are most recent |
 
 ## Streamlining sessions (why this file exists)
 
@@ -113,11 +113,11 @@ ground every session. Practice going forward:
    whole app.
 3. Update this file's module map when a module's *purpose* changes (new
    file, module repurposed) - not on every small edit. Keep it to one line
-   per module; put the "why"/history in the PRD backlog table instead.
+   per module; put the "why"/history in `docs/backlog-log.md`'s table instead.
    Check it as part of every commit that adds/removes/repurposes a module
    or changes the data flow (Zahir's explicit ask 2026-07-31) - a stale
    codemap defeats the point of reading it first.
 4. For memory: the session's auto-memory project file
    (`project_panga_job_search_tool.md`) should stay a log of decisions and
-   open threads, not a restatement of what's in this codemap or the PRD -
+   open threads, not a restatement of what's in this codemap or the FRS/backlog log -
    if something's derivable from either, don't duplicate it into memory.

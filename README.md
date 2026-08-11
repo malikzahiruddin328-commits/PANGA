@@ -26,5 +26,5 @@ version history (see `.gitignore`) and is never sent anywhere.
 
 ## Project status
 
-See `docs/job-search-automation-prd.md` for the full spec, including what's built,
-what's next, and what's backlogged.
+See `docs/frs.md` for the full functional spec, and `docs/backlog-log.md`
+for what's built, what's next, and what's backlogged.
