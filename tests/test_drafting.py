@@ -2,6 +2,7 @@ from tailoring.drafting import (
     ATS_KEYWORDS_SYSTEM_PROMPT,
     RESUME_SPEC,
     RESUME_SPEC_USAJOBS,
+    _draft_group,
     _draft_one,
     _drop_generic_soft_skill_keywords,
     _drop_years_experience_keywords,
@@ -454,25 +455,32 @@ def test_draft_one_does_not_inject_consistency_block_for_resume_itself(monkeypat
 
 
 def test_generate_documents_passes_the_just_drafted_resume_to_later_docs_in_the_same_batch(monkeypatch):
+    # cover_letter + exec_bio requested together route through _draft_group
+    # (2026-08-11) - mocked explicitly here for the same reason noted on
+    # the ordering test above.
     import tailoring.drafting as drafting
 
     seen_resume_text_for = {}
 
     def _fake_draft_one(client, shared_context, doc_key, model, on_progress=None, doc_index=1, doc_total=1, job=None, profile=None, resume_text_for_consistency=None):
         seen_resume_text_for[doc_key] = resume_text_for_consistency
-        if doc_key == "resume":
-            return {
-                # ats_score >= the self-correction target (90) so this
-                # unrelated cross-document-consistency test doesn't also
-                # exercise the self-correction retry loop.
-                "text": "PROFESSIONAL EXPERIENCE\nReal resume text.", "ats_score": 95,
-                "ats_rationale": "", "ats_next_actions": [], "clarifying_questions": [], "unconfirmed_claims": [],
-                "missing_required_keywords": [], "missing_preferred_keywords": [],
-            }
-        return "drafted text"
+        # ats_score >= the self-correction target (90) so this unrelated
+        # cross-document-consistency test doesn't also exercise the
+        # self-correction retry loop.
+        return {
+            "text": "PROFESSIONAL EXPERIENCE\nReal resume text.", "ats_score": 95,
+            "ats_rationale": "", "ats_next_actions": [], "clarifying_questions": [], "unconfirmed_claims": [],
+            "missing_required_keywords": [], "missing_preferred_keywords": [],
+        }
+
+    def _fake_draft_group(client, shared_context, doc_keys, model, on_progress, indices, doc_total, job, profile, resume_text_for_consistency):
+        for doc_key in doc_keys:
+            seen_resume_text_for[doc_key] = resume_text_for_consistency
+        return {doc_key: "drafted text" for doc_key in doc_keys}, {}
 
     monkeypatch.setattr(drafting, "_client", lambda: object())
     monkeypatch.setattr(drafting, "_draft_one", _fake_draft_one)
+    monkeypatch.setattr(drafting, "_draft_group", _fake_draft_group)
     job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": [], "ats_preferred_keywords": []}
 
     drafting.generate_documents(job, {}, ["resume", "cover_letter", "exec_bio"])
@@ -535,6 +543,15 @@ def test_generate_documents_drafts_non_resume_docs_concurrently(monkeypatch):
     # barrier both must reach before either is allowed to return. If a
     # future regression accidentally serialized these calls again, this
     # test would hang past its own timeout rather than pass by accident.
+    #
+    # Deliberately uses exec_bio + apply_answers, not cover_letter +
+    # exec_bio (2026-08-11): cover_letter/exec_bio/leadership_summary now
+    # combine into ONE _draft_group work item when 2+ of them are
+    # requested together (see _draft_group's own docstring) - they're no
+    # longer two independent concurrent calls in that case by design. This
+    # test still needs two genuinely independent work items, so it picks
+    # one group-eligible key alone (stays on the solo _draft_one path)
+    # plus apply_answers (never grouped).
     import threading
 
     import tailoring.drafting as drafting
@@ -549,10 +566,10 @@ def test_generate_documents_drafts_non_resume_docs_concurrently(monkeypatch):
     monkeypatch.setattr(drafting, "_draft_one", _fake_draft_one)
     job = {"source": "linkedin", "job_id": "1"}
 
-    result = drafting.generate_documents(job, {}, ["cover_letter", "exec_bio"])
+    result = drafting.generate_documents(job, {}, ["exec_bio", "apply_answers"])
 
-    assert result["cover_letter"] == "drafted cover_letter"
     assert result["exec_bio"] == "drafted exec_bio"
+    assert result["apply_answers"] == "drafted apply_answers"
     assert result["_errors"] == {}
 
 
@@ -561,6 +578,12 @@ def test_generate_documents_resume_always_drafts_before_the_concurrent_pool(monk
     # on the resume being fully drafted before any other doc starts (see
     # generate_documents()'s own docstring) - resume must never be
     # submitted into the same thread pool as the other doc_keys.
+    #
+    # cover_letter + exec_bio requested together now route through
+    # _draft_group (2026-08-11, combined-schema cache fix), not two
+    # separate _draft_one calls - mocks both so this test still exercises
+    # the real routing decision instead of accidentally falling through
+    # _draft_group's own call_structured-failure fallback path.
     import tailoring.drafting as drafting
 
     call_order = []
@@ -573,16 +596,16 @@ def test_generate_documents_resume_always_drafts_before_the_concurrent_pool(monk
             "missing_required_keywords": [], "missing_preferred_keywords": [],
         }
 
-    def _fake_draft_one(client, shared_context, doc_key, model, on_progress=None, doc_index=1, doc_total=1, job=None, profile=None, resume_text_for_consistency=None):
-        call_order.append(doc_key)
+    def _fake_draft_group(client, shared_context, doc_keys, model, on_progress, indices, doc_total, job, profile, resume_text_for_consistency):
+        call_order.extend(doc_keys)
         # If this ever runs before the resume, resume_text_for_consistency
         # would still be None here instead of the resume's real text.
         assert resume_text_for_consistency == "Real resume text."
-        return f"drafted {doc_key}"
+        return {doc_key: f"drafted {doc_key}" for doc_key in doc_keys}, {}
 
     monkeypatch.setattr(drafting, "_client", lambda: object())
     monkeypatch.setattr(drafting, "_draft_resume_with_self_correction", _fake_self_correction)
-    monkeypatch.setattr(drafting, "_draft_one", _fake_draft_one)
+    monkeypatch.setattr(drafting, "_draft_group", _fake_draft_group)
     job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": [], "ats_preferred_keywords": []}
 
     drafting.generate_documents(job, {}, ["resume", "cover_letter", "exec_bio"])
@@ -595,6 +618,9 @@ def test_generate_documents_one_doc_failing_does_not_lose_the_others(monkeypatch
     # Core partial-failure contract: with 2+ doc_keys requested, one
     # document raising must never discard a sibling document that already
     # succeeded, and must never raise out of generate_documents() itself.
+    # Uses exec_bio + apply_answers (not both group-eligible together) so
+    # this stays a pure solo-path test - _draft_group's own partial/
+    # catastrophic-failure handling is covered separately below.
     import tailoring.drafting as drafting
     from tailoring.drafting import DraftingFailed
 
@@ -602,7 +628,7 @@ def test_generate_documents_one_doc_failing_does_not_lose_the_others(monkeypatch
     monkeypatch.setattr(drafting, "_report_drafting_failure", lambda job, doc_key, exc: reported.append((doc_key, str(exc))))
 
     def _fake_draft_one(client, shared_context, doc_key, model, on_progress=None, doc_index=1, doc_total=1, job=None, profile=None, resume_text_for_consistency=None):
-        if doc_key == "cover_letter":
+        if doc_key == "exec_bio":
             raise DraftingFailed("simulated refusal")
         return f"drafted {doc_key}"
 
@@ -610,12 +636,12 @@ def test_generate_documents_one_doc_failing_does_not_lose_the_others(monkeypatch
     monkeypatch.setattr(drafting, "_draft_one", _fake_draft_one)
     job = {"source": "linkedin", "job_id": "1"}
 
-    result = drafting.generate_documents(job, {}, ["cover_letter", "exec_bio"])
+    result = drafting.generate_documents(job, {}, ["exec_bio", "apply_answers"])
 
-    assert result["exec_bio"] == "drafted exec_bio"
-    assert "cover_letter" not in result
-    assert result["_errors"] == {"cover_letter": "simulated refusal"}
-    assert reported == [("cover_letter", "simulated refusal")]
+    assert result["apply_answers"] == "drafted apply_answers"
+    assert "exec_bio" not in result
+    assert result["_errors"] == {"exec_bio": "simulated refusal"}
+    assert reported == [("exec_bio", "simulated refusal")]
 
 
 def test_generate_documents_catches_and_reports_any_exception_type_not_just_drafting_errors(monkeypatch):
@@ -625,7 +651,8 @@ def test_generate_documents_catches_and_reports_any_exception_type_not_just_draf
     # error) escaped uncaught, crashed the whole generate_documents() call,
     # discarded every doc that HAD already succeeded in the same batch, and
     # never reported to Bhangi. This proves an arbitrary exception type is
-    # now handled exactly like the anticipated ones.
+    # now handled exactly like the anticipated ones. Uses exec_bio +
+    # apply_answers - see comment on the test above for why.
     import tailoring.drafting as drafting
 
     reported = []
@@ -640,9 +667,9 @@ def test_generate_documents_catches_and_reports_any_exception_type_not_just_draf
     monkeypatch.setattr(drafting, "_draft_one", _fake_draft_one)
     job = {"source": "linkedin", "job_id": "1"}
 
-    result = drafting.generate_documents(job, {}, ["cover_letter", "exec_bio"])
+    result = drafting.generate_documents(job, {}, ["exec_bio", "apply_answers"])
 
-    assert result["cover_letter"] == "drafted cover_letter"
+    assert result["apply_answers"] == "drafted apply_answers"
     assert "exec_bio" in result["_errors"]
     assert reported == [("exec_bio", "KeyError")]
 
@@ -710,6 +737,13 @@ def test_generate_documents_errors_key_always_present_on_full_success(monkeypatc
 
 
 def test_generate_documents_never_exceeds_max_concurrent_drafts(monkeypatch):
+    # 2026-08-11: cover_letter/exec_bio/leadership_summary now combine into
+    # ONE _draft_group pool work item instead of three separate _draft_one
+    # ones (see _draft_group's own docstring), so requesting all 4
+    # non-resume doc types together now submits 2 pool work items (the
+    # group + apply_answers), not 4 - mocks both so this still verifies
+    # real overlap between genuinely independent work items, just against
+    # the new, smaller real ceiling rather than the old one.
     import threading
 
     import tailoring.drafting as drafting
@@ -718,7 +752,7 @@ def test_generate_documents_never_exceeds_max_concurrent_drafts(monkeypatch):
     concurrent_count = 0
     max_seen = 0
 
-    def _fake_draft_one(client, shared_context, doc_key, model, on_progress=None, doc_index=1, doc_total=1, job=None, profile=None, resume_text_for_consistency=None):
+    def _track_concurrency():
         nonlocal concurrent_count, max_seen
         with lock:
             concurrent_count += 1
@@ -727,20 +761,185 @@ def test_generate_documents_never_exceeds_max_concurrent_drafts(monkeypatch):
         time.sleep(0.05)
         with lock:
             concurrent_count -= 1
+
+    def _fake_draft_one(client, shared_context, doc_key, model, on_progress=None, doc_index=1, doc_total=1, job=None, profile=None, resume_text_for_consistency=None):
+        _track_concurrency()
         return f"drafted {doc_key}"
+
+    def _fake_draft_group(client, shared_context, doc_keys, model, on_progress, indices, doc_total, job, profile, resume_text_for_consistency):
+        _track_concurrency()
+        return {doc_key: f"drafted {doc_key}" for doc_key in doc_keys}, {}
 
     monkeypatch.setattr(drafting, "_client", lambda: object())
     monkeypatch.setattr(drafting, "_draft_one", _fake_draft_one)
+    monkeypatch.setattr(drafting, "_draft_group", _fake_draft_group)
     job = {"source": "linkedin", "job_id": "1"}
     doc_keys = ["cover_letter", "exec_bio", "leadership_summary", "apply_answers"]  # 4 non-resume types, all requested
 
     drafting.generate_documents(job, {}, doc_keys)
 
     assert max_seen <= drafting.MAX_CONCURRENT_DRAFTS
-    # Real overlap, not just "the code technically uses a pool" - thread
-    # scheduling jitter means not all 4 are guaranteed to land in the same
-    # instant, but more than one must, or this isn't concurrency at all.
+    # Real overlap, not just "the code technically uses a pool" - the
+    # group work item and apply_answers must genuinely overlap.
     assert max_seen > 1
+
+
+# --- _draft_group: combined cover_letter/exec_bio/leadership_summary call (2026-08-11) ---
+
+def test_draft_group_uses_one_combined_schema_call_for_all_requested_keys(monkeypatch):
+    import tailoring.drafting as drafting
+
+    captured = {}
+
+    def _fake_call_structured(client, **kwargs):
+        captured["schema"] = kwargs["schema"]
+        captured["call_count"] = captured.get("call_count", 0) + 1
+        return {"cover_letter": "Dear Hiring Team...", "exec_bio": "Jane Doe is...", "leadership_summary": "A proven leader..."}
+
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured)
+    job = {"source": "linkedin", "job_id": "1"}
+    indices = {"cover_letter": 2, "exec_bio": 3, "leadership_summary": 4}
+
+    results, errors = _draft_group(
+        object(), [], ["cover_letter", "exec_bio", "leadership_summary"], None, None, indices, 4,
+        job=job, profile={}, resume_text_for_consistency=None,
+    )
+
+    assert captured["call_count"] == 1  # one call, not three
+    assert set(captured["schema"]["properties"]) == {"cover_letter", "exec_bio", "leadership_summary"}
+    assert results == {
+        "cover_letter": "Dear Hiring Team...", "exec_bio": "Jane Doe is...", "leadership_summary": "A proven leader...",
+    }
+    assert errors == {}
+
+
+def test_draft_group_retries_only_the_blank_field_not_the_whole_batch(monkeypatch):
+    # A malformed field inside an otherwise-good combined response should
+    # cost a small targeted retry, not discard the two good fields or
+    # force a full expensive re-draft of all three.
+    import tailoring.drafting as drafting
+
+    call_structured_calls = []
+
+    def _fake_call_structured(client, **kwargs):
+        call_structured_calls.append(kwargs["schema"])
+        return {"cover_letter": "Dear Hiring Team...", "exec_bio": "", "leadership_summary": "A proven leader..."}
+
+    draft_one_calls = []
+
+    def _fake_draft_one(client, shared_context, doc_key, model, on_progress=None, doc_index=1, doc_total=1, job=None, profile=None, resume_text_for_consistency=None):
+        draft_one_calls.append(doc_key)
+        return "Individually redrafted exec bio."
+
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured)
+    monkeypatch.setattr(drafting, "_draft_one", _fake_draft_one)
+    job = {"source": "linkedin", "job_id": "1"}
+    indices = {"cover_letter": 2, "exec_bio": 3, "leadership_summary": 4}
+
+    results, errors = _draft_group(
+        object(), [], ["cover_letter", "exec_bio", "leadership_summary"], None, None, indices, 4,
+        job=job, profile={}, resume_text_for_consistency=None,
+    )
+
+    assert len(call_structured_calls) == 1  # the combined call itself is never retried in full
+    assert draft_one_calls == ["exec_bio"]  # only the blank field gets an individual re-draft
+    assert results["cover_letter"] == "Dear Hiring Team..."  # good fields kept as-is
+    assert results["leadership_summary"] == "A proven leader..."
+    assert results["exec_bio"] == "Individually redrafted exec bio."
+    assert errors == {}
+
+
+def test_draft_group_falls_back_to_independent_drafting_on_a_full_call_failure(monkeypatch):
+    # The combined call itself failing outright (refusal, exhausted
+    # truncation retries, API error) must not sink all three docs together
+    # - falls back to today's existing independent-per-doc path so fault
+    # isolation never regresses versus before this function existed.
+    import tailoring.drafting as drafting
+    from tailoring.drafting import DraftingFailed
+
+    def _always_fails(client, **kwargs):
+        raise DraftingFailed("simulated total failure")
+
+    def _fake_draft_one(client, shared_context, doc_key, model, on_progress=None, doc_index=1, doc_total=1, job=None, profile=None, resume_text_for_consistency=None):
+        if doc_key == "exec_bio":
+            raise DraftingFailed("this one also fails independently")
+        return f"drafted {doc_key}"
+
+    monkeypatch.setattr(drafting, "call_structured", _always_fails)
+    monkeypatch.setattr(drafting, "_draft_one", _fake_draft_one)
+    job = {"source": "linkedin", "job_id": "1"}
+    indices = {"cover_letter": 2, "exec_bio": 3, "leadership_summary": 4}
+
+    results, errors = _draft_group(
+        object(), [], ["cover_letter", "exec_bio", "leadership_summary"], None, None, indices, 4,
+        job=job, profile={}, resume_text_for_consistency=None,
+    )
+
+    # The two docs that succeed independently are NOT lost just because
+    # the combined call and one sibling doc both failed.
+    assert results == {"cover_letter": "drafted cover_letter", "leadership_summary": "drafted leadership_summary"}
+    assert "exec_bio" in errors
+    assert "exec_bio" not in results
+
+
+def test_draft_group_escalates_max_tokens_on_a_genuine_truncation(monkeypatch):
+    import tailoring.drafting as drafting
+
+    calls = []
+
+    def _fake_call_structured(client, **kwargs):
+        calls.append(kwargs["max_tokens"])
+        if len(calls) == 1:
+            raise drafting.LLMResponseTruncated("truncated")
+        return {"cover_letter": "text", "exec_bio": "text"}
+
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured)
+    job = {"source": "linkedin", "job_id": "1"}
+    indices = {"cover_letter": 2, "exec_bio": 3}
+
+    results, errors = _draft_group(
+        object(), [], ["cover_letter", "exec_bio"], None, None, indices, 3,
+        job=job, profile={}, resume_text_for_consistency=None,
+    )
+
+    assert len(calls) == 2
+    assert calls[1] > calls[0]  # escalated to the larger tier
+    assert errors == {}
+
+
+def test_draft_group_job_json_is_uncached_and_placed_after_the_cached_profile_block(monkeypatch):
+    # Core cache-fix assertion: the cache_control marker must stay only on
+    # the job-invariant shared_context block, and job-specific text must
+    # never be folded into that same cached block, or cross-job cache
+    # reuse (the whole point of this fix) silently breaks again.
+    import tailoring.drafting as drafting
+
+    captured = {}
+
+    def _fake_call_structured(client, **kwargs):
+        captured["user_content"] = kwargs["user_content"]
+        return {"cover_letter": "text", "exec_bio": "text"}
+
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured)
+    shared_context = [{"type": "text", "text": "CANDIDATE'S MASTER PROFILE:\n{}", "cache_control": {"type": "ephemeral"}}]
+    job = {"source": "linkedin", "job_id": "1", "title": "A Very Specific Job Title"}
+    indices = {"cover_letter": 2, "exec_bio": 3}
+
+    _draft_group(
+        object(), shared_context, ["cover_letter", "exec_bio"], None, None, indices, 3,
+        job=job, profile={}, resume_text_for_consistency=None,
+    )
+
+    blocks = captured["user_content"]
+    cached_blocks = [b for b in blocks if b.get("cache_control")]
+    assert len(cached_blocks) == 1
+    assert "A Very Specific Job Title" not in cached_blocks[0]["text"]
+    job_blocks = [b for b in blocks if "A Very Specific Job Title" in b["text"]]
+    assert len(job_blocks) == 1
+    assert "cache_control" not in job_blocks[0]
+    # The job block must come after the cached profile block in the
+    # list, per Anthropic's own prefix-cache ordering requirement.
+    assert blocks.index(job_blocks[0]) > blocks.index(cached_blocks[0])
 
 
 def test_ats_keywords_schema_supports_either_or_group_items():
