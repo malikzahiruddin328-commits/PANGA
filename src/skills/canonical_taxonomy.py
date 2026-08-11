@@ -27,6 +27,7 @@ import re
 import tempfile
 from pathlib import Path
 
+from security.file_lock import locked
 from skill_label_match import skills_match
 
 TAXONOMY_PATH = Path(__file__).resolve().parent / "canonical_skills.json"
@@ -121,3 +122,58 @@ def add_canonical_entry(taxonomy: dict, category: str, canonical_label: str, ali
     entries = taxonomy.setdefault(category, [])
     entries.append({"id": new_id, "canonical_label": canonical_label, "aliases": sorted(set(aliases))})
     return new_id
+
+
+def resolve_or_create_canonical_id(label: str, category: str, aliases: list[str] | None = None) -> str:
+    """Real, cross-process-safe entry point for the live one-at-a-time
+    case (profile/interview.py's save path, hit for real every time
+    Zahir answers a gap question) - found and fixed 2026-08-11 (RM
+    caught this live, mid-merge, while Zahir was actively interviewing
+    through a separate concurrent session): load_taxonomy()/
+    add_canonical_entry()/save_taxonomy() called separately with no
+    locking is a genuine read-modify-write race - two concurrent callers
+    (e.g. two live interview sessions, or a live interview racing a
+    migration/backfill script) can both read the same old taxonomy, both
+    decide to add their own new entry, and whichever calls save_taxonomy()
+    second silently overwrites the first caller's addition with no error.
+    master_profile.json's own writes were already protected by
+    locked("master_profile") - this file had no equivalent.
+
+    Wraps the whole load -> find-or-create -> save sequence in
+    locked("canonical_taxonomy") (security.file_lock's real, cross-
+    process advisory lock, same primitive master_profile.json's own
+    writes already use) so the check-then-create is genuinely atomic -
+    no other process can interleave between this call's read and its
+    write. Every caller should go through this function (or
+    run_locked_bulk_mutation() below for a batch of many labels in one
+    critical section) rather than calling load_taxonomy()/save_taxonomy()
+    directly for a mutation - those two stay available for read-only
+    callers (find_canonical_id() consumers like drafting.py's clarifying-
+    question dedup), which don't need the lock since save_taxonomy()'s
+    atomic temp-file+os.replace write already guarantees a reader never
+    sees a half-written file."""
+    with locked("canonical_taxonomy"):
+        taxonomy = load_taxonomy()
+        canonical_id = find_canonical_id(label, taxonomy)
+        if canonical_id is None:
+            canonical_id = add_canonical_entry(taxonomy, category, label, aliases=aliases)
+            save_taxonomy(taxonomy)
+        return canonical_id
+
+
+def run_locked_bulk_mutation(mutate_fn):
+    """Same real cross-process safety as resolve_or_create_canonical_id()
+    above, for a batch operation that needs to load once, mutate many
+    times in memory, and save once as a single critical section (e.g. a
+    migration/backfill pass over many labels) rather than one lock
+    acquisition per label. `mutate_fn(taxonomy)` mutates the taxonomy
+    dict in place and may return a result; that result (plus the final
+    taxonomy) is returned to the caller. Every real migration/backfill
+    script must go through this rather than calling load_taxonomy()/
+    save_taxonomy() directly around its own loop - the exact gap RM
+    caught live 2026-08-11."""
+    with locked("canonical_taxonomy"):
+        taxonomy = load_taxonomy()
+        result = mutate_fn(taxonomy)
+        save_taxonomy(taxonomy)
+        return taxonomy, result

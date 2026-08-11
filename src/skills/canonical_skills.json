@@ -2765,5 +2765,27 @@
         "Direct partnership with GTM/Sales leadership"
       ]
     }
+  ],
+  "Uncategorized (migration fallback)": [
+    {
+      "id": "desired_job_titles",
+      "canonical_label": "Desired job titles",
+      "aliases": []
+    },
+    {
+      "id": "desired_target_industries",
+      "canonical_label": "Desired target industries",
+      "aliases": []
+    },
+    {
+      "id": "gxp_change_control_and_system_lifecycle_management",
+      "canonical_label": "GxP change control and system lifecycle management",
+      "aliases": []
+    },
+    {
+      "id": "regulatory_examination_readiness_for_banking_supervisors_occ",
+      "canonical_label": "Regulatory examination readiness for banking supervisors (OCC, FDIC, FRB, FFIEC IT Examination Handbook)",
+      "aliases": []
+    }
   ]
 }

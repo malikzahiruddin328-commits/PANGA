@@ -24,7 +24,7 @@ clustering means slightly less dedup value than ideal - it can never mean
 a real answer silently disappears."""
 
 from llm_client import LLMResponseTruncated
-from skills.canonical_taxonomy import add_canonical_entry, find_canonical_id
+from skills.canonical_taxonomy import add_canonical_entry, find_canonical_id, run_locked_bulk_mutation
 
 _CLUSTER_SCHEMA = {
     "type": "object",
@@ -145,3 +145,29 @@ def migrate_gap_interview_answers(profile: dict, taxonomy: dict) -> tuple[dict, 
             fallback_labels.append(skill)
         answer["canonical_skill_id"] = canonical_id
     return new_profile, fallback_labels
+
+
+def run_locked_backfill(profile: dict) -> tuple[dict, list[str]]:
+    """Real, cross-process-safe entry point for a migration/backfill run
+    against the live taxonomy file - found and fixed 2026-08-11 (RM
+    caught it live, mid-merge, while Zahir was actively interviewing
+    through a separate concurrent session hitting profile/interview.py's
+    save path against this same taxonomy file). Every real backfill/
+    migration script must call THIS rather than calling load_taxonomy()/
+    migrate_gap_interview_answers()/save_taxonomy() separately - those
+    three calls with no locking between them is a genuine read-modify-
+    write race across processes, the same class of gap
+    resolve_or_create_canonical_id() fixes for the live one-at-a-time
+    case.
+
+    Wraps the whole load -> migrate -> save sequence in canonical_taxonomy.
+    run_locked_bulk_mutation() (the real, cross-process
+    locked("canonical_taxonomy") primitive, same one
+    resolve_or_create_canonical_id() uses) so a concurrent live interview
+    can never race this and silently lose either side's new entries.
+    Returns (new_profile, fallback_labels) - same shape as
+    migrate_gap_interview_answers() itself; caller still owns actually
+    persisting new_profile via profile.storage.save_profile() (already
+    protected by its own locked("master_profile"))."""
+    _, result = run_locked_bulk_mutation(lambda taxonomy: migrate_gap_interview_answers(profile, taxonomy))
+    return result

@@ -13,7 +13,7 @@ from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from skills.lookup import skills_for  # noqa: E402
-from skills.canonical_taxonomy import add_canonical_entry, find_canonical_id, load_taxonomy, save_taxonomy  # noqa: E402
+from skills.canonical_taxonomy import find_canonical_id, load_taxonomy, resolve_or_create_canonical_id  # noqa: E402
 from profile.storage import load_profile, save_profile  # noqa: E402
 from profile.ingest import resume_text as _shared_resume_text  # noqa: E402
 from security.file_lock import locked  # noqa: E402
@@ -72,13 +72,20 @@ def _canonical_id_for(skill: str) -> str:
     "grows over time, never loses a real answer" guarantee as the bulk
     migration in tailoring.taxonomy_migration). Persists any newly
     created entry immediately so the next save_answer()/_already_answered()
-    call sees it."""
-    taxonomy = load_taxonomy()
-    canonical_id = find_canonical_id(skill, taxonomy)
-    if canonical_id is None:
-        canonical_id = add_canonical_entry(taxonomy, "Uncategorized", skill, aliases=[])
-        save_taxonomy(taxonomy)
-    return canonical_id
+    call sees it.
+
+    Real bug found + fixed 2026-08-11 (RM caught it live, mid-merge,
+    while Zahir was actively interviewing through a separate concurrent
+    session): this used to call load_taxonomy()/add_canonical_entry()/
+    save_taxonomy() with no locking at all - a genuine cross-process
+    read-modify-write race (two concurrent save_answer() calls, or a
+    live interview racing a migration/backfill script, could both read
+    the same old taxonomy and whichever saved last would silently
+    overwrite the other's new entry). resolve_or_create_canonical_id()
+    wraps the whole thing in the same real, cross-process
+    locked("canonical_taxonomy") primitive master_profile.json's own
+    writes already use - see its own docstring for the full story."""
+    return resolve_or_create_canonical_id(skill, "Uncategorized", aliases=[])
 
 
 def detect_gaps(industry: str, role: str) -> list[dict]:
