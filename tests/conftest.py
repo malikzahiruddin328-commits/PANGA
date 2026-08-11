@@ -73,6 +73,7 @@ def isolated_data(tmp_path, monkeypatch):
     import cost_log
     import debug_log
     import linkedin.storage as linkedin_storage
+    import linkedin.connections_store as connections_store
     import prospector.prospector_score as prospector_score
     import scan_retry_tracker
     import search.freshness_check as freshness_check
@@ -116,6 +117,14 @@ def isolated_data(tmp_path, monkeypatch):
     # profile export - at least as sensitive as the resume text this
     # fixture already protects).
     monkeypatch.setattr(linkedin_storage, "LINKEDIN_PATH", tmp_path / "linkedin_profile.json")
+    # Same class of gap as LINKEDIN_PATH immediately above, found live
+    # 2026-08-10 while writing tests for the file-locking fix on this same
+    # module's sibling: linkedin.connections_store.CONNECTIONS_PATH was
+    # never isolated either, so any test exercising save_connections()
+    # would have silently written the real data/linkedin/connections.json
+    # - PII about Zahir's real professional contacts, not just his own
+    # data.
+    monkeypatch.setattr(connections_store, "CONNECTIONS_PATH", tmp_path / "connections.json")
     # debug_log.py (2026-08-09's always-on error logging addition) writes
     # to a real file path too - isolated for the same reason as every
     # store above, so no test exercising it can touch the real
