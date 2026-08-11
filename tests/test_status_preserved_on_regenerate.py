@@ -71,6 +71,39 @@ def test_regenerate_resume_button_preserves_applied_status(applied_job, monkeypa
     assert app_record["resume_text"] == "PROFESSIONAL EXPERIENCE\nRegenerated.\n\nSKILLS\nPython"
 
 
+def test_regenerate_resume_button_blocked_while_a_generation_is_already_in_progress(applied_job, monkeypatch):
+    # Same real race as the "Generate documents" button test below, for
+    # the single-resume "Generate resume" path in Analyze Fit
+    # (regenerate_resume_and_persist), a separate real call site of
+    # generate_documents() that needs the same guard.
+    import tailoring.drafting as drafting
+    from tailoring.applications import try_acquire_generation_lock
+
+    monkeypatch.setattr(drafting, "generate_documents", _fake_generate_documents)
+    monkeypatch.setattr(drafting, "check_regenerate_impact", lambda job, app_record, profile: {
+        "has_new_info": True, "new_fact_count": 1, "current_score": 80,
+        "estimated_new_score": 88, "cost_estimate": 0.05, "last_generation_cost": None,
+    })
+    monkeypatch.setattr("tailoring.dossier.sync_workspace_documents", lambda *a, **k: None)
+
+    at = AppTest.from_file(APP_PATH)
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.session_state["results_show_applied"] = True
+    at.run(timeout=30)
+
+    assert try_acquire_generation_lock("Dice", "job1") is True
+
+    generate_button = next(b for b in at.button if b.key and b.key.startswith("analyzefit_generate_"))
+    generate_button.click().run(timeout=30)
+
+    assert not at.exception
+    error_texts = [e.value for e in at.error]
+    assert any("already in progress" in t for t in error_texts)
+    app_record = get_application("Dice", "job1")
+    assert app_record["resume_text"] == "PROFESSIONAL EXPERIENCE\nOriginal draft.\n\nSKILLS\nPython"
+
+
 def test_generate_documents_button_preserves_applied_status(applied_job, monkeypatch):
     import tailoring.drafting as drafting
 
@@ -161,6 +194,45 @@ def test_generate_documents_partial_failure_error_survives_the_rerun(applied_job
     # keep re-showing the same stale failure forever.
     at.run(timeout=30)
     assert not any("Claude declined to draft this document" in e.value for e in at.error)
+
+
+def test_generate_documents_button_blocked_while_a_generation_is_already_in_progress(applied_job, monkeypatch):
+    # Real, reachable race (2026-08-11, PRD gap assigned via Panga-
+    # Documentor/General): two browser tabs open on the same job's Results
+    # page, or a fast double-click, both hitting "Generate documents" close
+    # together. Simulates the second click landing while the first is
+    # still (per the real record) in progress - the button must refuse to
+    # start a second draft rather than silently letting whichever finishes
+    # last overwrite the other's real, already-paid-for draft.
+    import tailoring.drafting as drafting
+    from tailoring.applications import try_acquire_generation_lock
+
+    monkeypatch.setattr(drafting, "is_configured", lambda: True)
+    monkeypatch.setattr(drafting, "generate_documents", _fake_generate_documents)
+    monkeypatch.setattr("tailoring.dossier.sync_workspace_documents", lambda *a, **k: None)
+
+    at = AppTest.from_file(APP_PATH)
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.session_state["results_show_applied"] = True
+    at.run(timeout=30)
+
+    resume_checkbox = next(c for c in at.checkbox if c.key and c.key.startswith("doc_resume_"))
+    resume_checkbox.set_value(True)
+    at.run(timeout=30)
+
+    # Simulate the other tab/click already holding the lock.
+    assert try_acquire_generation_lock("Dice", "job1") is True
+
+    generate_button = next(b for b in at.button if b.key and b.key.startswith("gendocs_"))
+    generate_button.click().run(timeout=30)
+
+    assert not at.exception
+    error_texts = [e.value for e in at.error]
+    assert any("already in progress" in t for t in error_texts)
+    # The original draft must survive untouched - no second draft ran.
+    app_record = get_application("Dice", "job1")
+    assert app_record["resume_text"] == "PROFESSIONAL EXPERIENCE\nOriginal draft.\n\nSKILLS\nPython"
 
 
 def test_generate_documents_without_api_key_preserves_applied_status(applied_job, monkeypatch):

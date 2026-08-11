@@ -128,3 +128,79 @@ def test_get_applications_with_open_clarifying_questions_drops_off_after_regener
     # linger with stale questions.
     applications.upsert_application("Dice", "1", status="under review", resume_clarifying_questions=[])
     assert applications.get_applications_with_open_clarifying_questions() == []
+
+
+def test_try_acquire_generation_lock_succeeds_when_no_application_record_exists_yet(isolated_data):
+    # Real case: the very first Generate click on a job that's never had
+    # an application record created at all.
+    assert applications.try_acquire_generation_lock("Dice", "1") is True
+    app = applications.get_application("Dice", "1")
+    assert app["generation_lock_acquired_at"]
+    assert app["status"] == "under review"
+
+
+def test_try_acquire_generation_lock_fails_while_genuinely_held(isolated_data):
+    # The real scenario this guards against: two browser tabs (or a fast
+    # double-click) both hitting Generate on the same job close together.
+    assert applications.try_acquire_generation_lock("Dice", "1") is True
+    assert applications.try_acquire_generation_lock("Dice", "1") is False
+
+
+def test_try_acquire_generation_lock_succeeds_again_after_release(isolated_data):
+    assert applications.try_acquire_generation_lock("Dice", "1") is True
+    applications.release_generation_lock("Dice", "1")
+    assert applications.try_acquire_generation_lock("Dice", "1") is True
+
+
+def test_try_acquire_generation_lock_does_not_block_a_different_job(isolated_data):
+    assert applications.try_acquire_generation_lock("Dice", "1") is True
+    assert applications.try_acquire_generation_lock("Dice", "2") is True
+
+
+def test_release_generation_lock_is_a_safe_no_op_when_nothing_was_held(isolated_data):
+    # A finally block always calls this, even on a path that returned
+    # early before ever acquiring - must never raise on an already-clear
+    # or nonexistent lock.
+    applications.release_generation_lock("Dice", "1")  # no application record at all
+    applications.upsert_application("Dice", "2", status="under review")
+    applications.release_generation_lock("Dice", "2")  # record exists, lock never held
+
+
+def test_try_acquire_generation_lock_recovers_from_a_stale_lock(isolated_data, monkeypatch):
+    # Real scenario CLAUDE.md's own "check for locking errors...unhandled
+    # exceptions that could leave a lock held" concern names directly: a
+    # process crashes or the connection drops mid-draft, after acquiring
+    # the lock but before its finally block ever runs release_generation_
+    # lock(). Without a staleness ceiling, that job would be locked out of
+    # Generate forever.
+    import tailoring.applications as applications_module
+    from datetime import datetime, timedelta, timezone
+
+    assert applications.try_acquire_generation_lock("Dice", "1") is True
+
+    # Simulate that acquisition happening well past the staleness ceiling.
+    apps = applications.load_applications()
+    stale_time = datetime.now(timezone.utc) - timedelta(minutes=applications_module._GENERATION_LOCK_STALE_AFTER_MINUTES + 1)
+    for app in apps:
+        if app["source"] == "Dice" and app["job_id"] == "1":
+            app["generation_lock_acquired_at"] = stale_time.isoformat()
+    applications._save_all(apps)
+
+    assert applications.try_acquire_generation_lock("Dice", "1") is True
+
+
+def test_try_acquire_generation_lock_still_blocks_a_recent_lock(isolated_data):
+    # Sanity check for the staleness test above - a lock well within the
+    # ceiling must still block, not just any timestamped lock.
+    import tailoring.applications as applications_module
+    from datetime import datetime, timedelta, timezone
+
+    assert applications.try_acquire_generation_lock("Dice", "1") is True
+    apps = applications.load_applications()
+    recent_time = datetime.now(timezone.utc) - timedelta(minutes=1)
+    for app in apps:
+        if app["source"] == "Dice" and app["job_id"] == "1":
+            app["generation_lock_acquired_at"] = recent_time.isoformat()
+    applications._save_all(apps)
+
+    assert applications.try_acquire_generation_lock("Dice", "1") is False
