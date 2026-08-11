@@ -85,7 +85,7 @@ from tailoring.interview_prep import load_interview_prep, get_interview_prep, re
 from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
 from tailoring.ats_score import detect_matched_keyword_regressions
 from tailoring.unconfirmed_claims import find_unconfirmed_markers, resolve_unconfirmed_claim
-from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed, analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_impact as _check_regenerate_impact, request_additional_gap_questions as _request_additional_gap_questions, reextract_ats_keywords_and_rescore as _reextract_ats_keywords_and_rescore, rescore_against_cached_keywords as _rescore_against_cached_keywords, gap_scan_is_current as _gap_scan_is_current, gap_scan_baseline_fingerprint as _gap_scan_baseline_fingerprint
+from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed, analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_impact as _check_regenerate_impact, request_additional_gap_questions as _request_additional_gap_questions, reextract_ats_keywords_and_rescore as _reextract_ats_keywords_and_rescore, rescore_against_cached_keywords as _rescore_against_cached_keywords, gap_scan_is_current as _gap_scan_is_current, gap_scan_baseline_fingerprint as _gap_scan_baseline_fingerprint, _report_drafting_failure
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
 from prospector.rejection_diagnosis import gather_diagnosis_input, diagnose
 from prospector.target_accounts import load_target_accounts, set_status as set_target_account_status, set_website, load_website_lookup_cost, save_website_lookup_cost, find_disqualified_with_new_activity
@@ -714,6 +714,17 @@ def regenerate_resume_and_persist(job: dict, on_progress, success_message: str) 
         regen = generate_documents(job, load_profile(), ["resume"], on_progress=on_progress)
     except (DraftingNotConfigured, DraftingFailed) as exc:
         st.error(str(exc))
+        return None
+    except Exception as exc:
+        # generate_documents() re-raises ANY exception type for a
+        # single-doc_key request (2026-08-10) so a genuine bug elsewhere in
+        # the pipeline is never silently swallowed - but its own hedged,
+        # already-safe-to-show message only exists for the two named types
+        # above. Anything else gets logged/Bhangi-reported (same path as
+        # the concurrent multi-doc case - see _report_drafting_failure) and
+        # a generic message here, never the raw exception text.
+        _report_drafting_failure(job, "resume", exc)
+        st.error("Something went wrong while regenerating this resume. It's been logged - try again in a moment.")
         return None
     new_resume = regen["resume"]
     upsert_application(
@@ -3459,6 +3470,18 @@ elif active_tab == "results":
                         except (DraftingNotConfigured, DraftingFailed) as exc:
                             progress_bar.empty()
                             st.error(str(exc))
+                        except Exception as exc:
+                            # Only reachable when exactly one document type was
+                            # selected (generate_documents() re-raises ANY
+                            # exception type for a single-doc_key request,
+                            # 2026-08-10) - for 2+ selected docs, a failure in
+                            # one never raises here at all anymore; it lands in
+                            # drafted["_errors"] instead (see the success branch
+                            # below), so every doc that DID succeed is still
+                            # saved rather than thrown away.
+                            progress_bar.empty()
+                            _report_drafting_failure(job, selected[0], exc)
+                            st.error("Something went wrong while drafting this document. It's been logged - try again in a moment.")
                         else:
                             progress_bar.progress(1.0, text=":material/check_circle: Done.")
                             resume_draft = drafted.get("resume")
@@ -3494,7 +3517,20 @@ elif active_tab == "results":
                                 # popped the next time this expander renders, so
                                 # it doesn't stay force-expanded forever.
                                 st.session_state[f"just_drafted_resume_{job['source']}_{job['job_id']}"] = True
-                            st.toast("Documents drafted. Review and download them below, then use them for the actual application.", icon=":material/check_circle:")
+                            # generate_documents() with 2+ doc_keys never raises
+                            # on a per-doc failure (2026-08-10) - it reports to
+                            # Bhangi and returns the failure in drafted["_errors"]
+                            # instead, so whichever docs DID succeed are still
+                            # saved above. Surface what failed rather than
+                            # silently telling Zahir everything worked.
+                            failed = drafted.get("_errors") or {}
+                            if failed:
+                                failed_labels = ", ".join(doc_labels.get(k, k) for k in failed)
+                                st.toast(f"Some documents drafted, but {failed_labels} failed - see below.", icon=":material/warning:")
+                                for doc_key, msg in failed.items():
+                                    st.error(f"{doc_labels.get(doc_key, doc_key)}: {msg}")
+                            else:
+                                st.toast("Documents drafted. Review and download them below, then use them for the actual application.", icon=":material/check_circle:")
                             st.rerun()
 
                 doc_field_map = {
