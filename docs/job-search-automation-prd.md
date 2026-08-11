@@ -999,6 +999,34 @@ tool rather than something used moment-to-moment.
 history from scoring, target accounts, and outreach to have anything to
 say. Folded into build step 8 above, not a separate step.
 
+**Fixed 2026-08-10 (Zahir's adversarial self-audit request, #22):** the
+"nothing to analyze yet" gate on the "Run Learn Engine analysis" button
+summed raw list lengths across all four `learn_input` categories, but
+`target_account_vs_outcome` appends ONE ENTRY PER TARGET ACCOUNT
+UNCONDITIONALLY, not just ones with a real correlatable outcome - with 78
+real target accounts already in the store, that one list alone always
+pushed the sum well past zero regardless of whether `scoring_vs_outcome`/
+`outreach_vs_outcome`/`interview_outcomes` had anything real in them. The
+gate could never correctly say "nothing to analyze yet" again once
+Prospector had been used at all. Fixed with
+`_count_analyzeable_learn_inputs()` in `src/ui/app.py`: only a
+`target_account_vs_outcome` entry with `real_posting_appeared_since=True`
+counts - a "still watching, nothing has happened yet" account genuinely
+has no outcome to correlate its qualification against. The other three
+categories are left as raw counts, since each is already conditionally
+populated in `learn_engine.py` (same "meaningful count, not raw list
+length" fix as the sibling rejection-diagnosis gate above it, which
+already used explicit `rejected_count`/`not_interested_with_reason_count`
+rather than a bare `len()`). Checked against real production data: today
+the gate happens to still pass either way (49 scored applications alone
+clear zero), so this wasn't visibly broken yet - but the raw-`len()`
+version would have silently defeated the gate the moment scoring/
+outreach/interview data went back to zero (a fresh install, or historical
+data cleanup), which is exactly the scenario regression-tested here (78
+synthetic target accounts, zero everything else, gate correctly reports
+nothing analyzeable). Tests: `tests/test_learn_engine_gate.py`, 5 cases
+including the real 78-account reproduction. Full suite: 816 passed.
+
 ## 18. Applications Pivot Table (Designed 2026-07-30, not yet built)
 
 A dedicated page for slicing application history the way a spreadsheet

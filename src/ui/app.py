@@ -1905,6 +1905,43 @@ SIGNAL_TYPE_LABELS = {
 }
 
 
+def _count_analyzeable_learn_inputs(learn_input: dict) -> int:
+    """Real gap found 2026-08-10 (Zahir's adversarial self-audit request,
+    PRD S17 #22): the Learn Engine's "nothing to analyze yet" gate used to
+    sum raw list lengths across all four learn_input categories, but
+    target_account_vs_outcome (see learn_engine.gather_learn_engine_input)
+    appends ONE ENTRY PER TARGET ACCOUNT UNCONDITIONALLY - not just ones
+    with a real correlatable outcome - so with 78 real target accounts
+    already in the store, that one list alone always pushed the raw sum
+    well past zero, regardless of whether scoring_vs_outcome/outreach_vs_
+    outcome/interview_outcomes had anything real in them. The gate could
+    never correctly say "nothing to analyze yet" again once Prospector had
+    been used at all - it was checking "does Prospector have ANY target
+    account on file", not "is there real signal to reason over", defeating
+    the whole point of gating (same "meaningful count, not raw list
+    length" fix as the sibling rejection-diagnosis gate, which already
+    used explicit rejected_count/not_interested_with_reason_count rather
+    than a bare len()). Fixed by only counting a target_account_vs_outcome
+    entry when real_posting_appeared_since is True - a "still just
+    watching, nothing has happened yet" account genuinely has no outcome
+    to correlate its qualification against, which is exactly the case
+    this gate exists to filter out. The other three categories are left
+    as raw counts - each is already conditionally populated
+    (scoring_vs_outcome needs a real fit_score, outreach_vs_outcome/
+    interview_outcomes need a real record to exist at all), not appended
+    once per some larger always-present collection the way target_
+    account_vs_outcome was."""
+    meaningful_target_accounts = sum(
+        1 for t in learn_input["target_account_vs_outcome"] if t["real_posting_appeared_since"]
+    )
+    return (
+        len(learn_input["scoring_vs_outcome"])
+        + meaningful_target_accounts
+        + len(learn_input["outreach_vs_outcome"])
+        + len(learn_input["interview_outcomes"])
+    )
+
+
 @st.cache_data(show_spinner=False)
 def _cached_paused_accounts_rereview(target_accounts, jobs, applications):
     """Cache wrapper for target_accounts.find_paused_accounts_with_new_
@@ -4429,7 +4466,7 @@ elif active_tab == "prospector":
                 st.markdown(f"**Known gap:** {_escape_markdown_dollar(gap)}")
     if st.button("Run Learn Engine analysis", type="primary"):
         learn_input = gather_learn_engine_input(applications, jobs, target_accounts, outreach_records, prep_records)
-        total_inputs = sum(len(learn_input[k]) for k in ("scoring_vs_outcome", "target_account_vs_outcome", "outreach_vs_outcome", "interview_outcomes"))
+        total_inputs = _count_analyzeable_learn_inputs(learn_input)
         if total_inputs == 0:
             st.info("Nothing to analyze yet - come back once there's more history across scoring, target accounts, outreach, or interviews.")
         else:
