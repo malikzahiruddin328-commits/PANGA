@@ -2124,43 +2124,83 @@ if active_tab == "settings":
             key="job_sources_lever_editor",
         )
 
+        def _validate_source_rows(rows, required_fields, seen_names):
+            """required_fields is [(row_key, display_label), ...].
+            seen_names is a set shared across ALL 4 tables' calls (mutated
+            in place) so a company_name reused across different platforms
+            is caught too, not just within one table - see
+            job_sources.load_job_sources()'s own docstring for why a
+            cross-platform collision matters (freshness_check.py's
+            build_api_source_lookup() keys one dict by name across all 4
+            platforms combined). Returns a list of human-readable problems,
+            checked BEFORE any int()/dict-building below - Streamlit's
+            column_config `required=True` is a visual hint only, not a hard
+            gate on what data_editor actually returns on the same rerun a
+            row was just added and not yet fully filled in (real bug found
+            2026-08-10, Mirror's audit: int(None) on an unfilled required
+            NumberColumn crashed this whole save handler, before any of
+            the try/except below ever ran)."""
+            errors = []
+            for i, row in enumerate(rows, start=1):
+                for row_key, label in required_fields:
+                    value = row.get(row_key)
+                    if value is None or value == "":
+                        errors.append(f"Row {i}: \"{label}\" is required but empty.")
+                name = row.get("company_name")
+                if name:
+                    if name in seen_names:
+                        errors.append(f"Row {i}: \"{name}\" is already used by another row above - company names must be unique.")
+                    seen_names.add(name)
+            return errors
+
         if st.button("Save job-board sources"):
-            # Advanced per-company filters (e.g. IQVIA's US-only facet) aren't
-            # exposed in this table - carry them over by company_name so
-            # editing/re-saving the list above doesn't silently drop them.
-            existing_facets = {c["company_name"]: c.get("applied_facets") for c in job_sources_data["workday"]}
-            new_workday = []
-            for row in workday_rows:
-                entry = {
-                    "company_name": row["company_name"], "tenant": row["tenant"], "site": row["site"],
-                    "wd_number": int(row["wd_number"]), "limit": int(row["limit"]),
-                }
-                facets = existing_facets.get(row["company_name"])
-                if facets:
-                    entry["applied_facets"] = facets
-                new_workday.append(entry)
-            new_smartrecruiters = [
-                {"company_name": row["company_name"], "company_id": row["company_id"], "limit": int(row["limit"])}
-                for row in smartrecruiters_rows
-            ]
-            new_greenhouse = [
-                {"company_name": row["company_name"], "board_token": row["board_token"], "limit": int(row["limit"])}
-                for row in greenhouse_rows
-            ]
-            new_lever = [
-                {"company_name": row["company_name"], "company_slug": row["company_slug"], "limit": int(row["limit"])}
-                for row in lever_rows
-            ]
-            try:
-                save_job_sources({
-                    "workday": new_workday, "smartrecruiters": new_smartrecruiters,
-                    "greenhouse": new_greenhouse, "lever": new_lever,
-                })
-            except Exception as exc:
-                st.error(f"Failed to save job-board sources: {exc}")
+            seen_names = set()
+            validation_errors = (
+                _validate_source_rows(workday_rows, [("company_name", "Company"), ("tenant", "Tenant"), ("site", "Site"), ("wd_number", "WD #"), ("limit", "Max results")], seen_names)
+                + _validate_source_rows(smartrecruiters_rows, [("company_name", "Company"), ("company_id", "Company ID"), ("limit", "Max results")], seen_names)
+                + _validate_source_rows(greenhouse_rows, [("company_name", "Company"), ("board_token", "Board token"), ("limit", "Max results")], seen_names)
+                + _validate_source_rows(lever_rows, [("company_name", "Company"), ("company_slug", "Company slug"), ("limit", "Max results")], seen_names)
+            )
+            if validation_errors:
+                st.error("Couldn't save - fix these first:\n\n" + "\n".join(f"- {e}" for e in validation_errors))
             else:
-                st.toast("Saved job-board sources.", icon=":material/check_circle:")
-                st.rerun()
+                # Advanced per-company filters (e.g. IQVIA's US-only facet)
+                # aren't exposed in this table - carry them over by
+                # company_name so editing/re-saving the list above doesn't
+                # silently drop them.
+                existing_facets = {c["company_name"]: c.get("applied_facets") for c in job_sources_data["workday"]}
+                new_workday = []
+                for row in workday_rows:
+                    entry = {
+                        "company_name": row["company_name"], "tenant": row["tenant"], "site": row["site"],
+                        "wd_number": int(row["wd_number"]), "limit": int(row["limit"]),
+                    }
+                    facets = existing_facets.get(row["company_name"])
+                    if facets:
+                        entry["applied_facets"] = facets
+                    new_workday.append(entry)
+                new_smartrecruiters = [
+                    {"company_name": row["company_name"], "company_id": row["company_id"], "limit": int(row["limit"])}
+                    for row in smartrecruiters_rows
+                ]
+                new_greenhouse = [
+                    {"company_name": row["company_name"], "board_token": row["board_token"], "limit": int(row["limit"])}
+                    for row in greenhouse_rows
+                ]
+                new_lever = [
+                    {"company_name": row["company_name"], "company_slug": row["company_slug"], "limit": int(row["limit"])}
+                    for row in lever_rows
+                ]
+                try:
+                    save_job_sources({
+                        "workday": new_workday, "smartrecruiters": new_smartrecruiters,
+                        "greenhouse": new_greenhouse, "lever": new_lever,
+                    })
+                except Exception as exc:
+                    st.error(f"Failed to save job-board sources: {exc}")
+                else:
+                    st.toast("Saved job-board sources.", icon=":material/check_circle:")
+                    st.rerun()
 
     st.subheader("Job-alert email senders")
     st.markdown(
