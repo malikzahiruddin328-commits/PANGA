@@ -138,15 +138,23 @@ inline - same rule Bhangi follows for its own scope
 
 A distinct, narrower path from the numbered flow above, not a shortcut
 through it: Backlog (or another session) relays a pure documentation edit
-- typically a new/updated PRD backlog row - with no code changes,
-committed and pushed directly to `master`'s shared checkout rather than
-through a feature-branch worktree. Written down here explicitly
-(2026-08-10, Release Manager's own conduct audit) because it had been
-happening all along on unwritten judgment, not a documented exception -
-"a markdown-only diff can't break a Python test suite" is sound reasoning,
-but it was never actually *written* as the rule, which meant there was no
-fixed boundary for what else might ride along under the same "it's just a
-doc" logic.
+- typically a new/updated PRD backlog row - with no code changes. This
+still goes through a worktree and branch exactly like any code change -
+**there is no shared-checkout shortcut for this, regardless of how small
+or doc-vs-code the change is.** (Corrected 2026-08-11: an earlier version
+of this section documented committing doc-only relays directly to
+`master`'s shared checkout, written down as an explicit exception during
+Release Manager's own 2026-08-10 conduct audit. That directly conflicted
+with a standing rule Zahir set the same night, "confirmed the hard way"
+after two separate sessions - UI refinement and Prospector design - each
+committed a doc-only edit straight to the shared checkout reasoning it
+was lighter-weight than a real code change: "the rule is about WHERE a
+commit lands [the shared checkout, at risk from another session's
+concurrent `git stash`/checkout/reset], not about how small or
+code-vs-doc the change is - there is no size or content-type carve-out."
+Release Manager is not exempt from that rule either - flagged to the hub
+2026-08-11 rather than assumed, confirmed explicitly: fix this section to
+match, don't ask again.)
 
 What's still required, every time: confirm the actual diff is doc-only
 (`git diff --stat` shows only the expected file(s), nothing else) and that
@@ -159,14 +167,21 @@ confirmed at 25 inserted rows, then staged and committed without
 re-checking - the committed result actually had 29, because 4 more rows
 landed in the same shared file in the gap between the check and the
 `git add`. The extra content turned out to be legitimate, but it was
-committed unreviewed, which is the real gap, not the content itself.
+committed unreviewed, which is the real gap, not the content itself. If
+the relayed edit is already sitting as an uncommitted diff in the shared
+checkout (e.g. another session edited it there directly, itself a
+violation of the no-exception rule above but not this session's mistake
+to compound) - save it as a patch, revert the shared checkout, and apply
+the patch inside a fresh worktree instead of building on top of where it
+already landed.
 
 What's explicitly skipped for this path, and why: the full `pytest` run
 (step 5 above) - a change confirmed doc-only by the check above cannot
 affect Python behavior, so running the suite anyway would just be
 overhead with no real signal. This is the one documented exception to "run
-the full suite before it goes anywhere near `master`" - not a precedent
-for skipping it anywhere else.
+the full suite before it goes anywhere near `master`" - it is NOT an
+exception to going through a worktree, which every change (code or doc)
+always does.
 
 ## What it explicitly does not do
 
