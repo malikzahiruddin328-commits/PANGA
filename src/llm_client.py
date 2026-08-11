@@ -50,6 +50,40 @@ four gaps in the above:
    models_tried, not just the last exception's own status/type/
    request_id - previously indistinguishable from a first-attempt-only
    failure when reading panga_debug.log after the fact.
+
+Daily spend cap (2026-08-11): CLAUDE.md's cost-blast-radius rule stops
+expensive new code from shipping unchecked, but nothing stopped an
+already-shipped, already-running process (the daily job-search batch
+scoring 455 jobs) from spending past a real limit once it started -
+there was no runtime circuit breaker, only development-time discipline.
+_check_spend_cap() closes that gap: called at the very top of every real
+call (before any HTTP request is even prepared), it blocks NEW calls once
+today's real cost_log spend reaches the cap, but never touches a call
+already past this check - same "finish what's running, halt anything
+new" pattern as tonight's C2 design discussion. Sized from real
+production cost_log data (2026-08-11): a normal light day (2026-08-09)
+spent $2.77; the runaway fit_score batch that actually happened
+2026-08-11 crossed $10 within ~7 minutes of starting and reached $63.86
+before the day was half over. DEFAULT_DAILY_SPEND_CAP_USD=20.0 sits well
+above normal light-usage spend (no risk of blocking real interactive use)
+while cutting a runaway batch off within minutes of it starting, not
+after $60+ is already gone - override via PANGA_DAILY_SPEND_CAP_USD if
+that default proves wrong in practice. Resets at UTC midnight (matches
+every cost_log timestamp's own timezone - this codebase has no local-
+timezone handling anywhere else, so introducing one here for calendar-day
+alignment would add complexity for a benefit that doesn't matter: what
+matters is bounding a day's spend, not precisely which midnight).
+
+Known limitation, documented rather than silently assumed away: the cap
+check reads cost_log fresh each call but isn't an atomic reservation - if
+several calls are genuinely concurrent (the Streamlit app and a scheduled
+task can both be mid-call at once), they can each pass the check before
+any of them logs its own cost, so the cap can be overshot by the
+concurrently-in-flight calls' combined cost before the block engages.
+This is a circuit breaker (stop the bleeding soon after crossing), not a
+hard ceiling - a precise version would need real distributed reservation
+logic this codebase has no infrastructure for elsewhere, and would be
+over-engineering for what's actually needed here.
 """
 
 import json
@@ -57,6 +91,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 import anthropic
@@ -69,6 +104,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "claude-opus-5"
 FALLBACK_MODEL = "claude-sonnet-5"
+
+DEFAULT_DAILY_SPEND_CAP_USD = 20.0  # see module docstring for the real-data reasoning
 
 # Transient errors worth retrying/falling back on. Anything else (bad
 # request, auth, content policy, etc.) propagates on the first attempt.
@@ -174,6 +211,18 @@ class LLMResponseTruncated(LLMCallFailed):
     failure just as likely to retry something a bigger budget can't help.
     Added 2026-08-08 for tailoring.job_alert_reasoning.extract_listings'
     escalating-max_tokens retry - see that module for why."""
+    pass
+
+
+class LLMSpendCapExceeded(LLMCallFailed):
+    """Raised by _check_spend_cap() when today's real cost_log spend has
+    already reached the daily cap, BEFORE any HTTP request for this call
+    is made (2026-08-11 - see module docstring's "Daily spend cap"
+    section). Subclasses LLMCallFailed so every existing `except
+    LLMCallFailed` still catches this the same way; a caller that wants
+    to react specifically (e.g. stop a batch loop early rather than
+    treating it as one failed item among many) can catch this narrower
+    type instead."""
     pass
 
 
@@ -289,6 +338,110 @@ def get_client() -> "anthropic.Anthropic":
     return anthropic.Anthropic(max_retries=0)
 
 
+def _daily_spend_cap_usd() -> float:
+    """Read fresh per call (not cached at import time) so an operator can
+    raise/lower PANGA_DAILY_SPEND_CAP_USD without restarting the app -
+    same per-call-env-read convention call_structured already uses for
+    ANTHROPIC_MODEL. Falls back to the default rather than raising on a
+    malformed value - a bad env var must never itself become an outage on
+    every single AI call."""
+    raw = os.environ.get("PANGA_DAILY_SPEND_CAP_USD")
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            logger.error("PANGA_DAILY_SPEND_CAP_USD=%r isn't a valid number - using the default $%.2f instead.", raw, DEFAULT_DAILY_SPEND_CAP_USD)
+    return DEFAULT_DAILY_SPEND_CAP_USD
+
+
+def _todays_spend_usd() -> float:
+    """Real cumulative cost_log spend for the current UTC calendar day.
+    Reads cost_log fresh every call - deliberately not cached, since the
+    whole point is real-time enforcement, and cost_log is a small,
+    infrequently-read file at this call frequency (once per real AI call,
+    not a hot per-event path)."""
+    from cost_log import load_cost_log
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    return sum(
+        e.get("cost_usd") or 0
+        for e in load_cost_log()
+        if (e.get("timestamp") or "").startswith(today)
+    )
+
+
+_cap_alarm_logged_for_date = None  # tracks which UTC date already got its one CRITICAL log line
+
+
+def _log_cap_block(purpose: str) -> None:
+    """Records a blocked (never-attempted) call to cost_log in the same
+    success=False shape _log_failed_call uses for genuine API failures
+    (error_type="spend_cap_exceeded" distinguishes the two) - so the Ops
+    tab's failed_call_count surfaces a cap trip the same way it surfaces
+    a real failure, not a second invisible bucket nobody thinks to check.
+    Swallows its own failures - a logging problem must never mask the
+    real LLMSpendCapExceeded already being raised to the caller."""
+    try:
+        from cost_log import log_api_cost
+
+        log_api_cost(
+            purpose=purpose, model="none", input_tokens=0, output_tokens=0, cost_usd=0.0,
+            success=False, error_type="spend_cap_exceeded", attempt_count=0, models_tried=[],
+        )
+    except Exception:
+        logger.exception("Failed to log spend-cap-block record (purpose=%s).", purpose)
+
+
+def _check_spend_cap(purpose: str) -> None:
+    """Raises LLMSpendCapExceeded if today's real spend has already
+    reached the daily cap - called at the very top of call_structured/
+    call_with_web_search, before any HTTP request is even built, so a
+    tripped cap blocks NEW calls only. Anything that already passed this
+    check keeps running to completion, including its own retries/
+    fallback attempt inside _call_with_retries - there's no cap check
+    inside that loop, by design, matching "finish what's running, halt
+    anything new" (see module docstring).
+
+    The FIRST block of a given UTC day logs at CRITICAL - always written
+    to panga_debug.log regardless of PANGA_DEBUG (debug_log.setup_always_
+    on_error_logging's handler is set at ERROR level, and CRITICAL > ERROR)
+    - so this is genuinely unmissable, not a line buried among routine
+    per-call ERROR logs. Every subsequent block that same day logs at
+    ERROR instead, so a batch loop hammering into the cap doesn't spam
+    CRITICAL alarms for every single blocked item. The "once per day"
+    dedup is per-process (a plain module global) - Panga runs several
+    processes (the Streamlit app, up to 3 scheduled tasks), each with its
+    own separate copy of this state, so if two different processes both
+    independently hit the cap the same day, each logs its own one-time
+    CRITICAL rather than there being a single system-wide alarm. Still far
+    better than one CRITICAL per blocked call, and correct - a real
+    cross-process dedup would need shared state this codebase doesn't
+    have infrastructure for elsewhere, and isn't worth building for a
+    log-spam concern this minor."""
+    spent = _todays_spend_usd()
+    cap = _daily_spend_cap_usd()
+    if spent < cap:
+        return
+
+    global _cap_alarm_logged_for_date
+    today = datetime.now(timezone.utc).date().isoformat()
+    if _cap_alarm_logged_for_date != today:
+        _cap_alarm_logged_for_date = today
+        logger.critical(
+            "DAILY SPEND CAP EXCEEDED - blocking all further AI calls until it resets at UTC midnight. "
+            "Spent $%.2f today, cap is $%.2f. First blocked purpose: %s.",
+            spent, cap, purpose,
+        )
+    else:
+        logger.error("Blocked AI call - daily spend cap still exceeded ($%.2f spent, cap $%.2f, purpose=%s).", spent, cap, purpose)
+
+    _log_cap_block(purpose)
+    raise LLMSpendCapExceeded(
+        f"Today's AI spend (${spent:.2f}) has reached the daily cap (${cap:.2f}). "
+        "New AI calls are paused until it resets at UTC midnight. Anything already running will finish."
+    )
+
+
 def _log_cost(
     response, model: str, purpose: str, job_key: tuple[str, str] | None,
     duration_ms: float | None = None,
@@ -386,6 +539,7 @@ def call_structured(
     from debug_log import setup_always_on_error_logging
 
     setup_always_on_error_logging()
+    _check_spend_cap(purpose)
 
     primary_model = model or os.environ.get("ANTHROPIC_MODEL") or DEFAULT_MODEL
 
@@ -469,6 +623,12 @@ def call_with_web_search(
     is 0.0 if the call failed before any usage was billed. Never raises on
     API error (both original callers treated a failed lookup as "no
     result found", not a hard error) - callers check for an empty string.
+    The daily spend cap (2026-08-11) respects this same contract: a
+    tripped cap returns ("", 0.0) same as any other blocked call here,
+    rather than raising LLMSpendCapExceeded the way call_structured does -
+    this function's existing callers have never had a reason to wrap it
+    in a try/except, and breaking that now would risk an unhandled crash
+    somewhere that's never needed one before.
 
     purpose/job_key (score-first-resume-flow spec item 7): same real-cost
     logging as call_structured() - see _log_cost()."""
@@ -476,6 +636,10 @@ def call_with_web_search(
     from debug_log import setup_always_on_error_logging
 
     setup_always_on_error_logging()
+    try:
+        _check_spend_cap(purpose)
+    except LLMSpendCapExceeded:
+        return "", 0.0
 
     primary_model = model or DEFAULT_MODEL
 
