@@ -16,6 +16,19 @@
   (jobs.json is already 300+ records and growing daily), consider the cost
   of an operation before adding it to something that runs 4x/day or every
   10 minutes.
+- **Check for cost/spend blast radius**: any new or modified code path that
+  calls a paid AI model must have its real per-call cost and expected call
+  volume estimated before it ships at scale - not discovered after the
+  fact. Prefer the cheapest model that meets the quality bar, add a
+  free/cheap pre-filter before an expensive call where one is possible, and
+  use prompt caching for content that repeats across calls (e.g. a profile
+  embedded in every scoring call). If a new pipeline could plausibly run
+  hundreds of paid calls, flag the projected cost to the hub/Zahir before
+  building it at that scale - don't wait to be asked. (Real incident,
+  2026-08-09/10: the Anthropic account ran fully out of credits;
+  `fit_score` turned out to be 81% of all spend, using the priciest model
+  with no pre-filter or caching, never checked before being built at
+  scale.)
 
 Apply these checks whenever writing or reviewing code in this repo, not just
 when explicitly asked.
