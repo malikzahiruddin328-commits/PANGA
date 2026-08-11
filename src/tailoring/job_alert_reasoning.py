@@ -108,6 +108,7 @@ def extract_listings(subject: str, body: str) -> list[dict]:
                 effort="medium",
                 thinking=False,
                 refusal_message="Claude declined to extract listings from this email.",
+                purpose="job_alert_extract_listings",
             )
         except LLMResponseTruncated:
             if max_tokens == _MAX_TOKENS_TIERS[-1]:

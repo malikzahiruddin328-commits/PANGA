@@ -88,6 +88,7 @@ def classify_thread(thread_summary: dict, full_body: str | None = None) -> dict:
         effort="medium",
         thinking=False,
         refusal_message="Claude declined to classify this email. Treating as not_related for safety.",
+        purpose="cta_classify_thread",
     )
 
 
@@ -188,6 +189,7 @@ def match_application_confirmation(thread_summary: dict, full_body: str, candida
         effort="medium",
         thinking=False,
         refusal_message="Claude declined to match this email. Treating as no match for safety.",
+        purpose="cta_match_application_confirmation",
     )
 
 
@@ -243,6 +245,7 @@ def match_cta_application(category: str, thread_summary: dict, full_body: str, c
         effort="medium",
         thinking=False,
         refusal_message="Claude declined to match this email. Treating as no match for safety.",
+        purpose="cta_match_application",
     )
 
 
@@ -291,5 +294,6 @@ def draft_cta_reply(category: str, subject: str, snippet: str, available_slots: 
         effort="medium",
         thinking=False,
         refusal_message="Claude declined to draft a reply.",
+        purpose="cta_draft_reply",
     )
     return data["reply_body"]
