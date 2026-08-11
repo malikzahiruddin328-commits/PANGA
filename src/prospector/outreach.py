@@ -7,7 +7,7 @@ responded/no-response): "planned" added as the state before any draft
 exists - Zahir logging "I want to reach out to X" is itself worth
 recording even before a message is drafted. Same kind of small,
 documented lifecycle extension as applications.py's real status set grew
-beyond the PRD's original sketch.
+beyond `docs/prospector-spec.md`'s original sketch.
 
 Email drafting REUSES the Gmail-draft mechanism from cta_emails.py/the
 panga-cta-fulfillment scheduled task (§14) rather than a second pathway -

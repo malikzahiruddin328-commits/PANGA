@@ -139,7 +139,10 @@ def save_round(
     interviewers is replaced wholesale rather than merged, since by this
     point Claude holds the full researched list, including anyone added
     since start_round(). likely_questions/questions_to_ask are lists of
-    dicts - see docs/job-search-automation-prd.md §10 for the field shape."""
+    dicts - see docs/backlog-log.md §10 for the field shape (note: this
+    citation predates the 2026-08-11 doc split and already looked stale
+    then - §10 doesn't actually describe a field shape; flagged, not
+    fixed, as part of that migration)."""
     records = load_interview_prep()
     round_ = _get_or_create_round(_get_or_create_record(records, source, job_id), round_label)
     if interviewers is not None:

@@ -3,7 +3,7 @@
 Branch: `feature/native-packaging`. Started 2026-07-31, split out of the
 "General" brainstorming session into its own dedicated chat per Zahir's
 usual one-session-per-purpose pattern. Full backlog context:
-`docs/job-search-automation-prd.md` §13 — "Native Windows app packaging"
+`docs/backlog-log.md` §13 — "Native Windows app packaging"
 and "Direct LLM API integration (replace Claude Code orchestration)" rows.
 
 ## Goal
@@ -161,7 +161,7 @@ been verified vs. not.
   independently in `licensing/local_state.py`'s own docstring as "not yet
   confirmed with the update-mechanism branch".
 - **Licensing / per-user API key handling for a sold product** — separate,
-  not-yet-designed backlog item (PRD §13), deliberately deferred until this
+  not-yet-designed backlog item (`docs/backlog-log.md` §13), deliberately deferred until this
   branch and its direct-API prerequisite are further along, since license/
   billing design depends on how end-user API calls actually get made.
 - **Code signing** — not needed yet (Zahir is still the only real user).

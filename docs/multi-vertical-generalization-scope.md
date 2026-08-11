@@ -3,7 +3,7 @@
 Branch: `feature/multi-vertical-generalization`. Started 2026-07-31, split
 out of the "General" brainstorming session into its own dedicated chat per
 Zahir's usual one-session-per-purpose pattern. Full backlog context:
-`docs/job-search-automation-prd.md` §13 — "Generalize Panga for
+`docs/backlog-log.md` §13 — "Generalize Panga for
 multi-vertical sale" row.
 
 ## Goal
@@ -132,7 +132,7 @@ real paying customer in that vertical to validate against. Prospector
 should degrade gracefully for a vertical with no signal source yet (say so
 explicitly in the UI — "not available for this industry yet" — not show
 empty/wrong data). Matches the standing architecture principle already in
-the PRD: "should not be over-engineered for scale it doesn't need yet."
+`docs/frs.md`: "should not be over-engineered for scale it doesn't need yet."
 
 ### 5. Disqualifiers become user-editable
 **Status: done (2026-08-01).** The CISO-rule pattern (a real, non-obvious

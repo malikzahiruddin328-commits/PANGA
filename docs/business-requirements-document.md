@@ -6,7 +6,7 @@ active feature branches (`feature/native-packaging`,
 `feature/update-mechanism`, `feature/licensing`,
 `feature/multi-vertical-generalization`) into one document. This is a
 business/product document, not a technical spec — for implementation
-detail, see `docs/job-search-automation-prd.md` and each branch's own
+detail, see `docs/frs.md` and each branch's own
 `docs/*-scope.md`.
 
 ## 1. Executive Summary
@@ -35,7 +35,7 @@ any trade or industry, not just Zahir's own.
 
 - **Pricing**: $200/year, subscription, billed annually. **Explicitly a
   placeholder** — not validated against real costs. See the "Realistic
-  cost evaluator" backlog item (PRD §13) before treating this as final.
+  cost evaluator" backlog item (`docs/backlog-log.md` §13) before treating this as final.
 - **Trial**: 15 days free, no charge, before the first billing event.
 - **Billing processor**: Stripe (Stripe Billing + card processing — 2.9%
   + $0.30 per charge, +0.5% of subscription volume on the Starter tier, no
@@ -75,9 +75,9 @@ targeting nuclear vs. plastics-forming plants all need the app to
 recognize and work with *their* career, not default to executive IT
 titles.
 
-## 5. Product Scope (summary — see PRD for full detail)
+## 5. Product Scope (summary — see FRS for full detail)
 
-Already built (personal-tool phase, see `docs/job-search-automation-prd.md`
+Already built (personal-tool phase, see `docs/backlog-log.md`
 for complete history): resume ingestion, gap-probing interview, multi-source
 job search (USAJOBS, job boards, company ATS feeds, industry boards),
 compatibility scoring, tailored resume/cover-letter drafting, encrypted
@@ -101,6 +101,20 @@ call-to-action monitoring and fulfillment.
    — per-user industry/vertical intake, resume-driven title-ladder
    reasoning, per-user target-role generation, user-editable
    disqualifiers.
+
+## 5a. Platform Roadmap
+
+Moved here from `docs/job-search-automation-prd.md` §5 on 2026-08-11
+(Zahir's call, via Panga-Documentor: this is a business-level platform
+commitment, not a functional spec item) — content unchanged.
+
+- Prove out the workflow as a local tool/script first
+- Package as a Windows desktop app once stabilized
+- Port to Mac after that
+- (Open question, deferred: whether native Windows app vs. cross-platform
+  framework like Electron/Tauri gives better ROI — worth revisiting once
+  the core logic is proven, since packaging choice shouldn't block MVP
+  validation)
 
 ## 6. Non-Functional Requirements
 
@@ -181,7 +195,7 @@ actual submission, as Microsoft revises this periodically)
 
 ## 10. Open Backlog Items Referenced by This Document
 
-See `docs/job-search-automation-prd.md` §13 for the authoritative backlog.
+See `docs/backlog-log.md` §13 for the authoritative backlog.
 Items this BRD depends on or surfaces:
 - Marketing and sales strategy (not started)
 - Realistic cost evaluator (not started) — needed before §3's pricing is
@@ -196,7 +210,7 @@ Items this BRD depends on or surfaces:
 
 ## 11. Real-Cost Table (researched 2026-08-01, verify before committing spend)
 
-Every line item across this BRD and the PRD backlog with an actual dollar
+Every line item across this BRD and the backlog log with an actual dollar
 cost, in one place. "$0" items are prioritized first per Zahir's explicit
 instruction (2026-08-01) — nothing with a real cost gets scheduled
 alongside the free work by default.
