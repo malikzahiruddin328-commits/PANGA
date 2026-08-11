@@ -73,7 +73,11 @@ def setup_debug_logging() -> None:
 # (fulfill_archive_requests/fulfill_cta_draft_requests/
 # fulfill_outreach_draft_requests) were failing open with zero exception
 # logging anywhere, unlike every other scheduled-task-adjacent module.
-_ALWAYS_ON_LOGGER_NAMES = ("llm_client", "fulfillment")
+# "notifications" added 2026-08-11: send_notification()'s logger.exception()
+# call wrote nowhere durable in Zahir's real usage without this - RM caught
+# that the fix's own tests only passed because pytest's caplog attaches its
+# own handler directly, bypassing this always-on mechanism entirely.
+_ALWAYS_ON_LOGGER_NAMES = ("llm_client", "fulfillment", "notifications")
 
 
 def setup_always_on_error_logging() -> None:

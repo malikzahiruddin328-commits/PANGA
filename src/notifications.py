@@ -44,4 +44,14 @@ def send_notification(title: str, message: str, timeout_seconds: int = 10) -> No
             check=False,
         )
     except (subprocess.SubprocessError, OSError):
+        # RM caught (2026-08-11): logger.exception() alone writes nowhere
+        # durable in real usage unless something has already called
+        # debug_log.setup_always_on_error_logging() - true for llm_client/
+        # fulfillment callers but NOT for gmail_cta_scan.py/job_alert_scan.py,
+        # which import this module directly with no such call upstream. Same
+        # self-contained call-it-right-before-logging pattern llm_client.py
+        # itself uses, so this doesn't depend on caller import order.
+        from debug_log import setup_always_on_error_logging
+
+        setup_always_on_error_logging()
         logger.exception("Failed to show system-tray notification: %r", title)
