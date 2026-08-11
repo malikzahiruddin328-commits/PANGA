@@ -88,7 +88,7 @@ from tailoring.unconfirmed_claims import find_unconfirmed_markers, resolve_uncon
 from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed, analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_impact as _check_regenerate_impact, request_additional_gap_questions as _request_additional_gap_questions, reextract_ats_keywords_and_rescore as _reextract_ats_keywords_and_rescore, rescore_against_cached_keywords as _rescore_against_cached_keywords, gap_scan_is_current as _gap_scan_is_current, gap_scan_baseline_fingerprint as _gap_scan_baseline_fingerprint
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
 from prospector.rejection_diagnosis import gather_diagnosis_input, diagnose
-from prospector.target_accounts import load_target_accounts, set_status as set_target_account_status, set_website, load_website_lookup_cost, save_website_lookup_cost, find_disqualified_with_new_activity
+from prospector.target_accounts import load_target_accounts, set_status as set_target_account_status, set_website, load_website_lookup_cost, save_website_lookup_cost, find_paused_accounts_with_new_activity
 from prospector.company_lookup import lookup_company_website
 from prospector.outreach import (
     add_outreach, update_status as update_outreach_status, request_draft,
@@ -1843,6 +1843,23 @@ SIGNAL_TYPE_LABELS = {
     "funding_event": "Funding/IPO filing",
     "regulatory_filing": "Regulatory filing (deprecated signal - see note above)",
 }
+
+
+@st.cache_data(show_spinner=False)
+def _cached_paused_accounts_rereview(target_accounts, jobs, applications):
+    """Cache wrapper for target_accounts.find_paused_accounts_with_new_
+    activity() (PRD S16a #10, 2026-08-10) - that function is otherwise
+    recomputed from scratch on EVERY Streamlit rerun (any widget
+    interaction anywhere in the app reruns this whole script top-to-
+    bottom), not just when target_accounts/jobs/applications actually
+    change. Measured ~675ms unconditionally at real data volume before
+    this, growing with jobs.json's real weekly growth. st.cache_data
+    hashes its arguments' actual content, so a rerun that doesn't change
+    any of these three inputs is a cache hit - passing target_accounts as
+    a real argument (rather than the function loading it internally) is
+    what makes that hash actually reflect target_account status changes
+    too, not just jobs/applications."""
+    return find_paused_accounts_with_new_activity(target_accounts, jobs, applications)
 # Known channels the "Add a job manually" fallback can attribute a posting
 # to - kept in sync with the sources industry_boards.py/company_sites.py
 # actually search, plus LinkedIn (default, since it's the one channel with
@@ -3988,30 +4005,40 @@ elif active_tab == "prospector":
             st.toast(f"Prospector Score: {result['score']}/100.", icon=":material/check_circle:")
             st.rerun()
 
-    # Real gap found live 2026-08-09: "disqualified" is sticky by design
-    # (see target_accounts.MANUAL_STATUSES) so it never silently changes on
-    # its own - but that also meant a company that picked up a real posting
-    # AFTER being disqualified (UCB Pharma, BAUSCH, BeOne Medicines USA -
-    # BeOne's is now an application under review) sat disqualified forever
-    # with nothing flagging the mismatch back. This is a deterministic,
+    # Real gap found live 2026-08-09: a manual "paused" status (disqualified
+    # or stale - see target_accounts.PAUSED_STATUSES) is sticky by design
+    # so it never silently changes on its own - but that also meant a
+    # company that picked up a real posting AFTER being disqualified (UCB
+    # Pharma, BAUSCH, BeOne Medicines USA - BeOne's is now an application
+    # under review) sat that way forever with nothing flagging the mismatch
+    # back. Extended 2026-08-10 (#15/#16) to also catch a genuinely new
+    # signal added to an already-paused account, and to cover "stale" the
+    # same way "disqualified" was already covered. This is a deterministic,
     # zero-cost check (not dependent on the Prospector Score's LLM
     # reasoning noticing it in the data), so it's always visible here
-    # rather than gated behind a "Compute Prospector Score" click.
-    rereview_flags = find_disqualified_with_new_activity(jobs, applications)
+    # rather than gated behind a "Compute Prospector Score" click -
+    # cached (#10) so it's only actually recomputed when target_accounts/
+    # jobs/applications change, not on every unrelated rerun.
+    rereview_flags = _cached_paused_accounts_rereview(target_accounts, jobs, applications)
     if rereview_flags:
         lines = [
-            f"**{len(rereview_flags)} disqualified account(s) have new activity since being "
-            "disqualified - worth a second look.** Status stays disqualified until you change "
-            "it yourself; this only flags that evidence exists now that wasn't there when you "
-            "disqualified it.",
+            f"**{len(rereview_flags)} paused account(s) (disqualified/stale) have new activity "
+            "since that call - worth a second look.** Status stays exactly as you set it until "
+            "you change it yourself; this only flags that evidence exists now that wasn't there "
+            "when you made that call.",
             "",
         ]
         for flag in rereview_flags:
-            job_bits = "; ".join(
-                f'"{m["title"]}" at {m["organization"]}' + (f' (application: {m["application_status"]})' if m["application_status"] else "")
-                for m in flag["matching_jobs"]
-            )
-            lines.append(f"- **{flag['company_name']}**: {job_bits}")
+            bits = []
+            for m in flag["matching_jobs"]:
+                bit = f'"{m["title"]}" at {m["organization"]}'
+                if m["application_status"]:
+                    bit += f' (application: {m["application_status"]})'
+                bits.append(bit)
+            for sig in flag["new_signals"]:
+                sig_label = SIGNAL_TYPE_LABELS.get(sig["signal_type"], sig["signal_type"])
+                bits.append(f"new {sig_label} signal ({sig['detail']}, observed {sig['date_observed'][:10]})")
+            lines.append(f"- **{flag['company_name']}** ({flag['status']}): {'; '.join(bits)}")
         st.warning("\n".join(lines))
 
     st.subheader("Target accounts")

@@ -569,7 +569,8 @@ Medicines USA) were disqualified for good reasons at the time (a stale
 trial, an already-approved-drug signal), then each later picked up a real
 job posting - BeOne's is now an application under review - with nothing
 ever surfacing that mismatch back to Zahir. Fixed with
-`target_accounts.find_disqualified_with_new_activity(jobs, applications)`:
+`target_accounts.find_disqualified_with_new_activity(jobs, applications)`
+(renamed 2026-08-10, see below):
 a deterministic, zero-cost cross-reference (same normalize-and-substring
 match as `commercial_hiring.py`/`connections.py`) that flags any
 disqualified account with a real posting that wasn't part of the evidence
@@ -593,6 +594,60 @@ real examples flagged correctly including BeOne's "under review"
 application; Securitas correctly excluded). Live-verified in an isolated
 Streamlit instance (port 8505) - warning box renders with the exact
 expected content, stopped cleanly after.
+
+**Hardened 2026-08-10 (Zahir's whole-codebase adversarial self-audit
+request, items #10/#15/#16/#20):** four real gaps in the fix above, found
+by re-examining it under the same "what's the sibling scenario" lens that
+built it in the first place.
+- **#20 - added `status_updated_at`** to every target account, bumped on
+  any real status change (manual `set_status()` or automatic
+  qualified/watching recomputation), same rule as `applications.py`'s
+  `status_updated_at`. Prerequisite for the two gaps below - without a
+  "when did Zahir make this call" timestamp, there's no way to tell
+  evidence that existed *before* a status decision from evidence that
+  arrived genuinely *after* it. Records whose status hasn't changed since
+  before this field existed don't have it - excluded from the two checks
+  below, not backfilled or guessed at, same convention as every other
+  "added on date X" field in this codebase.
+- **#15 - new signals on an already-paused account.** The original fix
+  only checked for a real job posting appearing later - a signal added
+  via `add_signal()` directly to an already-disqualified/stale account
+  (e.g. a fresh ClinicalTrials.gov trial found by a live Claude Code
+  session) was silently absorbed into `signals` with nothing surfaced,
+  even though it's the exact same "new evidence, sticky status" shape.
+  Now compares each signal's `date_observed` against `status_updated_at`.
+- **#16 - "stale" had zero coverage.** The original fix checked
+  `status == "disqualified"` only; "stale" accounts (also a manual,
+  sticky, "stopped watching this" status) got nothing. 0 stale accounts
+  exist in real data today so this was unreproduced live, but zero
+  protection the moment Zahir marks anything stale. `"contacted"` is
+  deliberately still excluded - that status means active engagement, not
+  a pause, a genuinely different situation.
+- **#10 - real O(paused accounts x jobs) performance cost**, ~675ms
+  unconditionally on every single Prospector tab render (Streamlit reruns
+  the whole script on any widget interaction anywhere in the app, not
+  just Prospector-tab ones) - projected ~1.3s at 5K jobs, ~2.6s at 10K,
+  reachable within 2-3 months at real ~1200 jobs/week growth. Fixed two
+  ways: (1) each job's normalized organization name is computed ONCE up
+  front instead of being re-normalized per paused account (the actual
+  dominant cost, not the substring check itself), (2) the UI call site
+  wraps the whole function in `st.cache_data` so a rerun that doesn't
+  change `target_accounts`/`jobs`/`applications` is a cache hit instead
+  of a full recompute. Required changing the function's own signature to
+  accept `target_accounts` as a real parameter instead of self-loading it
+  internally - the self-load was fine before caching existed, but would
+  have made `st.cache_data` silently ignore target_accounts changes
+  (stale cache hits on a status Zahir had literally just changed) had it
+  stayed hidden inside the function body.
+
+Renamed `find_disqualified_with_new_activity` -> `find_paused_accounts_with_
+new_activity` to match the now-broader disqualified+stale scope (new
+`PAUSED_STATUSES` constant). Regression-tested: lock-verification tests
+carried over unchanged, new tests for the timestamp bump (manual and
+automatic transitions), the new-signal-since-status-change check
+(including the "no status_updated_at yet" gap case), the stale-status
+case, and a real perf measurement against production-scale synthetic data
+confirming the precompute-once change actually reduces wall-clock time.
 
 ### 16b. Outreach (new funnel stage)
 
