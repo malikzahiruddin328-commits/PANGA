@@ -503,6 +503,220 @@ def test_generate_documents_uses_existing_resume_text_when_resume_not_in_this_ba
     assert seen_resume_text_for["cover_letter"] == "An already-stored resume."
 
 
+def test_generate_documents_drafts_non_resume_docs_concurrently(monkeypatch):
+    # Real concurrency, not just "the code technically uses a thread pool" -
+    # two workers must genuinely overlap in wall-clock time, proven with a
+    # barrier both must reach before either is allowed to return. If a
+    # future regression accidentally serialized these calls again, this
+    # test would hang past its own timeout rather than pass by accident.
+    import threading
+
+    import tailoring.drafting as drafting
+
+    barrier = threading.Barrier(2, timeout=5)
+
+    def _fake_draft_one(client, shared_context, doc_key, model, on_progress=None, doc_index=1, doc_total=1, job=None, profile=None, resume_text_for_consistency=None):
+        barrier.wait()  # raises threading.BrokenBarrierError if the other worker never arrives
+        return f"drafted {doc_key}"
+
+    monkeypatch.setattr(drafting, "_client", lambda: object())
+    monkeypatch.setattr(drafting, "_draft_one", _fake_draft_one)
+    job = {"source": "linkedin", "job_id": "1"}
+
+    result = drafting.generate_documents(job, {}, ["cover_letter", "exec_bio"])
+
+    assert result["cover_letter"] == "drafted cover_letter"
+    assert result["exec_bio"] == "drafted exec_bio"
+    assert result["_errors"] == {}
+
+
+def test_generate_documents_resume_always_drafts_before_the_concurrent_pool(monkeypatch):
+    # The self-correction loop and cross-document consistency both depend
+    # on the resume being fully drafted before any other doc starts (see
+    # generate_documents()'s own docstring) - resume must never be
+    # submitted into the same thread pool as the other doc_keys.
+    import tailoring.drafting as drafting
+
+    call_order = []
+
+    def _fake_self_correction(client, shared_context, model, on_progress, doc_index, doc_total, job, profile):
+        call_order.append("resume")
+        return {
+            "text": "Real resume text.", "ats_score": 95, "ats_rationale": "", "ats_next_actions": [],
+            "clarifying_questions": [], "unconfirmed_claims": [],
+            "missing_required_keywords": [], "missing_preferred_keywords": [],
+        }
+
+    def _fake_draft_one(client, shared_context, doc_key, model, on_progress=None, doc_index=1, doc_total=1, job=None, profile=None, resume_text_for_consistency=None):
+        call_order.append(doc_key)
+        # If this ever runs before the resume, resume_text_for_consistency
+        # would still be None here instead of the resume's real text.
+        assert resume_text_for_consistency == "Real resume text."
+        return f"drafted {doc_key}"
+
+    monkeypatch.setattr(drafting, "_client", lambda: object())
+    monkeypatch.setattr(drafting, "_draft_resume_with_self_correction", _fake_self_correction)
+    monkeypatch.setattr(drafting, "_draft_one", _fake_draft_one)
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": [], "ats_preferred_keywords": []}
+
+    drafting.generate_documents(job, {}, ["resume", "cover_letter", "exec_bio"])
+
+    assert call_order[0] == "resume"
+    assert set(call_order[1:]) == {"cover_letter", "exec_bio"}
+
+
+def test_generate_documents_one_doc_failing_does_not_lose_the_others(monkeypatch):
+    # Core partial-failure contract: with 2+ doc_keys requested, one
+    # document raising must never discard a sibling document that already
+    # succeeded, and must never raise out of generate_documents() itself.
+    import tailoring.drafting as drafting
+    from tailoring.drafting import DraftingFailed
+
+    reported = []
+    monkeypatch.setattr(drafting, "_report_drafting_failure", lambda job, doc_key, exc: reported.append((doc_key, str(exc))))
+
+    def _fake_draft_one(client, shared_context, doc_key, model, on_progress=None, doc_index=1, doc_total=1, job=None, profile=None, resume_text_for_consistency=None):
+        if doc_key == "cover_letter":
+            raise DraftingFailed("simulated refusal")
+        return f"drafted {doc_key}"
+
+    monkeypatch.setattr(drafting, "_client", lambda: object())
+    monkeypatch.setattr(drafting, "_draft_one", _fake_draft_one)
+    job = {"source": "linkedin", "job_id": "1"}
+
+    result = drafting.generate_documents(job, {}, ["cover_letter", "exec_bio"])
+
+    assert result["exec_bio"] == "drafted exec_bio"
+    assert "cover_letter" not in result
+    assert result["_errors"] == {"cover_letter": "simulated refusal"}
+    assert reported == [("cover_letter", "simulated refusal")]
+
+
+def test_generate_documents_catches_and_reports_any_exception_type_not_just_drafting_errors(monkeypatch):
+    # 2026-08-10 fix: a prior version only caught DraftingNotConfigured/
+    # DraftingFailed inside the concurrent batch - any other exception
+    # (a bug in local post-processing, not an anticipated API/refusal
+    # error) escaped uncaught, crashed the whole generate_documents() call,
+    # discarded every doc that HAD already succeeded in the same batch, and
+    # never reported to Bhangi. This proves an arbitrary exception type is
+    # now handled exactly like the anticipated ones.
+    import tailoring.drafting as drafting
+
+    reported = []
+    monkeypatch.setattr(drafting, "_report_drafting_failure", lambda job, doc_key, exc: reported.append((doc_key, type(exc).__name__)))
+
+    def _fake_draft_one(client, shared_context, doc_key, model, on_progress=None, doc_index=1, doc_total=1, job=None, profile=None, resume_text_for_consistency=None):
+        if doc_key == "exec_bio":
+            raise KeyError("unexpected response shape")
+        return f"drafted {doc_key}"
+
+    monkeypatch.setattr(drafting, "_client", lambda: object())
+    monkeypatch.setattr(drafting, "_draft_one", _fake_draft_one)
+    job = {"source": "linkedin", "job_id": "1"}
+
+    result = drafting.generate_documents(job, {}, ["cover_letter", "exec_bio"])
+
+    assert result["cover_letter"] == "drafted cover_letter"
+    assert "exec_bio" in result["_errors"]
+    assert reported == [("exec_bio", "KeyError")]
+
+
+def test_generate_documents_single_doc_key_reraises_any_exception_type(monkeypatch):
+    # Preserves the pre-existing single-doc contract (callers like the
+    # resume-regen path rely on a raise, not a swallowed error) - extended
+    # 2026-08-10 to cover exception types beyond DraftingNotConfigured/
+    # DraftingFailed, since generate_documents() as a whole no longer
+    # narrows what it catches.
+    import tailoring.drafting as drafting
+
+    def _fake_draft_one(client, shared_context, doc_key, model, on_progress=None, doc_index=1, doc_total=1, job=None, profile=None, resume_text_for_consistency=None):
+        raise ValueError("boom")
+
+    monkeypatch.setattr(drafting, "_client", lambda: object())
+    monkeypatch.setattr(drafting, "_draft_one", _fake_draft_one)
+    job = {"source": "linkedin", "job_id": "1"}
+
+    import pytest
+    with pytest.raises(ValueError, match="boom"):
+        drafting.generate_documents(job, {}, ["cover_letter"])
+
+
+def test_generate_documents_resume_failure_does_not_block_the_other_docs(monkeypatch):
+    # The resume drafts synchronously before the pool - if IT fails, the
+    # remaining doc_keys must still draft (without a consistency block,
+    # since there's no fresh resume text to be consistent with), not be
+    # skipped just because the batch's first document failed.
+    import tailoring.drafting as drafting
+
+    def _fake_self_correction(client, shared_context, model, on_progress, doc_index, doc_total, job, profile):
+        raise RuntimeError("resume drafting blew up")
+
+    def _fake_draft_one(client, shared_context, doc_key, model, on_progress=None, doc_index=1, doc_total=1, job=None, profile=None, resume_text_for_consistency=None):
+        assert resume_text_for_consistency is None
+        return f"drafted {doc_key}"
+
+    monkeypatch.setattr(drafting, "_client", lambda: object())
+    monkeypatch.setattr(drafting, "_draft_resume_with_self_correction", _fake_self_correction)
+    monkeypatch.setattr(drafting, "_draft_one", _fake_draft_one)
+    monkeypatch.setattr(drafting, "_report_drafting_failure", lambda job, doc_key, exc: None)
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": [], "ats_preferred_keywords": []}
+
+    result = drafting.generate_documents(job, {}, ["resume", "cover_letter"])
+
+    assert "resume" not in result
+    assert result["cover_letter"] == "drafted cover_letter"
+    assert "resume" in result["_errors"]
+
+
+def test_generate_documents_errors_key_always_present_on_full_success(monkeypatch):
+    import tailoring.drafting as drafting
+
+    def _fake_draft_one(client, shared_context, doc_key, model, on_progress=None, doc_index=1, doc_total=1, job=None, profile=None, resume_text_for_consistency=None):
+        return f"drafted {doc_key}"
+
+    monkeypatch.setattr(drafting, "_client", lambda: object())
+    monkeypatch.setattr(drafting, "_draft_one", _fake_draft_one)
+    job = {"source": "linkedin", "job_id": "1"}
+
+    result = drafting.generate_documents(job, {}, ["cover_letter"])
+
+    assert result["_errors"] == {}
+
+
+def test_generate_documents_never_exceeds_max_concurrent_drafts(monkeypatch):
+    import threading
+
+    import tailoring.drafting as drafting
+
+    lock = threading.Lock()
+    concurrent_count = 0
+    max_seen = 0
+
+    def _fake_draft_one(client, shared_context, doc_key, model, on_progress=None, doc_index=1, doc_total=1, job=None, profile=None, resume_text_for_consistency=None):
+        nonlocal concurrent_count, max_seen
+        with lock:
+            concurrent_count += 1
+            max_seen = max(max_seen, concurrent_count)
+        import time
+        time.sleep(0.05)
+        with lock:
+            concurrent_count -= 1
+        return f"drafted {doc_key}"
+
+    monkeypatch.setattr(drafting, "_client", lambda: object())
+    monkeypatch.setattr(drafting, "_draft_one", _fake_draft_one)
+    job = {"source": "linkedin", "job_id": "1"}
+    doc_keys = ["cover_letter", "exec_bio", "leadership_summary", "apply_answers"]  # 4 non-resume types, all requested
+
+    drafting.generate_documents(job, {}, doc_keys)
+
+    assert max_seen <= drafting.MAX_CONCURRENT_DRAFTS
+    # Real overlap, not just "the code technically uses a pool" - thread
+    # scheduling jitter means not all 4 are guaranteed to land in the same
+    # instant, but more than one must, or this isn't concurrency at all.
+    assert max_seen > 1
+
+
 def test_ats_keywords_schema_supports_either_or_group_items():
     # Anthropic's structured-output schema rejects "oneOf" (confirmed
     # live, 2026-08-08) - "anyOf" is the supported equivalent, used here.

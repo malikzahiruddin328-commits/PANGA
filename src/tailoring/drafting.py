@@ -13,8 +13,11 @@ console.anthropic.com - this module never creates or manages the key itself.
 """
 
 import json
+import logging
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
+from pathlib import Path
 
 import anthropic
 
@@ -32,6 +35,20 @@ from skill_label_match import normalize_skill_label, skills_match
 from tailoring.ats_score import STANDARD_HEADERS, detect_keyword_wording_regressions, detect_matched_keyword_regressions, plateau_note_for_gaps, score_resume_against_keywords, score_resume_ats
 from tailoring.baseline_resume import select_baseline_resume_text
 from tailoring.claim_verification import flag_unverified_resume_claims
+
+logger = logging.getLogger(__name__)
+
+# Matches ui/app.py's own PROJECT_ROOT convention (src/tailoring/drafting.py
+# -> repo root) - needed locally only for Bhangi's build-identification
+# (bhangi.build_info.detect_build), see _report_drafting_failure().
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# Bounded per CLAUDE.md's standing race/perf rules - never spins up more
+# worker threads than there are non-resume documents actually requested in
+# one batch (5 doc types exist today, so this is already a small, fixed
+# ceiling, not a scaling knob). Resume is never in this pool - see
+# generate_documents()'s own docstring for why.
+MAX_CONCURRENT_DRAFTS = 5
 
 _WORK_HISTORY_MONTH_YEAR_RE = re.compile(r"^(\d{1,2})/(\d{4})$")
 _WORK_HISTORY_YEAR_RE = re.compile(r"^(\d{4})$")
@@ -1763,6 +1780,55 @@ def _lookup_company_address(
     return text
 
 
+def _report_drafting_failure(job: dict, doc_key: str, exc: Exception) -> None:
+    """Logs full technical detail locally, then best-effort files a Bhangi
+    support issue - the same short-message/full-detail split
+    llm_client.py's _clean_message_for_status_error() already established
+    after the 2026-08-05 incident where a raw error blob leaked into the
+    UI (see that function's own comment). Zahir only ever sees the short,
+    hedged DraftingFailed/DraftingNotConfigured message (or, for an
+    exception type this module never anticipated, a generic fallback - see
+    ui/app.py's call site) via st.error(); the doc_key, job identity, and
+    exception type/message this function logs and files are for
+    debugging, not for him to read directly.
+
+    Called for EVERY doc_key failure in generate_documents()'s concurrent
+    batch regardless of exception type (2026-08-10 - a prior version only
+    reported the two anticipated DraftingNotConfigured/DraftingFailed
+    types, so a genuine bug elsewhere in the pipeline - e.g. a KeyError in
+    local post-processing - silently skipped Bhangi reporting entirely).
+
+    Bhangi is an optional sibling checkout (see ui/app.py's
+    _find_bhangi_src, which puts it on sys.path if present) - not
+    something this module depends on. If it isn't importable, or issue
+    creation itself fails for any reason, that must never make an
+    already-failed draft attempt worse, so every failure in this function
+    is caught and logged, never re-raised."""
+    job_ref = f"{job.get('source', '?')}/{job.get('job_id', '?')}"
+    logger.error(
+        "Drafting failed for doc_key=%s job=%s (%s): %s: %s",
+        doc_key, job_ref, job.get("title", "?"), type(exc).__name__, exc,
+    )
+    try:
+        from bhangi.build_info import detect_build
+        from bhangi.issues import create_issue
+    except ImportError:
+        return
+    try:
+        create_issue(
+            project="panga",
+            title=f"Drafting failed: {doc_key} ({job.get('title', 'unknown role')})",
+            description=(
+                f"doc_key: {doc_key}\n"
+                f"job: {job_ref} - {job.get('title', '?')} at {job.get('organization', '?')}\n"
+                f"exception: {type(exc).__name__}: {exc}"
+            ),
+            build=detect_build(PROJECT_ROOT),
+        )
+    except Exception:
+        logger.exception("Failed to file Bhangi issue for drafting failure (doc_key=%s)", doc_key)
+
+
 def generate_documents(
     job: dict,
     profile: dict,
@@ -1773,21 +1839,51 @@ def generate_documents(
 ) -> dict:
     """Drafts real, tailored document text for exactly the requested doc_keys
     (subset of "resume", "cover_letter", "exec_bio", "leadership_summary",
-    "apply_answers"), one API call per document type so progress is real,
-    not simulated. The
-    job+profile context is identical across those calls and marked
-    cacheable, so only the first call pays full price for it - subsequent
-    ones in the same batch read it back at ~10% cost.
-    If given, on_progress(i, total, doc_key, substatus=None) is called right
-    before drafting starts on the i-th (1-indexed) of `total` documents
-    (substatus=None), then repeatedly during that document's own generation
-    with a live sub-status ("thinking...", "writing... (N characters so
-    far)") as the response streams in.
-    Returns {doc_key: drafted_text}, except "resume" maps to {"text": ...,
-    "suggested_strategy_tag": str, "ats_score": int, "ats_rationale": str,
-    "ats_next_actions": [...], "clarifying_questions": [{"skill": ...,
-    "question": ..., "suggested_answer": ...}]} instead of a
-    plain string. ats_score/ats_rationale/ats_next_actions are computed
+    "apply_answers"). The job+profile context is identical across every
+    call and marked cacheable, so only the first call pays full price for
+    it - subsequent ones read it back at ~10% cost, though true
+    concurrency (see below) means several calls in the same batch can race
+    to be "first" against that cache, so the pricing win isn't guaranteed
+    the way it was when every call ran strictly one after another; the
+    wall-clock win is the trade-off being made.
+
+    Concurrency (2026-08-10): if "resume" is one of doc_keys, it always
+    drafts FIRST and alone, synchronously, via
+    _draft_resume_with_self_correction - never inside the concurrent pool
+    below. Two things depend on this ordering and neither has a way to
+    tolerate the resume racing against them: the self-correction loop
+    itself (up to 3 attempts, the slowest single doc type by a wide
+    margin) and cross-document consistency (cover_letter/exec_bio/
+    leadership_summary are each told to stay factually consistent with
+    the resume's ACTUAL final text - see _resume_consistency_block() -
+    which only exists once the resume is fully drafted). Every OTHER
+    requested doc_key then runs concurrently on a bounded thread pool
+    (MAX_CONCURRENT_DRAFTS workers, never more than the number of
+    non-resume docs requested), each worker on its own freshly constructed
+    Anthropic client (constructing anthropic.Anthropic() does no network
+    I/O, so this has no real cost) - requesting several non-resume
+    documents no longer waits on them one at a time.
+
+    If given, on_progress(i, total, doc_key, substatus=None) is called
+    once per document currently drafting - the resume synchronously
+    first, then the rest concurrently. `total` is the full requested
+    count; `i` for the resume is always 1, and for concurrently-drafted
+    docs reflects their position in doc_keys, NOT completion order.
+    Because those documents draft concurrently, substatus updates for
+    different doc_keys can interleave in any order once the resume (if
+    requested) has finished - callers can no longer assume one document
+    finishes before the next starts, except that the resume itself always
+    finishes (or fails) before any other document's on_progress fires.
+
+    Returns {doc_key: drafted_text, ..., "_errors": {doc_key: message}}.
+    "_errors" is always present (an empty dict on full success) so callers
+    have one consistent shape to check rather than needing to distinguish
+    "no errors key" from "empty errors" - a doc_key missing from BOTH the
+    main results and "_errors" never happens. "resume" maps to {"text":
+    ..., "suggested_strategy_tag": str, "ats_score": int, "ats_rationale":
+    str, "ats_next_actions": [...], "clarifying_questions": [{"skill":
+    ..., "question": ..., "suggested_answer": ...}]} instead of a plain
+    string. ats_score/ats_rationale/ats_next_actions are computed
     deterministically by tailoring.ats_score.score_resume_ats() from real
     keyword-overlap arithmetic between the posting's own text (title +
     qualification_summary/description, whichever this job record has - see
@@ -1800,9 +1896,28 @@ def generate_documents(
     profile/interview.py's save_answer(), the same mechanism this feeds
     back into via the Results tab). "apply_answers"
     maps to a list of {"label": ..., "value": ...} dicts (a ready-to-paste
-    packet for common ATS form fields) rather than a single string. Raises
-    DraftingNotConfigured if no API key is set, DraftingFailed on
-    refusal/truncation/API error.
+    packet for common ATS form fields) rather than a single string.
+
+    One document failing never prevents the others from completing or
+    being returned, REGARDLESS of the exception type it raises - its
+    message lands in "_errors" instead, and the failure is logged plus
+    best-effort reported to Bhangi (see _report_drafting_failure) rather
+    than raised (2026-08-10: broadened from only catching the two
+    anticipated DraftingNotConfigured/DraftingFailed types - a genuine bug
+    elsewhere in the pipeline, e.g. a local post-processing KeyError,
+    used to escape uncaught, discard every other doc that HAD already
+    finished in the same batch, and skip Bhangi reporting entirely). The
+    one exception: if doc_keys has exactly one entry and that document
+    fails, this raises the original exception directly instead (any
+    type - was previously narrowed to DraftingNotConfigured/DraftingFailed
+    only), preserving the single-doc exception contract callers like the
+    resume-regen path rely on.
+
+    Results are written into the returned dict only from this function's
+    own thread - the resume synchronously before the pool starts, then
+    each concurrent worker's result inside the as_completed() loop below
+    as its future finishes - never from inside a worker thread, so
+    there's no concurrent-write race to reason about.
 
     When "cover_letter" is requested and this job hasn't been searched for
     an address before, also looks up the organization's real mailing
@@ -1813,7 +1928,10 @@ def generate_documents(
     immediately after this call returns. Never falls back to a guessed
     address - an unconfirmed lookup caches "" (searched, not found) so it
     isn't re-searched every regenerate, and docx_export.py's own
-    "[Company Address]" placeholder covers that case.
+    "[Company Address]" placeholder covers that case. Runs before any
+    drafting starts (resume or concurrent), never inside a worker thread,
+    where two docs needing the same prep could race to write the same job
+    fields - same reasoning for the ATS-keyword extraction below it.
 
     existing_resume_text (2026-08-09): when doc_keys doesn't include
     "resume" (a "regenerate just the other documents" case - e.g. a job
@@ -1822,11 +1940,10 @@ def generate_documents(
     exec_bio/leadership_summary can still be checked for factual
     consistency against it - see _resume_consistency_block(). When
     "resume" IS in doc_keys, the freshly-drafted resume text is used
-    automatically instead (doc_keys already guarantees "resume" is
-    processed first when present - see ui/app.py's doc_types ordering),
+    automatically instead (the resume always drafts first - see above),
     so this param is only needed for the resume-not-in-this-batch case."""
     if not doc_keys:
-        return {}
+        return {"_errors": {}}
 
     client = _client()
     job_key = (job["source"], job["job_id"]) if job.get("source") and job.get("job_id") else None
@@ -1849,31 +1966,52 @@ def generate_documents(
         "cache_control": {"type": "ephemeral"},
     }]
 
-    results = {}
+    results: dict = {}
+    errors: dict = {}
     total = len(doc_keys)
     resume_text_for_consistency = existing_resume_text
-    for i, doc_key in enumerate(doc_keys, start=1):
-        if on_progress:
-            on_progress(i, total, doc_key)
-        if doc_key == "resume":
-            # Self-correcting loop (2026-08-09), not a single one-shot
-            # call - see _draft_resume_with_self_correction's own
-            # docstring. resume_text_for_consistency is deliberately not
-            # passed here: the resume is never a _CROSS_DOCUMENT_
-            # CONSISTENCY_DOC_KEYS target itself (nothing needs to stay
-            # consistent WITH it while it's still being drafted).
-            results[doc_key] = _draft_resume_with_self_correction(
-                client, shared_context, model, on_progress, i, total, job, profile,
+    remaining_keys = [k for k in doc_keys if k != "resume"]
+
+    if "resume" in doc_keys:
+        try:
+            results["resume"] = _draft_resume_with_self_correction(
+                client, shared_context, model, on_progress, 1, total, job, profile,
             )
-        else:
-            results[doc_key] = _draft_one(
-                client, shared_context, doc_key, model, on_progress, i, total,
+            resume_text_for_consistency = results["resume"]["text"]
+        except Exception as exc:
+            if total == 1:
+                raise
+            _report_drafting_failure(job, "resume", exc)
+            errors["resume"] = str(exc)
+
+    if remaining_keys:
+        # doc_index for progress purposes matches each key's position in
+        # the originally-requested doc_keys (1-indexed) - "resume", if
+        # present, always occupies index 1, so the first non-resume key
+        # starts at 2.
+        indices = {doc_key: doc_keys.index(doc_key) + 1 for doc_key in remaining_keys}
+
+        def _draft_one_worker(doc_key: str):
+            worker_client = _client()
+            return _draft_one(
+                worker_client, shared_context, doc_key, model, on_progress, indices[doc_key], total,
                 job=job, profile=profile, resume_text_for_consistency=resume_text_for_consistency,
             )
-        if doc_key == "resume":
-            fresh_resume = results["resume"]
-            resume_text_for_consistency = fresh_resume["text"] if isinstance(fresh_resume, dict) else fresh_resume
-    return results
+
+        max_workers = min(len(remaining_keys), MAX_CONCURRENT_DRAFTS)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_key = {pool.submit(_draft_one_worker, doc_key): doc_key for doc_key in remaining_keys}
+            for future in as_completed(future_to_key):
+                doc_key = future_to_key[future]
+                try:
+                    results[doc_key] = future.result()
+                except Exception as exc:
+                    if total == 1:
+                        raise
+                    _report_drafting_failure(job, doc_key, exc)
+                    errors[doc_key] = str(exc)
+
+    return {**results, "_errors": errors}
 
 
 def analyze_fit_before_drafting(job: dict, profile: dict, app_record: dict) -> dict:

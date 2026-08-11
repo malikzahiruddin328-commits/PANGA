@@ -79,9 +79,26 @@ def grace_state(now: Optional[datetime] = None) -> dict:
     answer instead (docs/licensing-scope.md state 4 requires "confirmed via
     a real successful check-in" - this function only ever produces states
     2 and 3, "can't verify").
+
+    The 3-day grace window exists to protect a legitimately verified
+    customer from a transient connectivity gap - it must NOT also extend
+    to a customer whose last successful check-in already confirmed they're
+    expired. Without this guard, a confirmed-expired customer regains up
+    to 3 more days of access on nothing more than a subsequent network
+    blip or backend error (client.py routes every non-409 failure through
+    this function, not just true offline cases) - found in adversarial
+    review 2026-08-10, see the licensing session's audit report.
     """
     now = now or datetime.now(timezone.utc)
     state = _load_raw()
+
+    last_entitlement = state.get("last_known_entitlement")
+    if last_entitlement is not None and last_entitlement.get("status") == "expired":
+        return {
+            "state": f"expired_{last_entitlement.get('reason', 'subscription')}",
+            "expires_at": last_entitlement.get("expires_at"),
+        }
+
     last_checkin_raw = state.get("last_successful_checkin_at")
     if last_checkin_raw is None:
         return {"state": "never_verified"}

@@ -47,6 +47,44 @@ def test_grace_state_just_under_three_days_is_still_grace(isolated_license_paths
     assert result["days_left"] > 0
 
 
+def test_expired_entitlement_stays_expired_on_subsequent_network_failure(isolated_license_paths):
+    # Regression for the "grace leaks onto confirmed-expired customers" bug:
+    # a real successful check-in that itself reported "expired" must not be
+    # reinterpreted as grace-eligible just because time-since-checkin is
+    # small. The whole point of "expired" is that it's authoritative.
+    local_state, _ = isolated_license_paths
+    now = datetime.now(timezone.utc)
+    local_state.record_successful_checkin(
+        {"status": "expired", "reason": "subscription", "expires_at": "2026-08-01T00:00:00Z"}, now=now,
+    )
+
+    result = local_state.grace_state(now=now + timedelta(minutes=1))
+    assert result["state"] == "expired_subscription"
+    assert result["expires_at"] == "2026-08-01T00:00:00Z"
+
+
+def test_expired_trial_stays_expired_on_subsequent_network_failure(isolated_license_paths):
+    local_state, _ = isolated_license_paths
+    now = datetime.now(timezone.utc)
+    local_state.record_successful_checkin(
+        {"status": "expired", "reason": "trial", "expires_at": "2026-08-01T00:00:00Z"}, now=now,
+    )
+
+    result = local_state.grace_state(now=now + timedelta(days=10))
+    assert result["state"] == "expired_trial"
+
+
+def test_verified_entitlement_still_gets_normal_grace_treatment(isolated_license_paths):
+    # Make sure the fix didn't break the intended fail-open path for an
+    # actually-verified customer hitting a connectivity gap.
+    local_state, _ = isolated_license_paths
+    now = datetime.now(timezone.utc)
+    local_state.record_successful_checkin({"status": "verified", "expires_at": "2027-01-01T00:00:00Z"}, now=now)
+
+    result = local_state.grace_state(now=now + timedelta(hours=1))
+    assert result["state"] == "grace"
+
+
 def test_clock_skew_does_not_produce_negative_days_offline(isolated_license_paths):
     local_state, _ = isolated_license_paths
     now = datetime.now(timezone.utc)
