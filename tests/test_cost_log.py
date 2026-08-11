@@ -71,3 +71,36 @@ def test_last_cost_for_job_can_narrow_to_a_specific_purpose(isolated_data):
     log_api_cost(purpose="draft_resume", model="claude-opus-5", input_tokens=1, output_tokens=1, cost_usd=0.05, job_key=("linkedin", "1"))
     assert last_cost_for_job("linkedin", "1", purpose="draft_resume") == 0.05
     assert last_cost_for_job("linkedin", "1", purpose="ats_keyword_extraction") == 0.001
+
+
+# 2026-08-10 audit fix #26: failed calls are now loggable too, with their
+# own diagnostic fields, so real failed-call volume is no longer invisible.
+
+def test_log_api_cost_defaults_success_to_true(isolated_data):
+    log_api_cost(purpose="fit_score", model="claude-opus-5", input_tokens=1000, output_tokens=200, cost_usd=0.01)
+    entry = load_cost_log()[0]
+    assert entry["success"] is True
+
+
+def test_log_api_cost_records_a_failed_call(isolated_data):
+    log_api_cost(
+        purpose="fit_score", model="claude-opus-5", input_tokens=0, output_tokens=0, cost_usd=0.0,
+        duration_ms=3200.0, success=False, error_type="overloaded_error",
+        attempt_count=4, models_tried=["claude-opus-5", "claude-opus-5", "claude-opus-5", "claude-sonnet-5"],
+    )
+    entry = load_cost_log()[0]
+    assert entry["success"] is False
+    assert entry["error_type"] == "overloaded_error"
+    assert entry["attempt_count"] == 4
+    assert entry["models_tried"] == ["claude-opus-5", "claude-opus-5", "claude-opus-5", "claude-sonnet-5"]
+    assert entry["cost_usd"] == 0.0
+
+
+def test_log_api_cost_omits_failure_fields_on_success(isolated_data):
+    # A success entry shouldn't carry error_type/attempt_count/models_tried
+    # at all - keeps old entries and new success entries shaped the same.
+    log_api_cost(purpose="fit_score", model="claude-opus-5", input_tokens=1000, output_tokens=200, cost_usd=0.01)
+    entry = load_cost_log()[0]
+    assert "error_type" not in entry
+    assert "attempt_count" not in entry
+    assert "models_tried" not in entry
