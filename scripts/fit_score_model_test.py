@@ -58,6 +58,8 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from dotenv import load_dotenv  # noqa: E402
+
 import cost_log  # noqa: E402
 import profile.storage as profile_storage  # noqa: E402
 import search.job_store as job_store  # noqa: E402
@@ -79,6 +81,13 @@ BASELINE_PATH = Path(
 # per-checkout file, so decryption/re-encryption is identical either way -
 # no key-mismatch risk from running this from a worktree.
 REAL_ROOT = Path(r"C:\Users\User\Desktop\Myra\Panga")
+# llm_client.py's own load_dotenv(PROJECT_ROOT / ".env") call resolves
+# PROJECT_ROOT relative to ITS OWN __file__ (this worktree), so it loads
+# nothing (no .env here, gitignored like every worktree) - is_configured()
+# was accidentally False the whole way through until this was added.
+# Loaded explicitly here from the real root instead, same reasoning as
+# every other real-data-path override in this file.
+load_dotenv(REAL_ROOT / ".env")
 job_store.JOBS_PATH = REAL_ROOT / "data" / "jobs" / "jobs.json"
 profile_storage.MASTER_PROFILE_PATH = REAL_ROOT / "data" / "profile" / "structured" / "master_profile.json"
 cost_log.COST_LOG_PATH = REAL_ROOT / "data" / "cost_log.json"

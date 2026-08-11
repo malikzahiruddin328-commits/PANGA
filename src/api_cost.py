@@ -6,11 +6,29 @@ prospector/company_lookup.py, prospector/prospector_score.py, ...) should
 call this instead of reimplementing the token/search math per module.
 """
 
-# $/1M tokens, per model - only claude-opus-5 is used anywhere in Panga
-# today (see tailoring/drafting.py's DEFAULT_MODEL), but keyed by model so
-# a future second model doesn't silently get priced as Opus 5.
+# $/1M tokens, per model - only claude-opus-5 was used anywhere in Panga
+# when this table was first written (see tailoring/drafting.py's
+# DEFAULT_MODEL), but keyed by model so a future second model doesn't
+# silently get priced as Opus 5.
+#
+# Real gap found 2026-08-11 (fit_score cheaper-model test): sonnet/haiku
+# were missing entirely, so every real API call made against them during
+# the test silently failed to log its cost - estimate_response_cost()
+# raised KeyError, and llm_client._log_cost()'s own broad
+# "except Exception: logger.exception(...)" swallowed it (by design, so a
+# logging failure never breaks the real API call - see that function's
+# docstring), which converted this module's own "fail loudly rather than
+# silently under-report" intent into exactly the silent under-report it
+# was written to prevent. Added claude-sonnet-5/claude-haiku-4-5 rates so
+# this stops happening for the two models Panga is actively testing.
+# claude-sonnet-5 uses Anthropic's introductory rate ($2/$10 per MTok,
+# in effect through 2026-08-31) - update to the standard $3/$15 after
+# that date.
 _TOKEN_PRICING_PER_MTOK = {
     "claude-opus-5": {"input": 5.00, "output": 25.00},
+    "claude-sonnet-5": {"input": 2.00, "output": 10.00},
+    "claude-haiku-4-5": {"input": 1.00, "output": 5.00},
+    "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00},
 }
 _WEB_SEARCH_PER_SEARCH = 10.00 / 1000
 

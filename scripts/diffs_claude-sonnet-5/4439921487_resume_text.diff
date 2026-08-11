@@ -1,0 +1,119 @@
+--- baseline/resume_text
++++ new/resume_text
+@@ -1,71 +1,72 @@
+-ZAHIR UDDIN
+-Montville, NJ | +1 617-538-1025 | malikzahiruddin328@gmail.com | linkedin.com/in/zahiruddinmalik
++Zahir Uddin
++Montville, NJ
++Phone: +1 617-538-1025
++Email: malikzahiruddin328@gmail.com
++LinkedIn: linkedin.com/in/zahiruddinmalik
+ 
+ PROFESSIONAL SUMMARY
+ 
+-Enterprise systems and digital technology leader with 25+ years in Information Technology across regulated life sciences, with 15+ years leading Enterprise Resource Planning (ERP) and Finance implementations, optimizations and rollouts and 12+ years in people management roles. Built and ran the full back-office ecosystem for a commercial pharmaceutical business - SAP S/4HANA (FICO/MM), Ariba, Coupa, NetSuite, UKG, iCIMS, Salesforce/Veeva, Snowflake - as the trusted technology partner to Finance, HR, Legal, Supply Chain and Procurement leaders. Automation and AI applied where it pays: three AI solutions in production, including agent-based security triage that removed an entire first-line cost layer.
+-- ERP/Finance ownership: SAP S/4HANA FICO/MM delivered in roughly 9-12 months ahead of a first U.S. product launch, with Ariba and Coupa covering procure-to-pay and expense.
+-- Enterprise ecosystems and integrations: architected and governed an integrated estate spanning ERP, Human Resources Information System (HRIS), CRM, MDM, Snowflake and Workato/API integration, with ServiceNow for IT service management.
+-- AI/ML integration into enterprise workflows: production AI for SOC triage, expense compliance anomaly detection and Medical Affairs next best action; natural language processing over five years of unstructured field notes; Copilot, Claude and Snowflake Cortex in working use.
+-- Data governance frameworks and enterprise data platforms: COO-chaired governance council, domain ownership across Finance, HR, Legal, Product and Commercial data, on a Snowflake platform serving roughly 400 business users.
+-- Compliance: SOX/K-SOX ITGCs designed to US SOX 404 standards and tested by PwC, GxP validation, HIPAA and data privacy reporting, GDPR vendor Data Processing Agreements and retention controls, GAAP-aligned financial reporting feeds.
++Enterprise technology executive with 25+ years leading ERP, HRIS, and finance-adjacent platform strategy within life sciences and other regulated industries, most recently as Head of IT at SK Life Science, Inc., where I owned the enterprise application ecosystem supporting $1B in annual commercial operations. Strong record partnering with Finance, HR, Legal, Supply Chain, and Procurement leaders to drive automation, reduce operational overhead, and build compliant, audit-ready platforms under SOX, GxP, and data privacy frameworks - directly relevant to NeoGenomics' mandate for an Automation & AI-first enterprise systems leader.
++
++- ERP/Finance implementations and 12+ years leadership: Owned SAP S/4HANA (FICO/MM) and Ariba lifecycle management at SK Life Science across more than 12 years of enterprise technology leadership, including over 7 years directly managing IT teams and managed-service partners.
++- HRIS and HR process automation: Partnered with HR on UKG and iCIMS-based workforce analytics, payroll, and benefits administration, and evaluated Workday as part of a broader enterprise HRIS strategy.
++- AI/ML integration: Directed AI-enabled automation of first-line security operations, an MSL next-best-action predictive analytics model, and expense anomaly detection using Snowflake Cortex, Microsoft Copilot, and a multi-agent Claude implementation.
++- Data governance and enterprise data platforms: Built a pragmatic data governance framework with a COO-chaired governance council spanning Finance, Legal, HR, IT, and QA, underpinning a Snowflake/Power BI analytics platform with roughly 150 production dashboards and 400 business users.
++- Platform and vendor experience: Implemented and owned ServiceNow ITSM, led an enterprise-wide RPA vendor bake-off across UiPath, Automation Anywhere, and Blue Prism, and delivered Oracle Financials-based ERP integration, backed by an Oracle Certified Professional (OCP) credential.
+ 
+ PROFESSIONAL EXPERIENCE
+ 
+-SK Life Science, Inc. (SKLSI) - Paramus, NJ
++SK Life Science, Inc. (SKLSI), Paramus, NJ
+ 
+ Head of IT
+ January 2024 - January 2026
+-- Owned the enterprise technology estate supporting $1B in annual commercial operations, partnering directly with Finance, HR, Legal, Quality, Supply Chain, R&D and Manufacturing leaders; reported to the global CFO and sat on the US/Korea leadership committee.
+-- Cut operating expenses by 30% through vendor renegotiation, cloud rightsizing, license consolidation and a rebalancing of internal headcount against managed service providers - value against cost argued line by line at renewal.
+-- Put AI to work on real back-office overhead: converted first-line security operations SOPs into agents triggered off ServiceNow tickets and inbound mail, removing the first-line cost layer entirely and saving an estimated $300,000-$500,000 a year.
+-- Strengthened SOX, GxP and operational governance across roughly 12-15 validated systems, processing 150-200 change controls a year with no validated application out of compliance since 2018 and no missed service level agreement across the whole period.
+-- Led technology diligence, Day-1 readiness and post-close integration for two business integrations - systems cutover, data migration, cybersecurity, vendor contract novation, user transition and help desk scale-up - both closing at an NPS of 9.
+-- Ran an $8M technology budget and a 38-person blended organization through eight direct reports, with specialist systems integrators covering SAP, Veeva, data, NOC, SOC and help desk.
++- Delivered enterprise IT transformation aligning technology, data, cybersecurity, and governance strategies with executive priorities across manufacturing, R&D, commercial, Finance, Quality, and Supply Chain, enabling scalable support for $1B in annual commercial operations.
++- Reduced operating expenses by 30% by modernizing cloud, SaaS, vendor, and infrastructure spend through vendor renegotiation, cloud rightsizing, license consolidation, and a shift in headcount/MSP mix.
++- Strengthened regulatory, SOX, and operational governance by implementing compliant validation, access, change-control, and audit-readiness frameworks, supporting K-SOX reporting and DART filings for the Korean parent with Information Technology General Controls (ITGCs) designed to US SOX 404 standards.
++- Directed AI-enabled automation of first-line security operations (agent-based SOC triage), an MSL next-best-action model built on Snowflake Cortex that applied natural language processing to five years of unstructured field notes and CRM data, and AI-based expense anomaly detection, delivering an estimated $300,000-$500,000 in annual operational savings.
++- Led technology diligence, Day-1 readiness, and post-close integration planning for two SK Life Science business integration initiatives, covering systems cutover, data migration, cybersecurity, vendor contract novation, and help desk/endpoint scale-up.
++- Established a pragmatic data governance framework with a COO-chaired governance council spanning Finance, Legal, HR, IT, and QA, supporting a Snowflake/Power BI analytics platform with roughly 150 production dashboards serving approximately 400 business users.
+ 
+ Head of Applications
+ March 2020 - December 2023
+-- Replaced fragmented manual processes with an integrated, validated enterprise application ecosystem, enabling the company's first U.S. pharmaceutical product launch within 14 months.
+-- Delivered SAP S/4HANA (FICO/MM) alongside Ariba, taking procure-to-pay and order-to-cash off spreadsheets; order-to-invoice cycle time fell by roughly 30-40% after the SAP and Coupa rework.
+-- Reduced process inefficiency by 40% through platform selection and vendor alignment, and trained 400-500 users into the SAP and Veeva go-live with better than 90% active use inside 90 days.
+-- Moved enterprise analytics to Snowflake in 2021, replacing a custom platform at under a third of the prior cost, and stood up Power BI and Tableau reporting for Finance, FP&A, Commercial, Supply Chain, HR and Legal.
+-- Modernized regulated application infrastructure for commercial scale readiness - the product this ecosystem supported grew from launch to $1B in annual sales.
++- Orchestrated the transition from fragmented manual processes to an integrated, validated enterprise application ecosystem, enabling the company's first U.S. pharmaceutical product launch within 14 months.
++- Accelerated enterprise application readiness by reducing process inefficiencies by 40% through strategic platform selection and vendor alignment across SAP S/4HANA, Ariba, and Veeva.
++- Modernized regulated application infrastructure, improving interoperability, compliance, and operational readiness for commercial scale.
++- Migrated identity infrastructure from Okta to Azure AD and ultimately Entra ID, reducing identity licensing cost by 58% while consolidating single sign-on across the combined organization.
++- Implemented and maintained DocuSign in a validated 21 CFR Part 11 state through ongoing monthly releases, supporting compliant electronic signature workflows across Finance, Quality, and Legal.
+ 
+ Enterprise Architect and Commercial Systems Lead
+ September 2018 - February 2020
+-- Set the future-state enterprise architecture and deployed 8+ core platforms - CRM, Veeva R&D, ERP, drug serialization, commercial analytics and Master Data Management (MDM) - for first-drug launch readiness, starting from two IT staff and two contractors.
+-- Improved reporting accuracy and operational efficiency by 35% through commercial data curation and MDM-driven governance.
+-- Ran the RFPs and vendor negotiations, working requirements through with business owners rather than around them.
++- Architected future-state enterprise architecture and deployed 8+ core platforms including CRM, Veeva R&D, ERP, drug serialization, commercial analytics, and Master Data Management (MDM), enabling first-drug launch readiness.
++- Boosted reporting accuracy and operational efficiency by 35% by optimizing enterprise data delivery through enhanced commercial data curation and MDM-driven governance.
++- Led RFPs and vendor negotiations, partnering with business leaders on requirements across ERP, CRM, and data platform selection.
+ 
+ EARLIER CAREER
+ 
+-Customer Success Architect, Reltio, May 2017 - September 2018 - Advised 10+ enterprise customers on MDM architecture and governance; lifted platform adoption 30% through structured quarterly business reviews.
+-
+-US Professional Services Director, Streebo, Inc., February 2013 - May 2017 - Carried $4M in annual consulting revenue across five accounts, leading 25 US and 50 offshore consultants on enterprise data warehouse, BI and MDM programs; owned NetSuite and Google Workspace for the firm's own operations.
+-
+-Application Manager (MDM), Univision Communication, September 2010 - January 2013 - Delivered an enterprise MDM and Salesforce-based media asset platform that generated $20M in syndication revenue within two quarters.
+-
+-Principal Consultant, Kalido Practice Lead, Project Performance Corporation, December 2008 - August 2010 - Built the Kalido practice to $1.5M in revenue growth, serving federal civilian clients from McLean, VA.
+-
+-Senior Consultant / Consultant / Support Analyst, Kalido, September 2001 - December 2008 - Delivered data warehouse and MDM programs for AbbVie, Eisai, J&J/Ethicon, TD Bank and Labatt, including Oracle Financials, SAP and PeopleSoft integration frameworks; also ran corporate IT for under 200 staff across the US, UK, France and India.
++Customer Success Architect, Reltio, May 2017 - September 2018: Advised enterprise life sciences clients on MDM architecture and governance, increasing customer platform adoption by 30%.
++US Professional Services Director, Streebo, Inc., February 2013 - May 2017: Led delivery across five enterprise accounts generating $4M in annual consulting revenue, managing 25 US-based and 50 offshore consultants on EDW, BI, and MDM transformation programs.
++Application Manager (MDM), Univision Communication, September 2010 - January 2013: Generated $20M in syndication revenue by implementing an enterprise MDM and Salesforce-based media asset management platform.
++Principal Consultant, Kalido Practice Lead, Project Performance Corporation, 2008 - 2010: Led the Kalido practice, growing revenue by $1.5M through team building and delivery leadership on federal and commercial data programs.
++Senior Consultant / Consultant / Support Analyst, Kalido Inc., 2001 - February 2008: Delivered enterprise data warehousing and MDM solutions for pharmaceutical and consumer clients including Eisai, AbbVie, and Ethicon/Johnson & Johnson.
+ 
+ EDUCATION
++Bachelor of Science, Information Systems (Artificial Intelligence major, Honours), Brunel University London, Middlesex, UK, 1997 - 2001
+ 
+-Bachelor of Science, Information Systems (Artificial Intelligence major, Honours) - Brunel University London, Middlesex, UK, 1997 - 2001
+ 
+ CERTIFICATIONS
+ 
+-Reltio MDM Certification (2017); Six Sigma Green Belt (2012); Kalido Accredited Consultant (2004); Oracle Certified Professional (OCP) - Oracle 8 DBA Track
++Oracle Certified Professional (OCP) - Oracle 8 DBA Track
++Reltio MDM Certification, 2017
++Six Sigma Green Belt, 2012
++Kalido Accredited Consultant, 2004
+ 
+-CORE SKILLS
++SKILLS
+ 
+-ERP: SAP S/4HANA (FICO/MM), SAP Ariba, Coupa, NetSuite, Oracle Financials, TM1
+-HRIS and workforce: UKG, iCIMS, onboarding/offboarding automation, workforce analytics
+-Enterprise platforms: ServiceNow, Salesforce CRM, Veeva CRM and R&D Suite, Microsoft 365, Power Platform, DocuSign
+-Integration and automation: Workato, REST APIs, Informatica, Talend, SnapLogic, Azure Data Factory, Azure DevOps
+-Data: Snowflake, Power BI, Tableau, Looker, Master Data Management (Reltio, Informatica), Collibra, data governance frameworks, enterprise data platforms
+-AI/ML: AI/ML integration into enterprise workflows, predictive analytics, natural language processing, Snowflake Cortex, Copilot, Claude, SaaS AI capabilities
+-Compliance: SOX ITGC, GAAP reporting support, GDPR, HIPAA, GxP/CSV validation, 21 CFR Part 11, audit readiness
+-Leadership: enterprise technology strategy, people management, vendor management, contract negotiation, change management, release management, budget ownership, executive communication
+-
+-Onsite in Ramsey, NJ and available for 20-50% travel.+ERP: SAP S/4HANA (FICO, MM), Oracle Financials, Ariba
++HRIS: UKG, iCIMS, Workday (evaluation)
++CRM/Commercial: Salesforce CRM, Veeva CRM, Veeva R&D Suite
++Data & Analytics: Master Data Management (MDM), Snowflake, Power BI, Tableau, Data Warehousing, Data Governance
++AI/Automation: AI/ML Integration, Predictive Analytics, Natural Language Processing (NLP), Microsoft Copilot, Snowflake Cortex, Claude, Agent-Based Automation, UiPath (vendor evaluation)
++Compliance & Governance: SOX ITGC, GAAP-aligned reporting support, GDPR, HIPAA, GxP/CSV Governance, 21 CFR Part 11, Audit Readiness, Validation, Change Control
++Platforms: ServiceNow (ITSM), Azure, AWS, Microsoft 365, Identity & Access Management (Azure AD/Entra ID)
++Delivery: Vendor Management, Change Management, Release Management, ITIL Service Strategies, Agile/Waterfall SDLC, On/Offshore Team Management

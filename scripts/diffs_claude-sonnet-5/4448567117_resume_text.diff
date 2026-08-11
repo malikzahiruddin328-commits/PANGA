@@ -1,0 +1,109 @@
+--- baseline/resume_text
++++ new/resume_text
+@@ -1,69 +1,61 @@
+ Zahir Uddin
+-Montville, NJ (relocating to the Boston area) | +1 617-538-1025 | malikzahiruddin328@gmail.com | linkedin.com/in/zahiruddinmalik
++Montville, NJ
++Phone: +1 617-538-1025
++Email: malikzahiruddin328@gmail.com
++LinkedIn: linkedin.com/in/zahiruddinmalik
+ 
+ PROFESSIONAL SUMMARY
++Enterprise IT executive with over 25 years of experience across life sciences and other regulated industries, including more than seven years building and running Information Technology (IT) for a commercial-stage pharmaceutical company from pre-launch through $1B in annual sales. Most recently Head of IT (CIO-equivalent) at SK Life Science, Inc., where I built a SaaS-first, GxP- and SOX-compliant technology environment from the ground up and served as strategic advisor to the COO and later the global CFO. Comfortable operating at both levels the role calls for: setting IT strategy and technology roadmaps with the executive team one day, negotiating a vendor contract or reviewing a security incident the next. Willing to relocate to the Boston area and available onsite within roughly 30 days of an offer.
+ 
+-Enterprise Information Technology (IT) executive with 25+ years across biotechnology, pharmaceuticals, and other regulated environments, including seven years leading IT at a US pharmaceutical affiliate from pre-commercial stage through first product launch and on to $1B in annual sales. Former Head of IT (CIO-equivalent) accountable for IT strategy, cloud infrastructure, cybersecurity, enterprise applications, data and analytics, IT governance, and vendor management. Comfortable operating as the only senior technologist in the room: setting the multi-year roadmap with the executive team one week, sorting out an endpoint or a vendor contract the next.
+-- Clinical-stage and R&D support: owned Veeva CTMS, eTMF, RIM, Quality Docs and Medical Information, with EDC held by the CRO; supported the acquisition and integration of a preclinical company that has since moved into Phase 1.
+-- Commercial scale readiness: built the validated commercial ecosystem for a first US launch in 14 months, and the technology foundation behind $1B in annual commercial operations.
+-- Regulated environments: SOX ITGC (K-SOX with controls designed to US SOX 404 standards, tested by PwC), GxP/CSV, 21 CFR Part 11, DSCSA serialization, and FDA pre-approval inspection support.
+-- AI-enabled solutions and automation: three AI capabilities in production - security operations triage, expense anomaly detection, and a medical next-best-action model - all with human review retained.
+-- Building rather than inheriting: joined a US entity with two IT staff and no real function, and stood up the hires, policies, vendors, and platforms from there.
++- IT strategy and technology roadmaps: built and executed SK Life Science's enterprise IT roadmap from pre-launch in 2018 through $1B in commercial operations, aligning cloud infrastructure, enterprise applications, and cybersecurity with R&D, Quality, and Commercial priorities.
++- Clinical-stage and regulated environments: supported technology diligence and integration for a preclinical entity (Protiovant, later SK Life Science Labs) acquired into the business, and owned Veeva CTMS and Veeva eTMF for active clinical development.
++- Cybersecurity, data privacy, business continuity: owned IT governance, cybersecurity, risk management, and disaster recovery for a US-listed public company, with ITGC controls designed to US SOX 404 standards and tested annually by PwC.
++- AI-enabled solutions and automation: sponsored production AI use cases, including agent-based security operations automation, compliance analytics, and Medical Affairs next-best-action modeling, with human review and audit trails preserved throughout.
++- Building IT from the ground up: stood up SK Life Science's IT function from two FTEs and roughly $3M in annual spend at pre-launch to a full enterprise organization supporting $1B in commercial revenue - the arc a clinical-stage company approaching commercialization is now navigating.
+ 
+ PROFESSIONAL EXPERIENCE
+ 
+-SK Life Science, Inc. (SKLSI) - Paramus, NJ
+-September 2018 - January 2026
++SK Life Science, Inc. (SKLSI)
+ 
+ Head of IT (CIO-equivalent)
+ January 2024 - January 2026
+-- Owned enterprise IT strategy and the multi-year technology roadmap across R&D, clinical, manufacturing, commercial, Finance, Quality, and Supply Chain, reporting to the global CFO and sitting on the leadership committee; the environment scaled to support $1B in annual commercial operations.
+-- Cut operating expense by 30% through vendor renegotiation, cloud rightsizing, license consolidation, and a shift in the managed service provider mix; identity licensing alone fell 58% after moving from Okta to Azure AD and then Entra ID.
+-- Ran IT operations for roughly 650 users across three offices plus Korea-based staff - cloud infrastructure on Azure and AWS, networks, storage, databases, telecommunications (Teams Phone and Zoom, replacing an older PBX), disaster recovery, and end-user services - with no missed service level agreement (SLA) from 2018 through departure and an average IT Net Promoter Score of 9.
+-- Held IT governance, cybersecurity, data privacy, risk management, business continuity and disaster recovery for a regulated biotech environment: annual DR tests plus unannounced runs, a 24-hour recovery time objective on critical GxP systems, GDPR data mapping and vendor data processing agreements with Legal, and a NIST self-assessment moving from roughly 40-50% to 85-90%.
+-- Introduced practical automation and AI-enabled solutions - first-line SOC standard operating procedures converted to agents, saving an estimated $300K-$500K a year, plus expense anomaly detection and an MSL next-best-action model credited with a 78% improvement in engagement.
+-- Led technology diligence, Day-1 readiness, and post-close integration for two business integrations (one preclinical, one product-stage), covering systems cutover, data migration, cybersecurity, contract novation, and user transition.
++- Led IT strategy and a multi-year technology roadmap for a nine-person IT organization plus managed-service partners, aligning cloud infrastructure, cybersecurity, enterprise applications, and data governance with executive priorities across manufacturing, R&D, commercial, Finance, Quality, and Supply Chain, scaling to support $1B in annual commercial operations.
++- Reduced IT operating expenses by 30% through vendor renegotiation, cloud rightsizing, license consolidation, and MSP realignment, while maintaining an average departmental Net Promoter Score of 9 and zero missed SLAs.
++- Owned IT governance, cybersecurity, data privacy, risk management, business continuity, and disaster recovery for a regulated, publicly traded biopharmaceutical company - designed ITGC controls to US SOX 404 standards under the Korean parent's K-SOX program, tested annually by PwC, and supported the Korean DART regulatory filing process.
++- Directed technology diligence, Day-1 readiness, and post-close integration for two business acquisitions, including a preclinical company (Protiovant/SK Life Science Labs) - direct exposure to clinical-stage technology needs within a larger corporate structure.
++- Sponsored practical AI-enabled solutions including agent-based first-line security operations automation (an estimated $300K-$500K in annual savings) and Medical Affairs next-best-action analytics, with human review and audit trails preserved to satisfy GxP and change-control requirements.
++- Managed vendor relationships and an approximately $8M annual IT budget, negotiating contracts across SAP, Veeva, Salesforce, Snowflake, Azure, and cybersecurity platforms.
+ 
+ Vice President, Head of Applications
+ March 2020 - December 2023
+-- Moved the company off fragmented manual processes onto an integrated, validated enterprise application ecosystem, enabling the first US pharmaceutical product launch within 14 months.
+-- Selected and implemented the core enterprise applications - SAP S/4HANA (FICO and MM), Ariba and Coupa, Veeva CRM and R&D suite, Veeva CTMS and eTMF, TraceLink serialization, DocuSign maintained in a validated 21 CFR Part 11 state - and cut process inefficiency by 40% through platform choice and vendor alignment.
+-- Ran the change management and adoption effort for the SAP and Veeva go-lives, training roughly 400-500 users with 90%+ active use inside the first 90 days.
+-- Held about 12-15 systems in the validated inventory with 150-200 change controls a year and periodic review on the highest-risk GxP systems; no validated application fell out of compliance from 2018 onward.
+-- Built the Snowflake and Power BI analytics platform (migrated in 2021 from a costly custom solution at under a third of the prior spend), reaching roughly 150 production dashboards and 400 business users.
++- Orchestrated the transition from fragmented manual processes to an integrated, validated enterprise application ecosystem, enabling the company's first U.S. pharmaceutical product launch within 14 months.
++- Reduced process inefficiencies by 40% through strategic platform selection and vendor alignment across SAP S/4HANA, Veeva CRM/R&D, and Ariba.
++- Led change management and user adoption for the SAP S/4HANA and Veeva go-live, training 400-500 users and achieving over 90% active adoption within the first 90 days.
++- Modernized regulated application infrastructure, improving interoperability, compliance, and operational readiness for commercial scale - a foundation that helped grow the launch product to $1B in annual sales.
++- Implemented Veeva CTMS and Veeva eTMF alongside the Veeva R&D suite to support active clinical development, with CRO partners retaining ownership of the electronic data capture (EDC) system; migrated identity management from Okta to Azure AD and ultimately Entra ID, cutting identity licensing cost by 58%.
+ 
+ Enterprise Architect and Commercial Systems Lead
+ September 2018 - February 2020
+-- Set the future-state enterprise architecture and deployed 8+ core platforms - CRM, Veeva R&D, ERP, drug serialization, commercial analytics, and Master Data Management (MDM) - for first-drug launch readiness, starting from two IT staff and around $3M in annual pre-launch IT spend.
+-- Improved reporting accuracy and operational efficiency by 35% through better commercial data curation and MDM-driven governance.
+-- Led RFPs and vendor negotiations, working with business leaders on requirements and build-versus-buy decisions.
++- Joined SK Life Science pre-launch with a two-person IT team and roughly $3M in annual technology spend, and built the enterprise architecture and vendor foundation - CRM, Veeva R&D, ERP, drug serialization, commercial analytics, and Master Data Management (MDM) - from the ground up.
++- Architected 8+ core platforms enabling first-drug launch readiness, improving reporting accuracy and operational efficiency by 35% through enhanced commercial data curation and MDM-driven governance.
++- Led RFPs and vendor negotiations, partnering directly with business leaders to define requirements for a regulated, SaaS-first technology stack.
++- Established the drug-serialization (DSCSA) architecture as system owner, negotiating data feeds with the distribution hub, internal SAP, and the data warehouse in collaboration with the Chief Medical Officer and third-party logistics partners.
+ 
+ EARLIER CAREER
++Customer Success Architect, Reltio (May 2017 - September 2018) - Advised life-sciences and enterprise clients on MDM architecture, expanding platform adoption across 10+ accounts and growing adoption 30% through quarterly business reviews.
++US Professional Services Director, Streebo, Inc. (February 2013 - May 2017) - Led delivery across five enterprise accounts including Eisai and AbbVie, managing US and offshore consultants and generating $4M in annual consulting revenue for EDW, BI, and MDM transformation programs.
++Application Manager (MDM), Univision Communication (September 2010 - January 2013) - Delivered an enterprise MDM and Salesforce-based media asset management platform generating $20M in syndication revenue within two quarters.
++Principal Consultant, Kalido Practice Lead, Project Performance Corporation (PPC) (2008 - 2010) - Led the Kalido consulting practice for federal and commercial clients, growing revenue by $1.5M.
++Senior Consultant / Consultant / Support Analyst, Kalido Inc. (2001 - February 2008) - Delivered enterprise data warehousing and MDM implementations for pharmaceutical and consumer clients including Ethicon (J&J), GSK, Abbott, and Pfizer, while also managing corporate IT operations across Kalido's US, UK, France, and India offices.
+ 
+-Customer Success Architect, Reltio, May 2017 - September 2018 - Advised 10+ enterprise life sciences customers on MDM architecture and governance; lifted platform adoption 30%.
+-
+-US Professional Services Director, Streebo, Inc., February 2013 - May 2017 - Led $4M in annual consulting revenue and 75 billable consultants across five accounts, including Eisai and AbbVie data and launch analytics programs.
+-
+-Principal Consultant, Kalido Practice Lead, Project Performance Corporation (PPC), December 2008 - August 2010 - Built the Kalido practice for a federal services firm, growing revenue by $1.5M.
+-
+-Application Manager (MDM), Univision Communication, September 2010 - January 2013 - Delivered an enterprise MDM and Salesforce media asset platform that generated $20M in syndication revenue within two quarters.
+-
+-Support Analyst / Consultant / Senior Consultant, Kalido Inc., September 2001 - December 2008 - Delivered data warehouse and MDM programs for Ethicon (J&J), GSK, Abbott and Pfizer, and ran corporate IT for under 200 staff across the US, UK, France and India.
++CORE SKILLS
++IT Strategy, Technology Roadmaps, IT Governance, IT Operations, Change Management, Vendor Management, IT Budget & Cost Optimization, Business Continuity, Disaster Recovery, Risk Management, Data Privacy, Cloud Infrastructure (Azure, AWS), Networks, Enterprise Applications (SAP S/4HANA, Veeva CRM/R&D, Salesforce), Systems Integration, Identity & Access Management, Endpoint Security, Master Data Management (MDM), Data Warehousing, Snowflake, Power BI, Analytics Strategy, Automation, AI-Enabled Solutions, GxP/CSV Governance, 21 CFR Part 11, SOX ITGC, Audit Readiness, Validation, Change Control, People Leadership, Executive Communication
+ 
+ EDUCATION
+-
+-Bachelor of Science (Honours), Information Systems, Artificial Intelligence major - Brunel University London, Middlesex, UK, 1997 - 2001
++Bachelor of Science, Information Systems (Artificial Intelligence major, Honours), Brunel University London, Middlesex, UK, 1997 - 2001
+ 
+ CERTIFICATIONS
+-
+-Reltio MDM Certification, 2017 | Six Sigma Green Belt, 2012 | Kalido Accredited Consultant, 2004 | Oracle Certified Professional (OCP), Oracle 8 DBA Track
+-
+-CORE SKILLS
+-
+-IT strategy; technology roadmaps; IT operations; IT governance; IT budget ownership ($8M); vendor management and contract negotiation; build-versus-buy; change management and user adoption; people leadership (8 direct reports, 38-person blended organization)
+-
+-Cloud infrastructure (Azure, AWS, Microsoft 365); networks, storage, telecommunications; enterprise applications (SAP S/4HANA, Ariba, Coupa, NetSuite, Veeva CRM/R&D/CTMS/eTMF/RIM/QMS, Salesforce, UKG, iCIMS, TM1); systems integration (Workato, Informatica, SnapLogic)
+-
+-Cybersecurity (identity and access management, Entra ID, Intune, Defender, Zscaler, incident response); data privacy (GDPR, CCPA); risk management; business continuity; disaster recovery; SOX ITGC; GxP/CSV; 21 CFR Part 11; SOC 2 Trust Services Criteria; NIST alignment
+-
+-Data and analytics (Snowflake, Power BI, Tableau, Looker, MDM, data governance); automation and AI-enabled solutions (Snowflake Cortex, Microsoft Copilot, agentic SOC triage)+Reltio MDM Certification, 2017
++Six Sigma Green Belt, 2012
++Kalido Accredited Consultant, 2004
++Oracle Certified Professional (OCP) - Oracle 8 DBA Track

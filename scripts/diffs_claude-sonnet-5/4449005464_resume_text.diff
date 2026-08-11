@@ -1,0 +1,116 @@
+--- baseline/resume_text
++++ new/resume_text
+@@ -1,72 +1,60 @@
+ Zahir Uddin
+-Montville, NJ | +1 617-538-1025 | malikzahiruddin328@gmail.com | linkedin.com/in/zahiruddinmalik
++Montville, NJ
++Phone: +1 617-538-1025
++Email: malikzahiruddin328@gmail.com
++LinkedIn: linkedin.com/in/zahiruddinmalik
+ 
+ PROFESSIONAL SUMMARY
++Data and technology executive with more than 25 years building and running commercial data platforms, Master Data Management (MDM) programs, and analytics organizations across pharma and life sciences, including seven-plus years leading enterprise data, applications, and IT for a commercial-stage pharmaceutical company through its first U.S. launch and subsequent scale-up to $1 billion in annual commercial operations. Deep, hands-on background in core pharma commercial data domains - HCP/HCO, patient claims, Rx, market access, specialty pharmacy, and CRM data - paired with direct ownership of data governance, data quality, cost management, and platform reliability at enterprise scale. Comfortable as the connective tissue between Commercial, IT, Finance, and Central Data functions, turning business objectives into funded, governed data product roadmaps.
+ 
+-Commercial data and analytics leader with 25+ years across pharma and life sciences, spanning data engineering, data products, commercial analytics, and consulting. Built and ran the enterprise data platform, Master Data Management (MDM), and commercial analytics estate that carried a US pharmaceutical launch through to $1B in annual sales - so the whole arc from first data domain to commercial scale readiness sits inside my own track record. Deep in the core pharma commercial domains Merck names here: Patient claims, Rx, market access, Health Care Professional (HCP)/Health Care Organization (HCO), specialty pharmacy, and CRM data. Comfortable owning product roadmaps, Service Level Agreements (SLAs), compute cost, and governance in the same breath.
+-
+-- Core Human Health data domains: HCP/HCO, Product, Patient, Payer, Vendor, Finance and Commercial domains defined with named business owners and a governance council chaired by the COO, with Finance, Legal/Compliance, HR, IT and Global QA at the table.
+-- Data product strategy and lifecycle: roadmap, requirements, prioritization, release and adoption for around 150 production dashboards and curated datasets serving roughly 400 business users across Commercial, Market Access, Medical Affairs, Finance and Supply Chain.
+-- Data platform and pipeline engineering: Snowflake with Azure Data Factory (Spark/Python) handling ~40TB of IQVIA data and multi-petabyte study and machine data, organized in curated bronze/silver/gold layers on a Medallion architecture pattern; AWS delivery on an earlier SaaS analytics platform. Databricks itself is adjacent, not hands-on.
+-- Generative AI (GenAI) and Agentic AI in production: agent-based first-line security operations automation worth $300K-$500K a year, a Medical Science Liaison next-best-action model on Snowflake Cortex, and AI expense anomaly detection; designed governed Retrieval-Augmented Generation (RAG) patterns with vector stores and semantic layers for internal knowledge retrieval.
+-- Cost management and delivery excellence: 30% reduction in technology operating expense, analytics platform delivered at under a third of the prior custom build's cost, and no missed SLA between 2018 and January 2026.
++- Core commercial HH domains: built and governed HCP/HCO, Product, Vendor, Finance, and Commercial data domains at SK Life Science, directly aligned to the performance management, patient, HCP, and account/payer analytics domains this role owns.
++- Data product strategy and delivery: owned the Snowflake-based enterprise analytics platform end to end - roughly 150 production dashboards serving about 400 business users across Commercial, Medical Affairs, Finance, and R&D - the same vision-to-adoption lifecycle this role calls for.
++- GenAI and Agentic AI in production: sponsored agent-based automation of first-line security operations (an estimated $300,000-$500,000 in annual savings), a Snowflake Cortex-built MSL next-best-action model that field leadership credited with over a 78% improvement in engagement, and designed governed Retrieval-Augmented Generation (RAG) pipelines with vector stores? for secure internal knowledge retrieval.
++- Cost management and operational excellence at scale: reduced technology operating expense by 30% through vendor renegotiation, cloud rightsizing, and license consolidation, while maintaining 100% SLA attainment company-wide from 2018 through 2026.
++- Compliance by design: embedded HIPAA, GDPR, and California privacy (CCPA/CPRA-aligned) requirements directly into data pipeline and platform design, alongside GxP and SOX controls.
+ 
+ PROFESSIONAL EXPERIENCE
+ 
+-SK Life Science, Inc. (SKLSI), Paramus, NJ
++SK Life Science, Inc. (SKLSI) - Paramus, NJ
+ 
+-Head of IT, January 2024 - January 2026
+-- Owned enterprise data, analytics, cybersecurity and governance strategy across Commercial, Market Access, Medical Affairs, R&D, manufacturing, Finance, Quality and Supply Chain, supporting $1B in annual commercial operations.
+-- Ran the commercial data estate on Snowflake and Power BI as the single source of truth: performance management, field reporting and incentive compensation for roughly 150 field representatives, payer and MMIT access segmentation, gross-to-net inputs for Finance, and specialty pharmacy 867/852 dispense and HUB feeds.
+-- Cut technology operating expense by 30% through vendor renegotiation, cloud rightsizing, license consolidation and an MSP shift; moved MDM from Informatica to Reltio on cost grounds without losing HCP/HCO mastering quality.
+-- Put three AI capabilities into production - agentic first-line security operations, MSL next-best-action, and expense anomaly detection - with human review, audit trails and change control kept intact under GxP and SOX.
+-- Represented IT quarterly on the data compliance and privacy committee, owning the IT HIPAA and privacy policy set, GDPR vendor Data Processing Agreements, data mapping and retention, and California PII obligations under CCPA/CPRA.
+-- Held every committed SLA from 2018 through departure, with an average departmental Net Promoter Score of 9 across that period.
++Head of IT
++January 2024 - January 2026
++- Delivered enterprise IT and data transformation aligning technology, data governance, and cybersecurity strategy with executive priorities across manufacturing, R&D, Commercial, Finance, Quality, and Supply Chain, enabling scalable support for $1 billion in annual commercial operations.
++- Owned the enterprise data and analytics ecosystem (roughly $1.5M of an $8M technology budget), built on Snowflake with curated bronze/silver/gold data layers following a Medallion architecture pattern?, feeding Power BI and, from a 2025 evaluation, Looker as the strategic semantic layer for governed self-service analytics.
++- Directed a data governance model spanning HCP/HCO, Product, Vendor, Finance, Employee, and Commercial domains, with business ownership, stewardship, and formal change control embedded into ERP, MDM, integration, and analytics programs to meet GxP, SOX, and audit requirements.
++- Sponsored three AI solutions in production - agentic first-line security operations automation (roughly $300,000-$500,000 in annual savings), an MSL next-best-action model on Snowflake Cortex, and AI-based expense anomaly detection - governed with human review, audit trails, and validated systems of record as the source of truth.
++- Reduced technology operating expense by 30% through vendor renegotiation, cloud rightsizing, license consolidation, and MSP realignment, while maintaining zero missed SLAs from 2018 through departure.
++- Led technology diligence, Day-1 readiness, and post-close integration for two SK Life Science business combinations, covering systems cutover, data migration, and cybersecurity onboarding.
+ 
+-Head of Applications, March 2020 - December 2023
+-- Took the commercial and enterprise application estate from fragmented manual process to a validated, integrated ecosystem, enabling the company's first US pharmaceutical launch within 14 months.
+-- Grew the data and analytics organization from 10 to 38 across data engineering, BI development and data science, working through eight direct reports - senior managers, architects and technical leads - plus strategic delivery partners including Improzo, ZS, Axtria, Coforge and Genpact.
+-- Owned an $8M technology budget with around $1.5M on the data and analytics ecosystem, and set the prioritization model - a weighted score on strategic value, urgency, risk and effort, reviewed at the governance council.
+-- Migrated commercial, finance and R&D reporting onto Snowflake in 2021, replacing a custom build at under a third of the running cost, and grew credit consumption roughly threefold to 2025 as new domains landed.
+-- Ran demand intake of perhaps 60-80 business requests a year with roughly a third funded into delivery, negotiating scope and timelines with Commercial, Finance and IT stakeholders directly.
++Head of Applications
++March 2020 - December 2023
++- Directed the enterprise application and commercial data ecosystem - ERP, Veeva CRM/R&D, MDM, drug serialization, and commercial analytics - through the company's first U.S. pharmaceutical product launch within 14 months.
++- Reduced process inefficiencies by 40% through platform selection and vendor alignment, accelerating launch readiness across Commercial, Finance, and Supply Chain.
++- Modernized regulated application infrastructure to improve interoperability, compliance, and operational readiness for commercial scale, growing the data and analytics organization from roughly 10 to 38 people over the period.
++- Grew self-service BI adoption to roughly 250 active business users on governed Snowflake/Power BI dashboards, cutting management reporting cycles from days to near real time.
++- Partnered with the Chief Commercial Officer and Commercial Operations on incentive compensation reporting, territory alignment, and demand forecasting drawn directly from the commercial data warehouse.
+ 
+-Enterprise Architect and Commercial Systems Lead, September 2018 - February 2020
+-- Set the future-state architecture and deployed 8+ core platforms - Veeva CRM, Veeva R&D, SAP S/4HANA, drug serialization, commercial analytics and MDM - to reach launch readiness.
+-- Improved reporting accuracy and operating efficiency by 35% through commercial data curation and MDM-driven governance across HCP/HCO and product master domains.
+-- Led RFPs and vendor negotiations, translating commercial stakeholder objectives into requirements and prioritized backlogs.
++Enterprise Architect and Commercial Systems Lead
++September 2018 - February 2020
++- Architected the future-state enterprise data and applications environment and deployed eight-plus core platforms - CRM, Veeva R&D, ERP, drug serialization, commercial analytics, and MDM - enabling first-drug launch readiness from a near-zero starting IT base.
++- Improved reporting accuracy and operational efficiency by 35% by optimizing enterprise data delivery through enhanced commercial data curation and MDM-driven governance across HCP/HCO and product domains.
++- Led RFPs and vendor negotiations for the core data and analytics stack, partnering directly with Commercial and Finance leadership on requirements.
+ 
+ EARLIER CAREER
++Customer Success Architect, Reltio (May 2017 - September 2018) - Advised enterprise life sciences and other clients on Reltio MDM architecture and adoption, lifting platform adoption 30% through strategic account reviews.
++US Professional Services Director, Streebo, Inc. (February 2013 - May 2017) - Led delivery of EDW, BI, and MDM transformation programs for Eisai, AbbVie, and other enterprise accounts, managing 25 US-based and 50 offshore consultants on $4M in annual consulting revenue.
++Application Manager (MDM), Univision Communications (September 2010 - January 2013) - Delivered an enterprise MDM and Salesforce-based media asset platform generating $20M in syndication revenue within two quarters.
++Principal Consultant, Kalido Practice Lead, Project Performance Corporation (2008 - 2010) - Led the Kalido MDM/EDW practice, growing revenue by $1.5M through team-building and delivery discipline.
++Senior Consultant / Consultant / Support Analyst, Kalido Inc. (2001 - February 2008) - Delivered enterprise data warehousing, MDM, and product-hierarchy solutions for Ethicon/Johnson & Johnson, GSK, Abbott, and Pfizer.
+ 
+-Customer Success Architect, Reltio, May 2017 - September 2018 - Advised 10+ enterprise life sciences customers on MDM architecture, governance and adoption; lifted platform adoption 30% through quarterly business reviews and fed client requirements back to product management.
+-
+-US Professional Services Director (co-founder), Streebo, Inc., February 2013 - May 2017 - Carried $4M in annual delivery revenue across five enterprise accounts with 25 US and 50 offshore consultants on Enterprise Data Warehouse (EDW), BI and MDM programs; improved data delivery efficiency 50%.
+-
+-Application Manager (MDM), Univision Communication, September 2010 - January 2013 - Delivered an enterprise MDM and Salesforce media asset platform that generated $20M in syndication revenue within two quarters; established data governance practice.
+-
+-Principal Consultant, Kalido Practice Lead, Project Performance Corporation (PPC), December 2008 - August 2010 - Built and led the Kalido practice, growing it to $1.5M in revenue.
+-
+-Support Analyst / Kalido Consultant / Senior Kalido Consultant, Kalido, September 2001 - December 2008 - Delivered EDW, MDM and product hierarchy solutions for pharma and consumer clients including Ethicon (J&J), Unilever, Labatt and BP.
+-
+-Selected pharma client programs (Eisai, AbbVie): led an 8-person onshore/offshore team on EDW and MDM optimization for 50% efficiency gain; implemented Customer Master and prescriber data platforms as systems of record for enterprise reporting and regulatory compliance; supported two product launches and standardized a reusable data integration framework; delivered Product Master MDM across 75 countries for 20% budget savings; ran the data governance program for the Sales and Planning division.
+-
+-SKILLS
+-
+-Data: Master Data Management (MDM), Data Governance, Data Modeling, Data Quality, Data Pipelines, Data Engineering, Data Management, Information Management, Data Warehousing, semantic layers, Medallion architecture (bronze/silver/gold), API orchestration, Business Intelligence (BI), Data Visualization, Database Administration
+-Domains: Patient claims, Rx, market access, HCP/HCO, specialty pharmacy, CRM data, payer and account analytics, field reporting, marketing mix and campaign analytics, omnichannel execution, incentive compensation, gross-to-net, customer engagement
+-Platforms: Snowflake, AWS, Azure (Data Factory, Entra ID), Spark, Python, Informatica (PowerCenter & IICS), Reltio, Collibra, Workato, SnapLogic, Talend, dbt, Looker, Power BI, Tableau, Teradata, Oracle, SQL Server, Veeva CRM/Align/Events, Salesforce, SAP S/4HANA, Snowflake Cortex
+-AI: GenAI, Agentic AI, RAG pipelines, vector stores, AI-enabled data engineering, Natural Language Processing (NLP)
+-Governance and compliance: HIPAA, GDPR, CCPA/CPRA, GxP/CSV, 21 CFR Part 11, SOX ITGC, audit readiness
+-Leadership and delivery: data product strategy, product lifecycle ownership, agile product development, Software Development Life Cycle (SDLC), Software Development, System Designs, Design Applications, SLAs and reliability at scale, cost management, prioritization, operational excellence, delivery excellence, functional leadership, strategic leadership, budget management, vendor negotiation, risk mitigation strategies
+-
+-EDUCATION
+-
+-Bachelor's degree - Bachelor of Science (BSc), Information Systems, Artificial Intelligence major, Honours, Brunel University London, Middlesex, UK, 1997 - 2001
+-
+-Entrepreneurial and innovation background in place of an MBA or other advanced degree: co-founded Streebo, Inc. and built its US professional services business to $4M in annual revenue, including a $2.5M license sale; roughly one internal executive leadership and innovation workshop every two years over a 12-year period at SK Life Science.
++CORE SKILLS
++Data Product Strategy, Data Engineering, Data Governance, Data Modeling, Data Pipelines, Data Quality, Data Management, Data Visualization, Business Intelligence (BI), Database Administration, Cost Management, Customer Engagement, Marketing Mix and Campaign Analytics, Operational Excellence, Prioritization, Software Development, Software Development Life Cycle (SDLC), System Designs, Design Applications, Information Management, Master Data Management (MDM), Enterprise Architecture, Medallion Architecture, Snowflake, Azure Data Factory, Databricks (adjacent, Spark/Python pipelines), AWS, Azure, Generative AI (GenAI), Agentic AI, Retrieval-Augmented Generation (RAG) Pipelines, RAG Pipelines, Vector Stores, Semantic Layers (Looker), HIPAA, GDPR, CCPA/CPRA, Agile Product Development, API Orchestration (Workato), Patient Claims, Rx, Market Access, HCP/HCO, Specialty Pharmacy, CRM Data (Salesforce, Veeva), Service Level Agreements (SLAs), Six Sigma, Vendor Management, Data Governance Councils
+ 
+ CERTIFICATIONS
+-
+ Reltio MDM Certification, 2017
+ Six Sigma Green Belt, 2012
+ Kalido Accredited Consultant, 2004
+-Oracle Certified Professional (OCP) - Oracle 8 DBA Track+Oracle Certified Professional (OCP) - Oracle 8 DBA Track
++
++EDUCATION
++Bachelor of Science, Information Systems (Artificial Intelligence major, Honours), Brunel University London, Middlesex, UK, 1997 - 2001
