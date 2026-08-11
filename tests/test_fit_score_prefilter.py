@@ -98,6 +98,7 @@ def test_domain_plausibility_prompt_stays_minimal_not_full_profile_json(monkeypa
         captured["user_content"] = user_content
         captured["max_tokens"] = max_tokens
         captured["model"] = kwargs.get("model")
+        captured["effort"] = kwargs.get("effort")
         return {"plausible": True, "reason": ""}
 
     monkeypatch.setattr(fit_score_prefilter, "_client", lambda: object())
@@ -109,6 +110,13 @@ def test_domain_plausibility_prompt_stays_minimal_not_full_profile_json(monkeypa
     assert "work_history" not in captured["user_content"]
     assert "IT/data/cybersecurity executive." in captured["user_content"]
     assert "Corporate IT" in captured["user_content"]
+    # Real bug found 2026-08-11: claude-haiku-4-5 rejects the effort key in
+    # output_config outright ("This model does not support the effort
+    # parameter") - every one of 126 real domain-check calls in that day's
+    # live validation failed on this, silently caught by should_skip_
+    # scoring's own fail-open handling. effort=None omits the key entirely
+    # rather than guessing a value the model will accept.
+    assert captured["effort"] is None
 
 
 # --- Logging: the non-negotiable "never silently dropped" requirement ------

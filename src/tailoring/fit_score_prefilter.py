@@ -120,7 +120,14 @@ def _domain_plausibility(job: dict, profile: dict) -> dict:
         schema=_domain_schema(),
         max_tokens=300,
         model=PREFILTER_MODEL,
-        effort="low",
+        # claude-haiku-4-5 rejects the effort key in output_config outright
+        # ("This model does not support the effort parameter") - a real
+        # bug found live-validating this exact call 2026-08-11: every one
+        # of 126 real domain-check calls in that run failed on this, each
+        # silently caught by should_skip_scoring's own fail-open handling,
+        # so layer 2 had never actually executed once. See
+        # llm_client.call_structured's own docstring for the fix.
+        effort=None,
         thinking=False,
         refusal_message="Claude declined to run the domain pre-check.",
         purpose="fit_score_prefilter",
