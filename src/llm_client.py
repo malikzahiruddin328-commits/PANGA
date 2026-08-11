@@ -485,6 +485,8 @@ def _log_cost(
             purpose=purpose, model=model,
             input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens,
             cost_usd=cost, job_key=job_key, duration_ms=duration_ms,
+            cache_creation_input_tokens=getattr(response.usage, "cache_creation_input_tokens", None),
+            cache_read_input_tokens=getattr(response.usage, "cache_read_input_tokens", None),
         )
     except Exception:
         logger.exception("Failed to log API call cost (purpose=%s) - the call itself still succeeded.", purpose)
@@ -518,7 +520,7 @@ def _log_failed_call(exc: BaseException, purpose: str, job_key: tuple[str, str] 
 
 def call_structured(
     client: "anthropic.Anthropic",
-    system,
+    system: str | list[dict],
     user_content,
     schema: dict,
     max_tokens: int,
@@ -543,6 +545,14 @@ def call_structured(
     Returns the parsed JSON dict. Raises LLMNotConfigured (via the caller's
     own get_client() call, before this function is even reached) and
     LLMCallFailed on API error, refusal, truncation, or invalid JSON.
+
+    system may be a plain string (unchanged behavior) or a list of content-
+    block dicts (2026-08-11, fit_score prompt-caching fix) - pass a list
+    when part of the system content should be Anthropic prompt-cached
+    (mark the cacheable block with "cache_control": {"type": "ephemeral"}).
+    Passed straight through to the API unmodified either way - the
+    Anthropic SDK accepts both shapes natively, so no reshaping happens
+    here. See tailoring.drafting.score_job for the real caller.
 
     Transient failures (overloaded/rate-limit/connection errors) are retried
     with backoff, then retried once more against a fallback model if the

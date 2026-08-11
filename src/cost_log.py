@@ -32,6 +32,7 @@ def log_api_cost(
     job_key: tuple[str, str] | None = None, duration_ms: float | None = None,
     success: bool = True, error_type: str | None = None,
     attempt_count: int | None = None, models_tried: list[str] | None = None,
+    cache_creation_input_tokens: int | None = None, cache_read_input_tokens: int | None = None,
 ) -> None:
     """Appends one real, already-computed call's cost to the log. job_key
     is (source, job_id) when this call was for a specific job posting
@@ -57,7 +58,15 @@ def log_api_cost(
     duration_ms/error_type/attempt_count/models_tried preserve what
     actually happened. success defaults True so every existing caller
     (which never had a reason to think about failure logging) keeps
-    working unchanged."""
+    working unchanged.
+
+    cache_creation_input_tokens/cache_read_input_tokens (2026-08-11,
+    fit_score prompt-caching fix): the real per-call breakdown of Anthropic
+    prompt-caching token pools, straight from the response, so a cache hit
+    is independently verifiable in this log later - not just inferred from
+    a lower cost_usd. None (the default) for any call that didn't use
+    caching at all, same "optional, existing callers unaffected" pattern
+    as every other optional field here."""
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "purpose": purpose,
@@ -68,6 +77,10 @@ def log_api_cost(
         "duration_ms": duration_ms,
         "success": success,
     }
+    if cache_creation_input_tokens:
+        entry["cache_creation_input_tokens"] = cache_creation_input_tokens
+    if cache_read_input_tokens:
+        entry["cache_read_input_tokens"] = cache_read_input_tokens
     if not success:
         entry["error_type"] = error_type
         entry["attempt_count"] = attempt_count
