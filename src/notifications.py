@@ -6,7 +6,10 @@ already present on every Windows install - no new dependency, and no
 Start-Menu app registration needed (unlike a real toast notification, which
 requires an AppUserModelID)."""
 
+import logging
 import subprocess
+
+logger = logging.getLogger(__name__)
 
 
 def _ps_escape(text: str) -> str:
@@ -41,4 +44,4 @@ def send_notification(title: str, message: str, timeout_seconds: int = 10) -> No
             check=False,
         )
     except (subprocess.SubprocessError, OSError):
-        pass
+        logger.exception("Failed to show system-tray notification: %r", title)
