@@ -49,6 +49,7 @@ this scale.
 """
 
 import hashlib
+import json
 import re
 
 import requests
@@ -59,6 +60,32 @@ HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 def _normalize_for_hash(text: str | None) -> str:
     return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+# Location-specific normalization on top of _normalize_for_hash() - real bug
+# found 2026-08-11 (Mirror's audit, docs/review-sweep-reports/2026-08-07-
+# mirror-audit.md F2): _stable_job_id() was supposed to dedupe a posting
+# found via BOTH Dice code paths (fetch_dice_jobs()'s direct scrape vs.
+# normalize_dice_job()'s MCP path), but the two format location differently
+# for the exact same real posting - "Hybrid in Ann Arbor, Michigan" (scrape)
+# vs. "Ann Arbor, Michigan, USA" (MCP), "No location provided" (scrape) vs.
+# None (MCP) - so the hash never matched. Confirmed live against production
+# data: 0 of 141 (title, organization) pairs present on both paths shared a
+# job_id. Stripping the work-mode prefix ("Hybrid/Remote/On-site in/or ")
+# and country suffix (", USA") before hashing - not fixing the two scrapers
+# to agree on a display format (fragile, either could change independently;
+# this fixes the comparison instead of the source data, more durable).
+_LOCATION_WORKMODE_PREFIX_RE = re.compile(r"^(hybrid|remote|on-site)\s+(in|or)\s+")
+_LOCATION_COUNTRY_SUFFIX_RE = re.compile(r",?\s*usa$")
+
+
+def _normalize_location_for_hash(location: str | None) -> str:
+    text = _normalize_for_hash(location)
+    text = _LOCATION_WORKMODE_PREFIX_RE.sub("", text)
+    text = _LOCATION_COUNTRY_SUFFIX_RE.sub("", text).strip()
+    if text == "no location provided":
+        return ""
+    return text
 
 
 def _stable_job_id(source: str, title: str | None, organization: str | None, location: str | None) -> str:
@@ -82,8 +109,11 @@ def _stable_job_id(source: str, title: str | None, organization: str | None, loc
     to fields that are actually stable here rather than to an already-
     stable job_id. Real tradeoff, accepted: two genuinely different
     postings with identical title/org/location would now collide - far
-    rarer than the every-run duplication this replaces."""
-    key = "|".join(_normalize_for_hash(v) for v in (title, organization, location))
+    rarer than the every-run duplication this replaces. Location goes
+    through the extra _normalize_location_for_hash() pass above (title/
+    organization don't need it - no equivalent formatting-variance bug
+    found there) - see that function's docstring for why."""
+    key = "|".join([_normalize_for_hash(title), _normalize_for_hash(organization), _normalize_location_for_hash(location)])
     return hashlib.sha1(f"{source}:{key}".encode()).hexdigest()[:16]
 
 
@@ -248,6 +278,48 @@ def fetch_dice_jobs(keyword: str, limit: int = 25) -> list[dict]:
             "apply_url": posting_url,
         })
     return jobs
+
+
+def fetch_dice_job_description(posting_url: str) -> str | None:
+    """Real JD text for one direct-scrape Dice posting - real gap found
+    2026-08-11 (Mirror's audit F1): fetch_dice_jobs() above never set
+    `description` at all, unlike its sibling normalize_dice_job() (the MCP
+    path, which gets a ~500-char excerpt for free in its own search
+    response) - the direct scrape is the one that actually runs on the
+    daily unattended job search (run_search.py STEP 2c), so resumes were
+    being drafted/scored against zero real JD content for every Dice
+    posting found this way.
+
+    Takes the job's own `posting_url` (https://www.dice.com/job-detail/
+    <guid>), NOT `job_id` - job_id is now _stable_job_id()'s content hash,
+    not the raw Dice guid the real URL needs (a real bug caught live while
+    building this: calling this with job_id 404s, since that string was
+    never a valid Dice URL segment to begin with).
+
+    The job-detail page's search-result cards have no inline description
+    (confirmed live) - but the page itself embeds a standard schema.org
+    JobPosting JSON-LD block (`<script data-testid="jobDetailStructuredData"
+    type="application/ld+json">`) with a full `description` field (HTML),
+    not just an excerpt - a more stable extraction target than guessing at
+    Dice's own CSS classes, and the same real content normalize_dice_job()'s
+    truncated `summary` field is itself an excerpt of.
+
+    Raises on failure rather than swallowing it - unlike company_sites.py's
+    equivalent Workday/SmartRecruiters fetchers (flagged separately, Mirror
+    F5, as a real gap: silent failures with no signal anywhere). The
+    caller (scripts/run_search.py's search_dice()) logs the exception,
+    same as every other per-item failure in that script."""
+    response = requests.get(posting_url, headers=HEADERS, timeout=20)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+    script = soup.select_one('[data-testid="jobDetailStructuredData"]')
+    if not script:
+        return None
+    data = json.loads(script.get_text())
+    html_description = data.get("description")
+    if not html_description:
+        return None
+    return BeautifulSoup(html_description, "html.parser").get_text("\n", strip=True) or None
 
 
 def fetch_built_in_jobs(keyword: str, limit: int = 25) -> list[dict]:

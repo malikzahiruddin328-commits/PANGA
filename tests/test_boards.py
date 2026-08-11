@@ -162,12 +162,79 @@ def test_fetch_dice_jobs_id_matches_mcp_path_for_same_content():
     # The whole point of unifying both Dice code paths onto _stable_job_id():
     # the same real posting found via either path must dedupe against
     # itself under source="Dice", regardless of which path found it first.
-    scraped = boards._stable_job_id("Dice", "Chief Information Officer", "Acme Corp", "Ann Arbor, Michigan")
+    #
+    # Real bug found 2026-08-11 (Mirror's audit F2): this test originally
+    # used the IDENTICAL location string ("Ann Arbor, Michigan") on both
+    # sides, which never actually exercised the real-world mismatch and so
+    # never caught that the docstring's dedup claim was false in
+    # production - confirmed live, 0 of 141 real (title, organization)
+    # pairs present on both paths shared a job_id, because the two paths
+    # format location differently for the same real posting: the scrape
+    # includes a work-mode prefix ("Hybrid in ..."), the MCP path includes
+    # a country suffix ("..., USA"). Using the exact real mismatched
+    # strings here now, not matching ones.
+    scraped = boards._stable_job_id("Dice", "Chief Information Officer", "Acme Corp", "Hybrid in Ann Arbor, Michigan")
     mcp_normalized = normalize_dice_job({
         "guid": "totally-different-mcp-guid", "title": "Chief Information Officer",
-        "companyName": "Acme Corp", "jobLocation": {"displayName": "Ann Arbor, Michigan"},
+        "companyName": "Acme Corp", "jobLocation": {"displayName": "Ann Arbor, Michigan, USA"},
     })
     assert scraped == mcp_normalized["job_id"]
+
+
+def test_location_normalization_strips_workmode_prefix_and_country_suffix():
+    # Real examples from production data (Mirror's audit F2).
+    assert boards._normalize_location_for_hash("Hybrid in Ann Arbor, Michigan") == "ann arbor, michigan"
+    assert boards._normalize_location_for_hash("Ann Arbor, Michigan, USA") == "ann arbor, michigan"
+    assert boards._normalize_location_for_hash("Remote or Lacey, Washington") == "lacey, washington"
+    assert boards._normalize_location_for_hash("Lacey, Washington, USA") == "lacey, washington"
+    assert boards._normalize_location_for_hash("No location provided") == ""
+    assert boards._normalize_location_for_hash(None) == ""
+
+
+def test_location_normalization_does_not_over_strip_a_real_city_name():
+    # "On-site" prefix and city names containing "USA"-like substrings
+    # shouldn't get mangled - only a clean trailing ", USA"/" USA" suffix
+    # and a clean leading work-mode phrase are stripped.
+    assert boards._normalize_location_for_hash("On-site in Houston, Texas") == "houston, texas"
+    assert boards._normalize_location_for_hash("Houston, Texas") == "houston, texas"
+
+
+# Real markup shape, live-confirmed 2026-08-11: the job-detail page embeds
+# a standard schema.org JobPosting JSON-LD block with the full description.
+_DICE_DETAIL_PAGE_WITH_JD = """
+<html><body>
+<script data-testid="jobDetailStructuredData" type="application/ld+json">
+{"@context": "https://schema.org", "@type": "JobPosting", "title": "CIO",
+ "description": "<h2>About the role</h2><p>Leadership of the IT department.</p>"}
+</script>
+</body></html>
+"""
+
+_DICE_DETAIL_PAGE_NO_STRUCTURED_DATA = "<html><body><p>Job not found</p></body></html>"
+
+
+def test_fetch_dice_job_description_extracts_real_text(monkeypatch):
+    monkeypatch.setattr(boards.requests, "get", lambda url, headers=None, timeout=None: _FakeResponse(_DICE_DETAIL_PAGE_WITH_JD))
+    description = boards.fetch_dice_job_description("https://www.dice.com/job-detail/abc-123")
+    assert description == "About the role\nLeadership of the IT department."
+
+
+def test_fetch_dice_job_description_returns_none_when_no_structured_data(monkeypatch):
+    monkeypatch.setattr(boards.requests, "get", lambda url, headers=None, timeout=None: _FakeResponse(_DICE_DETAIL_PAGE_NO_STRUCTURED_DATA))
+    assert boards.fetch_dice_job_description("https://www.dice.com/job-detail/does-not-exist") is None
+
+
+def test_fetch_dice_job_description_raises_on_http_error(monkeypatch):
+    # Deliberately does NOT swallow the failure (unlike company_sites.py's
+    # Workday/SmartRecruiters JD fetchers, flagged separately - Mirror's
+    # audit F5 - as a real gap: silent failures with no signal anywhere).
+    # The caller in run_search.py's search_dice() logs it instead.
+    monkeypatch.setattr(boards.requests, "get", lambda url, headers=None, timeout=None: _FakeResponse("error", status_code=500))
+    try:
+        boards.fetch_dice_job_description("https://www.dice.com/job-detail/abc-123")
+        assert False, "should have raised"
+    except RuntimeError:
+        pass
 
 
 def test_normalize_dice_job_captures_summary_as_description():

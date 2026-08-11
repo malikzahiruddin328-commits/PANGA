@@ -139,13 +139,37 @@ def search_aggregators(target_roles: list[dict], countries: list[str]) -> int:
 def search_dice(target_roles: list[dict]) -> int:
     """Direct scrape, no MCP - see boards.fetch_dice_jobs()'s docstring for
     why this is safe to run unattended (server-rendered, plain `requests`
-    reaches it fine, unlike ZipRecruiter/Indeed's WAF)."""
+    reaches it fine, unlike ZipRecruiter/Indeed's WAF).
+
+    JD backfill for genuinely NEW postings only (Mirror's audit F1, real
+    gap: this path never captured description at all, unlike its MCP
+    sibling): fetches boards.fetch_dice_job_description() per posting, but
+    only for ones not already in the store when this function started -
+    deliberately NOT the same shape as company_sites.py's Workday/
+    SmartRecruiters JD fetch (Mirror's audit F4, a real design concern:
+    that one re-fetches every already-stored posting's JD on every single
+    run, before dedup even happens). existing_ids is a single job_store
+    snapshot taken once, updated in memory as roles are processed - the
+    same real posting turning up under two different role keywords in one
+    run only gets its JD fetched once, not once per keyword match."""
     added = 0
     errors = 0
+    existing_ids = {(j.get("source"), j.get("job_id")) for j in job_store.load_jobs()}
     for role in target_roles:
         try:
             jobs = boards.fetch_dice_jobs(role["name"], limit=25)
+            new_jobs = [j for j in jobs if (j.get("source"), j.get("job_id")) not in existing_ids]
             added += job_store.save_jobs(jobs)
+            for job in new_jobs:
+                existing_ids.add((job.get("source"), job.get("job_id")))
+                if not job.get("posting_url"):
+                    continue
+                try:
+                    description = boards.fetch_dice_job_description(job["posting_url"])
+                    if description:
+                        job_store.update_job_description(job["source"], job["job_id"], description)
+                except Exception as exc:  # noqa: BLE001 - one posting's JD fetch failing shouldn't stop the rest
+                    _log(f"  [boards] Dice JD fetch failed for {job.get('title')!r} ({job['job_id']}): {exc}")
         except Exception as exc:  # noqa: BLE001 - one role's failure shouldn't stop the rest
             errors += 1
             _log(f"  [boards] Dice search failed for {role['name']!r}: {exc}")

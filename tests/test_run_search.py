@@ -8,7 +8,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import run_search  # noqa: E402
-from search import company_sites, job_sources, source_activity, usajobs  # noqa: E402
+from search import boards, company_sites, job_sources, job_store, source_activity, usajobs  # noqa: E402
 
 
 @pytest.fixture
@@ -53,6 +53,64 @@ def test_search_usajobs_still_runs_job_category_code_search(isolated_run_search,
     # ran (0 error) even though the only target_role was skipped - the
     # job_category_code search still counts as a real attempt.
     assert data["USAJOBS"][0]["had_error"] is False
+
+
+def _dice_job(job_id, title="CIO", organization="Acme Corp", posting_url=None):
+    return {
+        "source": "Dice", "job_id": job_id, "title": title, "organization": organization,
+        "location": "Remote", "posting_url": posting_url or f"https://www.dice.com/job-detail/{job_id}",
+    }
+
+
+def test_search_dice_backfills_description_for_new_postings_only(isolated_run_search, monkeypatch):
+    # Real gap found 2026-08-11 (Mirror's audit F1): fetch_dice_jobs()
+    # never captured description at all. Fixed by fetching it separately
+    # here, but ONLY for postings genuinely new this run - not the same
+    # "re-fetch every already-stored posting on every run" shape flagged
+    # as a real cost concern for Workday/SmartRecruiters (Mirror's audit F4).
+    job_store.save_jobs([_dice_job("already-here")])  # pre-existing
+    monkeypatch.setattr(boards, "fetch_dice_jobs", lambda keyword, limit=25: [
+        _dice_job("already-here"), _dice_job("brand-new", title="VP IT"),
+    ])
+    fetch_calls = []
+    monkeypatch.setattr(boards, "fetch_dice_job_description", lambda posting_url: fetch_calls.append(posting_url) or "Real JD text.")
+
+    run_search.search_dice([{"name": "CIO"}])
+
+    assert fetch_calls == ["https://www.dice.com/job-detail/brand-new"]  # not the pre-existing one
+    jobs_by_id = {j["job_id"]: j for j in job_store.load_jobs()}
+    assert jobs_by_id["brand-new"]["description"] == "Real JD text."
+    assert "description" not in jobs_by_id["already-here"]
+
+
+def test_search_dice_only_fetches_description_once_across_multiple_roles(isolated_run_search, monkeypatch):
+    # The same real posting can turn up under more than one target_role
+    # keyword in a single run - its JD should only be fetched once, not
+    # once per role match.
+    monkeypatch.setattr(boards, "fetch_dice_jobs", lambda keyword, limit=25: [_dice_job("posting-1")])
+    fetch_calls = []
+    monkeypatch.setattr(boards, "fetch_dice_job_description", lambda posting_url: fetch_calls.append(posting_url) or "JD text.")
+
+    run_search.search_dice([{"name": "CIO"}, {"name": "IT Director"}])
+
+    assert len(fetch_calls) == 1
+
+
+def test_search_dice_jd_fetch_failure_does_not_stop_the_run(isolated_run_search, monkeypatch):
+    monkeypatch.setattr(boards, "fetch_dice_jobs", lambda keyword, limit=25: [_dice_job("posting-1"), _dice_job("posting-2")])
+
+    def _flaky(posting_url):
+        if "posting-1" in posting_url:
+            raise RuntimeError("network error")
+        return "Real JD text."
+    monkeypatch.setattr(boards, "fetch_dice_job_description", _flaky)
+
+    added = run_search.search_dice([{"name": "CIO"}])
+
+    assert added == 2  # both jobs still saved, despite one JD fetch failing
+    jobs_by_id = {j["job_id"]: j for j in job_store.load_jobs()}
+    assert "description" not in jobs_by_id["posting-1"]
+    assert jobs_by_id["posting-2"]["description"] == "Real JD text."
 
 
 def test_search_industry_boards_records_activity_per_source(isolated_run_search, monkeypatch):
