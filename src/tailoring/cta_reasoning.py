@@ -91,7 +91,26 @@ def classify_thread(thread_summary: dict, full_body: str | None = None) -> dict:
     )
 
 
-_MATCH_SYSTEM_PROMPT = """You are matching an application-confirmation email to a specific job record from Zahir Uddin's job-search tool "Panga", so his application status can be updated automatically. Only report a match if you are genuinely confident - if the email doesn't give enough detail to distinguish between multiple candidate jobs (e.g. two identically-titled postings at different times), do not guess; report matched=false instead. A wrong match is worse than no match."""
+_ORG_MISMATCH_WARNING = (
+    "Organization name is usually a far more reliable disambiguator than "
+    "title wording - two different real job postings frequently share "
+    "similar or overlapping title text (e.g. both containing the word "
+    "\"Digital\"), but rarely share an employer name. Weigh the "
+    "organization the email is actually from (its sender domain, "
+    "letterhead, or explicit company name in the body) more heavily than "
+    "title similarity - a candidate whose organization clearly doesn't "
+    "match the email's real sender/company is a bad match even if its "
+    "title looks similar, and a candidate whose organization DOES match "
+    "is a strong signal even if the title wording differs slightly. Real "
+    "incident (2026-08-09): a rejection email that opened by naming its "
+    "own organization was matched to a completely different candidate at "
+    "an unrelated company, purely on loose title-word overlap - don't "
+    "repeat that mistake."
+)
+
+_MATCH_SYSTEM_PROMPT = f"""You are matching an application-confirmation email to a specific job record from Zahir Uddin's job-search tool "Panga", so his application status can be updated automatically. Only report a match if you are genuinely confident - if the email doesn't give enough detail to distinguish between multiple candidate jobs (e.g. two identically-titled postings at different times), do not guess; report matched=false instead. A wrong match is worse than no match.
+
+{_ORG_MISMATCH_WARNING}"""
 
 _MATCH_SCHEMA = {
     "type": "object",
@@ -106,6 +125,49 @@ _MATCH_SCHEMA = {
 }
 
 
+_MIN_ORG_HINT_LENGTH = 4  # a name shorter than this (e.g. "BD") is too
+# generic to safely substring-match against arbitrary email text without
+# risking a false positive - short/acronym organization names are left to
+# the LLM's own judgment, same as before this fix existed.
+
+
+def _organization_hint(full_body: str, candidate_jobs: list[dict]) -> str:
+    """Deterministic pre-check, appended to the match call's content when
+    it fires: if exactly one candidate's organization name is explicitly
+    stated in the email body, surface that as an explicit hint rather
+    than leaving the LLM to notice it unassisted. Real gap found
+    2026-08-09 (Zahir spotted a wrong live match, traced by General): a
+    rejection email that opened by literally naming its own organization
+    ("UAB Medicine emailed... not selected for the Chief Digital and
+    Information Officer") still got matched to a completely unrelated
+    candidate at a different company ("BD"), purely on loose title-word
+    overlap ("Digital" in both titles) - both candidates had real,
+    populated organization fields already (the earlier "candidates have
+    no title/org" join gap, fixed 2026-08-07, was NOT the cause here;
+    this is a genuine matching miss against otherwise-good data, a
+    different failure mode). Returns "" (no hint) when zero or more than
+    one candidate's organization appears - an ambiguous or absent signal
+    is left entirely to the LLM's judgment, same as before this fix."""
+    lowered_body = full_body.lower()
+    matches = [
+        job for job in candidate_jobs
+        if (org := (job.get("organization") or "").strip())
+        and len(org) >= _MIN_ORG_HINT_LENGTH
+        and org.lower() in lowered_body
+    ]
+    if len(matches) != 1:
+        return ""
+    job = matches[0]
+    return (
+        f"\n\nDETERMINISTIC HINT: the organization name '{job['organization']}' "
+        f"appears verbatim in the email body, and exactly one candidate "
+        f"(source={job['source']}, job_id={job['job_id']}) has that "
+        "organization. Per the organization-vs-title guidance above, give "
+        "this candidate strong weight unless the rest of the email clearly "
+        "contradicts it."
+    )
+
+
 def match_application_confirmation(thread_summary: dict, full_body: str, candidate_jobs: list[dict]) -> dict:
     """candidate_jobs is the list of applications currently "under review"
     (tailoring.applications.load_applications() filtered by the caller).
@@ -115,6 +177,7 @@ def match_application_confirmation(thread_summary: dict, full_body: str, candida
         f"CONFIRMATION EMAIL:\nSubject: {thread_summary.get('subject', '')}\n"
         f"From: {thread_summary.get('sender', '')}\nBody:\n{full_body}\n\n"
         "CANDIDATE JOBS CURRENTLY 'UNDER REVIEW':\n" + json.dumps(candidate_jobs, indent=2, default=str)
+        + _organization_hint(full_body, candidate_jobs)
     )
     return call_structured(
         client,
@@ -128,7 +191,9 @@ def match_application_confirmation(thread_summary: dict, full_body: str, candida
     )
 
 
-_CTA_MATCH_SYSTEM_PROMPT = """You are matching a job-search email (a rejection, interview request, or offer) to a specific job record from Zahir Uddin's job-search tool "Panga", so his application status can be updated automatically. Only report a match if you are genuinely confident - if the email doesn't give enough detail to distinguish between multiple candidate jobs (e.g. two identically-titled postings at different companies, or the email is generic/ambiguous about which role it's about), do not guess; report matched=false instead. A wrong match is worse than no match - it would silently mark the wrong application as rejected/interviewing/offered."""
+_CTA_MATCH_SYSTEM_PROMPT = f"""You are matching a job-search email (a rejection, interview request, or offer) to a specific job record from Zahir Uddin's job-search tool "Panga", so his application status can be updated automatically. Only report a match if you are genuinely confident - if the email doesn't give enough detail to distinguish between multiple candidate jobs (e.g. two identically-titled postings at different companies, or the email is generic/ambiguous about which role it's about), do not guess; report matched=false instead. A wrong match is worse than no match - it would silently mark the wrong application as rejected/interviewing/offered.
+
+{_ORG_MISMATCH_WARNING}"""
 
 # Same shape as _MATCH_SCHEMA above, kept as its own object rather than
 # shared so each prompt's schema description text stays accurate to what
@@ -167,6 +232,7 @@ def match_cta_application(category: str, thread_summary: dict, full_body: str, c
         f"Subject: {thread_summary.get('subject', '')}\n"
         f"From: {thread_summary.get('sender', '')}\nBody:\n{full_body}\n\n"
         "CANDIDATE APPLICATIONS (not yet in a final/closed status):\n" + json.dumps(candidate_jobs, indent=2, default=str)
+        + _organization_hint(full_body, candidate_jobs)
     )
     return call_structured(
         client,
