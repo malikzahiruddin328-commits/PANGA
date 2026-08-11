@@ -85,10 +85,10 @@ from tailoring.interview_prep import load_interview_prep, get_interview_prep, re
 from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
 from tailoring.ats_score import detect_matched_keyword_regressions
 from tailoring.unconfirmed_claims import find_unconfirmed_markers, resolve_unconfirmed_claim
-from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed, analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_impact as _check_regenerate_impact, request_additional_gap_questions as _request_additional_gap_questions, reextract_ats_keywords_and_rescore as _reextract_ats_keywords_and_rescore, rescore_against_cached_keywords as _rescore_against_cached_keywords, gap_scan_is_current as _gap_scan_is_current, gap_scan_baseline_fingerprint as _gap_scan_baseline_fingerprint
+from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed, analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_impact as _check_regenerate_impact, request_additional_gap_questions as _request_additional_gap_questions, reextract_ats_keywords_and_rescore as _reextract_ats_keywords_and_rescore, rescore_against_cached_keywords as _rescore_against_cached_keywords, gap_scan_is_current as _gap_scan_is_current, gap_scan_baseline_fingerprint as _gap_scan_baseline_fingerprint, _report_drafting_failure
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
 from prospector.rejection_diagnosis import gather_diagnosis_input, diagnose
-from prospector.target_accounts import load_target_accounts, set_status as set_target_account_status, set_website, load_website_lookup_cost, save_website_lookup_cost, find_disqualified_with_new_activity
+from prospector.target_accounts import load_target_accounts, set_status as set_target_account_status, set_website, load_website_lookup_cost, save_website_lookup_cost, find_paused_accounts_with_new_activity
 from prospector.company_lookup import lookup_company_website
 from prospector.outreach import (
     add_outreach, update_status as update_outreach_status, request_draft,
@@ -613,6 +613,39 @@ def left_aligned_columns(df: pd.DataFrame, extra: dict | None = None) -> dict:
 OUTREACH_STATUSES = ["planned", "drafted", "sent", "responded", "no_response"]
 
 
+_DUPLICATE_OUTREACH_WINDOW_SECONDS = 10
+
+
+def _is_likely_duplicate_outreach_submit(existing: list[dict], contact_name: str, channel: str, notes: str | None) -> bool:
+    """PRD S16b, 2026-08-10: the "Log outreach" form had no dedup check and
+    (before this fix) didn't clear itself after a successful submit, so an
+    accidental double-click - or a confused re-click on a form that still
+    visibly showed the same filled-in values - created a second identical
+    outreach record. Only guards against a genuine accidental re-submit
+    (same contact/channel/notes, created within the last
+    _DUPLICATE_OUTREACH_WINDOW_SECONDS) - deliberately narrow so a real
+    follow-up outreach to the same contact days or weeks later is never
+    silently blocked, only the same-moment accident is."""
+    now = datetime.now(timezone.utc)
+    for o in existing:
+        if o["contact_name"].strip().lower() != contact_name.strip().lower():
+            continue
+        if o["channel"] != channel:
+            continue
+        if (o.get("notes") or "") != (notes or ""):
+            continue
+        created = o.get("created_at")
+        if not created:
+            continue
+        try:
+            age_seconds = (now - datetime.fromisoformat(created)).total_seconds()
+        except (ValueError, TypeError):
+            continue
+        if 0 <= age_seconds <= _DUPLICATE_OUTREACH_WINDOW_SECONDS:
+            return True
+    return False
+
+
 def render_outreach_section(key_prefix: str, target_account_name: str | None = None, job_source: str | None = None, job_id: str | None = None) -> None:
     """Shared outreach UI (PRD §16b) - called from both the target-account
     detail panel and a job's detail panel, since outreach anchors to
@@ -670,19 +703,35 @@ def render_outreach_section(key_prefix: str, target_account_name: str | None = N
     # found live while testing this exact fix, 2026-08-08).
     log_outreach_key = f"{key_prefix}_log_outreach_expander"
     with st.expander("Log new outreach", expanded=st.session_state.get(log_outreach_key, False), key=log_outreach_key, on_change="rerun"):
-        oc_name = st.text_input("Contact name", key=f"{key_prefix}_new_contact_name")
-        oc_title = st.text_input("Contact title (optional)", key=f"{key_prefix}_new_contact_title")
-        oc_channel = st.selectbox("Channel", ["email", "linkedin", "phone", "in_person"], key=f"{key_prefix}_new_channel")
-        oc_email = st.text_input("Contact email (optional, needed to request a drafted email)", key=f"{key_prefix}_new_email") if oc_channel == "email" else None
-        oc_notes = st.text_area("Notes (optional)", key=f"{key_prefix}_new_notes")
+        # Real gap found 2026-08-10 (Zahir's adversarial self-audit): this
+        # form had no dedup check and didn't clear after a successful
+        # submit - the same filled-in values just sat there, inviting an
+        # accidental double-click/re-click to create a duplicate record.
+        # Streamlit forbids writing to a widget's session_state key after
+        # it's already been instantiated this run, so the fields can't
+        # just be reset in place - instead every field key carries a
+        # "generation" suffix that bumps on successful submit, which makes
+        # Streamlit instantiate genuinely NEW (empty) widgets next render,
+        # same pattern Streamlit's own docs recommend for clearing a form.
+        form_gen_key = f"{key_prefix}_log_outreach_gen"
+        gen = st.session_state.get(form_gen_key, 0)
+        oc_name = st.text_input("Contact name", key=f"{key_prefix}_new_contact_name_{gen}")
+        oc_title = st.text_input("Contact title (optional)", key=f"{key_prefix}_new_contact_title_{gen}")
+        oc_channel = st.selectbox("Channel", ["email", "linkedin", "phone", "in_person"], key=f"{key_prefix}_new_channel_{gen}")
+        oc_email = st.text_input("Contact email (optional, needed to request a drafted email)", key=f"{key_prefix}_new_email_{gen}") if oc_channel == "email" else None
+        oc_notes = st.text_area("Notes (optional)", key=f"{key_prefix}_new_notes_{gen}")
         if st.button("Log outreach", key=f"{key_prefix}_new_save"):
             if oc_name:
-                add_outreach(
-                    oc_name, oc_channel, job_source=job_source, job_id=job_id,
-                    target_account_name=target_account_name, contact_title=oc_title or None,
-                    contact_email=oc_email or None, notes=oc_notes or None,
-                )
-                st.toast("Logged.", icon=":material/check_circle:")
+                if _is_likely_duplicate_outreach_submit(existing, oc_name, oc_channel, oc_notes):
+                    st.toast("Already logged just now - not creating a duplicate.", icon=":material/info:")
+                else:
+                    add_outreach(
+                        oc_name, oc_channel, job_source=job_source, job_id=job_id,
+                        target_account_name=target_account_name, contact_title=oc_title or None,
+                        contact_email=oc_email or None, notes=oc_notes or None,
+                    )
+                    st.toast("Logged.", icon=":material/check_circle:")
+                st.session_state[form_gen_key] = gen + 1
                 st.rerun()
             else:
                 st.warning("Contact name is required.")
@@ -714,6 +763,17 @@ def regenerate_resume_and_persist(job: dict, on_progress, success_message: str) 
         regen = generate_documents(job, load_profile(), ["resume"], on_progress=on_progress)
     except (DraftingNotConfigured, DraftingFailed) as exc:
         st.error(str(exc))
+        return None
+    except Exception as exc:
+        # generate_documents() re-raises ANY exception type for a
+        # single-doc_key request (2026-08-10) so a genuine bug elsewhere in
+        # the pipeline is never silently swallowed - but its own hedged,
+        # already-safe-to-show message only exists for the two named types
+        # above. Anything else gets logged/Bhangi-reported (same path as
+        # the concurrent multi-doc case - see _report_drafting_failure) and
+        # a generic message here, never the raw exception text.
+        _report_drafting_failure(job, "resume", exc)
+        st.error("Something went wrong while regenerating this resume. It's been logged - try again in a moment.")
         return None
     new_resume = regen["resume"]
     upsert_application(
@@ -1880,6 +1940,23 @@ def _count_analyzeable_learn_inputs(learn_input: dict) -> int:
         + len(learn_input["outreach_vs_outcome"])
         + len(learn_input["interview_outcomes"])
     )
+
+
+@st.cache_data(show_spinner=False)
+def _cached_paused_accounts_rereview(target_accounts, jobs, applications):
+    """Cache wrapper for target_accounts.find_paused_accounts_with_new_
+    activity() (PRD S16a #10, 2026-08-10) - that function is otherwise
+    recomputed from scratch on EVERY Streamlit rerun (any widget
+    interaction anywhere in the app reruns this whole script top-to-
+    bottom), not just when target_accounts/jobs/applications actually
+    change. Measured ~675ms unconditionally at real data volume before
+    this, growing with jobs.json's real weekly growth. st.cache_data
+    hashes its arguments' actual content, so a rerun that doesn't change
+    any of these three inputs is a cache hit - passing target_accounts as
+    a real argument (rather than the function loading it internally) is
+    what makes that hash actually reflect target_account status changes
+    too, not just jobs/applications."""
+    return find_paused_accounts_with_new_activity(target_accounts, jobs, applications)
 # Known channels the "Add a job manually" fallback can attribute a posting
 # to - kept in sync with the sources industry_boards.py/company_sites.py
 # actually search, plus LinkedIn (default, since it's the one channel with
@@ -3496,6 +3573,18 @@ elif active_tab == "results":
                         except (DraftingNotConfigured, DraftingFailed) as exc:
                             progress_bar.empty()
                             st.error(str(exc))
+                        except Exception as exc:
+                            # Only reachable when exactly one document type was
+                            # selected (generate_documents() re-raises ANY
+                            # exception type for a single-doc_key request,
+                            # 2026-08-10) - for 2+ selected docs, a failure in
+                            # one never raises here at all anymore; it lands in
+                            # drafted["_errors"] instead (see the success branch
+                            # below), so every doc that DID succeed is still
+                            # saved rather than thrown away.
+                            progress_bar.empty()
+                            _report_drafting_failure(job, selected[0], exc)
+                            st.error("Something went wrong while drafting this document. It's been logged - try again in a moment.")
                         else:
                             progress_bar.progress(1.0, text=":material/check_circle: Done.")
                             resume_draft = drafted.get("resume")
@@ -3531,7 +3620,20 @@ elif active_tab == "results":
                                 # popped the next time this expander renders, so
                                 # it doesn't stay force-expanded forever.
                                 st.session_state[f"just_drafted_resume_{job['source']}_{job['job_id']}"] = True
-                            st.toast("Documents drafted. Review and download them below, then use them for the actual application.", icon=":material/check_circle:")
+                            # generate_documents() with 2+ doc_keys never raises
+                            # on a per-doc failure (2026-08-10) - it reports to
+                            # Bhangi and returns the failure in drafted["_errors"]
+                            # instead, so whichever docs DID succeed are still
+                            # saved above. Surface what failed rather than
+                            # silently telling Zahir everything worked.
+                            failed = drafted.get("_errors") or {}
+                            if failed:
+                                failed_labels = ", ".join(doc_labels.get(k, k) for k in failed)
+                                st.toast(f"Some documents drafted, but {failed_labels} failed - see below.", icon=":material/warning:")
+                                for doc_key, msg in failed.items():
+                                    st.error(f"{doc_labels.get(doc_key, doc_key)}: {msg}")
+                            else:
+                                st.toast("Documents drafted. Review and download them below, then use them for the actual application.", icon=":material/check_circle:")
                             st.rerun()
 
                 doc_field_map = {
@@ -4025,30 +4127,40 @@ elif active_tab == "prospector":
             st.toast(f"Prospector Score: {result['score']}/100.", icon=":material/check_circle:")
             st.rerun()
 
-    # Real gap found live 2026-08-09: "disqualified" is sticky by design
-    # (see target_accounts.MANUAL_STATUSES) so it never silently changes on
-    # its own - but that also meant a company that picked up a real posting
-    # AFTER being disqualified (UCB Pharma, BAUSCH, BeOne Medicines USA -
-    # BeOne's is now an application under review) sat disqualified forever
-    # with nothing flagging the mismatch back. This is a deterministic,
+    # Real gap found live 2026-08-09: a manual "paused" status (disqualified
+    # or stale - see target_accounts.PAUSED_STATUSES) is sticky by design
+    # so it never silently changes on its own - but that also meant a
+    # company that picked up a real posting AFTER being disqualified (UCB
+    # Pharma, BAUSCH, BeOne Medicines USA - BeOne's is now an application
+    # under review) sat that way forever with nothing flagging the mismatch
+    # back. Extended 2026-08-10 (#15/#16) to also catch a genuinely new
+    # signal added to an already-paused account, and to cover "stale" the
+    # same way "disqualified" was already covered. This is a deterministic,
     # zero-cost check (not dependent on the Prospector Score's LLM
     # reasoning noticing it in the data), so it's always visible here
-    # rather than gated behind a "Compute Prospector Score" click.
-    rereview_flags = find_disqualified_with_new_activity(jobs, applications)
+    # rather than gated behind a "Compute Prospector Score" click -
+    # cached (#10) so it's only actually recomputed when target_accounts/
+    # jobs/applications change, not on every unrelated rerun.
+    rereview_flags = _cached_paused_accounts_rereview(target_accounts, jobs, applications)
     if rereview_flags:
         lines = [
-            f"**{len(rereview_flags)} disqualified account(s) have new activity since being "
-            "disqualified - worth a second look.** Status stays disqualified until you change "
-            "it yourself; this only flags that evidence exists now that wasn't there when you "
-            "disqualified it.",
+            f"**{len(rereview_flags)} paused account(s) (disqualified/stale) have new activity "
+            "since that call - worth a second look.** Status stays exactly as you set it until "
+            "you change it yourself; this only flags that evidence exists now that wasn't there "
+            "when you made that call.",
             "",
         ]
         for flag in rereview_flags:
-            job_bits = "; ".join(
-                f'"{m["title"]}" at {m["organization"]}' + (f' (application: {m["application_status"]})' if m["application_status"] else "")
-                for m in flag["matching_jobs"]
-            )
-            lines.append(f"- **{flag['company_name']}**: {job_bits}")
+            bits = []
+            for m in flag["matching_jobs"]:
+                bit = f'"{m["title"]}" at {m["organization"]}'
+                if m["application_status"]:
+                    bit += f' (application: {m["application_status"]})'
+                bits.append(bit)
+            for sig in flag["new_signals"]:
+                sig_label = SIGNAL_TYPE_LABELS.get(sig["signal_type"], sig["signal_type"])
+                bits.append(f"new {sig_label} signal ({sig['detail']}, observed {sig['date_observed'][:10]})")
+            lines.append(f"- **{flag['company_name']}** ({flag['status']}): {'; '.join(bits)}")
         st.warning("\n".join(lines))
 
     st.subheader("Target accounts")
