@@ -119,7 +119,7 @@ missed job listing. §9's results-driven UI doesn't see any of this unless
 it's explicitly wired in.
 
 **Shape, in three layers:**
-1. **Scan** (`panga-gmail-cta-scan`, 4x/day) — reads Zahir's inbox, classifies
+1. **Scan** (`panga-gmail-cta-scan`, 3x/day — 8am/12pm/4pm) — reads Zahir's inbox, classifies
    each new thread, and applies Gmail labels for state (no database). Also
    tries to auto-match "application received" confirmations to a specific
    `applications` row (§4) via `applications.suggest_status()`, so Zahir
@@ -130,12 +130,15 @@ it's explicitly wired in.
    Action** page in the Streamlit UI (§9), grouped by category, so Zahir has
    one place to work through everything instead of hunting through his inbox
    for a `Panga/Call-to-Action` label.
-3. **Fulfillment loop** (`panga-cta-fulfillment`, every 10 min) — executes
-   what Zahir clicks on that page. **Dismiss** archives the email in Gmail
-   and labels it `Panga/Handled`. **Draft reply** has Claude compose a real
-   Gmail draft tailored to the email (category + content), created via the
-   Gmail connector but **never auto-sent** — Zahir reviews and sends it
-   himself, same "prepare but don't submit" principle as §2's application
+3. **Fulfillment loop** (`panga-cta-fulfillment`, 2x/day — 8am/4pm, throttled
+   down from every 10 minutes 2026-08-05 for cost reasons — a manual "Send
+   and receive" button on the dashboard covers the gap in between) —
+   executes what Zahir clicks on that page. **Dismiss** archives the email
+   in Gmail and labels it `Panga/Handled`. **Draft reply** has Claude
+   compose a real Gmail draft tailored to the email (category + content),
+   created via the Gmail connector but **never auto-sent** — Zahir reviews
+   and sends it himself, same "prepare but don't submit" principle as §2's
+   application
    packages. The loop also runs in reverse: once Zahir sends a draft it
    created, it notices (by checking Gmail's live Drafts list) and clears that
    item from the dashboard automatically, so he never has to remember to come

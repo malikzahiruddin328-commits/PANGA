@@ -195,10 +195,10 @@ title_block(d, W, "Panga — Gmail Call-to-Action Handling (FRS \u00a714)")
 
 bw, bh = 340, 110
 b_inbox = box(d, 60, 130, bw, bh, "Zahir's Gmail Inbox", "Interview invites, offers, rejections, questions")
-b_scan = box(d, 480, 130, bw, bh, "panga-gmail-cta-scan", "4x/day — classify + label + auto-match \u2018applied\u2019 confirmations")
+b_scan = box(d, 480, 130, bw, bh, "panga-gmail-cta-scan", "3x/day (8am/12pm/4pm) — classify + label + auto-match \u2018applied\u2019 confirmations")
 b_dashboard = box(d, 900, 130, bw, bh, "Call to Action tab (ui/app.py)", "Dashboard mirror — one place to work through everything")
 b_click = box(d, 900, 340, bw, bh, "Zahir clicks", "Dismiss, or Draft reply")
-b_fulfill = box(d, 480, 340, bw, bh, "panga-cta-fulfillment", "Every 10 min — archives / drafts a real Gmail reply")
+b_fulfill = box(d, 480, 340, bw, bh, "panga-cta-fulfillment", "2x/day (8am/4pm) — archives / drafts a real Gmail reply")
 b_gmail2 = box(d, 60, 340, bw, bh, "Gmail", "Draft created \u2014 never auto-sent, Zahir reviews & sends")
 b_clear = box(d, 480, 550, bw, bh, "Dashboard self-clears", "Fulfillment task notices the sent draft and clears the item")
 
