@@ -1,11 +1,23 @@
 """Shared fulfillment logic for Call-to-Action + Prospector outreach
 requests - archive/draft/reconcile, running against every configured
-inbox account via inbox_accounts.py. Used by BOTH scripts/cta_fulfillment.py
-(the 2x/day scheduled run, throttled down from every 10 minutes 2026-08-05
-for cost reasons) and the dashboard's synchronous "Send and receive"
-button (src/ui/app.py's Call to Action tab) - one shared implementation,
-not two, so a manual sync and a scheduled run can never drift apart in
-behavior. See docs/manual-sync-button-scope.md.
+inbox account via inbox_accounts.py. Used by scripts/cta_fulfillment.py
+(only invoked via the dormant, not-currently-active Windows-Task-Scheduler
+path - see scripts/install_scheduled_tasks.ps1) and the dashboard's
+synchronous "Send and receive" button (src/ui/app.py's Call to Action tab).
+
+**Correction, 2026-08-11:** this docstring used to claim "one shared
+implementation, not two, so a manual sync and a scheduled run can never
+drift apart in behavior" - wrong. The real, live 2x/day schedule Zahir
+actually runs (`panga-cta-fulfillment`, a Claude Code scheduled task under
+`~/.claude/scheduled-tasks/`) is a THIRD, independent implementation of
+this same archive/draft/reconcile logic - it drives the Gmail MCP
+connector's tools directly and never calls this module at all. See
+docs/manual-sync-button-scope.md's 2026-08-11 correction for the full
+story of the confusion this caused (a stale "last synced" status card,
+mistaken for evidence live automation was broken when it wasn't).
+`get_last_synced_at()` below now accounts for that live task's own activity,
+but the underlying three-implementations-of-one-thing structure is
+unchanged, not consolidated.
 
 Reply/outreach composition (tailoring.cta_reasoning.draft_cta_reply,
 prospector.outreach_reasoning.draft_outreach_email) was already a direct
@@ -33,6 +45,7 @@ which caller is writing - unchanged by this module existing. SYNC_STATUS_PATH
 below gets the same treatment for the same reason.
 """
 
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -56,15 +69,75 @@ from tailoring.cta_reasoning import draft_cta_reply
 PROJECT_ROOT = Path(__file__).resolve().parent
 SYNC_STATUS_PATH = PROJECT_ROOT.parent / "data" / "fulfillment" / "sync_status.json"
 
+# The 2x/day live automation (panga-cta-fulfillment, a Claude Code
+# scheduled task under ~/.claude/scheduled-tasks/) is a SECOND, independent
+# implementation of this same archive/draft/reconcile logic - it drives the
+# Gmail MCP connector's tools directly rather than calling this module, so
+# it never touches SYNC_STATUS_PATH above (real gap found 2026-08-11: the
+# dashboard's "last synced" card read only this module's own timestamp and
+# sat stuck 2+ days stale while the real scheduled task was running fine
+# the whole time - see docs/manual-sync-button-scope.md's now-corrected
+# "one code path" claim). It does, unconditionally on every run, write a
+# report to this hub-inbox folder - the one real, deterministic signal of
+# when it last ran that doesn't depend on that task's prompt remembering an
+# extra step.
+HUB_INBOX_DIR = PROJECT_ROOT.parent.parent / ".claude" / "hub-inbox"
+
 _INVALID_EMAIL_MARKERS = ("noreply", "no-reply")
+
+logger = logging.getLogger(__name__)
+
+
+def _ensure_error_logging() -> None:
+    """Real gap found 2026-08-11, Mirror's audit: this module's three
+    paid-AI-call handlers below caught every exception and only ever
+    incremented a bare failures counter - a real archive/draft/reconcile
+    failure (a broken Gmail token, a malformed item, an LLM error) was
+    completely invisible beyond that count, unlike every other
+    scheduled-task-adjacent module in the codebase. Mirrors llm_client.py's
+    own lazy-import-and-call pattern so this module stays quiet (and
+    dependency-light) unless something actually fails."""
+    from debug_log import setup_always_on_error_logging
+
+    setup_always_on_error_logging()
 
 
 # ---- last-synced tracking ----
 
+def _latest_scheduled_report_at() -> Optional[datetime]:
+    """Timestamp of the most recent panga-cta-fulfillment hub-inbox report
+    (the live Claude-scheduled task's own unconditional per-run report),
+    read via file mtime rather than parsing the filename's local-time
+    stamp - simpler and correct regardless of timezone. None if the
+    hub-inbox folder doesn't exist or has no matching reports yet."""
+    if not HUB_INBOX_DIR.is_dir():
+        return None
+    reports = list(HUB_INBOX_DIR.glob("*-cta-fulfillment-*.md"))
+    if not reports:
+        return None
+    latest_mtime = max(report.stat().st_mtime for report in reports)
+    return datetime.fromtimestamp(latest_mtime, tz=timezone.utc)
+
+
 def get_last_synced_at() -> Optional[str]:
-    """ISO 8601 timestamp of the last successful run (manual or
-    scheduled), or None if fulfillment has never completed a run."""
-    return read_json(SYNC_STATUS_PATH, default={}).get("last_synced_at")
+    """ISO 8601 timestamp of the last successful run of EITHER fulfillment
+    path - this module (manual "Send and receive" button, or the dormant
+    Windows-Task-Scheduler script) or the live panga-cta-fulfillment
+    scheduled task (see HUB_INBOX_DIR above) - whichever is more recent.
+    None only if neither has ever run."""
+    manual_or_wts = read_json(SYNC_STATUS_PATH, default={}).get("last_synced_at")
+    manual_dt = None
+    if manual_or_wts:
+        try:
+            manual_dt = datetime.fromisoformat(manual_or_wts)
+        except ValueError:
+            manual_dt = None
+    scheduled_dt = _latest_scheduled_report_at()
+    if manual_dt and scheduled_dt:
+        return max(manual_dt, scheduled_dt).isoformat()
+    if scheduled_dt:
+        return scheduled_dt.isoformat()
+    return manual_or_wts
 
 
 def _record_sync_completed() -> None:
@@ -99,17 +172,23 @@ def _account_key(item: dict) -> tuple:
 # ---- CTA: archive ----
 
 def fulfill_archive_requests(accounts_by_key: dict) -> int:
+    _ensure_error_logging()
     failures = 0
     for item in get_pending_archive_requests():
         account = accounts_by_key.get(_account_key(item))
         if account is None:
             failures += 1
+            logger.error(
+                "Archive request skipped - no configured account for provider=%s account=%s (thread_id=%s).",
+                item.get("provider", "gmail"), item.get("account", "gmail"), item.get("thread_id"),
+            )
             continue
         try:
             account.archive(item["thread_id"])
             mark_archived(item["thread_id"])
         except Exception:  # noqa: BLE001 - one item's failure shouldn't stop the rest
             failures += 1
+            logger.exception("Failed to archive CTA thread_id=%s.", item.get("thread_id"))
     return failures
 
 
@@ -138,6 +217,7 @@ def _get_available_interview_slots() -> Optional[list]:
 
 
 def fulfill_cta_draft_requests(accounts_by_key: dict) -> int:
+    _ensure_error_logging()
     failures = 0
     pending = get_pending_draft_requests()
     interview_slots = _get_available_interview_slots() if any(item["category"] == "interview_request" for item in pending) else None
@@ -145,6 +225,10 @@ def fulfill_cta_draft_requests(accounts_by_key: dict) -> int:
         account = accounts_by_key.get(_account_key(item))
         if account is None:
             failures += 1
+            logger.error(
+                "CTA draft request skipped - no configured account for provider=%s account=%s (thread_id=%s).",
+                item.get("provider", "gmail"), item.get("account", "gmail"), item.get("thread_id"),
+            )
             continue
         try:
             slots_for_item = interview_slots if item["category"] == "interview_request" else None
@@ -155,6 +239,7 @@ def fulfill_cta_draft_requests(accounts_by_key: dict) -> int:
             mark_draft_created(item["thread_id"], draft_id, draft_link=draft_link)
         except Exception:  # noqa: BLE001
             failures += 1
+            logger.exception("Failed to draft CTA reply for thread_id=%s (category=%s).", item.get("thread_id"), item.get("category"))
     return failures
 
 
@@ -221,6 +306,7 @@ def fulfill_outreach_draft_requests(accounts_by_key: dict) -> int:
     deliberately different rule from CTA replies, which draft regardless
     of how the sender address looks (replying to a real inbound thread is
     never guessing an address)."""
+    _ensure_error_logging()
     failures = 0
     gmail_account = accounts_by_key.get(("gmail", "gmail"))
     fallback_account = gmail_account or next(iter(accounts_by_key.values()), None)
@@ -242,6 +328,7 @@ def fulfill_outreach_draft_requests(accounts_by_key: dict) -> int:
             )
         except Exception:  # noqa: BLE001
             failures += 1
+            logger.exception("Failed to draft outreach email for outreach_id=%s.", record.get("outreach_id"))
     return failures
 
 

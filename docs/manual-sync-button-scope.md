@@ -24,11 +24,31 @@ direct-API/OAuth/IMAP client with no MCP or live-session dependency
 (confirmed zero `mailopoly`/MCP references anywhere in `src/` before
 starting, same check done for the earlier multi-provider scan work).
 
-**`src/fulfillment.py` is the one shared implementation** of the archive/
-draft/reconcile logic, called by both `scripts/cta_fulfillment.py` (the
-2x/day scheduled run - now a thin wrapper) and the dashboard button. A
-manual sync and a scheduled run can never drift apart in behavior because
-there's only one code path, not two.
+**`src/fulfillment.py` is the shared implementation** of the archive/
+draft/reconcile logic used by `scripts/cta_fulfillment.py` (a thin wrapper,
+only actually invoked by the dormant Windows-Task-Scheduler path - see
+below) and the dashboard button.
+
+**Correction, 2026-08-11 (real doc-vs-code drift, found while investigating
+a false "automation is broken" alarm):** the claim that used to be here -
+"a manual sync and a scheduled run can never drift apart in behavior
+because there's only one code path" - is **wrong** for the live 2x/day
+schedule Zahir actually runs. That schedule is a Claude Code scheduled
+task (`panga-cta-fulfillment`, `~/.claude/scheduled-tasks/`), which is a
+**second, independent implementation** of this same archive/draft/
+reconcile logic - it drives the Gmail MCP connector's tools directly, not
+`src/fulfillment.py`. Three code paths exist in total for the same
+underlying steps: this module (manual button + the dormant WTS script),
+and the live scheduled task's own SKILL.md-driven reasoning. Concretely,
+this drift caused a real bug: the dashboard's "last synced" status card
+read only this module's `get_last_synced_at()`, which the live scheduled
+task never updates - so the card sat stuck days-stale while the real
+automation was running fine the whole time. Fixed 2026-08-11:
+`get_last_synced_at()` now also reads the live task's own unconditional
+hub-inbox report timestamps (see `fulfillment.py`'s `HUB_INBOX_DIR`) and
+returns whichever source is more recent. The underlying three-
+implementations-of-one-thing structure itself is unchanged - not
+consolidated, just no longer silently misreported.
 
 ## What was already built vs. what this branch added
 

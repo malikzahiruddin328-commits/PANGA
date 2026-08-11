@@ -1,3 +1,8 @@
+# *** NOT ACTIVE TODAY - only runs after a real PyInstaller install, which
+# *** hasn't shipped yet. This is not Panga's live automation; see
+# *** scripts\install_scheduled_tasks.ps1's banner and
+# *** docs\manual-sync-button-scope.md's 2026-08-11 correction. ***
+#
 # Packaged-install counterpart of scripts\install_scheduled_tasks.ps1
 # (native-packaging Phase 1). That script targets venv\Scripts\python.exe
 # + a scripts\*.py path, which don't exist in a PyInstaller build - there's

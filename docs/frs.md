@@ -119,7 +119,7 @@ missed job listing. §9's results-driven UI doesn't see any of this unless
 it's explicitly wired in.
 
 **Shape, in three layers:**
-1. **Scan** (`panga-gmail-cta-scan`, 4x/day) — reads Zahir's inbox, classifies
+1. **Scan** (`panga-gmail-cta-scan`, 3x/day — 8am/12pm/4pm) — reads Zahir's inbox, classifies
    each new thread, and applies Gmail labels for state (no database). Also
    tries to auto-match "application received" confirmations to a specific
    `applications` row (§4) via `applications.suggest_status()`, so Zahir
@@ -130,12 +130,15 @@ it's explicitly wired in.
    Action** page in the Streamlit UI (§9), grouped by category, so Zahir has
    one place to work through everything instead of hunting through his inbox
    for a `Panga/Call-to-Action` label.
-3. **Fulfillment loop** (`panga-cta-fulfillment`, every 10 min) — executes
-   what Zahir clicks on that page. **Dismiss** archives the email in Gmail
-   and labels it `Panga/Handled`. **Draft reply** has Claude compose a real
-   Gmail draft tailored to the email (category + content), created via the
-   Gmail connector but **never auto-sent** — Zahir reviews and sends it
-   himself, same "prepare but don't submit" principle as §2's application
+3. **Fulfillment loop** (`panga-cta-fulfillment`, 2x/day — 8am/4pm, throttled
+   down from every 10 minutes 2026-08-05 for cost reasons — a manual "Send
+   and receive" button on the dashboard covers the gap in between) —
+   executes what Zahir clicks on that page. **Dismiss** archives the email
+   in Gmail and labels it `Panga/Handled`. **Draft reply** has Claude
+   compose a real Gmail draft tailored to the email (category + content),
+   created via the Gmail connector but **never auto-sent** — Zahir reviews
+   and sends it himself, same "prepare but don't submit" principle as §2's
+   application
    packages. The loop also runs in reverse: once Zahir sends a draft it
    created, it notices (by checking Gmail's live Drafts list) and clears that
    item from the dashboard automatically, so he never has to remember to come
@@ -285,3 +288,37 @@ synthetic data - real company names from Zahir's actual target accounts/
 applications appeared in later iterations for concreteness, but no real
 personal data was in the mockups since they're client-side sample arrays,
 not live Panga data.
+
+## 19. Cost Governance — Daily Spend Cap (built 2026-08-11)
+
+Added by Panga-Documentor while producing the first BRD/FRS DOCX export —
+a real, permanent piece of system behavior that had only ever been
+described in `docs/backlog-log.md`'s build history, not in the FRS proper.
+Full technical detail lives in `src/llm_client.py`'s own module docstring;
+this section records the product-level shape.
+
+**Problem:** the cost-blast-radius principle (`CLAUDE.md`) governs new code
+being written, but does nothing to stop an already-running process from
+overspending once started — a real overnight incident (455 jobs scored
+through the existing `fit_score` pipeline) crossed $10 within ~7 minutes
+and reached $63.86 before the day was half over.
+
+**What shipped:** every real AI call now passes through
+`_check_spend_cap()` before any HTTP request is prepared — it blocks NEW
+calls once today's real logged spend (`cost_log`) reaches a daily cap
+(`PANGA_DAILY_SPEND_CAP_USD`, default $10), while letting anything already
+in flight finish. The first block of a UTC day logs at CRITICAL severity;
+every blocked call is also recorded in `cost_log` itself
+(`error_type="spend_cap_exceeded"`), visible via the Ops tab's failed-call
+count. The daily job-search notification (the one Zahir actually receives)
+leads with a warning if the cap tripped that day, so a cap-hit day never
+silently produces "nothing to report."
+
+**Known, disclosed limitation:** the cap check is a circuit breaker, not a
+hard reservation — under genuine cross-process concurrency (the Streamlit
+app and a scheduled task both mid-call at once) the cap can be overshot by
+the combined cost of everything already in flight before the block
+engages. Documented as an accepted tradeoff in the code itself rather than
+a gap to silently assume away; see `docs/backlog-log.md`'s spend-cap row
+for the full history.
+
