@@ -106,6 +106,7 @@ DEFAULT_MODEL = "claude-opus-5"
 FALLBACK_MODEL = "claude-sonnet-5"
 
 DEFAULT_DAILY_SPEND_CAP_USD = 20.0  # see module docstring for the real-data reasoning
+SPEND_CAP_ERROR_TYPE = "spend_cap_exceeded"  # cost_log entries blocked by the cap use this error_type
 
 # Transient errors worth retrying/falling back on. Anything else (bad
 # request, auth, content policy, etc.) propagates on the first attempt.
@@ -386,10 +387,30 @@ def _log_cap_block(purpose: str) -> None:
 
         log_api_cost(
             purpose=purpose, model="none", input_tokens=0, output_tokens=0, cost_usd=0.0,
-            success=False, error_type="spend_cap_exceeded", attempt_count=0, models_tried=[],
+            success=False, error_type=SPEND_CAP_ERROR_TYPE, attempt_count=0, models_tried=[],
         )
     except Exception:
         logger.exception("Failed to log spend-cap-block record (purpose=%s).", purpose)
+
+
+def spend_cap_tripped_today() -> bool:
+    """True if the daily spend cap blocked any call today (UTC), in ANY
+    process - reads cost_log directly rather than in-process state, since
+    the Streamlit app and up to 3 scheduled tasks all share one cost_log
+    and any of them could have been the one that tripped it. Lets a
+    caller like scripts/run_search.py's daily scheduled task tell the
+    difference between "nothing to report" and "the spend cap silently
+    blocked most of today's scoring" in its own summary notification -
+    2026-08-11 fast-follow: the notification Zahir already gets from that
+    task should say this, not require him to separately check the Ops
+    tab or panga_debug.log to find out why a batch came up short."""
+    from cost_log import load_cost_log
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    return any(
+        e.get("error_type") == SPEND_CAP_ERROR_TYPE and (e.get("timestamp") or "").startswith(today)
+        for e in load_cost_log()
+    )
 
 
 def _check_spend_cap(purpose: str) -> None:

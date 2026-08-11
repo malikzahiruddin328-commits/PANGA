@@ -40,6 +40,7 @@ from notifications import send_notification  # noqa: E402
 from profile.storage import load_profile  # noqa: E402
 from search import aggregators, boards, company_sites, freshness_check, industry_boards, job_sources, job_store, source_activity, usajobs  # noqa: E402
 from tailoring.applications import get_unreviewed_skip_reasons  # noqa: E402
+from llm_client import spend_cap_tripped_today  # noqa: E402
 from tailoring.drafting import DraftingFailed, DraftingNotConfigured, score_job  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -319,8 +320,25 @@ def score_unscored_jobs(profile: dict) -> list[dict]:
     return strong_matches
 
 
-def notify(strong_matches: list[dict], unreviewed_skip_count: int) -> None:
+def notify(strong_matches: list[dict], unreviewed_skip_count: int, spend_cap_hit: bool = False) -> None:
+    """spend_cap_hit (2026-08-11 fast-follow): whether llm_client's daily
+    spend cap blocked any call today, in any process - checked once in
+    run() via llm_client.spend_cap_tripped_today() and passed in here
+    rather than queried again, so this stays a pure formatting function.
+    Before this, a tripped cap was only visible in the Ops tab or
+    panga_debug.log - Zahir's own daily-search notification said nothing
+    about it, so a day where the cap silently cut scoring short looked
+    identical to a normal quiet day with no matches. Listed FIRST (not
+    appended) so it survives the message[:200] truncation below and is
+    the first thing read, matching the "genuinely visible, unmissable"
+    bar the cap itself was already held to (its own CRITICAL log line).
+    This also means a cap-hit day with zero strong matches and zero
+    unreviewed reasons now still sends a notification (previously "not
+    parts: return" would have silently sent nothing at all on such a day
+    - arguably worse than the specific gap this was built to close)."""
     parts = []
+    if spend_cap_hit:
+        parts.append("Daily AI spend cap was hit today - some job scoring may have been skipped. Check the Ops tab.")
     if strong_matches:
         listed = ", ".join(f"{j['title']} at {j['organization']} ({j['fit_score']})" for j in strong_matches[:3])
         remainder = len(strong_matches) - 3
@@ -386,7 +404,10 @@ def run() -> None:
     _log(f"  {len(unreviewed)} unreviewed")
 
     _log("STEP 7 - Notify")
-    notify(strong_matches, len(unreviewed))
+    spend_cap_hit = spend_cap_tripped_today()
+    if spend_cap_hit:
+        _log("  daily spend cap was hit today - flagging in the notification")
+    notify(strong_matches, len(unreviewed), spend_cap_hit)
 
     _log("STEP 8 - Freshness check")
     checked, marked, newly_pending, reopened = freshness_check.check_and_mark_closed_postings()
