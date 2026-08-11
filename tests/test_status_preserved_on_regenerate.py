@@ -104,6 +104,65 @@ def test_generate_documents_button_preserves_applied_status(applied_job, monkeyp
     assert app_record["resume_text"] == "PROFESSIONAL EXPERIENCE\nRegenerated.\n\nSKILLS\nPython"
 
 
+def test_generate_documents_partial_failure_error_survives_the_rerun(applied_job, monkeypatch):
+    # Real bug found by RM (2026-08-11) while reviewing the concurrent-
+    # drafting exception-handling fix: the per-doc st.error(...) for a
+    # partially-failed batch was called immediately before the existing
+    # unconditional st.rerun() - Streamlit tears that render down before it
+    # paints, so the failure detail flashed and vanished before Zahir could
+    # read it (same class as the earlier st.success/info/warning-before-
+    # rerun bug, just newly hit via st.error() here). Fixed by stashing the
+    # failure into session_state and rendering it on the NEXT render
+    # instead - AppTest's .run() settles past the internal st.rerun(), so
+    # if the fix regressed back to the old bug, `at.error` below would come
+    # back empty even though the toast/upsert still happened.
+    import tailoring.drafting as drafting
+
+    def _fake_generate_documents_partial_failure(job, profile, doc_keys, on_progress=None, existing_resume_text=None):
+        return {
+            "resume": {
+                "text": "PROFESSIONAL EXPERIENCE\nRegenerated.\n\nSKILLS\nPython",
+                "suggested_strategy_tag": "", "ats_score": 88,
+                "ats_rationale": "Matched keywords.", "ats_next_actions": [], "clarifying_questions": [],
+            },
+            "_errors": {"cover_letter": "Claude declined to draft this document."},
+        }
+
+    monkeypatch.setattr(drafting, "is_configured", lambda: True)
+    monkeypatch.setattr(drafting, "generate_documents", _fake_generate_documents_partial_failure)
+    monkeypatch.setattr("tailoring.dossier.sync_workspace_documents", lambda *a, **k: None)
+
+    at = AppTest.from_file(APP_PATH)
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.session_state["results_show_applied"] = True
+    at.run(timeout=30)
+
+    resume_checkbox = next(c for c in at.checkbox if c.key and c.key.startswith("doc_resume_"))
+    resume_checkbox.set_value(True)
+    cover_letter_checkbox = next(c for c in at.checkbox if c.key and c.key.startswith("doc_cover_letter_"))
+    cover_letter_checkbox.set_value(True)
+    at.run(timeout=30)
+
+    generate_button = next(b for b in at.button if b.key and b.key.startswith("gendocs_"))
+    generate_button.click().run(timeout=30)
+
+    assert not at.exception
+    # The resume half of the batch still succeeded and saved.
+    app_record = get_application("Dice", "job1")
+    assert app_record["resume_text"] == "PROFESSIONAL EXPERIENCE\nRegenerated.\n\nSKILLS\nPython"
+    # The cover_letter failure detail must actually be visible on the
+    # settled (post-rerun) render, not just have existed transiently.
+    error_texts = [e.value for e in at.error]
+    assert any("cover_letter" in t.lower() or "Cover letter" in t for t in error_texts)
+    assert any("Claude declined to draft this document" in t for t in error_texts)
+
+    # One-shot: a later, unrelated rerun of this same job's detail must not
+    # keep re-showing the same stale failure forever.
+    at.run(timeout=30)
+    assert not any("Claude declined to draft this document" in e.value for e in at.error)
+
+
 def test_generate_documents_without_api_key_preserves_applied_status(applied_job, monkeypatch):
     monkeypatch.setattr("tailoring.drafting.is_configured", lambda: False)
 

@@ -3468,6 +3468,24 @@ elif active_tab == "results":
                             st.rerun()
 
                 st.markdown("**Documents for this application**")
+                # Persisted one render past the st.rerun() that follows a
+                # partially-failed "Generate documents" click (2026-08-11,
+                # RM's finding while reviewing the earlier _errors fix):
+                # st.error() called immediately before an unconditional
+                # st.rerun() never actually reaches the user - Streamlit
+                # tears down that render before it paints, same flash-and-
+                # vanish class as the st.success/info/warning-before-rerun
+                # bug this codebase already fixed elsewhere, just newly hit
+                # here via st.error(). Stashed into session_state instead
+                # (same one-shot pop pattern as just_drafted_resume above)
+                # so it survives the rerun and renders on the NEXT one,
+                # right where Zahir's eyes already are after clicking
+                # "Generate documents".
+                drafting_errors_key = f"drafting_errors_{job.get('source')}_{job.get('job_id')}"
+                persisted_failures = st.session_state.pop(drafting_errors_key, None)
+                if persisted_failures:
+                    for label_and_msg in persisted_failures:
+                        st.error(label_and_msg)
                 doc_types = [
                     ("resume", "Resume"),
                     ("cover_letter", "Cover letter"),
@@ -3590,13 +3608,29 @@ elif active_tab == "results":
                             # saved above. Surface what failed rather than
                             # silently telling Zahir everything worked.
                             failed = drafted.get("_errors") or {}
+                            drafting_errors_key = f"drafting_errors_{job['source']}_{job['job_id']}"
                             if failed:
                                 failed_labels = ", ".join(doc_labels.get(k, k) for k in failed)
                                 st.toast(f"Some documents drafted, but {failed_labels} failed - see below.", icon=":material/warning:")
-                                for doc_key, msg in failed.items():
-                                    st.error(f"{doc_labels.get(doc_key, doc_key)}: {msg}")
+                                # st.error() here never reaches Zahir - the
+                                # unconditional st.rerun() below tears this
+                                # render down before it paints (RM's finding,
+                                # 2026-08-11). Stashed for the NEXT render to
+                                # pick up instead - see the pop() near the top
+                                # of this job's "Documents for this
+                                # application" section.
+                                st.session_state[drafting_errors_key] = [
+                                    f"{doc_labels.get(doc_key, doc_key)}: {msg}" for doc_key, msg in failed.items()
+                                ]
                             else:
                                 st.toast("Documents drafted. Review and download them below, then use them for the actual application.", icon=":material/check_circle:")
+                                # Clears any stale failure stashed by an
+                                # earlier attempt on this same job that was
+                                # never actually rendered (e.g. the user
+                                # navigated away before the section came back
+                                # around) - this generate succeeded in full,
+                                # so nothing failed-looking should linger.
+                                st.session_state.pop(drafting_errors_key, None)
                             st.rerun()
 
                 doc_field_map = {
