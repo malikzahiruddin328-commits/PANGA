@@ -291,5 +291,6 @@ def draft_cta_reply(category: str, subject: str, snippet: str, available_slots: 
         effort="medium",
         thinking=False,
         refusal_message="Claude declined to draft a reply.",
+        purpose="cta_draft_reply",
     )
     return data["reply_body"]

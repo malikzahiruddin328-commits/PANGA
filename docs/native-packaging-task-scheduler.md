@@ -1,5 +1,19 @@
 # Native Windows Task Scheduler wiring (Phase 1, native-packaging branch)
 
+**Not active today.** This describes a FUTURE mechanism for a standalone
+packaged build that hasn't shipped - Zahir's real, current automation runs
+entirely through the live Claude Code scheduled tasks in the table below,
+not through Windows Task Scheduler. Native packaging is on the back
+burner (see project memory / `docs/backlog-log.md`'s Licensing/Native
+entry), so this table is stale scaffolding, not a status report - don't
+check `schtasks` to answer "is Panga's automation working," check
+`mcp__scheduled-tasks__list_scheduled_tasks` instead. Real incident,
+2026-08-11: an audit did exactly that, found `Panga-JobAlertScan` never
+registered and `Panga-CtaFulfillment` Disabled/stale here, and reported
+live automation as broken - it wasn't; see
+`docs/manual-sync-button-scope.md`'s 2026-08-11 correction for the full
+story.
+
 Replaces the 3 Claude Code scheduled tasks (`panga-daily-job-search`,
 `panga-gmail-cta-scan`, `panga-cta-fulfillment` - see
 `docs/daily-job-search-task.md`, `docs/email-monitoring-task.md`) with

@@ -150,7 +150,38 @@ against these specifically, don't wait to rediscover them tab by tab:**
    created - the code was real and correct, but nothing activated it.
    When shipping a feature gated behind user config or a scheduled task,
    verify the config is actually populated and the task actually exists,
-   not just that the code path is reachable.
+   not just that the code path is reachable. **Recurred 2026-08-11 in a
+   sneakier shape - "never activated" mistaken for "two systems doing the
+   same job, only one of them real."** An audit checked Windows Task
+   Scheduler (`schtasks`) for `Panga-JobAlertScan`/`Panga-CtaFulfillment`,
+   found one never registered and the other Disabled/stale, and reported
+   Panga's live automation as broken. It wasn't - Task Scheduler is
+   scaffolding for a native-packaged build that hasn't shipped
+   (back-burner, see project memory); the actual live automation is a
+   *separate*, independently-built Claude Code scheduled-tasks system
+   (`mcp__scheduled-tasks__list_scheduled_tasks` /
+   `~/.claude/scheduled-tasks/`), which was running fine the whole time -
+   verified against real production data (a job added same-day) and a
+   real per-run hub-inbox report, not just the scheduler's own claim.
+   Same root failure as the original case (a mechanism that looks wired
+   up isn't actually the one doing the work) but harder to catch because
+   BOTH mechanisms exist, are named almost identically
+   (`Panga-CtaFulfillment` vs. `panga-cta-fulfillment`), and one being
+   stale looks exactly like evidence of a real outage unless you already
+   know a second, unrelated system is the live one. A related doc claim -
+   "a manual sync and a scheduled run can never drift apart because
+   there's only one code path" (`docs/manual-sync-button-scope.md`) - was
+   also flatly wrong for the same reason: the live scheduled task never
+   went through that "one" code path at all. **When a status check
+   (`schtasks`, a "last synced" timestamp, any single indicator) says
+   something is broken, verify against the actual live mechanism before
+   trusting it - a plausible-looking but wrong system can fail
+   "correctly" while the real one works fine.** Fixed the concrete
+   symptom (dashboard's stale "last synced" card) and marked the
+   Windows-Task-Scheduler scaffolding clearly inactive so this can't
+   recur the same way, but did not consolidate the underlying three
+   parallel implementations into one - that's a larger, not-yet-scoped
+   cleanup, not this fix's job.
 
 2026-08-06: Zahir made this explicit after having to personally spot and
 name a port-isolation issue (prod vs. test dev-server ports colliding)
