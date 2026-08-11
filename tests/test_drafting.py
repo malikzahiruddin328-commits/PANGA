@@ -1521,6 +1521,48 @@ def test_rescore_against_cached_keywords_needs_no_api_call(monkeypatch):
     assert "changed" not in result
 
 
+def test_extract_ats_keywords_stamps_the_current_extractor_version(monkeypatch):
+    # 2026-08-10, real gap found: no version marker existed at all, so a
+    # future fix to the extraction/cleanup pipeline had no way to tell
+    # which already-cached jobs it should apply to. A successful
+    # extraction must stamp the current version alongside the keywords.
+    import tailoring.drafting as drafting
+
+    def _fake_call_structured(client, **kwargs):
+        return {"required_keywords": ["Python"], "preferred_keywords": []}
+
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured)
+    monkeypatch.setattr("search.job_store.update_job_ats_keywords", lambda *a, **kw: None)
+
+    job = {"source": "linkedin", "job_id": "1", "title": "Engineer", "description": "Needs Python."}
+    drafting._extract_ats_keywords(object(), job, model=None)
+
+    assert job["ats_keywords_extractor_version"] == drafting.ATS_KEYWORDS_EXTRACTOR_VERSION
+
+
+def test_is_ats_keywords_stale_false_when_never_extracted():
+    import tailoring.drafting as drafting
+
+    assert drafting.is_ats_keywords_stale({"source": "linkedin", "job_id": "1"}) is False
+
+
+def test_is_ats_keywords_stale_false_when_current_version():
+    import tailoring.drafting as drafting
+
+    job = {"ats_required_keywords": ["Python"], "ats_keywords_extractor_version": drafting.ATS_KEYWORDS_EXTRACTOR_VERSION}
+    assert drafting.is_ats_keywords_stale(job) is False
+
+
+def test_is_ats_keywords_stale_true_when_cached_under_an_older_or_missing_version():
+    import tailoring.drafting as drafting
+
+    # Cached before this feature existed at all - no version field.
+    assert drafting.is_ats_keywords_stale({"ats_required_keywords": ["Python"]}) is True
+    # Cached under an explicitly older version number.
+    stale_job = {"ats_required_keywords": ["Python"], "ats_keywords_extractor_version": drafting.ATS_KEYWORDS_EXTRACTOR_VERSION - 1}
+    assert drafting.is_ats_keywords_stale(stale_job) is True
+
+
 def test_reextract_ats_keywords_and_rescore_replaces_the_stale_cached_list(monkeypatch):
     # Forced AI re-extraction path, for the rarer case where the job-level
     # keyword cache itself is still stale/buggy (not just the stored score

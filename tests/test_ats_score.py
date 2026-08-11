@@ -225,6 +225,41 @@ def test_uppercase_it_acronym_still_satisfies_information_technology():
     assert result["missing_required_keywords"] == []
 
 
+def test_ma_state_abbreviation_does_not_falsely_satisfy_masters_degree():
+    # Real gap found 2026-08-10, live-reproduced against Zahir's real
+    # profile: "MA" is the US Postal abbreviation for Massachusetts and
+    # realistically appears CAPITALIZED in ordinary resume prose (a real
+    # employer location line), unlike "it" - the same case-sensitive-
+    # acronym backstop that fixed the "IT" bug doesn't protect here. A
+    # candidate with zero Master's-level education must still show
+    # "Master's degree" as missing even though their resume says
+    # "Burlington, MA".
+    resume = (
+        "PROFESSIONAL EXPERIENCE\nKalido - Burlington, MA\nJanuary 2010 - January 2013\n"
+        "- Led a data integration program.\n"
+    )
+    result = score_resume_against_keywords(["Master's degree"], [], resume)
+    assert [m["label"] for m in result["missing_required_keywords"]] == ["Master's degree"]
+
+
+def test_ms_product_abbreviation_does_not_falsely_satisfy_mba():
+    # Same real gap, the "MS" side: collides with "MS Office"/"MS Copilot"/
+    # "MS SQL Server" - real, ordinary tool mentions in a SKILLS section,
+    # also realistically capitalized.
+    resume = "SKILLS\nUsed MS Copilot and MS Office for productivity.\n"
+    result = score_resume_against_keywords(["MBA"], [], resume)
+    assert [m["label"] for m in result["missing_required_keywords"]] == ["MBA"]
+
+
+def test_spelled_out_masters_degree_still_matches_after_ma_ms_removal():
+    # The fix must not overcorrect - a resume that genuinely spells out the
+    # degree (not just the bare "MA"/"MS" acronym) must still match.
+    result = score_resume_against_keywords(
+        ["Master's degree"], [], "EDUCATION\nMaster of Science, Computer Science\n",
+    )
+    assert result["missing_required_keywords"] == []
+
+
 def test_multi_word_aliases_stay_case_insensitive():
     # Multi-word aliases ("bachelor's degree", "information technology")
     # are unambiguous - no common English phrase collides with them - so
@@ -277,6 +312,65 @@ def test_either_or_group_explanation_names_the_satisfying_alternative():
     result = score_resume_against_keywords(required, [], resume)
     assert "Bachelor's degree" in result["ats_rationale"]
     assert "satisfied via" in result["ats_rationale"]
+
+
+def test_empty_any_of_group_is_vacuously_satisfied_not_a_garbled_label():
+    # Real gap found 2026-08-10: {"any_of": []} is schema-valid (the AI
+    # extraction schema declares no minItems) but item.get("any_of") is
+    # falsy for an empty list, so this used to fall through to the plain-
+    # string branch and render the literal Python repr "{'any_of': []}" as
+    # a missing required keyword - visible to Zahir as if it were a real
+    # skill to confirm. A group with zero named alternatives has nothing
+    # to fail against, so it must be treated as satisfied, not missing.
+    result = score_resume_against_keywords([{"any_of": []}], [], "Some resume text with nothing relevant.")
+    assert result["missing_required_keywords"] == []
+    assert "any_of" not in str(result["missing_required_keywords"])
+
+
+def test_non_list_any_of_is_excluded_not_silently_over_satisfied():
+    # Real gap found 2026-08-10: a non-list any_of value (e.g. a bare
+    # string - reachable via a stale cached job record predating the live
+    # schema's array enforcement, not via the live extraction call itself)
+    # used to be iterated character-by-character, turning
+    # {"any_of": "Bachelor's degree"} into a 17-member group of single
+    # letters that trivially matched almost any resume text. Must now be
+    # excluded from scoring entirely - neither satisfied nor a real gap.
+    result = score_resume_against_keywords(
+        [{"any_of": "Bachelor's degree"}, "Python"], [], "SKILLS\nPython\n",
+    )
+    assert result["missing_required_keywords"] == []
+    assert result["ats_score"] == score_resume_against_keywords(["Python"], [], "SKILLS\nPython\n")["ats_score"]
+
+
+def test_accidental_duplicate_flat_keyword_does_not_dilute_other_point_values():
+    # Real gap found 2026-08-10: two IDENTICAL flat keywords (an
+    # accidental extraction slip, not the documented legitimate case
+    # below) used to each count independently toward total_required,
+    # silently diluting every other missing keyword's point_value and
+    # inflating the overall score without the resume actually covering
+    # anything more.
+    resume = "SKILLS\nPython, SQL, Databricks, Kubernetes"  # missing Terraform
+    baseline = score_resume_against_keywords(["Python", "SQL", "Databricks", "Kubernetes", "Terraform"], [], resume)
+    with_dup = score_resume_against_keywords(
+        ["Python", "SQL", "Databricks", "Kubernetes", "Terraform", "Python"], [], resume,
+    )
+    assert with_dup["ats_score"] == baseline["ats_score"]
+    assert with_dup["missing_required_keywords"] == baseline["missing_required_keywords"]
+
+
+def test_flat_keyword_and_same_named_any_of_group_member_both_still_count():
+    # Must NOT be caught by the duplicate-flat-keyword dedup above - a term
+    # legitimately needing extraction both as a flat keyword AND as an
+    # any_of alternative (e.g. "Supply Chain Management" as both an
+    # acceptable degree field and its own substantive-experience
+    # requirement - see _RESUME_SPEC_COMMON's documented rule) represents
+    # two genuinely different requirements sharing a label, not a
+    # duplicate of the same one.
+    required = ["Supply Chain Management", {"any_of": ["Supply Chain Management", "Logistics"]}]
+    result = score_resume_against_keywords(required, [], "No relevant experience here.")
+    labels = [m["label"] for m in result["missing_required_keywords"]]
+    assert "Supply Chain Management" in labels
+    assert "Supply Chain Management OR Logistics" in labels
 
 
 def test_point_value_is_computed_from_the_real_scoring_formula_not_guessed():

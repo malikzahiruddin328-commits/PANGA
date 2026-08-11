@@ -580,6 +580,37 @@ def _ats_keywords_schema() -> dict:
     }
 
 
+# Bump whenever a change to the keyword-extraction/cleanup pipeline
+# (_drop_years_experience_keywords, _drop_generic_soft_skill_keywords,
+# _strip_degree_in_prefix_keywords, the either/or extraction rules in
+# ATS_KEYWORDS_SYSTEM_PROMPT, etc.) changes what a job's cached
+# ats_required_keywords/ats_preferred_keywords SHOULD look like. Stamped
+# alongside the cache on every successful extraction (see
+# is_ats_keywords_stale below) - 2026-08-10, real gap found: no version
+# marker existed at all, so every fix this week to this pipeline was
+# silently inert for any job scored before it shipped, with no way to
+# even ASK "which jobs are affected by the latest fix" short of
+# re-extracting every job unconditionally (see scripts/
+# reextract_ats_keywords_backfill.py, which does exactly that today -
+# a future version of it, or any other caller, can use
+# is_ats_keywords_stale() instead to target only the jobs that actually
+# need it).
+ATS_KEYWORDS_EXTRACTOR_VERSION = 1
+
+
+def is_ats_keywords_stale(job: dict) -> bool:
+    """True only if this job HAS a cached keyword list (None/missing means
+    "never extracted" - a different, already-handled case that
+    generate_documents's own gate covers, not what this checks) but it was
+    cached under an older extractor version than the current one. Never
+    triggers a re-extraction itself - that's a real API cost, left to an
+    explicit caller's decision (a bulk backfill script, an Ops-tab action)
+    rather than firing automatically on every draft/regenerate."""
+    if job.get("ats_required_keywords") is None:
+        return False
+    return job.get("ats_keywords_extractor_version") != ATS_KEYWORDS_EXTRACTOR_VERSION
+
+
 def _extract_ats_keywords(client: "anthropic.Anthropic", job: dict, model: str | None = None) -> tuple[list, list]:
     """One real-NLP-judgment AI call that pulls the literal required/
     preferred keyword list out of this job's own posting text (title +
@@ -627,8 +658,9 @@ def _extract_ats_keywords(client: "anthropic.Anthropic", job: dict, model: str |
 
     job["ats_required_keywords"] = required
     job["ats_preferred_keywords"] = preferred
+    job["ats_keywords_extractor_version"] = ATS_KEYWORDS_EXTRACTOR_VERSION
     if job.get("source") and job.get("job_id"):
-        update_job_ats_keywords(job["source"], job["job_id"], required, preferred)
+        update_job_ats_keywords(job["source"], job["job_id"], required, preferred, ATS_KEYWORDS_EXTRACTOR_VERSION)
     return required, preferred
 
 
