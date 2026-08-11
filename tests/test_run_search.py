@@ -8,7 +8,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import run_search  # noqa: E402
-from search import company_sites, job_sources, source_activity  # noqa: E402
+from search import company_sites, job_sources, source_activity, usajobs  # noqa: E402
 
 
 @pytest.fixture
@@ -24,6 +24,35 @@ def test_rigzone_is_not_in_the_daily_industry_board_fetchers():
     # wired into the daily run - see the commented-out line's own comment.
     names = [name for name, _fetch in run_search._INDUSTRY_BOARD_FETCHERS]
     assert "Rigzone" not in names
+
+
+def test_search_usajobs_skips_bare_director_keyword(isolated_run_search, monkeypatch):
+    # Real bug found 2026-08-11 (research task, live-verified against real
+    # production data before building): a bare "Director" keyword matches
+    # any federal director role regardless of field - confirmed a real,
+    # measurable contributor to the 31.8%-of-all-scored-jobs senior-
+    # titled-wrong-domain waste pattern. usajobs.search_jobs()'s own
+    # job_category_code=2210 (IT Management series) is the real
+    # structural domain filter for USAJOBS, already run separately - the
+    # bare keyword search is redundant-and-noisy on top of it for this
+    # one term specifically.
+    calls = []
+    monkeypatch.setattr(usajobs, "search_jobs", lambda **kwargs: calls.append(kwargs) or [])
+    target_roles = [{"name": "CIO"}, {"name": "Director"}, {"name": "VP Information Technology"}]
+    run_search.search_usajobs(target_roles, job_series=[])
+    keyword_calls = [c["keyword"] for c in calls if "keyword" in c]
+    assert "Director" not in keyword_calls
+    assert "CIO" in keyword_calls
+    assert "VP Information Technology" in keyword_calls  # a new domain-qualified role, not skipped
+
+
+def test_search_usajobs_still_runs_job_category_code_search(isolated_run_search, monkeypatch):
+    monkeypatch.setattr(usajobs, "search_jobs", lambda **kwargs: [])
+    run_search.search_usajobs([{"name": "Director"}], job_series=["2210"])
+    data = source_activity._load()
+    # ran (0 error) even though the only target_role was skipped - the
+    # job_category_code search still counts as a real attempt.
+    assert data["USAJOBS"][0]["had_error"] is False
 
 
 def test_search_industry_boards_records_activity_per_source(isolated_run_search, monkeypatch):
