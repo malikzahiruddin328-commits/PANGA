@@ -55,10 +55,30 @@ def _log(message: str) -> None:
     print(message, flush=True)
 
 
+
+# "Director" alone is skipped for USAJOBS' keyword search specifically -
+# real bug found 2026-08-11 (a research task, live-verified against real
+# production data before building): a bare "Director" keyword matches any
+# federal director role regardless of field (real estate, communications,
+# force support, nuclear...), confirmed 31.8% of all scored jobs
+# store-wide are exactly this senior-titled-wrong-domain pattern, with
+# USAJOBS a real contributor. usajobs.search_jobs()'s own docstring
+# already flagged this exact risk when job_category_code was added -
+# that supplementary search (job_series, "2210" = IT Management) is the
+# real structural domain filter for USAJOBS, so it's relied on here
+# instead of also re-running the noisy bare keyword. Other target_roles
+# keywords (CIO, SVP, VP, Head of IT, and the new domain-qualified
+# entries below) still search normally - this is specific to the one
+# confirmed-worst bare term on this one source, not a blanket change.
+_USAJOBS_SKIP_KEYWORDS = {"Director"}
+
+
 def search_usajobs(target_roles: list[dict], job_series: list[str]) -> int:
     added = 0
     attempts = errors = 0
     for role in target_roles:
+        if role["name"] in _USAJOBS_SKIP_KEYWORDS:
+            continue
         attempts += 1
         try:
             jobs = usajobs.search_jobs(keyword=role["name"], results_per_page=50)

@@ -9,6 +9,12 @@ target_roles:
   priority_weight: 9
 - name: Director
   priority_weight: 6
+- name: VP Information Technology
+  priority_weight: 9
+- name: SVP Technology
+  priority_weight: 9
+- name: IT Director
+  priority_weight: 6
 industries:
 - Lifesciences/Pharma
 - Federal Government
