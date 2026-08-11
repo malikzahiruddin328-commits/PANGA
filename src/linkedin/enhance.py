@@ -83,4 +83,5 @@ def analyze_profile(context: dict, on_progress=None) -> dict:
         effort="high",
         on_progress=on_progress,
         refusal_message="Claude declined to analyze this profile. Try again.",
+        purpose="linkedin_profile_enhance",
     )

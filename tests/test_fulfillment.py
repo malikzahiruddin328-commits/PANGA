@@ -40,6 +40,43 @@ def test_last_synced_starts_none_and_updates(isolated_data):
     assert fulfillment.get_last_synced_at() >= first
 
 
+def test_last_synced_at_none_when_neither_source_has_run(isolated_data):
+    assert fulfillment.get_last_synced_at() is None
+
+
+def test_last_synced_at_reads_scheduled_report_when_manual_never_ran(isolated_data):
+    fulfillment.HUB_INBOX_DIR.mkdir(parents=True)
+    (fulfillment.HUB_INBOX_DIR / "2026-08-11-cta-fulfillment-0806.md").write_text("quiet run")
+    assert fulfillment.get_last_synced_at() is not None
+
+
+def test_last_synced_at_prefers_the_more_recent_of_the_two_sources(isolated_data):
+    import os
+    from datetime import datetime, timedelta, timezone
+
+    fulfillment._record_sync_completed()  # manual sync "now"
+    manual_only = fulfillment.get_last_synced_at()
+
+    fulfillment.HUB_INBOX_DIR.mkdir(parents=True)
+    report = fulfillment.HUB_INBOX_DIR / "2026-08-09-cta-fulfillment-0806.md"
+    report.write_text("older run")
+    old_mtime = (datetime.now(timezone.utc) - timedelta(days=2)).timestamp()
+    os.utime(report, (old_mtime, old_mtime))
+
+    # Manual sync (just now) is more recent than the 2-day-old report -
+    # combined value should still reflect the manual sync, not regress to
+    # the older report.
+    assert fulfillment.get_last_synced_at() == manual_only
+
+    newer_report = fulfillment.HUB_INBOX_DIR / "2026-08-11-cta-fulfillment-0806.md"
+    newer_report.write_text("newer run")
+    # The live scheduled task's report is now the more recent source -
+    # combined value should pick it up instead of the stale manual sync.
+    combined = fulfillment.get_last_synced_at()
+    assert combined != manual_only
+    assert combined > manual_only
+
+
 def test_get_pending_count_sums_all_three_sources(isolated_data):
     assert fulfillment.get_pending_count() == 0
 
@@ -198,3 +235,43 @@ def test_run_full_fulfillment_records_sync_even_with_failures(isolated_data, mon
     summary = fulfillment.run_full_fulfillment()
     assert summary["failures"] >= 1
     assert fulfillment.get_last_synced_at() is not None  # still recorded - "last ran," not "last ran clean"
+
+
+def test_fulfill_archive_requests_logs_on_missing_account(isolated_data, caplog):
+    cta_emails.add_cta_email("t1", "S", "a@b.com", "s", "2026-08-05", "offer")
+    cta_emails.request_archive("t1")
+    with caplog.at_level("ERROR", logger="fulfillment"):
+        failures = fulfillment.fulfill_archive_requests({})
+    assert failures == 1
+    assert "t1" in caplog.text
+
+
+def test_fulfill_cta_draft_requests_logs_on_exception(isolated_data, monkeypatch, caplog):
+    cta_emails.add_cta_email("t1", "S", "a@b.com", "s", "2026-08-05", "offer")
+    cta_emails.request_draft("t1")
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated drafting failure")
+
+    monkeypatch.setattr(fulfillment, "draft_cta_reply", _boom)
+    account = FakeAccount("gmail", "gmail")
+    with caplog.at_level("ERROR", logger="fulfillment"):
+        failures = fulfillment.fulfill_cta_draft_requests({("gmail", "gmail"): account})
+    assert failures == 1
+    assert "t1" in caplog.text
+
+
+def test_fulfill_outreach_draft_requests_logs_on_exception(isolated_data, monkeypatch, caplog):
+    outreach.add_outreach("C", "email", target_account_name="Acme", contact_email="c@acme.com")
+    outreach_id = outreach.load_outreach()[0]["outreach_id"]
+    outreach.request_draft(outreach_id)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated drafting failure")
+
+    monkeypatch.setattr(fulfillment, "draft_outreach_email", _boom)
+    account = FakeAccount("gmail", "gmail")
+    with caplog.at_level("ERROR", logger="fulfillment"):
+        failures = fulfillment.fulfill_outreach_draft_requests({("gmail", "gmail"): account})
+    assert failures == 1
+    assert outreach_id in caplog.text

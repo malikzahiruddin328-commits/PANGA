@@ -159,5 +159,6 @@ def compute_prospector_score(input_data: dict, on_progress=None) -> dict:
         thinking=False,
         on_progress=on_progress,
         refusal_message="Claude declined to compute a score. Try again.",
+        purpose="prospector_score",
     )
     return {"score": data["score"], "rationale": data["rationale"], "next_actions": data["next_actions"]}

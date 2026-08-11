@@ -1498,6 +1498,18 @@ def _draft_one(
 
     job_key = (job["source"], job["job_id"]) if job and job.get("source") and job.get("job_id") else None
     user_content = list(shared_context)
+    if job is not None:
+        # Job text is per-call variable content, not the job-invariant
+        # profile - deliberately kept OUT of shared_context's own
+        # cache_control-marked block (see generate_documents()'s docstring)
+        # so the cached prefix stays identical across different jobs,
+        # not just across doc types within the same job. Uncached, and
+        # placed after the cached block per Anthropic's own prefix-cache
+        # ordering (static/cacheable content first, variable content after).
+        user_content.append({
+            "type": "text",
+            "text": "\n\nJOB POSTING:\n" + json.dumps(job, indent=2, default=str),
+        })
     if doc_key in _CROSS_DOCUMENT_CONSISTENCY_DOC_KEYS and resume_text_for_consistency:
         user_content.append(_resume_consistency_block(resume_text_for_consistency))
     user_content.append({"type": "text", "text": f"\n\nDraft: {doc_key}"})
@@ -1594,6 +1606,145 @@ def _draft_one(
     if doc_key == "apply_answers":
         return data.get("apply_answers", [])
     return data.get(doc_key, "")
+
+
+def _draft_group(
+    client: "anthropic.Anthropic",
+    shared_context: list[dict],
+    doc_keys: list[str],
+    model: str | None,
+    on_progress,
+    indices: dict,
+    doc_total: int,
+    job: dict | None,
+    profile: dict | None,
+    resume_text_for_consistency: str | None,
+) -> tuple[dict, dict]:
+    """Drafts 2+ of _CROSS_DOCUMENT_CONSISTENCY_DOC_KEYS (cover_letter,
+    exec_bio, leadership_summary) in ONE combined-schema call instead of
+    each on its own separate call (2026-08-11). _schema() already builds a
+    schema generically from a list of doc_keys, so this reuses it directly
+    - no new schema shape needed.
+
+    Real motivation: these three already shared the exact same cached
+    context (job + profile), but each used ITS OWN single-key schema, and
+    Anthropic's prompt-cache match requires the full request configuration
+    (including the schema/tool definition) to match, not just the cached
+    text block - so despite sharing identical cacheable content, none of
+    them ever hit a read against another, paying a full ~25% cache-WRITE
+    premium on every one of the three separately, every single time.
+    Combining them into one call with one shared schema removes the
+    mismatch entirely for this group: one write (or one read, if another
+    same-shaped call already primed the cache within the TTL) instead of
+    three.
+
+    Real error handling for two distinct failure shapes, deliberately
+    different: a genuinely bad field inside an otherwise-good response
+    doesn't need to cost as much as losing the whole batch, so it isn't
+    handled the same way as the whole call failing outright.
+
+    1. Combined call raises outright after exhausting retry tiers
+       (refusal, truncation not resolved by a bigger budget, network/API
+       error). Falls back to drafting each of doc_keys independently via
+       _draft_one, exactly as before this function existed - one doc's
+       failure here still never takes down the other two, matching
+       generate_documents()'s existing per-doc fault-isolation guarantee.
+       This trades away the cache/cost win only in this failure case, not
+       the common one.
+    2. Combined call SUCCEEDS but one or more individual fields come back
+       blank/whitespace-only (a malformed field inside an otherwise-good
+       response). Only the bad field(s) are individually re-drafted via
+       _draft_one (small extra cost, same cached context) - the good
+       fields from the combined call are kept as-is, never discarded and
+       never force a full combined re-draft.
+
+    Returns (results, errors) - both keyed by doc_key, covering every
+    entry in doc_keys between them (a key is never in both, and every key
+    ends up in exactly one). Callers should fold these into their own
+    results/errors dicts the same way a single _draft_one result would be
+    folded in, per doc_key."""
+    schema = _schema(doc_keys)
+    # Scaled up from _draft_one's single-doc [6000, 12000] tiers by doc
+    # count - same escalate-on-genuine-truncation pattern, just sized for
+    # N documents sharing one response instead of one.
+    max_tokens_tiers = [6000 * len(doc_keys), 12000 * len(doc_keys)]
+
+    def _progress(substatus):
+        if not on_progress:
+            return
+        for doc_key in doc_keys:
+            on_progress(indices[doc_key], doc_total, doc_key, substatus)
+
+    job_key = (job["source"], job["job_id"]) if job and job.get("source") and job.get("job_id") else None
+    user_content = list(shared_context)
+    if job is not None:
+        user_content.append({
+            "type": "text",
+            "text": "\n\nJOB POSTING:\n" + json.dumps(job, indent=2, default=str),
+        })
+    if resume_text_for_consistency:
+        user_content.append(_resume_consistency_block(resume_text_for_consistency))
+    user_content.append({"type": "text", "text": f"\n\nDraft: {', '.join(doc_keys)}"})
+
+    data = None
+    try:
+        for max_tokens in max_tokens_tiers:
+            try:
+                data = call_structured(
+                    client,
+                    system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
+                    user_content=user_content,
+                    schema=schema,
+                    max_tokens=max_tokens,
+                    model=model,
+                    effort="high",
+                    on_progress=_progress if on_progress else None,
+                    refusal_message=(
+                        "Claude declined to draft these documents. This is unusual for resume "
+                        "content - try again, or check the job posting text for anything unusual."
+                    ),
+                    purpose=f"draft_group_{'_'.join(sorted(doc_keys))}",
+                    job_key=job_key,
+                )
+            except LLMResponseTruncated:
+                if max_tokens == max_tokens_tiers[-1]:
+                    raise
+                continue
+            break
+    except Exception as exc:
+        logger.warning(
+            "draft_group combined call failed for %s (%s) - falling back to independent per-doc drafting",
+            doc_keys, exc,
+        )
+        results: dict = {}
+        errors: dict = {}
+        for doc_key in doc_keys:
+            try:
+                results[doc_key] = _draft_one(
+                    client, shared_context, doc_key, model, on_progress, indices[doc_key], doc_total,
+                    job=job, profile=profile, resume_text_for_consistency=resume_text_for_consistency,
+                )
+            except Exception as doc_exc:
+                errors[doc_key] = doc_exc
+        return results, errors
+
+    results = {doc_key: data.get(doc_key, "") for doc_key in doc_keys}
+    errors = {}
+    bad_keys = [doc_key for doc_key in doc_keys if not results[doc_key].strip()]
+    for doc_key in bad_keys:
+        logger.warning(
+            "draft_group combined call returned a blank %s - re-drafting just that field individually",
+            doc_key,
+        )
+        try:
+            results[doc_key] = _draft_one(
+                client, shared_context, doc_key, model, on_progress, indices[doc_key], doc_total,
+                job=job, profile=profile, resume_text_for_consistency=resume_text_for_consistency,
+            )
+        except Exception as doc_exc:
+            del results[doc_key]
+            errors[doc_key] = doc_exc
+    return results, errors
 
 
 _RESUME_SELF_CORRECTION_TARGET_SCORE = 90
@@ -1868,13 +2019,20 @@ def generate_documents(
 ) -> dict:
     """Drafts real, tailored document text for exactly the requested doc_keys
     (subset of "resume", "cover_letter", "exec_bio", "leadership_summary",
-    "apply_answers"). The job+profile context is identical across every
-    call and marked cacheable, so only the first call pays full price for
-    it - subsequent ones read it back at ~10% cost, though true
-    concurrency (see below) means several calls in the same batch can race
-    to be "first" against that cache, so the pricing win isn't guaranteed
-    the way it was when every call ran strictly one after another; the
-    wall-clock win is the trade-off being made.
+    "apply_answers"). The candidate's profile (job-invariant, unlike the
+    job posting itself) is marked cacheable, so only the first call in a
+    5-minute window pays full price for it - subsequent ones, even across
+    DIFFERENT jobs and different doc-type schemas, read it back at ~10%
+    cost (2026-08-11: previously the job posting was baked into the same
+    cached block as the profile, so the cached prefix changed on every
+    single job and cross-job reads never happened; separately, cover_
+    letter/exec_bio/leadership_summary each used a different output schema,
+    which also breaks Anthropic's cache match regardless of the text
+    content - both are fixed now, see _draft_group()). True concurrency
+    (see below) means several calls in the same batch can still race to be
+    "first" against the cache, so a pricing win isn't guaranteed the way it
+    was when every call ran strictly one after another; the wall-clock win
+    is the trade-off being made.
 
     Concurrency (2026-08-10): if "resume" is one of doc_keys, it always
     drafts FIRST and alone, synchronously, via
@@ -1986,12 +2144,19 @@ def generate_documents(
     if "resume" in doc_keys and job.get("ats_required_keywords") is None:
         _extract_ats_keywords(client, job, model)
 
+    # Job-invariant only (2026-08-11) - the job posting itself is appended
+    # separately, per-call, inside _draft_one, deliberately OUTSIDE this
+    # cached block. Previously both were baked into the same cache_control
+    # block, so every job's own text changed the cached prefix and no two
+    # jobs' calls could ever share a cache read - only same-job/same-schema
+    # retries (e.g. resume self-correction) hit. Splitting them means the
+    # profile prefix is now identical across every job, so distinct jobs'
+    # same-schema calls (e.g. two different jobs' "resume" calls, or two
+    # different jobs' combined cover_letter/exec_bio/leadership_summary
+    # calls) can now genuinely share a cache read within the 5-min TTL.
     shared_context = [{
         "type": "text",
-        "text": (
-            "JOB POSTING:\n" + json.dumps(job, indent=2, default=str) +
-            "\n\nCANDIDATE'S MASTER PROFILE:\n" + json.dumps(profile, indent=2, default=str)
-        ),
+        "text": "CANDIDATE'S MASTER PROFILE:\n" + json.dumps(profile, indent=2, default=str),
         "cache_control": {"type": "ephemeral"},
     }]
 
@@ -2027,9 +2192,30 @@ def generate_documents(
                 job=job, profile=profile, resume_text_for_consistency=resume_text_for_consistency,
             )
 
-        max_workers = min(len(remaining_keys), MAX_CONCURRENT_DRAFTS)
+        def _draft_group_worker(keys: list[str]):
+            worker_client = _client()
+            return _draft_group(
+                worker_client, shared_context, keys, model, on_progress, indices, total,
+                job=job, profile=profile, resume_text_for_consistency=resume_text_for_consistency,
+            )
+
+        # 2+ of the cross-document-consistency doc types (cover_letter/
+        # exec_bio/leadership_summary) draft together as ONE combined-
+        # schema work item (see _draft_group's own docstring for why) -
+        # any other requested doc_key (apply_answers, or just one of the
+        # three above on its own) still drafts independently, unchanged.
+        group_keys = [k for k in remaining_keys if k in _CROSS_DOCUMENT_CONSISTENCY_DOC_KEYS]
+        solo_keys = [k for k in remaining_keys if k not in _CROSS_DOCUMENT_CONSISTENCY_DOC_KEYS]
+        use_group = len(group_keys) >= 2
+        if not use_group:
+            solo_keys = remaining_keys
+            group_keys = []
+
+        max_workers = min(len(solo_keys) + (1 if group_keys else 0), MAX_CONCURRENT_DRAFTS)
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            future_to_key = {pool.submit(_draft_one_worker, doc_key): doc_key for doc_key in remaining_keys}
+            future_to_key = {pool.submit(_draft_one_worker, doc_key): doc_key for doc_key in solo_keys}
+            group_future = pool.submit(_draft_group_worker, group_keys) if group_keys else None
+
             for future in as_completed(future_to_key):
                 doc_key = future_to_key[future]
                 try:
@@ -2039,6 +2225,25 @@ def generate_documents(
                         raise
                     _report_drafting_failure(job, doc_key, exc)
                     errors[doc_key] = str(exc)
+
+            if group_future is not None:
+                try:
+                    group_results, group_errors = group_future.result()
+                except Exception as exc:
+                    # _draft_group is designed to never let an exception escape
+                    # (both its failure modes are caught internally - see its
+                    # own docstring) - this is only a safety net against a
+                    # genuine bug in that handling, so every group key is
+                    # still accounted for in "_errors" rather than silently
+                    # missing from the returned dict.
+                    for doc_key in group_keys:
+                        _report_drafting_failure(job, doc_key, exc)
+                        errors[doc_key] = str(exc)
+                else:
+                    results.update(group_results)
+                    for doc_key, exc in group_errors.items():
+                        _report_drafting_failure(job, doc_key, exc)
+                        errors[doc_key] = str(exc)
 
     return {**results, "_errors": errors}
 
