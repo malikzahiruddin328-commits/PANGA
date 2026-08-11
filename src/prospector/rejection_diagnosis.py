@@ -99,4 +99,5 @@ def diagnose(diagnosis_input: dict, on_progress=None) -> dict:
         thinking=False,
         on_progress=on_progress,
         refusal_message="Claude declined to run the diagnosis. Try again.",
+        purpose="rejection_diagnosis",
     )

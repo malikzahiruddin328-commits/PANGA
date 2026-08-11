@@ -1,10 +1,24 @@
+# *** NOT ACTIVE TODAY. Do not treat `schtasks`/Task Scheduler entries this
+# *** script created as evidence Panga's real automation is running or
+# *** broken - check `mcp__scheduled-tasks__list_scheduled_tasks` (or
+# *** ~/.claude/scheduled-tasks/) instead, that's the live system. ***
+# Real incident, 2026-08-11: an audit checked Task Scheduler, found
+# Panga-JobAlertScan never registered and Panga-CtaFulfillment Disabled/
+# stale, and reported live automation as broken. It wasn't - the actual
+# live automation (Claude Code's own scheduled-tasks system) was running
+# fine the whole time; Task Scheduler here was just never fully wired up
+# for a native-packaged build that hasn't shipped yet. See
+# docs/manual-sync-button-scope.md's 2026-08-11 correction for the full
+# story - don't repeat this confusion.
+#
 # Registers Panga's background jobs as native Windows Task Scheduler
 # tasks (native-packaging branch, 2026-07-31; Panga-JobAlertScan added
-# 2026-08-07) - replaces the Claude Code scheduled tasks
-# (panga-daily-job-search, panga-gmail-cta-scan, panga-cta-fulfillment),
-# which a standalone build can't carry (no live Claude Code session to
-# run them in). Same schedule as the originals (see
-# docs/email-monitoring-task.md, docs/daily-job-search-task.md).
+# 2026-08-07) - this is scaffolding for a FUTURE standalone-build install,
+# meant to replace the Claude Code scheduled tasks (panga-daily-job-search,
+# panga-gmail-cta-scan, panga-cta-fulfillment) that a packaged build can't
+# carry (no live Claude Code session to run them in). Same schedule as the
+# live originals (see docs/email-monitoring-task.md,
+# docs/daily-job-search-task.md).
 #
 # Run this once from an elevated-or-not PowerShell (no admin rights needed
 # for per-user scheduled tasks) after Phase 1's direct-API scripts are

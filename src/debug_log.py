@@ -67,16 +67,26 @@ def setup_debug_logging() -> None:
     sys.excepthook = _log_uncaught
 
 
+# Loggers that always write to panga_debug.log at ERROR+, regardless of
+# PANGA_DEBUG - see setup_always_on_error_logging() below. "fulfillment"
+# added 2026-08-11, Mirror's audit: its three paid-AI-call handlers
+# (fulfill_archive_requests/fulfill_cta_draft_requests/
+# fulfill_outreach_draft_requests) were failing open with zero exception
+# logging anywhere, unlike every other scheduled-task-adjacent module.
+_ALWAYS_ON_LOGGER_NAMES = ("llm_client", "fulfillment")
+
+
 def setup_always_on_error_logging() -> None:
     """Always active, regardless of PANGA_DEBUG - see module docstring.
-    Attaches a dedicated handler to llm_client's own logger only (not the
-    root logger setup_debug_logging() above configures), at ERROR level,
-    so normal usage stays quiet in this file except for a real API call
-    failure worth diagnosing later. Writes to the same panga_debug.log
-    path as the full-DEBUG mechanism - two independent FileHandlers on
-    the same path is safe here (this is a single-process Streamlit app,
-    and each handler's own writes are already line-buffered/flushed by
-    the standard logging module), matching this file's existing no-extra-
+    Attaches a dedicated handler to each logger named in
+    _ALWAYS_ON_LOGGER_NAMES only (not the root logger
+    setup_debug_logging() above configures), at ERROR level, so normal
+    usage stays quiet in this file except for a real failure worth
+    diagnosing later. Writes to the same panga_debug.log path as the
+    full-DEBUG mechanism - multiple independent FileHandlers on the same
+    path is safe here (this is a single-process Streamlit app, and each
+    handler's own writes are already line-buffered/flushed by the
+    standard logging module), matching this file's existing no-extra-
     locking convention for a diagnostic text log (unlike the real JSON
     data stores under data/, which do use security.file_lock).
     Idempotent - safe to call on every Streamlit rerun."""
@@ -89,11 +99,12 @@ def setup_always_on_error_logging() -> None:
     handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
     handler.setLevel(logging.ERROR)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    # Deliberately does NOT call llm_client_logger.setLevel() - that would
-    # set the LOGGER's own effective threshold, which would silence its
-    # DEBUG/INFO calls even under PANGA_DEBUG=1's full-verbosity mode
+    # Deliberately does NOT call each logger's own .setLevel() - that
+    # would set the LOGGER's own effective threshold, which would silence
+    # its DEBUG/INFO calls even under PANGA_DEBUG=1's full-verbosity mode
     # (a logger's own level gates BEFORE any handler ever sees the
     # record). Filtering only on the HANDLER (above) is enough to keep
     # this mechanism to ERROR+ without touching what other handlers -
     # like setup_debug_logging()'s root-logger one - are allowed to see.
-    logging.getLogger("llm_client").addHandler(handler)
+    for logger_name in _ALWAYS_ON_LOGGER_NAMES:
+        logging.getLogger(logger_name).addHandler(handler)

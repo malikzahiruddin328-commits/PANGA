@@ -242,12 +242,16 @@ def generate_prep(job: dict, profile: dict, interviewers: list[dict] | None = No
         for i in (interviewers or []) if i.get("name")
     ) or "not yet known"
 
+    job_key = (job.get("source"), job.get("job_id")) if job.get("source") and job.get("job_id") else None
+
     research_notes, _cost = call_with_web_search(
         client,
         system=_RESEARCH_SYSTEM_PROMPT,
         user_content=f"Company: {job.get('organization')}\nRole: {job.get('title')}\nInterviewers: {interviewer_names}",
         max_tokens=1500,
         max_uses=6,
+        purpose="interview_prep_research",
+        job_key=job_key,
     )
 
     content = json.dumps({
@@ -262,4 +266,6 @@ def generate_prep(job: dict, profile: dict, interviewers: list[dict] | None = No
         effort="high",
         on_progress=on_progress,
         refusal_message="Claude declined to generate interview prep. Try again.",
+        purpose="interview_prep_generate",
+        job_key=job_key,
     )
