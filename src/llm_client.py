@@ -485,6 +485,8 @@ def _log_cost(
             purpose=purpose, model=model,
             input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens,
             cost_usd=cost, job_key=job_key, duration_ms=duration_ms,
+            cache_creation_input_tokens=getattr(response.usage, "cache_creation_input_tokens", None),
+            cache_read_input_tokens=getattr(response.usage, "cache_read_input_tokens", None),
         )
     except Exception:
         logger.exception("Failed to log API call cost (purpose=%s) - the call itself still succeeded.", purpose)
@@ -518,12 +520,12 @@ def _log_failed_call(exc: BaseException, purpose: str, job_key: tuple[str, str] 
 
 def call_structured(
     client: "anthropic.Anthropic",
-    system,
+    system: str | list[dict],
     user_content,
     schema: dict,
     max_tokens: int,
     model: str | None = None,
-    effort: str = "high",
+    effort: str | None = "high",
     thinking: bool = True,
     on_progress=None,
     refusal_message: str = "Claude declined to respond. Try again.",
@@ -544,6 +546,14 @@ def call_structured(
     own get_client() call, before this function is even reached) and
     LLMCallFailed on API error, refusal, truncation, or invalid JSON.
 
+    system may be a plain string (unchanged behavior) or a list of content-
+    block dicts (2026-08-11, fit_score prompt-caching fix) - pass a list
+    when part of the system content should be Anthropic prompt-cached
+    (mark the cacheable block with "cache_control": {"type": "ephemeral"}).
+    Passed straight through to the API unmodified either way - the
+    Anthropic SDK accepts both shapes natively, so no reshaping happens
+    here. See tailoring.drafting.score_job for the real caller.
+
     Transient failures (overloaded/rate-limit/connection errors) are retried
     with backoff, then retried once more against a fallback model if the
     primary is still overloaded - see _call_with_retries.
@@ -558,7 +568,19 @@ def call_structured(
     updated; job_key (source, job_id) lets a later regenerate-confirmation
     prompt look up "what did the last real generation for this job cost."
     Logging failure never breaks the actual call - a cost-log write error
-    is logged and swallowed, not raised, since it isn't the caller's job."""
+    is logged and swallowed, not raised, since it isn't the caller's job.
+
+    effort=None (2026-08-11, real bug found live-validating the fit_score
+    pre-filter's Haiku domain check): claude-haiku-4-5 rejects the
+    `effort` key in output_config outright - "This model does not support
+    the effort parameter" (a real 400 from every one of 126 real domain-
+    check calls in that validation run, each one silently caught by the
+    caller's own fail-open handling, so this went completely unnoticed
+    until the debug log was actually read). effort now defaults to "high"
+    for backward compatibility with every existing Opus-only caller, but a
+    caller targeting a model that doesn't support it can pass effort=None
+    to omit the key entirely rather than guessing at a value the model
+    will accept."""
     from debug_log import setup_always_on_error_logging
 
     setup_always_on_error_logging()
@@ -567,10 +589,13 @@ def call_structured(
     primary_model = model or os.environ.get("ANTHROPIC_MODEL") or DEFAULT_MODEL
 
     def make_request(call_model):
+        output_config = {"format": {"type": "json_schema", "schema": schema}}
+        if effort is not None:
+            output_config["effort"] = effort
         kwargs = dict(
             model=call_model,
             max_tokens=max_tokens,
-            output_config={"effort": effort, "format": {"type": "json_schema", "schema": schema}},
+            output_config=output_config,
             system=system,
             messages=[{"role": "user", "content": user_content}],
         )

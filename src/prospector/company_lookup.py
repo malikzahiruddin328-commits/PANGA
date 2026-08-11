@@ -54,6 +54,7 @@ def lookup_company_website(company_name: str) -> tuple[str | None, float]:
         max_tokens=200,
         max_uses=5,
         model=DEFAULT_MODEL,
+        purpose="company_website_lookup",
     )
     match = _URL_RE.search(text)
     if not match:

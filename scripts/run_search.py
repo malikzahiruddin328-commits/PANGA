@@ -41,6 +41,7 @@ from profile.storage import load_profile  # noqa: E402
 from search import aggregators, boards, company_sites, freshness_check, industry_boards, job_sources, job_store, source_activity, usajobs  # noqa: E402
 from tailoring.applications import get_unreviewed_skip_reasons  # noqa: E402
 from llm_client import spend_cap_tripped_today  # noqa: E402
+from tailoring import fit_score_prefilter  # noqa: E402
 from tailoring.drafting import DraftingFailed, DraftingNotConfigured, score_job  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -344,7 +345,16 @@ def score_unscored_jobs(profile: dict) -> list[dict]:
     """Scores every job missing a fit_score via the direct API (mirrors the
     exact rubric tailoring.drafting.score_job already uses for manually-added
     jobs, per docs/native-packaging-scope.md Phase 1). Returns the list of
-    newly-scored job records that scored 60+, for the notification step."""
+    newly-scored job records that scored 60+, for the notification step.
+
+    Runs each job through fit_score_prefilter.should_skip_scoring() first
+    (Zahir's build-now authorization, 2026-08-11, after the day's spend cap
+    tripped at $63.86, 97% fit_score) - a free deterministic title exclusion
+    then a cheap Haiku domain-plausibility check, both ahead of the real
+    paid Opus score_job() call. A skipped job is NEVER dropped: it stays in
+    jobs.json exactly as unscored as before (identical to any job that
+    fails to score for any other reason), and every skip is logged via
+    log_prefilter_skip() for spot-check - non-negotiable per Zahir."""
     jobs = job_store.load_jobs()
     unscored = [j for j in jobs if "fit_score" not in j]
     if not unscored:
@@ -353,6 +363,11 @@ def score_unscored_jobs(profile: dict) -> list[dict]:
     _log(f"Scoring {len(unscored)} new job(s)...")
     strong_matches = []
     for job in unscored:
+        skip = fit_score_prefilter.should_skip_scoring(job, profile)
+        if skip:
+            fit_score_prefilter.log_prefilter_skip(job, skip)
+            _log(f"  [prefilter:{skip['layer']}] skipped {job.get('title')!r} at {job.get('organization')!r}: {skip['reason']}")
+            continue
         try:
             result = score_job(job, profile)
         except (DraftingNotConfigured, DraftingFailed) as exc:
