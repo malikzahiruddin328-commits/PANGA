@@ -77,6 +77,7 @@ def isolated_data(tmp_path, monkeypatch):
     import prospector.prospector_score as prospector_score
     import scan_retry_tracker
     import search.freshness_check as freshness_check
+    import tailoring.fit_score_prefilter as fit_score_prefilter
 
     monkeypatch.setattr(job_store, "JOBS_PATH", tmp_path / "jobs.json")
     monkeypatch.setattr(applications, "APPLICATIONS_PATH", tmp_path / "applications.json")
@@ -146,4 +147,9 @@ def isolated_data(tmp_path, monkeypatch):
     # check_and_mark_closed_postings() can't touch the real
     # data/jobs/freshness_check_state.json.
     monkeypatch.setattr(freshness_check, "_STATE_PATH", tmp_path / "freshness_check_state.json")
+    # fit_score_prefilter.py (2026-08-11, the pre-filter build) - same class
+    # of gap as every store above, isolated so a test exercising
+    # log_prefilter_skip() can't touch the real
+    # data/jobs/prefilter_log.json spot-check log.
+    monkeypatch.setattr(fit_score_prefilter, "PREFILTER_LOG_PATH", tmp_path / "prefilter_log.json")
     return tmp_path

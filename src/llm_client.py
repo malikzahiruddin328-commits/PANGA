@@ -525,7 +525,7 @@ def call_structured(
     schema: dict,
     max_tokens: int,
     model: str | None = None,
-    effort: str = "high",
+    effort: str | None = "high",
     thinking: bool = True,
     on_progress=None,
     refusal_message: str = "Claude declined to respond. Try again.",
@@ -568,7 +568,19 @@ def call_structured(
     updated; job_key (source, job_id) lets a later regenerate-confirmation
     prompt look up "what did the last real generation for this job cost."
     Logging failure never breaks the actual call - a cost-log write error
-    is logged and swallowed, not raised, since it isn't the caller's job."""
+    is logged and swallowed, not raised, since it isn't the caller's job.
+
+    effort=None (2026-08-11, real bug found live-validating the fit_score
+    pre-filter's Haiku domain check): claude-haiku-4-5 rejects the
+    `effort` key in output_config outright - "This model does not support
+    the effort parameter" (a real 400 from every one of 126 real domain-
+    check calls in that validation run, each one silently caught by the
+    caller's own fail-open handling, so this went completely unnoticed
+    until the debug log was actually read). effort now defaults to "high"
+    for backward compatibility with every existing Opus-only caller, but a
+    caller targeting a model that doesn't support it can pass effort=None
+    to omit the key entirely rather than guessing at a value the model
+    will accept."""
     from debug_log import setup_always_on_error_logging
 
     setup_always_on_error_logging()
@@ -577,10 +589,13 @@ def call_structured(
     primary_model = model or os.environ.get("ANTHROPIC_MODEL") or DEFAULT_MODEL
 
     def make_request(call_model):
+        output_config = {"format": {"type": "json_schema", "schema": schema}}
+        if effort is not None:
+            output_config["effort"] = effort
         kwargs = dict(
             model=call_model,
             max_tokens=max_tokens,
-            output_config={"effort": effort, "format": {"type": "json_schema", "schema": schema}},
+            output_config=output_config,
             system=system,
             messages=[{"role": "user", "content": user_content}],
         )
