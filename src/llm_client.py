@@ -60,15 +60,17 @@ _check_spend_cap() closes that gap: called at the very top of every real
 call (before any HTTP request is even prepared), it blocks NEW calls once
 today's real cost_log spend reaches the cap, but never touches a call
 already past this check - same "finish what's running, halt anything
-new" pattern as tonight's C2 design discussion. Sized from real
-production cost_log data (2026-08-11): a normal light day (2026-08-09)
-spent $2.77; the runaway fit_score batch that actually happened
-2026-08-11 crossed $10 within ~7 minutes of starting and reached $63.86
-before the day was half over. DEFAULT_DAILY_SPEND_CAP_USD=20.0 sits well
-above normal light-usage spend (no risk of blocking real interactive use)
-while cutting a runaway batch off within minutes of it starting, not
-after $60+ is already gone - override via PANGA_DAILY_SPEND_CAP_USD if
-that default proves wrong in practice. Resets at UTC midnight (matches
+new" pattern as tonight's C2 design discussion. Originally sized at $20
+from real production cost_log data (2026-08-11): a normal light day
+(2026-08-09) spent $2.77; the runaway fit_score batch that actually
+happened 2026-08-11 crossed $10 within ~7 minutes of starting and
+reached $63.86 before the day was half over - $20 was "meaningfully
+better than the $63 incident," not Zahir's actual comfort number.
+Lowered to DEFAULT_DAILY_SPEND_CAP_USD=10.0 the same day once he
+confirmed what he's really comfortable spending day to day on AI calls
+for a personal job-search tool - override via PANGA_DAILY_SPEND_CAP_USD
+if that default proves wrong in practice (e.g. temporarily raising it
+for a deliberate large batch run). Resets at UTC midnight (matches
 every cost_log timestamp's own timezone - this codebase has no local-
 timezone handling anywhere else, so introducing one here for calendar-day
 alignment would add complexity for a benefit that doesn't matter: what
@@ -105,7 +107,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "claude-opus-5"
 FALLBACK_MODEL = "claude-sonnet-5"
 
-DEFAULT_DAILY_SPEND_CAP_USD = 20.0  # see module docstring for the real-data reasoning
+DEFAULT_DAILY_SPEND_CAP_USD = 10.0  # see module docstring for the real-data reasoning
 SPEND_CAP_ERROR_TYPE = "spend_cap_exceeded"  # cost_log entries blocked by the cap use this error_type
 
 # Transient errors worth retrying/falling back on. Anything else (bad

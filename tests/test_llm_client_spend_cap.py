@@ -19,11 +19,20 @@ import pytest
 
 import llm_client
 from cost_log import load_cost_log, log_api_cost
-from llm_client import LLMSpendCapExceeded, _check_spend_cap, _todays_spend_usd, call_with_web_search
+from llm_client import DEFAULT_DAILY_SPEND_CAP_USD, LLMSpendCapExceeded, _check_spend_cap, _todays_spend_usd, call_with_web_search
 
 
 def _seed_todays_spend(amount_usd: float, purpose="fit_score"):
     log_api_cost(purpose=purpose, model="claude-opus-5", input_tokens=1000, output_tokens=1000, cost_usd=amount_usd)
+
+
+def test_default_daily_spend_cap_is_10_dollars():
+    # 2026-08-11: Zahir's real number, confirmed directly after the
+    # original $20 default (sized off "better than the $63 incident," not
+    # off his actual day-to-day comfort level) turned out to be wrong.
+    # A direct assertion so any future silent drift back to a different
+    # default gets caught, not just inferred from other tests passing.
+    assert DEFAULT_DAILY_SPEND_CAP_USD == 10.0
 
 
 def test_todays_spend_usd_sums_only_todays_entries(isolated_data):
@@ -63,7 +72,7 @@ def test_check_spend_cap_env_var_overrides_the_default(isolated_data, monkeypatc
 
 def test_check_spend_cap_ignores_a_malformed_env_var(isolated_data, monkeypatch, caplog):
     monkeypatch.setenv("PANGA_DAILY_SPEND_CAP_USD", "not-a-number")
-    _seed_todays_spend(5.0)  # well under the real default of 20.0
+    _seed_todays_spend(5.0)  # well under the real default of 10.0
     with caplog.at_level(logging.ERROR, logger="llm_client"):
         _check_spend_cap("fit_score")  # must not raise - falls back to the default
     assert any("isn't a valid number" in r.message for r in caplog.records)
