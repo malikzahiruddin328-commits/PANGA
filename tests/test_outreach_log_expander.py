@@ -71,16 +71,19 @@ def test_log_outreach_form_fields_survive_their_own_rerun(prospector_app_with_ta
     # never actually broken). Whether the expander's OWN visual state
     # also survives that same rerun is confirmed by live browser
     # verification instead - see this file's module docstring.
+    #
+    # Key carries a "_0" generation suffix (2026-08-10, PRD S16b #21) -
+    # see test_outreach_form_dedup_and_clear.py's module docstring for why.
     at = prospector_app_with_target_account
     at.session_state["active_tab"] = "prospector"
     at.session_state["ta_selected_idx"] = 0
     at.session_state["ta_Acme Corp_log_outreach_expander"] = True
     at.run(timeout=30)
 
-    name_box = next(t for t in at.text_input if t.key == "ta_Acme Corp_new_contact_name")
+    name_box = next(t for t in at.text_input if t.key == "ta_Acme Corp_new_contact_name_0")
     name_box.set_value("Jane Doe")
     at.run(timeout=30)  # the rerun the text_input's own change triggers
 
     assert not at.exception
-    name_box = next(t for t in at.text_input if t.key == "ta_Acme Corp_new_contact_name")
+    name_box = next(t for t in at.text_input if t.key == "ta_Acme Corp_new_contact_name_0")
     assert name_box.value == "Jane Doe"
