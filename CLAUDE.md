@@ -29,6 +29,21 @@
   `fit_score` turned out to be 81% of all spend, using the priciest model
   with no pre-filter or caching, never checked before being built at
   scale.)
+- **Any process that spends real money automatically needs an enforced
+  runtime circuit breaker, not just a development-time cost check.** The
+  principle above stops someone from *shipping new* expensive code
+  unchecked - it does nothing to stop an already-deployed process from
+  overspending once it's running. Any scheduled task, loop, or automated
+  pipeline that makes paid AI calls needs a real, enforced spend cap that
+  actually blocks new calls once crossed (finish what's already in
+  flight, halt anything new) - not just a comment or a documented
+  expectation. (Real incident, 2026-08-11: the daily job search scored
+  455 jobs overnight through the already-existing `fit_score` pipeline;
+  the cost-blast-radius rule above already existed by then but only
+  governs new code being written, so it did nothing to stop this. Zahir's
+  own words: "that cost-blast-radius rule did not save us from a loss or
+  spend of $60" - and "there have to be these circuit breakers in all
+  codes," not just this one incident.)
 
 Apply these checks whenever writing or reviewing code in this repo, not just
 when explicitly asked.
