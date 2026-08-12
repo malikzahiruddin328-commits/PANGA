@@ -134,6 +134,32 @@ def test_flag_if_slow_reports_real_seconds_in_the_notification(isolated_data, fa
     assert "585s" in message
 
 
+def test_flag_if_slow_reaches_the_real_subprocess_boundary(isolated_data, monkeypatch):
+    # RM caught (2026-08-11) that every other test here mocks
+    # notifications.send_notification directly, which proves _flag_if_slow
+    # CALLS it correctly but not that the real import chain and the real
+    # notifications.send_notification() implementation actually construct
+    # a real subprocess invocation - a typo in the import, a wrong function
+    # name, or a broken call inside send_notification() itself wouldn't be
+    # caught by mocking at that boundary. This patches one level deeper -
+    # notifications.subprocess.run - so the REAL send_notification() body
+    # runs, and asserts on the real PowerShell command it builds.
+    import notifications
+
+    mock_run = MagicMock(return_value=None)
+    monkeypatch.setattr(notifications.subprocess, "run", mock_run)
+
+    _flag_if_slow("draft_resume", "claude-opus-5", ("linkedin", "42"), 585_000.0)
+
+    mock_run.assert_called_once()
+    command = mock_run.call_args[0][0]
+    assert command[0] == "powershell"
+    script = command[-1]
+    assert "NotifyIcon" in script
+    assert "Slow AI call" in script
+    assert "585s" in script
+
+
 def test_flag_if_slow_swallows_its_own_failures(isolated_data, monkeypatch, caplog):
     import notifications
 
