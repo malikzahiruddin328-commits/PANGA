@@ -30,7 +30,17 @@ from pathlib import Path
 from security.file_lock import locked
 from skill_label_match import skills_match
 
-TAXONOMY_PATH = Path(__file__).resolve().parent / "canonical_skills.json"
+# Real personal data (labels/aliases are derived from the candidate's own
+# real answers - e.g. "CSAT/NPS numeric scores on consulting engagements"
+# is a real fragment of a real answer), same category as
+# profile/storage.py's master_profile.json - so it lives under data/ like
+# every other personal store, not tracked in git (2026-08-11, Zahir's
+# explicit "why would user-specific metadata go into product git" call -
+# this file was git-tracked from its initial build and had to be moved out
+# after the fact; see the same commit's history note about already-
+# committed content).
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+TAXONOMY_PATH = PROJECT_ROOT / "data" / "skills" / "canonical_skills.json"
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
@@ -45,6 +55,7 @@ def save_taxonomy(data: dict) -> None:
     """Atomic write (temp file + os.replace), same pattern as skills/
     lookup.py's save_role_skills() - never leaves a half-written file
     for a crash or a concurrent reader to see."""
+    TAXONOMY_PATH.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=TAXONOMY_PATH.parent, prefix=".canonical_skills_", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:

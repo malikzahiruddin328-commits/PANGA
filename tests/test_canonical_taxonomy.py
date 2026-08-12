@@ -85,3 +85,15 @@ def test_load_taxonomy_returns_empty_shell_when_file_does_not_exist_yet(tmp_path
 
     monkeypatch.setattr(ct, "TAXONOMY_PATH", tmp_path / "does_not_exist.json")
     assert load_taxonomy() == {"_meta": {}}
+
+
+def test_save_taxonomy_creates_the_data_directory_if_missing(tmp_path, monkeypatch):
+    import skills.canonical_taxonomy as ct
+
+    fake_path = tmp_path / "skills" / "canonical_skills.json"  # parent dir does not exist yet
+    monkeypatch.setattr(ct, "TAXONOMY_PATH", fake_path)
+    assert not fake_path.parent.exists()
+
+    save_taxonomy({"_meta": {}})
+
+    assert fake_path.exists()
