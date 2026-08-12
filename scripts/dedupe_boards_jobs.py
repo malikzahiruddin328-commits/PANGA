@@ -83,7 +83,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from search import job_store  # noqa: E402
-from search.boards import _normalize_for_hash, _stable_job_id  # noqa: E402
+from search.boards import _normalize_for_hash, _normalize_location_for_hash, _stable_job_id  # noqa: E402
 from security.crypto_store import write_json  # noqa: E402
 from security.file_lock import locked  # noqa: E402
 from tailoring import applications, dossier  # noqa: E402
@@ -96,11 +96,24 @@ def _log(message: str) -> None:
 
 
 def _group_key(job: dict) -> tuple:
+    # location uses the same _normalize_location_for_hash() _stable_job_id()
+    # itself calls (see search/boards.py), not the generic
+    # _normalize_for_hash() used for title/organization. Real bug found
+    # 2026-08-11: this used to call the generic normalizer for location too,
+    # so a Dice pair like "Charleston, South Carolina" vs "Charleston,
+    # South Carolina, USA" - which _stable_job_id() has treated as the same
+    # location (and computed the identical job_id for) ever since the F2
+    # fix landed - was never recognized as a duplicate group by THIS
+    # function, because the generic normalizer doesn't strip the ", USA"
+    # suffix or a work-mode prefix. Confirmed live: 6 real (source, job_id)
+    # pairs already sharing an identical job_id survived a full --apply run
+    # of this script for exactly this reason - the grouping and the hashing
+    # disagreed about what counts as "the same location."
     return (
         job.get("source"),
         _normalize_for_hash(job.get("title")),
         _normalize_for_hash(job.get("organization")),
-        _normalize_for_hash(job.get("location")),
+        _normalize_location_for_hash(job.get("location")),
     )
 
 

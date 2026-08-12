@@ -102,3 +102,62 @@ def test_ignores_sources_outside_the_affected_three(isolated_data):
     result = dedupe_boards_jobs.dedupe(apply=True)
     assert result["groups_merged"] == 0
     assert len(job_store.load_jobs()) == 2
+
+
+# --- Location-normalization consistency with _stable_job_id() (2026-08-11) ---
+# Real bug: this script's own grouping used to call the generic
+# _normalize_for_hash() for location, not the _normalize_location_for_hash()
+# _stable_job_id() itself uses (added for Mirror's F2 finding) - so a pair
+# _stable_job_id() already treats as identical (and gives the same job_id)
+# was never recognized as a duplicate group here. Live-confirmed: a real
+# --apply run against production data left 6 such pairs behind, already
+# sharing an identical job_id, purely because this function's grouping
+# disagreed with the hashing about what counts as "the same location."
+
+def test_groups_a_country_suffix_variant_with_the_bare_location(isolated_data):
+    job_store.save_jobs([
+        _dice_job("old-guid", title="Chief Information Officer (CIO)", organization="Summa Health System", location="Akron, Ohio"),
+        _dice_job("newer-guid", title="Chief Information Officer (CIO)", organization="Summa Health System", location="Akron, Ohio, USA"),
+    ])
+    result = dedupe_boards_jobs.dedupe(apply=True)
+    assert result["groups_merged"] == 1
+    assert result["records_removed"] == 1
+    assert len(job_store.load_jobs()) == 1
+
+
+def test_groups_a_work_mode_prefix_variant_with_the_bare_location(isolated_data):
+    job_store.save_jobs([
+        _dice_job("old-guid", title="VP, Engineering", organization="Workato", location="San Francisco, California"),
+        _dice_job("newer-guid", title="VP, Engineering", organization="Workato", location="Hybrid in San Francisco, California"),
+    ])
+    result = dedupe_boards_jobs.dedupe(apply=True)
+    assert result["groups_merged"] == 1
+    assert len(job_store.load_jobs()) == 1
+
+
+def test_does_not_merge_genuinely_different_locations(isolated_data):
+    # Sanity check the fix isn't over-broad - two real, distinct cities
+    # for the same title/org must stay separate.
+    job_store.save_jobs([
+        _dice_job("guid-akron", title="Chief Information Officer (CIO)", organization="Summa Health System", location="Akron, Ohio, USA"),
+        _dice_job("guid-dallas", title="Chief Information Officer (CIO)", organization="Summa Health System", location="Dallas, Texas, USA"),
+    ])
+    result = dedupe_boards_jobs.dedupe(apply=True)
+    assert result["groups_merged"] == 0
+    assert len(job_store.load_jobs()) == 2
+
+
+def test_merged_survivor_job_id_matches_what_stable_job_id_computes_today(isolated_data):
+    # The whole point of this fix: after merging, the survivor's job_id
+    # should be exactly what _stable_job_id() (the live save-path function)
+    # would compute for either variant - so a future scrape recognizes it
+    # as the same posting and doesn't re-add it.
+    job_store.save_jobs([
+        _dice_job("old-guid", title="Chief Information Officer (CIO)", organization="Summa Health System", location="Akron, Ohio"),
+        _dice_job("newer-guid", title="Chief Information Officer (CIO)", organization="Summa Health System", location="Akron, Ohio, USA"),
+    ])
+    dedupe_boards_jobs.dedupe(apply=True)
+    remaining = job_store.load_jobs()
+    assert len(remaining) == 1
+    expected_id = _stable_job_id("Dice", "Chief Information Officer (CIO)", "Summa Health System", "Akron, Ohio, USA")
+    assert remaining[0]["job_id"] == expected_id
