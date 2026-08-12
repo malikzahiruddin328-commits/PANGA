@@ -40,7 +40,7 @@ from notifications import send_notification  # noqa: E402
 from profile.storage import load_profile  # noqa: E402
 from search import aggregators, boards, company_sites, freshness_check, industry_boards, job_sources, job_store, source_activity, usajobs  # noqa: E402
 from tailoring.applications import get_unreviewed_skip_reasons  # noqa: E402
-from llm_client import spend_cap_tripped_today  # noqa: E402
+from llm_client import spend_cap_tripped_today, slowest_call_today  # noqa: E402
 from tailoring import fit_score_prefilter  # noqa: E402
 from tailoring.drafting import DraftingFailed, DraftingNotConfigured, score_job  # noqa: E402
 
@@ -379,7 +379,10 @@ def score_unscored_jobs(profile: dict) -> list[dict]:
     return strong_matches
 
 
-def notify(strong_matches: list[dict], unreviewed_skip_count: int, spend_cap_hit: bool = False) -> None:
+def notify(
+    strong_matches: list[dict], unreviewed_skip_count: int, spend_cap_hit: bool = False,
+    slowest_call: dict | None = None,
+) -> None:
     """spend_cap_hit (2026-08-11 fast-follow): whether llm_client's daily
     spend cap blocked any call today, in any process - checked once in
     run() via llm_client.spend_cap_tripped_today() and passed in here
@@ -394,10 +397,23 @@ def notify(strong_matches: list[dict], unreviewed_skip_count: int, spend_cap_hit
     This also means a cap-hit day with zero strong matches and zero
     unreviewed reasons now still sends a notification (previously "not
     parts: return" would have silently sent nothing at all on such a day
-    - arguably worse than the specific gap this was built to close)."""
+    - arguably worse than the specific gap this was built to close).
+
+    slowest_call (2026-08-11, systematic latency logging): the real
+    cost_log entry for today's slowest call that crossed llm_client.
+    SLOW_CALL_THRESHOLD_MS, from llm_client.slowest_call_today() - or None
+    if nothing crossed it. Every individual slow call already gets its
+    own immediate system-tray notification the moment it happens (see
+    llm_client._flag_if_slow) - this is a second, summary-level mention
+    in the batch's own daily notification, same "don't make Zahir go
+    looking" reasoning as the spend-cap line above, not a replacement for
+    the real-time one."""
     parts = []
     if spend_cap_hit:
         parts.append("Daily AI spend cap was hit today - some job scoring may have been skipped. Check the Ops tab.")
+    if slowest_call:
+        duration_s = (slowest_call.get("duration_ms") or 0) / 1000
+        parts.append(f"Slowest AI call today: {slowest_call.get('purpose', 'unspecified')} took {duration_s:.0f}s")
     if strong_matches:
         listed = ", ".join(f"{j['title']} at {j['organization']} ({j['fit_score']})" for j in strong_matches[:3])
         remainder = len(strong_matches) - 3
@@ -466,7 +482,11 @@ def run() -> None:
     spend_cap_hit = spend_cap_tripped_today()
     if spend_cap_hit:
         _log("  daily spend cap was hit today - flagging in the notification")
-    notify(strong_matches, len(unreviewed), spend_cap_hit)
+    slowest_call = slowest_call_today()
+    if slowest_call:
+        _log(f"  slowest AI call today: {slowest_call.get('purpose')} took "
+             f"{(slowest_call.get('duration_ms') or 0) / 1000:.0f}s - flagging in the notification")
+    notify(strong_matches, len(unreviewed), spend_cap_hit, slowest_call)
 
     _log("STEP 8 - Freshness check")
     checked, marked, newly_pending, reopened = freshness_check.check_and_mark_closed_postings()

@@ -86,6 +86,27 @@ This is a circuit breaker (stop the bleeding soon after crossing), not a
 hard ceiling - a precise version would need real distributed reservation
 logic this codebase has no infrastructure for elsewhere, and would be
 over-engineering for what's actually needed here.
+
+Slow-call outlier alerting (2026-08-11): Zahir hit a real 9m45s resume-
+generation call live and asked for systematic latency logging - "we
+should be logging everything and these are the things we should be
+catching," not something found by accident. Duration was already
+captured for every call (both success via _log_cost and failure via
+_log_failed_call) before this - the real gap was that nothing surfaced
+an outlier unless someone happened to open the Ops tab. _flag_if_slow()
+closes that: once a single call's real request_ms crosses
+SLOW_CALL_THRESHOLD_MS (60s, sized from real cost_log duration data - see
+the constant's own comment), it logs an ERROR-level line (always written
+to panga_debug.log, same always-on mechanism as failed-call/spend-cap
+logging) and fires an immediate system-tray notification via
+notifications.send_notification(), so a genuinely slow call is visible
+the moment it happens rather than only discoverable later. slowest_call_
+today() lets a daily batch process (scripts/run_search.py) report the
+day's slowest flagged call in its own notification too, same fast-follow
+pattern as spend_cap_tripped_today(). This is a different signal from
+ops_metrics.SLOW_LATENCY_THRESHOLD_MS (3.0s) - that one flags a PURPOSE's
+AVERAGE for the Ops tab's bar chart; this one flags a SINGLE call, in
+real time, as it happens.
 """
 
 import json
@@ -109,6 +130,19 @@ FALLBACK_MODEL = "claude-sonnet-5"
 
 DEFAULT_DAILY_SPEND_CAP_USD = 10.0  # see module docstring for the real-data reasoning
 SPEND_CAP_ERROR_TYPE = "spend_cap_exceeded"  # cost_log entries blocked by the cap use this error_type
+
+# Real-data reasoning (2026-08-11, Zahir hit a 9m45s resume-generation call
+# live and asked for systematic latency logging - "we should be logging
+# everything and these are the things we should be catching"): of 632 real
+# duration_ms entries in production cost_log at the time, p50 was ~4.4s,
+# p90 ~13.4s, p99 ~146s, max ~184s. 60s sits meaningfully above the real p90
+# tail (only ~5% of real calls exceed it) - high enough that an ordinary
+# retry-then-succeed sequence (worst case ~3 attempts x ~15s + ~3s backoff)
+# won't false-positive, low enough to actually catch a genuine outlier
+# before it reaches minutes. Distinct from ops_metrics.SLOW_LATENCY_
+# THRESHOLD_MS (3.0s) - that one flags a PURPOSE's AVERAGE for the Ops tab
+# bar chart; this one flags a SINGLE call in real time as it happens.
+SLOW_CALL_THRESHOLD_MS = 60_000.0
 
 # Transient errors worth retrying/falling back on. Anything else (bad
 # request, auth, content policy, etc.) propagates on the first attempt.
@@ -415,6 +449,35 @@ def spend_cap_tripped_today() -> bool:
     )
 
 
+def slowest_call_today() -> dict | None:
+    """The single slowest call logged today (UTC) that crossed
+    SLOW_CALL_THRESHOLD_MS, or None if nothing did - reads cost_log
+    directly, same "any process, real data" convention as spend_cap_
+    tripped_today(). Returns the real cost_log entry (has purpose/model/
+    duration_ms/success/timestamp) rather than a bool, so a caller like
+    scripts/run_search.py's daily notification can say WHAT was slow, not
+    just that something was (2026-08-11, same fast-follow pattern as the
+    spend cap's own notification integration).
+
+    Known limitation, same as _flag_if_slow's own: this only reports calls
+    that actually completed (successfully or not) - it cannot surface a
+    call that's still hung when this is checked. The real-time system-
+    tray notification in _flag_if_slow is what catches an interactive
+    slow call (like the resume-generation one Zahir hit) the moment it
+    happens; this function is for a once-daily batch summary, not a
+    replacement for that immediate signal."""
+    from cost_log import load_cost_log
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    todays_slow = [
+        e for e in load_cost_log()
+        if (e.get("timestamp") or "").startswith(today) and (e.get("duration_ms") or 0) >= SLOW_CALL_THRESHOLD_MS
+    ]
+    if not todays_slow:
+        return None
+    return max(todays_slow, key=lambda e: e.get("duration_ms") or 0)
+
+
 def _check_spend_cap(purpose: str) -> None:
     """Raises LLMSpendCapExceeded if today's real spend has already
     reached the daily cap - called at the very top of call_structured/
@@ -490,6 +553,52 @@ def _log_cost(
         )
     except Exception:
         logger.exception("Failed to log API call cost (purpose=%s) - the call itself still succeeded.", purpose)
+
+
+def _flag_if_slow(purpose: str, model: str, job_key: tuple[str, str] | None, request_ms: float | None) -> None:
+    """Real-time outlier alert for a single call (2026-08-11, Zahir hit a
+    9m45s resume-generation call live and asked for systematic latency
+    logging + a real, visible way to catch outliers - "not something we
+    find by accident"). duration_ms was already captured for every call
+    (success via _log_cost, failure via _log_failed_call) before this
+    existed - the actual gap was that nothing surfaced an outlier unless
+    someone happened to open the Ops tab and notice a slow bar. This adds
+    two things once a single call crosses SLOW_CALL_THRESHOLD_MS: an ERROR-
+    level log line (always written to panga_debug.log regardless of
+    PANGA_DEBUG, same always-on mechanism as failed-call/spend-cap logging)
+    and an immediate system-tray notification via notifications.send_
+    notification(), so a genuinely slow call is visible the moment it
+    happens - not just discoverable later by someone who goes looking.
+    Called for both successful and failed calls (a call that takes minutes
+    and THEN fails is at least as notable as one that takes minutes and
+    succeeds). Swallows its own failures same as _log_cost/_log_failed_call
+    - an alerting problem must never mask or replace the real call result
+    already in flight to the caller.
+
+    Known limitation, documented rather than silently assumed away: this
+    only fires for calls that go through call_structured/call_with_web_
+    search in the SAME process that's slow - a genuinely hung call that
+    never returns (as opposed to one that eventually returns/fails after
+    minutes) has no request_ms to check yet, so it can't be flagged until
+    it actually completes. There's no separate call-in-progress watchdog
+    here; building one would need its own timeout/cancellation design,
+    which is out of scope for this fix."""
+    if request_ms is None or request_ms < SLOW_CALL_THRESHOLD_MS:
+        return
+    try:
+        seconds = request_ms / 1000
+        logger.error(
+            "SLOW AI CALL: %.1fs (purpose=%s, model=%s, job_key=%s) - exceeded the %.0fs outlier threshold.",
+            seconds, purpose, model, job_key, SLOW_CALL_THRESHOLD_MS / 1000,
+        )
+        from notifications import send_notification
+
+        send_notification(
+            "Panga - Slow AI call",
+            f"A {purpose} call took {seconds:.0f}s (threshold {SLOW_CALL_THRESHOLD_MS / 1000:.0f}s).",
+        )
+    except Exception:
+        logger.exception("Failed to flag slow AI call (purpose=%s) - the call's own result is unaffected.", purpose)
 
 
 def _log_failed_call(exc: BaseException, purpose: str, job_key: tuple[str, str] | None) -> None:
@@ -623,6 +732,7 @@ def call_structured(
         result = _call_with_retries(make_request, primary_model, on_retry=report_retry)
     except anthropic.APIStatusError as exc:
         _log_failed_call(exc, purpose, job_key)
+        _flag_if_slow(purpose, getattr(exc, "_panga_models_tried", [primary_model])[-1], job_key, getattr(exc, "_panga_request_ms", None))
         raise LLMCallFailed(_clean_message_for_status_error(exc)) from exc
     except anthropic.APIConnectionError as exc:
         logger.error(
@@ -630,10 +740,12 @@ def call_structured(
             getattr(exc, "_panga_attempt_count", 1), getattr(exc, "_panga_models_tried", None), purpose, exc,
         )
         _log_failed_call(exc, purpose, job_key)
+        _flag_if_slow(purpose, getattr(exc, "_panga_models_tried", [primary_model])[-1], job_key, getattr(exc, "_panga_request_ms", None))
         raise LLMCallFailed("Couldn't reach the Claude API - check your internet connection.") from exc
     response, call_model = result.response, result.model
 
     _log_cost(response, call_model, purpose, job_key, duration_ms=result.request_ms)
+    _flag_if_slow(purpose, call_model, job_key, result.request_ms)
 
     if response.stop_reason == "refusal":
         logger.error("Claude refused to respond (purpose=%s): %s", purpose, refusal_message)
@@ -709,6 +821,7 @@ def call_with_web_search(
             purpose, exc.status_code, _error_type(exc), exc.request_id, exc.message,
         )
         _log_failed_call(exc, purpose, job_key)
+        _flag_if_slow(purpose, getattr(exc, "_panga_models_tried", [primary_model])[-1], job_key, getattr(exc, "_panga_request_ms", None))
         return "", 0.0
     except anthropic.APIConnectionError as exc:
         logger.error(
@@ -716,10 +829,12 @@ def call_with_web_search(
             getattr(exc, "_panga_attempt_count", 1), getattr(exc, "_panga_models_tried", None), purpose, exc,
         )
         _log_failed_call(exc, purpose, job_key)
+        _flag_if_slow(purpose, getattr(exc, "_panga_models_tried", [primary_model])[-1], job_key, getattr(exc, "_panga_request_ms", None))
         return "", 0.0
     response, call_model = result.response, result.model
 
     cost = estimate_response_cost(response, call_model)
     _log_cost(response, call_model, purpose, job_key, duration_ms=result.request_ms)
+    _flag_if_slow(purpose, call_model, job_key, result.request_ms)
     text = "".join(b.text for b in response.content if b.type == "text").strip()
     return text, cost
