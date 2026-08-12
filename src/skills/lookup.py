@@ -9,10 +9,27 @@ import re
 import tempfile
 from pathlib import Path
 
-DATA_PATH = Path(__file__).resolve().parent / "role_skills.json"
+# Real personal data - which industries/roles have been probed and what
+# skills matter for them is derived from this candidate's own real target
+# roles, same category as profile/storage.py's master_profile.json - so
+# it lives under data/ like every other personal store, not tracked in
+# git (2026-08-11, moved out after being git-tracked from initial build;
+# see canonical_taxonomy.py's TAXONOMY_PATH for the same fix applied
+# there, and the same commit's history note about already-committed
+# content).
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DATA_PATH = PROJECT_ROOT / "data" / "skills" / "role_skills.json"
 
 
 def load_role_skills() -> dict:
+    # Real consequence of moving this file under gitignored data/: unlike
+    # before (seeded via git on every checkout), a fresh checkout or a
+    # worktree with no data/ directory of its own genuinely has no file
+    # here yet. Same graceful-missing-file default as
+    # canonical_taxonomy.load_taxonomy() - an empty table (no industries
+    # known yet), not a crash.
+    if not DATA_PATH.exists():
+        return {}
     return json.loads(DATA_PATH.read_text(encoding="utf-8"))
 
 
@@ -54,6 +71,7 @@ def save_role_skills(industry: str, role: str, entries: list[dict]) -> None:
     # Atomic write (temp file + os.replace) so a crash or concurrent reader
     # never sees a half-written file - this store just got its first runtime
     # writer (Settings tab's generate_target_roles()) after being static.
+    DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=DATA_PATH.parent, prefix=".role_skills_", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:

@@ -79,6 +79,7 @@ def isolated_data(tmp_path, monkeypatch):
     import search.freshness_check as freshness_check
     import tailoring.fit_score_prefilter as fit_score_prefilter
     import skills.canonical_taxonomy as canonical_taxonomy
+    import skills.lookup as skills_lookup
 
     monkeypatch.setattr(job_store, "JOBS_PATH", tmp_path / "jobs.json")
     monkeypatch.setattr(applications, "APPLICATIONS_PATH", tmp_path / "applications.json")
@@ -164,4 +165,12 @@ def isolated_data(tmp_path, monkeypatch):
     # a test exercising save_answer()/_canonical_id_for() can't touch the
     # real src/skills/canonical_skills.json.
     monkeypatch.setattr(canonical_taxonomy, "TAXONOMY_PATH", tmp_path / "canonical_skills.json")
+    # skills/lookup.py's role_skills.json (2026-08-11, moved under data/
+    # alongside canonical_skills.json - both are real personal data, not
+    # product code) - same class of gap: this store just became genuinely
+    # mutable too (save_role_skills(), used tonight to add a real
+    # industry checklist live), isolated so a test exercising
+    # skills_for()/save_role_skills() can't touch the real
+    # data/skills/role_skills.json.
+    monkeypatch.setattr(skills_lookup, "DATA_PATH", tmp_path / "role_skills.json")
     return tmp_path
