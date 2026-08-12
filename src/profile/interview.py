@@ -165,6 +165,37 @@ def save_answer(
         save_profile(profile)
 
 
+def redirect_canonical_skill_id(old_id: str, new_id: str) -> int:
+    """Updates every gap_interview_answers entry whose canonical_skill_id
+    == old_id to new_id instead. Real, necessary step whenever two
+    canonical taxonomy entries get merged (see
+    skills.canonical_taxonomy.merge_canonical_entries()) - otherwise a
+    real answer would be left pointing at an id that no longer exists in
+    the taxonomy once the merged-away entry is removed.
+
+    Caller ordering (2026-08-11, the auto-merge build): call this BEFORE
+    merge_canonical_entries(), not after - see that function's own
+    docstring for why the order matters (a crash between the two leaves
+    the taxonomy holding both entries, which is harmless, rather than
+    ever leaving a real answer orphaned).
+
+    Locked (master_profile) for the whole read-modify-write, same as
+    save_answer(). Returns the number of entries actually redirected (0
+    is a valid, non-error result - just means nothing referenced old_id,
+    e.g. a merge between two entries neither of which has been answered
+    yet)."""
+    with locked("master_profile"):
+        profile = load_profile()
+        count = 0
+        for answer in profile.get("gap_interview_answers", []):
+            if answer.get("canonical_skill_id") == old_id:
+                answer["canonical_skill_id"] = new_id
+                count += 1
+        if count:
+            save_profile(profile)
+        return count
+
+
 if __name__ == "__main__":
     for gap in detect_gaps("Lifesciences/Pharma", "Head of IT / CIO"):
         print(f"- {gap['skill']}  ({gap['why_it_matters']})")

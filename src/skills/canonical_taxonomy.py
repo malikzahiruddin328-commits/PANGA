@@ -7,8 +7,8 @@ engagements" vs "Customer satisfaction scores on consulting engagements"
 matching can never catch it).
 
 This module is the deterministic data layer: load/save the taxonomy file
-(same atomic-write convention as skills/lookup.py's role_skills.json - a
-plain, unencrypted lookup table, not personal candidate data), and
+(same atomic-write convention as skills/lookup.py's role_skills.json -
+both real personal data now, see TAXONOMY_PATH below), and
 find_canonical_id() for matching a free-text label against it (reused
 by profile/interview.py's save_answer() and drafting.py's clarifying-
 question generation, so both sides of the "have we asked/answered this
@@ -41,6 +41,13 @@ from skill_label_match import skills_match
 # committed content).
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 TAXONOMY_PATH = PROJECT_ROOT / "data" / "skills" / "canonical_skills.json"
+
+# Append-only audit trail for auto-applied merges (2026-08-11, Zahir's
+# explicit call to let panga-taxonomy-fallback-consolidation auto-apply
+# high-confidence merges rather than wait for approval - see
+# log_taxonomy_merge() below). Real personal data (labels), same as
+# TAXONOMY_PATH itself - under data/, not tracked in git.
+MERGE_LOG_PATH = PROJECT_ROOT / "data" / "skills" / "taxonomy_merge_log.jsonl"
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
@@ -170,6 +177,103 @@ def resolve_or_create_canonical_id(label: str, category: str, aliases: list[str]
             canonical_id = add_canonical_entry(taxonomy, category, label, aliases=aliases)
             save_taxonomy(taxonomy)
         return canonical_id
+
+
+def _find_entry(taxonomy: dict, entry_id: str) -> dict | None:
+    for entries in _categories(taxonomy).values():
+        for entry in entries:
+            if entry["id"] == entry_id:
+                return entry
+    return None
+
+
+def merge_canonical_entries(survivor_id: str, merged_away_id: str) -> dict:
+    """Deterministically merges merged_away_id into survivor_id: folds
+    merged_away's canonical_label and every alias into survivor's own
+    aliases, then removes the merged_away entry from the taxonomy
+    entirely. Returns the updated taxonomy.
+
+    This is the EXECUTION half of an auto-merge (2026-08-11, Zahir's
+    explicit call for panga-taxonomy-fallback-consolidation to auto-apply
+    high-confidence merges) - the DECISION (which pair, how confident) is
+    real judgment made by the caller (an AI reasoning pass, not this
+    function); this function only does the mechanical part, the same
+    "AI decides, deterministic code executes" split every other
+    consequential action in this app already follows (is_disqualifier,
+    ats_score, etc.) - so a merge is always the same safe, tested
+    operation regardless of which run or which reasoning pass decided it.
+
+    Raises ValueError if survivor_id == merged_away_id (nothing to
+    merge), or if either id isn't actually in the taxonomy - a caller
+    passing a stale/already-merged id is a real bug worth a loud failure,
+    not a silent no-op.
+
+    Locked (canonical_taxonomy) for the whole read-modify-write, same
+    real cross-process safety as resolve_or_create_canonical_id().
+
+    IMPORTANT ordering for callers: any master_profile.json
+    gap_interview_answers referencing merged_away_id must be redirected
+    to survivor_id FIRST (see profile.interview.redirect_canonical_skill_id())
+    - BEFORE calling this function, not after. That order means a crash
+    between the two steps leaves the taxonomy still holding both entries
+    (harmless - just means the merge isn't fully applied yet) rather than
+    ever leaving a real answer pointing at an id that no longer exists
+    anywhere."""
+    if survivor_id == merged_away_id:
+        raise ValueError("survivor_id and merged_away_id must be different - nothing to merge")
+
+    with locked("canonical_taxonomy"):
+        taxonomy = load_taxonomy()
+        survivor = _find_entry(taxonomy, survivor_id)
+        merged_away = _find_entry(taxonomy, merged_away_id)
+        if survivor is None:
+            raise ValueError(f"survivor_id {survivor_id!r} not found in taxonomy")
+        if merged_away is None:
+            raise ValueError(f"merged_away_id {merged_away_id!r} not found in taxonomy")
+
+        new_aliases = set(survivor.get("aliases", []))
+        new_aliases.add(merged_away["canonical_label"])
+        new_aliases.update(merged_away.get("aliases", []))
+        new_aliases.discard(survivor["canonical_label"])
+        survivor["aliases"] = sorted(new_aliases)
+
+        for category in list(_categories(taxonomy).keys()):
+            taxonomy[category] = [e for e in taxonomy[category] if e["id"] != merged_away_id]
+
+        save_taxonomy(taxonomy)
+        return taxonomy
+
+
+def log_taxonomy_merge(
+    survivor_id: str, survivor_label: str, merged_away_id: str, merged_away_label: str,
+    reasoning: str, answers_redirected: int, timestamp: str,
+) -> None:
+    """Appends one real audit record for an auto-applied merge - every
+    auto-merge must call this (in addition to reporting to the hub), so
+    the merge is auditable after the fact even though there's no human
+    approval gate before it happens anymore. `timestamp` is the caller's
+    responsibility (real ISO8601 string) rather than computed here, same
+    reasoning as every other real-world timestamp in this codebase being
+    passed in rather than self-generated - keeps this function itself
+    trivially testable without mocking time.
+
+    A distinct lock name ("canonical_taxonomy_merge_log") from
+    "canonical_taxonomy" itself - appending a log entry for one merge
+    should never block or be blocked by a concurrent merge's own taxonomy
+    read-modify-write."""
+    MERGE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "timestamp": timestamp,
+        "survivor_id": survivor_id,
+        "survivor_label": survivor_label,
+        "merged_away_id": merged_away_id,
+        "merged_away_label": merged_away_label,
+        "reasoning": reasoning,
+        "gap_interview_answers_redirected": answers_redirected,
+    }
+    with locked("canonical_taxonomy_merge_log"):
+        with open(MERGE_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def run_locked_bulk_mutation(mutate_fn):

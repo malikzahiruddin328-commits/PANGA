@@ -3,7 +3,7 @@
 _already_answered() must catch real same-fact matches that plain
 skills_match() alone would miss."""
 
-from profile.interview import _already_answered, save_answer
+from profile.interview import _already_answered, redirect_canonical_skill_id, save_answer
 from profile.storage import load_profile
 from skills.canonical_taxonomy import load_taxonomy
 
@@ -70,3 +70,51 @@ def test_already_answered_still_uses_skills_match_for_legacy_entries_with_no_can
     _save(profile)
 
     assert _already_answered("databricks,") is True  # same case/punctuation-insensitive check as before
+
+
+def test_redirect_canonical_skill_id_updates_every_matching_answer(isolated_data):
+    save_answer(skill="CSAT/NPS numeric scores on consulting engagements", role_context="X", answer="9.2 average.", date_captured="2026-08-01")
+    old_id = load_profile()["gap_interview_answers"][0]["canonical_skill_id"]
+
+    count = redirect_canonical_skill_id(old_id, "csat_nps_scores_on_consulting_engagements")
+
+    assert count == 1
+    answers = load_profile()["gap_interview_answers"]
+    assert answers[0]["canonical_skill_id"] == "csat_nps_scores_on_consulting_engagements"
+
+
+def test_redirect_canonical_skill_id_leaves_non_matching_answers_untouched(isolated_data):
+    save_answer(skill="Databricks", role_context="X", answer="Yes.", date_captured="2026-08-01")
+    original_id = load_profile()["gap_interview_answers"][0]["canonical_skill_id"]
+
+    count = redirect_canonical_skill_id("some_other_id_never_used", "survivor_id")
+
+    assert count == 0
+    answers = load_profile()["gap_interview_answers"]
+    assert answers[0]["canonical_skill_id"] == original_id  # untouched - didn't match old_id
+
+
+def test_redirect_canonical_skill_id_updates_multiple_real_answers_sharing_the_merged_away_id(isolated_data):
+    # Real scenario a merge redirect must handle: two DIFFERENT skill
+    # labels that both happened to resolve to the same (about-to-be-
+    # merged-away) canonical id before the merge - both must move.
+    # Deliberately word-boundary-unrelated labels (unlike, say, "X" vs "X
+    # variant") so save_answer()'s own skills_match()-based update-in-place
+    # doesn't collapse them into a single answer before redirect even runs
+    # - this test is about two REAL SEPARATE answers sharing one id, not
+    # about save_answer()'s existing same-skill dedup.
+    from skills.canonical_taxonomy import add_canonical_entry, save_taxonomy
+
+    taxonomy = load_taxonomy()
+    shared_id = add_canonical_entry(taxonomy, "Uncategorized", "Old duplicate concept", aliases=["ODC legacy phrasing"])
+    save_taxonomy(taxonomy)
+
+    save_answer(skill="Old duplicate concept", role_context="X", answer="A", date_captured="2026-08-01")
+    save_answer(skill="ODC legacy phrasing", role_context="Y", answer="B", date_captured="2026-08-02")
+    assert len(load_profile()["gap_interview_answers"]) == 2  # sanity: two real separate answers, not one
+
+    count = redirect_canonical_skill_id(shared_id, "new_survivor_id")
+
+    assert count == 2
+    for a in load_profile()["gap_interview_answers"]:
+        assert a["canonical_skill_id"] == "new_survivor_id"
