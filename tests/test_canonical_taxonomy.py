@@ -3,7 +3,16 @@ layer (2026-08-11) - no AI, no live spend."""
 
 import json
 
-from skills.canonical_taxonomy import add_canonical_entry, find_canonical_id, load_taxonomy, save_taxonomy
+import pytest
+
+from skills.canonical_taxonomy import (
+    add_canonical_entry,
+    find_canonical_id,
+    load_taxonomy,
+    log_taxonomy_merge,
+    merge_canonical_entries,
+    save_taxonomy,
+)
 
 
 def _empty_taxonomy():
@@ -97,3 +106,124 @@ def test_save_taxonomy_creates_the_data_directory_if_missing(tmp_path, monkeypat
     save_taxonomy({"_meta": {}})
 
     assert fake_path.exists()
+
+
+def _taxonomy_with_two_real_entries():
+    # Real pair from tonight's actual taxonomy (2026-08-11) - genuinely the
+    # same fact worded two different ways, the exact class of duplicate
+    # this whole system exists to catch.
+    return {
+        "_meta": {},
+        "Compliance": [{
+            "id": "csat_nps_scores_on_consulting_engagements",
+            "canonical_label": "CSAT/NPS scores on consulting engagements",
+            "aliases": ["CSAT/NPS numeric scores on consulting engagements"],
+        }],
+        "Uncategorized": [{
+            "id": "customer_satisfaction_scores_on_consulting_engagements",
+            "canonical_label": "Customer satisfaction scores on consulting engagements",
+            "aliases": [],
+        }],
+    }
+
+
+def test_merge_canonical_entries_folds_label_and_aliases_into_survivor(tmp_path, monkeypatch):
+    import skills.canonical_taxonomy as ct
+
+    monkeypatch.setattr(ct, "TAXONOMY_PATH", tmp_path / "canonical_skills.json")
+    save_taxonomy(_taxonomy_with_two_real_entries())
+
+    result = merge_canonical_entries(
+        "csat_nps_scores_on_consulting_engagements",
+        "customer_satisfaction_scores_on_consulting_engagements",
+    )
+
+    survivor = next(e for e in result["Compliance"] if e["id"] == "csat_nps_scores_on_consulting_engagements")
+    assert "Customer satisfaction scores on consulting engagements" in survivor["aliases"]
+    assert "CSAT/NPS numeric scores on consulting engagements" in survivor["aliases"]  # original alias preserved
+
+
+def test_merge_canonical_entries_removes_the_merged_away_entry_entirely(tmp_path, monkeypatch):
+    import skills.canonical_taxonomy as ct
+
+    monkeypatch.setattr(ct, "TAXONOMY_PATH", tmp_path / "canonical_skills.json")
+    save_taxonomy(_taxonomy_with_two_real_entries())
+
+    merge_canonical_entries(
+        "csat_nps_scores_on_consulting_engagements",
+        "customer_satisfaction_scores_on_consulting_engagements",
+    )
+
+    reloaded = load_taxonomy()
+    all_ids = {e["id"] for entries in reloaded.values() if isinstance(entries, list) for e in entries}
+    assert "customer_satisfaction_scores_on_consulting_engagements" not in all_ids
+    assert reloaded["Uncategorized"] == []  # entry removed, category left empty rather than deleted
+
+
+def test_merge_canonical_entries_rejects_merging_an_id_into_itself(tmp_path, monkeypatch):
+    import skills.canonical_taxonomy as ct
+
+    monkeypatch.setattr(ct, "TAXONOMY_PATH", tmp_path / "canonical_skills.json")
+    save_taxonomy(_taxonomy_with_two_real_entries())
+
+    with pytest.raises(ValueError):
+        merge_canonical_entries("csat_nps_scores_on_consulting_engagements", "csat_nps_scores_on_consulting_engagements")
+
+
+def test_merge_canonical_entries_rejects_a_survivor_id_that_does_not_exist(tmp_path, monkeypatch):
+    import skills.canonical_taxonomy as ct
+
+    monkeypatch.setattr(ct, "TAXONOMY_PATH", tmp_path / "canonical_skills.json")
+    save_taxonomy(_taxonomy_with_two_real_entries())
+
+    with pytest.raises(ValueError):
+        merge_canonical_entries("does_not_exist", "customer_satisfaction_scores_on_consulting_engagements")
+
+
+def test_merge_canonical_entries_rejects_a_merged_away_id_that_does_not_exist(tmp_path, monkeypatch):
+    import skills.canonical_taxonomy as ct
+
+    monkeypatch.setattr(ct, "TAXONOMY_PATH", tmp_path / "canonical_skills.json")
+    save_taxonomy(_taxonomy_with_two_real_entries())
+
+    with pytest.raises(ValueError):
+        merge_canonical_entries("csat_nps_scores_on_consulting_engagements", "does_not_exist")
+
+
+def test_log_taxonomy_merge_appends_a_real_auditable_record(tmp_path, monkeypatch):
+    import skills.canonical_taxonomy as ct
+
+    log_path = tmp_path / "taxonomy_merge_log.jsonl"
+    monkeypatch.setattr(ct, "MERGE_LOG_PATH", log_path)
+
+    log_taxonomy_merge(
+        survivor_id="csat_nps_scores_on_consulting_engagements",
+        survivor_label="CSAT/NPS scores on consulting engagements",
+        merged_away_id="customer_satisfaction_scores_on_consulting_engagements",
+        merged_away_label="Customer satisfaction scores on consulting engagements",
+        reasoning="Same real fact - customer satisfaction score on a consulting engagement, worded two ways.",
+        answers_redirected=1,
+        timestamp="2026-08-11T22:00:00Z",
+    )
+
+    lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["survivor_id"] == "csat_nps_scores_on_consulting_engagements"
+    assert record["gap_interview_answers_redirected"] == 1
+
+
+def test_log_taxonomy_merge_appends_rather_than_overwrites_on_a_second_call(tmp_path, monkeypatch):
+    import skills.canonical_taxonomy as ct
+
+    log_path = tmp_path / "taxonomy_merge_log.jsonl"
+    monkeypatch.setattr(ct, "MERGE_LOG_PATH", log_path)
+
+    for i in range(2):
+        log_taxonomy_merge(
+            survivor_id=f"survivor_{i}", survivor_label="X", merged_away_id=f"merged_{i}", merged_away_label="Y",
+            reasoning="test", answers_redirected=0, timestamp="2026-08-11T22:00:00Z",
+        )
+
+    lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
