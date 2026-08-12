@@ -1,19 +1,21 @@
+import search.exclusion_filter as exclusion_filter
 import search.job_store as job_store
+from security.crypto_store import read_json
 
 
 def test_save_jobs_dedupes_by_source_and_job_id(isolated_data):
-    added_first = job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}])
-    added_second = job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer (repost)"}])
+    added_first = job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Director"}])
+    added_second = job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Director (repost)"}])
     assert added_first == 1
     assert added_second == 0
     jobs = job_store.load_jobs()
     assert len(jobs) == 1
     # Existing record is left untouched by the duplicate save, not updated.
-    assert jobs[0]["title"] == "Engineer"
+    assert jobs[0]["title"] == "Director"
 
 
 def test_save_jobs_stamps_date_added_on_new_records_only(isolated_data):
-    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}])
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Director"}])
     jobs = job_store.load_jobs()
     assert jobs[0]["date_added"]
 
@@ -64,7 +66,7 @@ def test_add_manual_job_blank_url_same_content_still_dedupes(isolated_data):
 
 
 def test_update_job_score_sets_fields_on_matching_job(isolated_data):
-    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}])
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Director"}])
     job_store.update_job_score("Dice", "1", 85, "Strong match")
     job = job_store.load_jobs()[0]
     assert job["fit_score"] == 85
@@ -72,7 +74,7 @@ def test_update_job_score_sets_fields_on_matching_job(isolated_data):
 
 
 def test_update_job_address_caches_empty_string_as_a_real_value(isolated_data):
-    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}])
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Director"}])
     job_store.update_job_address("Dice", "1", "")
     job = job_store.load_jobs()[0]
     # "" means "searched, not found" - distinct from the key being absent
@@ -82,7 +84,7 @@ def test_update_job_address_caches_empty_string_as_a_real_value(isolated_data):
 
 
 def test_update_job_ats_keywords_sets_both_lists_on_matching_job(isolated_data):
-    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}])
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Director"}])
     job_store.update_job_ats_keywords("Dice", "1", ["python", "sql"], ["aws"])
     job = job_store.load_jobs()[0]
     assert job["ats_required_keywords"] == ["python", "sql"]
@@ -92,7 +94,7 @@ def test_update_job_ats_keywords_sets_both_lists_on_matching_job(isolated_data):
 def test_update_job_ats_keywords_caches_empty_lists_as_a_real_value(isolated_data):
     # Empty lists mean "extracted, genuinely no such keywords" - distinct
     # from the keys being absent entirely ("never extracted").
-    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}])
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Director"}])
     job_store.update_job_ats_keywords("Dice", "1", [], [])
     job = job_store.load_jobs()[0]
     assert job["ats_required_keywords"] == []
@@ -100,7 +102,7 @@ def test_update_job_ats_keywords_caches_empty_lists_as_a_real_value(isolated_dat
 
 
 def test_update_job_ats_keywords_stamps_extractor_version_when_given(isolated_data):
-    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}])
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Director"}])
     job_store.update_job_ats_keywords("Dice", "1", ["python"], [], extractor_version=3)
     job = job_store.load_jobs()[0]
     assert job["ats_keywords_extractor_version"] == 3
@@ -110,7 +112,7 @@ def test_update_job_ats_keywords_extractor_version_stays_backward_compatible(iso
     # A caller that doesn't know about extractor_version (existing tests
     # above, any future caller) must not be forced to supply one or have
     # it default to something misleading.
-    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}])
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Director"}])
     job_store.update_job_ats_keywords("Dice", "1", ["python"], [])
     job = job_store.load_jobs()[0]
     assert "ats_keywords_extractor_version" not in job
@@ -194,3 +196,87 @@ def test_flag_freshness_check_downgraded_empty_targets_is_a_no_op(isolated_data)
     flagged = job_store.flag_freshness_check_downgraded([], reason="test")
     assert flagged == 0
     assert "freshness_check_downgraded" not in job_store.load_jobs()[0]
+
+
+# --- Search-time exclusion filter wiring (2026-08-12) -----------------------
+
+def test_save_jobs_excludes_ic_tier_job_from_the_store(isolated_data):
+    added = job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Sr. Systems Engineer"}])
+    assert added == 0
+    assert job_store.load_jobs() == []
+
+
+def test_save_jobs_excludes_clinical_job_from_the_store(isolated_data):
+    added = job_store.save_jobs([{
+        "source": "Indeed", "job_id": "1",
+        "title": "Senior Medical Director, Hematology Clinical Development",
+    }])
+    assert added == 0
+    assert job_store.load_jobs() == []
+
+
+def test_save_jobs_logs_every_excluded_job(isolated_data):
+    job_store.save_jobs([{
+        "source": "Indeed", "job_id": "1", "title": "Sr. Systems Engineer",
+        "organization": "AbbVie", "location": "Remote",
+    }])
+    entries = read_json(exclusion_filter.EXCLUSION_LOG_PATH, default=[])
+    assert len(entries) == 1
+    assert entries[0]["source"] == "Indeed"
+    assert entries[0]["job_id"] == "1"
+    assert entries[0]["title"] == "Sr. Systems Engineer"
+    assert entries[0]["organization"] == "AbbVie"
+    assert entries[0]["location"] == "Remote"
+    assert "seniority_mismatch" in entries[0]["exclusion_reason"]
+
+
+def test_save_jobs_still_saves_a_plausible_executive_job_normally(isolated_data):
+    added = job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Director, IT Service Continuity"}])
+    assert added == 1
+    jobs = job_store.load_jobs()
+    assert len(jobs) == 1
+    assert jobs[0]["title"] == "Director, IT Service Continuity"
+    assert jobs[0]["date_added"]
+
+
+def test_save_jobs_mixed_batch_keeps_only_the_plausible_ones(isolated_data):
+    added = job_store.save_jobs([
+        {"source": "Dice", "job_id": "1", "title": "Sr. Systems Engineer"},
+        {"source": "Dice", "job_id": "2", "title": "Director, IT Service Continuity"},
+        {"source": "Dice", "job_id": "3", "title": "Registered Nurse"},
+    ])
+    assert added == 1
+    jobs = job_store.load_jobs()
+    assert len(jobs) == 1
+    assert jobs[0]["job_id"] == "2"
+    entries = read_json(exclusion_filter.EXCLUSION_LOG_PATH, default=[])
+    assert {e["job_id"] for e in entries} == {"1", "3"}
+
+
+def test_save_jobs_apply_exclusion_false_bypasses_the_filter(isolated_data):
+    # Used by add_manual_job() below - Zahir's own manual paste UI and
+    # job_alert_scan.py's email-digest extraction are both explicitly
+    # exempt from search-time exclusion (see save_jobs()'s own docstring).
+    added = job_store.save_jobs(
+        [{"source": "linkedin", "job_id": "1", "title": "Sr. Systems Engineer"}],
+        apply_exclusion=False,
+    )
+    assert added == 1
+    assert len(job_store.load_jobs()) == 1
+    assert read_json(exclusion_filter.EXCLUSION_LOG_PATH, default=[]) == []
+
+
+def test_add_manual_job_is_never_excluded(isolated_data):
+    # Real regression guard: add_manual_job() feeds both Zahir's own
+    # manual-paste UI and job_alert_scan.py's email-digest intake, which has
+    # a standing, explicit "add every listing found" rule (CLAUDE.md,
+    # "Processing job-alert emails into job records") that predates and
+    # must not be broken by this filter.
+    job = job_store.add_manual_job(
+        title="Sr. Systems Engineer", organization="Acme", location="Remote",
+        description="d", posting_url="https://example.com/jobs/1",
+    )
+    jobs = job_store.load_jobs()
+    assert len(jobs) == 1
+    assert jobs[0]["job_id"] == job["job_id"]
+    assert read_json(exclusion_filter.EXCLUSION_LOG_PATH, default=[]) == []

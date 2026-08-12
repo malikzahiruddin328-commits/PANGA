@@ -80,6 +80,7 @@ def isolated_data(tmp_path, monkeypatch):
     import tailoring.fit_score_prefilter as fit_score_prefilter
     import skills.canonical_taxonomy as canonical_taxonomy
     import skills.lookup as skills_lookup
+    import search.exclusion_filter as exclusion_filter
 
     monkeypatch.setattr(job_store, "JOBS_PATH", tmp_path / "jobs.json")
     monkeypatch.setattr(applications, "APPLICATIONS_PATH", tmp_path / "applications.json")
@@ -173,4 +174,10 @@ def isolated_data(tmp_path, monkeypatch):
     # skills_for()/save_role_skills() can't touch the real
     # data/skills/role_skills.json.
     monkeypatch.setattr(skills_lookup, "DATA_PATH", tmp_path / "role_skills.json")
+    # exclusion_filter.py (2026-08-12, the search-time title-exclusion
+    # build) - same class of gap as fit_score_prefilter's PREFILTER_LOG_PATH
+    # above, isolated so a test exercising log_exclusions() (directly, or
+    # indirectly via job_store.save_jobs()) can't touch the real
+    # data/jobs/search_exclusion_log.json.
+    monkeypatch.setattr(exclusion_filter, "EXCLUSION_LOG_PATH", tmp_path / "search_exclusion_log.json")
     return tmp_path

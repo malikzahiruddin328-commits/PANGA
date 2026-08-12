@@ -4,6 +4,18 @@ wiring itself (prefiltered jobs never reach score_job, non-prefiltered
 jobs still do, every skip gets logged, the job record itself is never
 touched) - the prefilter module's own logic is covered in
 test_fit_score_prefilter.py.
+
+2026-08-12: these fixtures use "Firefighter" (not "Registered Nurse") as
+the deterministic-layer example. search.exclusion_filter now runs inside
+job_store.save_jobs() itself, earlier and cheaper than this prefilter, and
+its clinical_domain rule catches "Registered Nurse" before the job ever
+reaches the store - so a job with that title never gets this far to
+exercise fit_score_prefilter's own deterministic layer at all. "Firefighter"
+still matches fit_score_prefilter's own emergency-services exclusion
+pattern (layer="deterministic") while not tripping either of
+exclusion_filter's rules (not an IC-tier noun, not in its clinical
+pattern), so it reaches score_unscored_jobs() and stays a meaningful,
+independent test of this layer.
 """
 
 import sys
@@ -24,7 +36,7 @@ PROFILE = {"target_title_framings": [{"summary": "IT/data/cybersecurity executiv
 
 def test_prefiltered_job_never_reaches_score_job(isolated_data, monkeypatch):
     job_store.save_jobs([
-        {"source": "linkedin", "job_id": "1", "title": "Registered Nurse", "organization": "Big Health"},
+        {"source": "linkedin", "job_id": "1", "title": "Firefighter", "organization": "Big Health"},
     ])
     score_calls = []
     monkeypatch.setattr(run_search, "score_job", lambda job, profile: score_calls.append(job) or {"fit_score": 99, "fit_rationale": "x"})
@@ -38,7 +50,7 @@ def test_prefiltered_job_never_reaches_score_job(isolated_data, monkeypatch):
 
 def test_prefiltered_job_gets_logged_for_spot_check(isolated_data, monkeypatch):
     job_store.save_jobs([
-        {"source": "linkedin", "job_id": "1", "title": "Registered Nurse", "organization": "Big Health"},
+        {"source": "linkedin", "job_id": "1", "title": "Firefighter", "organization": "Big Health"},
     ])
     monkeypatch.setattr(run_search, "score_job", lambda job, profile: {"fit_score": 99, "fit_rationale": "x"})
 
@@ -67,7 +79,7 @@ def test_non_prefiltered_job_still_gets_scored_normally(isolated_data, monkeypat
 
 def test_mixed_batch_only_skips_the_prefiltered_ones(isolated_data, monkeypatch):
     job_store.save_jobs([
-        {"source": "linkedin", "job_id": "1", "title": "Registered Nurse", "organization": "Big Health"},
+        {"source": "linkedin", "job_id": "1", "title": "Firefighter", "organization": "Big Health"},
         {"source": "linkedin", "job_id": "2", "title": "VP Information Technology", "organization": "Acme"},
     ])
     scored_ids = []
