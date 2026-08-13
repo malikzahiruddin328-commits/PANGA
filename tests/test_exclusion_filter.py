@@ -118,6 +118,79 @@ def test_no_exclusion_for_a_plausible_unrelated_title():
     assert exclusion_filter.check_exclusion(_job("Chief Information Officer")) is None
 
 
+# --- Layer 3: project/program/product management track exclusion -----------
+
+@pytest.mark.parametrize("title", [
+    "Project Director",  # real title, Neil Hoosier & Associates
+    "DHS PROGRAM DIRECTOR 4 - 79704",  # real title
+    "VP of Product Management, Monetization",  # real title, Yelp
+    "Head of Product Management – Intelligence Ventures",  # real title, SPECTRUM
+    "Project Manager",
+    "Senior Project Manager",
+    "Program Manager",
+    "IT Program Manager",
+    "IT Project Manager",
+    "Director, Product Management",
+    "Director of Product Management, Hardware",
+    "Product Director",
+    "Vice President, Program Management Office",
+    "Head of Program Management Office (PMO)",
+])
+def test_pm_track_layer_excludes_pm_pgm_prodm_titles(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is not None
+    assert result["rule"] == "pm_track_mismatch"
+
+
+def test_pm_track_layer_excludes_even_when_seniority_layer_would_win_the_label():
+    # "IT PMO Consultant..." also carries "Consultant" (an IC-tier noun
+    # with no executive qualifier), so layer 1 (checked first) reports
+    # seniority_mismatch - same "which label wins the race doesn't matter,
+    # both layers agree to exclude" situation as "Clinical Scientist"
+    # above. What matters is the job is excluded either way.
+    result = exclusion_filter.check_exclusion(
+        _job("IT PMO Consultant - Project Governance & Portfolio Management")
+    )
+    assert result is not None
+    assert result["rule"] in ("seniority_mismatch", "pm_track_mismatch")
+
+
+@pytest.mark.parametrize("title", [
+    "Director, IT Service Continuity",  # real validated KEEP, AbbVie
+    "IT Director, Vendor Management",
+    "Director, Product Engineering",  # "Director" precedes "Product" - different sense
+    "Chief Information Officer (CIO)",
+    "Head of IT",
+    "VP Information Technology",
+])
+def test_pm_track_layer_does_not_catch_it_leadership_titles(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is None or result["rule"] != "pm_track_mismatch"
+
+
+# --- Layer 4: intern/internship exclusion ------------------------------------
+
+@pytest.mark.parametrize("title", [
+    "Intern - Biotechnologist (Protein)",  # real title
+    "Fall 2026 IT Intern (Incident Responder)",  # real title
+    "2027 Accounting & Finance Development Program Intern (Undergraduate)",  # real title
+    "Interested in an internship?",  # real title, junk/vague
+    "Summer IT Intern",
+])
+def test_intern_layer_excludes_intern_titles(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is not None
+    assert result["rule"] == "intern_role"
+
+
+def test_intern_layer_does_not_catch_a_role_directing_an_internship_program():
+    # Real title in the live store - this role DIRECTS an internship
+    # program, it isn't an intern position, and carries "Director" as an
+    # executive qualifier, same exemption shape as layer 1.
+    result = exclusion_filter.check_exclusion(_job("Dietitian (Dietetic Internship Director)"))
+    assert result is None or result["rule"] != "intern_role"
+
+
 # --- Logging: the non-negotiable "never silently dropped" requirement ------
 
 def test_log_exclusions_appends_full_record(isolated_data):

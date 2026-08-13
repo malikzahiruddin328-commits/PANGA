@@ -12,7 +12,7 @@ call, on jobs already sitting in the store), this runs on EVERY job coming
 out of EVERY search channel (USAJOBS, ZipRecruiter, Dice, Indeed, company
 sites, industry boards) before search.job_store.save_jobs() ever writes a
 record - so it must stay purely deterministic (no AI call, no network
-call) to be cheap enough to run at that volume. Two layers:
+call) to be cheap enough to run at that volume. Four layers:
 
 1. Seniority-tier exclusion: the candidate (Zahir) is a 25-year VP/CIO/
    Head-of-IT executive. An individual-contributor-tier noun in the title
@@ -34,6 +34,34 @@ call) to be cheap enough to run at that volume. Two layers:
    ("Director") that would otherwise keep it, so the clinical check must
    run regardless of the seniority verdict, not only when seniority
    already excluded it.
+3. Project/Program/Product management track exclusion (added 2026-08-13,
+   Zahir's explicit request): PM/PgM/ProdM is a DIFFERENT career track
+   from Zahir's IT-leadership target (CIO/CISO/Director-VP-Head of IT)
+   even at Director/VP level - "Project Director," "Program Director,"
+   "VP of Product Management" are all genuinely senior titles that would
+   otherwise SURVIVE layer 1 (which only filters IC-level titles, not
+   Director+/VP+), so this needs its own independent layer, same as
+   clinical. Scoped narrowly to the literal noun phrase (project/program/
+   product immediately followed by manager/management/director, or the
+   PMO acronym) specifically so it does NOT catch a real validated KEEP
+   like "Director, IT Service Continuity" or "IT Director, Vendor
+   Management" (neither contains "project/program/product" immediately
+   before "manager/management/director") - validated 2026-08-13 against
+   the full live job store (140 real occurrences / 113 unique titles
+   matched, incl. "Project Director," "DHS PROGRAM DIRECTOR 4 - 79704,"
+   "VP of Product Management, Monetization," "Head of Product Management
+   - Intelligence Ventures" - the exact real examples Zahir flagged from
+   the review queue).
+4. Intern/internship exclusion (added 2026-08-13): any title indicating
+   the posting itself IS an internship/entry-level intern role. Reuses
+   layer 1's _EXEC_QUALIFIER_PATTERN as an exemption, same shape as the
+   seniority layer's own IC-noun/exec-qualifier logic - a title
+   containing "internship" that ALSO carries an executive-qualifying word
+   ("Dietitian (Dietetic Internship Director)," a real title in the live
+   store) is a role that DIRECTS an internship program, not an intern
+   position, and must not be caught; plain intern postings ("Intern -
+   Biotechnologist (Protein)," "Fall 2026 IT Intern (...)") carry no such
+   qualifier and are excluded.
 
 Non-negotiable per Zahir's standing "never silently dropped" rule (the
 same one tailoring.fit_score_prefilter follows): an excluded job is never
@@ -87,6 +115,26 @@ _CLINICAL_PATTERN = re.compile(
     re.I,
 )
 
+# Layer 3: project/program/product management track exclusion. Deliberately
+# order-sensitive (project/program/product must come BEFORE
+# manager/management/director) so it does NOT catch a title where "Director"
+# precedes an unrelated "Product"/"Program" word (e.g. "Director, Product
+# Engineering" never matches - "product" isn't followed by
+# manager/management/director there), and does not touch a validated KEEP
+# like "Director, IT Service Continuity" or "IT Director, Vendor Management"
+# at all (neither contains "project"/"program"/"product" anywhere).
+_PM_TRACK_PATTERN = re.compile(
+    r"\b(?:project|program|product)\s+(?:manager|management|director)\b"
+    r"|\bpmo\b",
+    re.I,
+)
+
+# Layer 4: intern/internship exclusion. Reuses layer 1's
+# _EXEC_QUALIFIER_PATTERN as an exemption so a title that DIRECTS an
+# internship program ("Dietitian (Dietetic Internship Director)") is not
+# mistaken for an intern position itself.
+_INTERN_PATTERN = re.compile(r"\bintern\b|\binternship\b", re.I)
+
 
 def _seniority_exclude(title: str) -> str | None:
     if _IC_TIER_PATTERN.search(title) and not _EXEC_QUALIFIER_PATTERN.search(title):
@@ -101,12 +149,30 @@ def _clinical_exclude(title: str) -> str | None:
     return None
 
 
+def _pm_track_exclude(title: str) -> str | None:
+    match = _PM_TRACK_PATTERN.search(title)
+    if match:
+        return f"project/program/product management track (matched \"{match.group(0)}\")"
+    return None
+
+
+def _intern_exclude(title: str) -> str | None:
+    if _INTERN_PATTERN.search(title) and not _EXEC_QUALIFIER_PATTERN.search(title):
+        return "intern/internship-tier title with no executive-qualifying word present"
+    return None
+
+
 def check_exclusion(job: dict) -> dict | None:
     """Returns {"rule": ..., "reason": ...} if this job should never be
     persisted, or None if it should go through job_store.save_jobs()'s
-    normal path. Both layers are checked independently (not short-circuit
-    on layer 1's verdict) - see this module's own docstring on why
-    "Medical Director" needs layer 2 to fire regardless of layer 1."""
+    normal path. All four layers are independent checks (not short-
+    circuited on an earlier layer's verdict) - see this module's own
+    docstring on why "Medical Director" needs layer 2 to fire regardless
+    of layer 1. check_exclusion() returns the first rule that matches, in
+    layer order, purely for a single deterministic label per job - a title
+    can trip more than one layer (e.g. "IT PMO Consultant..." matches both
+    layer 1's IC-tier "Consultant" and layer 3's PM-track pattern) and is
+    excluded either way."""
     title = job.get("title") or ""
 
     reason = _seniority_exclude(title)
@@ -116,6 +182,14 @@ def check_exclusion(job: dict) -> dict | None:
     reason = _clinical_exclude(title)
     if reason:
         return {"rule": "clinical_domain", "reason": reason}
+
+    reason = _pm_track_exclude(title)
+    if reason:
+        return {"rule": "pm_track_mismatch", "reason": reason}
+
+    reason = _intern_exclude(title)
+    if reason:
+        return {"rule": "intern_role", "reason": reason}
 
     return None
 
