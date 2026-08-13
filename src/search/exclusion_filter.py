@@ -49,6 +49,8 @@ import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import yaml
+
 from security.crypto_store import read_json, write_json
 from security.file_lock import locked
 
@@ -56,6 +58,15 @@ logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 EXCLUSION_LOG_PATH = PROJECT_ROOT / "data" / "jobs" / "search_exclusion_log.json"
+
+# Layer 3 (2026-08-13, Settings tab "Custom title exclusions" build): the
+# user's own free-text list, stored in config/settings.yaml alongside
+# target_roles/industries/etc. (same plain-YAML store ui/app.py's
+# load_settings()/save_settings() already read/write - no new storage
+# layer for this). Read here directly rather than importing
+# ui.app.load_settings() to avoid a search -> ui import (ui already
+# imports from search; the reverse would be circular).
+SETTINGS_PATH = PROJECT_ROOT / "config" / "settings.yaml"
 
 # Layer 1: seniority-tier exclusion. \b word boundaries throughout so e.g.
 # "head" never matches inside "headquarters"/"overhead" and "chief" never
@@ -101,12 +112,56 @@ def _clinical_exclude(title: str) -> str | None:
     return None
 
 
-def check_exclusion(job: dict) -> dict | None:
+def load_custom_title_exclusions() -> list[str]:
+    """Returns the user's own free-text exclusion terms from
+    config/settings.yaml's "custom_title_exclusions" key - already
+    split/trimmed at save time (see ui/app.py's Settings tab handler), so
+    this returns them as-is. Missing file or missing key both resolve to
+    an empty list, not an error - a fresh install/an unused field is the
+    common case and must be a true no-op, not a crash or a spurious
+    exclusion.
+
+    Called once per save_jobs() batch (not once per job) by
+    job_store.save_jobs(), which passes the result into check_exclusion()
+    for every job in that batch - avoids re-reading this file once per
+    job on what can be a large multi-source search result."""
+    if not SETTINGS_PATH.exists():
+        return []
+    with open(SETTINGS_PATH, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    return data.get("custom_title_exclusions") or []
+
+
+def _custom_exclude(title: str, custom_exclusions: list[str]) -> str | None:
+    """Case-insensitive substring match, deliberately not the \\b
+    word-boundary regex the built-in layers use above: a non-technical
+    user typing a free-form fragment (e.g. "Program Director" meant to
+    catch "Senior Program Director, Clinical Ops") expects plain "contains
+    this text" behavior, not regex semantics they never opted into."""
+    title_lower = title.lower()
+    for term in custom_exclusions:
+        term_clean = (term or "").strip()
+        if term_clean and term_clean.lower() in title_lower:
+            return f"matched custom excluded term \"{term_clean}\""
+    return None
+
+
+def check_exclusion(job: dict, custom_exclusions: list[str] | None = None) -> dict | None:
     """Returns {"rule": ..., "reason": ...} if this job should never be
     persisted, or None if it should go through job_store.save_jobs()'s
-    normal path. Both layers are checked independently (not short-circuit
-    on layer 1's verdict) - see this module's own docstring on why
-    "Medical Director" needs layer 2 to fire regardless of layer 1."""
+    normal path. All three layers are checked independently (not
+    short-circuit on an earlier layer's verdict) - see this module's own
+    docstring on why "Medical Director" needs layer 2 to fire regardless
+    of layer 1; layer 3 (the user's own custom terms) is likewise checked
+    even when layers 1/2 already passed, so a custom term can catch a
+    title the built-in rules wouldn't.
+
+    custom_exclusions=None (the default) makes this call
+    load_custom_title_exclusions() itself, for any caller that doesn't
+    already have the list on hand (e.g. a one-off/test call). Real
+    per-job callers in a loop (job_store.save_jobs()) should load once and
+    pass the same list to every check_exclusion() call instead, to avoid
+    re-reading settings.yaml once per job."""
     title = job.get("title") or ""
 
     reason = _seniority_exclude(title)
@@ -116,6 +171,12 @@ def check_exclusion(job: dict) -> dict | None:
     reason = _clinical_exclude(title)
     if reason:
         return {"rule": "clinical_domain", "reason": reason}
+
+    if custom_exclusions is None:
+        custom_exclusions = load_custom_title_exclusions()
+    reason = _custom_exclude(title, custom_exclusions)
+    if reason:
+        return {"rule": "custom_user_exclusion", "reason": reason}
 
     return None
 

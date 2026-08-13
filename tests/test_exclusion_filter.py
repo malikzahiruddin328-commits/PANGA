@@ -118,6 +118,89 @@ def test_no_exclusion_for_a_plausible_unrelated_title():
     assert exclusion_filter.check_exclusion(_job("Chief Information Officer")) is None
 
 
+# --- Layer 3: custom user exclusions (2026-08-13, Settings tab build) ------
+
+def test_custom_exclusion_matches_case_insensitive_substring():
+    result = exclusion_filter.check_exclusion(
+        _job("Senior Program Director, Clinical Ops"),
+        custom_exclusions=["program director"],
+    )
+    assert result == {
+        "rule": "custom_user_exclusion",
+        "reason": 'matched custom excluded term "program director"',
+    }
+
+
+def test_custom_exclusion_is_a_free_form_substring_match_not_word_boundary():
+    # Deliberately NOT \b-bounded like the built-in layers - a non-technical
+    # user typing a fragment expects plain "contains this text", e.g. "CISO"
+    # should catch "Deputy CISO" and "intern" should catch "Internship".
+    assert exclusion_filter.check_exclusion(
+        _job("Deputy CISO"), custom_exclusions=["CISO"],
+    )["rule"] == "custom_user_exclusion"
+    assert exclusion_filter.check_exclusion(
+        _job("Summer Internship Program"), custom_exclusions=["Intern"],
+    )["rule"] == "custom_user_exclusion"
+
+
+def test_custom_exclusion_empty_list_has_no_effect():
+    assert exclusion_filter.check_exclusion(
+        _job("Director, IT Service Continuity"), custom_exclusions=[],
+    ) is None
+
+
+def test_custom_exclusion_term_matching_nothing_has_no_effect_and_no_error():
+    assert exclusion_filter.check_exclusion(
+        _job("Director, IT Service Continuity"),
+        custom_exclusions=["Underwater Basket Weaving Lead"],
+    ) is None
+
+
+def test_custom_exclusion_handles_blank_and_whitespace_only_terms_gracefully():
+    # A term list with stray empty strings (shouldn't happen given
+    # ui/app.py's save-time cleaning, but this is a public function other
+    # callers could hit directly) must not raise or match everything.
+    assert exclusion_filter.check_exclusion(
+        _job("Director, IT Service Continuity"),
+        custom_exclusions=["", "   ", "Underwater Basket Weaving Lead"],
+    ) is None
+
+
+def test_custom_exclusion_still_fires_when_built_in_layers_pass():
+    # "Program Director" alone passes both built-in layers (Director
+    # qualifies past seniority, no clinical match) - layer 3 must still be
+    # able to exclude it on its own.
+    assert exclusion_filter.check_exclusion(_job("Program Director")) is None
+    result = exclusion_filter.check_exclusion(
+        _job("Program Director"), custom_exclusions=["Program Director"],
+    )
+    assert result["rule"] == "custom_user_exclusion"
+
+
+def test_check_exclusion_defaults_to_loading_custom_exclusions_from_settings(isolated_data):
+    exclusion_filter.SETTINGS_PATH.write_text(
+        "custom_title_exclusions:\n- Program Director\n- CISO\n", encoding="utf-8",
+    )
+    result = exclusion_filter.check_exclusion(_job("Deputy CISO"))
+    assert result["rule"] == "custom_user_exclusion"
+
+
+def test_load_custom_title_exclusions_missing_file_returns_empty_list(isolated_data):
+    assert exclusion_filter.load_custom_title_exclusions() == []
+
+
+def test_load_custom_title_exclusions_missing_key_returns_empty_list(isolated_data):
+    exclusion_filter.SETTINGS_PATH.write_text("industries:\n- Pharma\n", encoding="utf-8")
+    assert exclusion_filter.load_custom_title_exclusions() == []
+
+
+def test_load_custom_title_exclusions_reads_configured_terms(isolated_data):
+    exclusion_filter.SETTINGS_PATH.write_text(
+        "custom_title_exclusions:\n- Project Manager\n- Intern\n", encoding="utf-8",
+    )
+    assert exclusion_filter.load_custom_title_exclusions() == ["Project Manager", "Intern"]
+
+
 # --- Logging: the non-negotiable "never silently dropped" requirement ------
 
 def test_log_exclusions_appends_full_record(isolated_data):
