@@ -199,26 +199,37 @@ def test_flag_freshness_check_downgraded_empty_targets_is_a_no_op(isolated_data)
 
 
 # --- Review gate (2026-08-13 basket/review build) ---
+#
+# Every save_jobs() call below also passes apply_exclusion=False (added
+# post-merge with the 2026-08-12 search-time exclusion filter, master):
+# these tests are about the review-gate/basket mechanics specifically, not
+# the exclusion filter, and bare titles like "Engineer"/"Manager" trip
+# exclusion_filter's IC-tier rule (no executive qualifier) merged in from
+# master - without this override save_jobs() would silently add 0 jobs and
+# every assertion below would IndexError on an empty store.
 
 def test_save_jobs_stamps_pending_review_status_by_default(isolated_data):
-    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}])
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}], apply_exclusion=False)
     job = job_store.load_jobs()[0]
     assert job["review_status"] == "pending"
 
 
 def test_save_jobs_review_required_false_stamps_accepted(isolated_data):
-    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}], review_required=False)
+    job_store.save_jobs(
+        [{"source": "Dice", "job_id": "1", "title": "Engineer"}],
+        apply_exclusion=False, review_required=False,
+    )
     job = job_store.load_jobs()[0]
     assert job["review_status"] == "accepted"
 
 
 def test_save_jobs_does_not_overwrite_review_status_on_existing_record(isolated_data):
-    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}])
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}], apply_exclusion=False)
     job_store.set_review_status("Dice", "1", "accepted")
     # A re-announced posting from a later search run must not silently
     # reset an already-reviewed job back to "pending" - save_jobs() only
     # ever touches genuinely new records.
-    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer (repost)"}])
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer (repost)"}], apply_exclusion=False)
     job = job_store.load_jobs()[0]
     assert job["review_status"] == "accepted"
 
@@ -232,27 +243,28 @@ def test_add_manual_job_skips_the_review_gate(isolated_data):
 
 
 def test_set_review_status_updates_matching_job(isolated_data):
-    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}])
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}], apply_exclusion=False)
     job_store.set_review_status("Dice", "1", "rejected")
     assert job_store.load_jobs()[0]["review_status"] == "rejected"
 
 
 def test_set_review_status_is_a_no_op_for_unknown_job(isolated_data):
-    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}])
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}], apply_exclusion=False)
     job_store.set_review_status("Dice", "does-not-exist", "accepted")
     assert job_store.load_jobs()[0]["review_status"] == "pending"
 
 
 # --- Basket (2026-08-13 build) ---
+# Same apply_exclusion=False note as the review-gate block above applies here.
 
 def test_add_to_basket_sets_in_basket_true(isolated_data):
-    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}])
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}], apply_exclusion=False)
     job_store.add_to_basket("Dice", "1")
     assert job_store.load_jobs()[0]["in_basket"] is True
 
 
 def test_remove_from_basket_deletes_the_key_entirely(isolated_data):
-    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}])
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}], apply_exclusion=False)
     job_store.add_to_basket("Dice", "1")
     job_store.remove_from_basket("Dice", "1")
     assert "in_basket" not in job_store.load_jobs()[0]
@@ -262,7 +274,7 @@ def test_basket_membership_persists_independently_per_job(isolated_data):
     job_store.save_jobs([
         {"source": "Dice", "job_id": "1", "title": "Engineer"},
         {"source": "Dice", "job_id": "2", "title": "Manager"},
-    ])
+    ], apply_exclusion=False)
     job_store.add_to_basket("Dice", "1")
     jobs = {j["job_id"]: j for j in job_store.load_jobs()}
     assert jobs["1"].get("in_basket") is True
@@ -270,7 +282,7 @@ def test_basket_membership_persists_independently_per_job(isolated_data):
 
 
 def test_remove_from_basket_is_a_no_op_for_job_never_added(isolated_data):
-    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}])
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Engineer"}], apply_exclusion=False)
     job_store.remove_from_basket("Dice", "1")  # should not raise
     assert "in_basket" not in job_store.load_jobs()[0]
 
