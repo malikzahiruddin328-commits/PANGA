@@ -85,6 +85,7 @@ from tailoring.interview_prep import load_interview_prep, get_interview_prep, re
 from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
 from tailoring.bulk_generate import generate_for_job, generate_for_basket
 from tailoring.discuss_and_draft import start_discussion, finish_discussion, MessageBoardUnavailable
+from tailoring.reasoner_cli import ReasonerUnavailable
 from tailoring.ats_score import detect_matched_keyword_regressions
 from tailoring.unconfirmed_claims import find_unconfirmed_markers, resolve_unconfirmed_claim
 from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed, analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_impact as _check_regenerate_impact, request_additional_gap_questions as _request_additional_gap_questions, reextract_ats_keywords_and_rescore as _reextract_ats_keywords_and_rescore, rescore_against_cached_keywords as _rescore_against_cached_keywords, gap_scan_is_current as _gap_scan_is_current, gap_scan_baseline_fingerprint as _gap_scan_baseline_fingerprint, _report_drafting_failure
@@ -448,19 +449,22 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                             if discussion_status in (None, "failed"):
                                 if st.button(
                                     "Discuss & draft", key=f"basket_item_discuss_{source}_{job_id}",
-                                    disabled=not drafting_is_configured(),
-                                    help="Posts this job's real open questions to the shared message board so you can resolve them live, for free, in a Claude Code conversation - the final draft only happens once, after you're done discussing. Not another instant paid draft.",
+                                    help="Posts this job's real open questions to the shared message board so you can resolve them live, for free, in a Claude Code conversation - generated via the subscription-covered claude CLI, not a paid API call. The final draft only happens once, after you're done discussing.",
                                 ):
                                     try:
                                         outcome = start_discussion(job, load_profile())
                                     except MessageBoardUnavailable as exc:
                                         st.toast(str(exc), icon=":material/error:")
+                                    except ReasonerUnavailable as exc:
+                                        st.toast(f"Can't generate questions right now: {exc}", icon=":material/error:")
                                     else:
                                         if outcome["posted"]:
                                             st.toast(f"{outcome['question_count']} open question(s) posted to the message board for {job_label(job)}.", icon=":material/forum:")
                                         else:
                                             st.toast(f"No open questions found for {job_label(job)} - nothing to discuss, use Generate directly.", icon=":material/check_circle:")
                                         st.rerun()
+                            elif discussion_status == "generating_questions":
+                                st.markdown(":material/hourglass_top: Generating questions...")
                             elif discussion_status == "awaiting_discussion":
                                 if st.button(
                                     "Finish draft", key=f"basket_item_finish_{source}_{job_id}",
@@ -488,7 +492,9 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                             if st.button(":material/close:", key=f"basket_item_remove_{source}_{job_id}", help="Remove from basket"):
                                 remove_from_basket(source, job_id)
                                 st.rerun()
-                        if discussion_status == "awaiting_discussion":
+                        if discussion_status == "generating_questions":
+                            st.markdown(":material/hourglass_top: Generating this job's opening questions via the subscription-covered reasoner - this can take upward of a minute.")
+                        elif discussion_status == "awaiting_discussion":
                             st.markdown(":material/forum: Awaiting your discussion - open questions are on the shared message board. Resolve them live, then click Finish draft.")
                         elif discussion_status == "failed":
                             st.markdown(f":material/error: Final draft failed after discussion: {app_record.get('discussion_error', 'unknown error')} - Discuss & draft again to retry.")

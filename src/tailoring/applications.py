@@ -392,7 +392,16 @@ def get_applications_with_open_clarifying_questions() -> list[dict]:
 # discuss_and_draft owns the actual flow, this module just tracks state on
 # the application record, same "stamp state on the record itself" pattern
 # already used for the generation lock / skip_reason_reviewed above).
-DISCUSSION_STATUSES = {"awaiting_discussion", "drafting_final", "done", "failed"}
+#
+# "generating_questions" added 2026-08-13 (fix/discuss-draft-subscription-
+# questions) when start_discussion()'s opening-question generation moved
+# off the paid API onto a subscription-covered `claude` CLI subprocess
+# call - that call can genuinely take upward of a minute on a large real
+# profile (same order of magnitude as the resume-reasoner path's own
+# 39-63s full-draft calls), so a second tab/session polling this record
+# mid-call needs to see real state, not nothing - same "not a black box"
+# requirement "drafting_final" already satisfies for finish_discussion().
+DISCUSSION_STATUSES = {"generating_questions", "awaiting_discussion", "drafting_final", "done", "failed"}
 
 
 def set_discussion_status(
