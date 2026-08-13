@@ -9,6 +9,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from search import exclusion_filter
 from security.crypto_store import read_json, write_json
 from security.file_lock import locked
 
@@ -22,7 +23,7 @@ def load_jobs() -> list[dict]:
     return read_json(JOBS_PATH, default=[])
 
 
-def save_jobs(new_jobs: list[dict]) -> int:
+def save_jobs(new_jobs: list[dict], apply_exclusion: bool = True) -> int:
     """Merges new_jobs into the store, keyed by (source, job_id). Returns the
     number of genuinely new jobs added (existing ones are left untouched).
 
@@ -30,13 +31,48 @@ def save_jobs(new_jobs: list[dict]) -> int:
     §16c - the Prospector KPI dashboard needs a discovery timestamp to
     report "jobs found this week"). Jobs saved before this date have no
     date_added and are counted in totals but not in any date-based slice -
-    there's no real discovery date to recover for them."""
+    there's no real discovery date to recover for them.
+
+    Search-time exclusion (2026-08-12, search.exclusion_filter) runs as an
+    earlier gate before the (source, job_id) dedup check below, which is
+    otherwise unchanged: a job matching a predictably-poor-fit title
+    pattern (IC-tier seniority with no executive qualifier, or a
+    clinical/medical domain role) is never written to jobs.json at all, so
+    it never reaches tailoring.fit_score's paid call. Per Zahir's
+    non-negotiable "never silently dropped" rule, every exclusion is still
+    logged to data/jobs/search_exclusion_log.json - see
+    exclusion_filter.log_exclusions() - logged AFTER the "jobs" lock is
+    released below, under its own separate lock, so this never holds two
+    locks at once.
+
+    apply_exclusion=False (used by add_manual_job() below) deliberately
+    bypasses all of the above. This module already has a standing, explicit
+    rule for one add_manual_job() caller - scripts/job_alert_scan.py's
+    email-digest extraction - that every listing found must be added, never
+    skipped for looking like the wrong industry/vertical/domain (Zahir's
+    explicit 2026-08-06 instruction; see this repo's CLAUDE.md,
+    "Processing job-alert emails into job records"): a dropped-at-intake
+    job never reaches him to evaluate at all, unlike a merely low-scored
+    one. The title-pattern exclusion this module adds is exactly that kind
+    of intake-time skip, so it must never apply to add_manual_job()'s path
+    (email-digest listings AND Zahir's own manual LinkedIn-paste UI, which
+    has the same problem for a different reason - he chose that specific
+    posting himself, so silently refusing to save it would be a confusing,
+    unexplained UI failure). It's scoped to apply only to the automated
+    search channels (USAJOBS, ZipRecruiter, Dice, Indeed, company sites,
+    industry boards) that this feature was built for."""
+    to_log: list[tuple[dict, dict]] = []
     with locked("jobs"):
         existing = load_jobs()
         seen = {(j.get("source"), j.get("job_id")) for j in existing}
 
         added = 0
         for job in new_jobs:
+            if apply_exclusion:
+                exclusion = exclusion_filter.check_exclusion(job)
+                if exclusion:
+                    to_log.append((job, exclusion))
+                    continue
             key = (job.get("source"), job.get("job_id"))
             if key in seen:
                 continue
@@ -46,7 +82,9 @@ def save_jobs(new_jobs: list[dict]) -> int:
             added += 1
 
         write_json(JOBS_PATH, existing)
-        return added
+
+    exclusion_filter.log_exclusions(to_log)
+    return added
 
 
 def add_manual_job(
@@ -101,7 +139,10 @@ def add_manual_job(
         "description": description,
         "posting_url": posting_url,
     }
-    save_jobs([job])
+    # apply_exclusion=False: see save_jobs()'s own docstring - this path
+    # (Zahir's manual paste UI AND job_alert_scan.py's email-digest
+    # extraction) is explicitly exempt from search-time exclusion.
+    save_jobs([job], apply_exclusion=False)
     return job
 
 

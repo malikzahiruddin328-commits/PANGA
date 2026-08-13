@@ -33,11 +33,20 @@ APP_PATH = "src/ui/app.py"
 def results_app(isolated_data, monkeypatch):
     monkeypatch.setenv("PANGA_TEST_MODE", "1")
 
+    # apply_exclusion=False (2026-08-12): this fixture pre-seeds jobs
+    # already sitting in the store to exercise Results-tab UI mechanics
+    # (channel expanders, the Pass dialog, badge counts) - it isn't testing
+    # search.exclusion_filter, and "Program Analyst"/"Data Engineer"/
+    # "Platform Engineer" are IC-tier titles that filter would now reject
+    # at save-time, silently emptying this fixture and breaking every test
+    # below for an unrelated reason. Same bypass add_manual_job() and
+    # job_alert_scan.py's extraction use for the same "not a search-time
+    # save" reason.
     save_jobs([
         {"source": "USAJOBS", "job_id": "u1", "title": "Program Analyst", "organization": "DoD", "location": "Remote"},
         {"source": "Indeed", "job_id": "i1", "title": "Data Engineer", "organization": "Acme Corp", "location": "Remote"},
         {"source": "Dice", "job_id": "d1", "title": "Platform Engineer", "organization": "Beta Inc", "location": "Remote"},
-    ])
+    ], apply_exclusion=False)
     update_job_score("USAJOBS", "u1", 85, "Strong match.")
     update_job_score("Indeed", "i1", 80, "Good match.")
     update_job_score("Dice", "d1", 40, "Below threshold.")
