@@ -7,7 +7,7 @@ Encrypted at rest (PRD §7) via security.crypto_store.
 import hashlib
 import re
 import shutil
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from search import exclusion_filter
@@ -19,6 +19,7 @@ LINKEDIN_JOB_ID_RE = re.compile(r"/jobs/view/(\d+)")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 JOBS_PATH = PROJECT_ROOT / "data" / "jobs" / "jobs.json"
 ARCHIVE_PATH = PROJECT_ROOT / "data" / "jobs" / "jobs-archive.json"
+ARCHIVE_DEDUP_LOG_PATH = PROJECT_ROOT / "data" / "jobs" / "archive_dedup_skip_log.json"
 
 PASSED_APPLICATION_STATUSES = {"not interested", "not-interested"}
 PROTECTED_APPLICATION_STATUSES = {"applied", "under review", "closed by employer"}
@@ -37,6 +38,54 @@ def save_jobs(new_jobs: list[dict], apply_exclusion: bool = True, review_require
     report "jobs found this week"). Jobs saved before this date have no
     date_added and are counted in totals but not in any date-based slice -
     there's no real discovery date to recover for them.
+
+    Archive dedup (2026-08-13, added alongside archive_stale_jobs() below):
+    the (source, job_id) "seen" check above only ever covered the live
+    jobs.json - a job archive_stale_jobs() moved OUT of jobs.json (a job
+    Zahir explicitly marked "not interested"/rejected, or one the scoring
+    pipeline gave a real fit_score under 60) still exists in
+    jobs-archive.json, and a still-open posting keeps surfacing in every
+    search channel's results indefinitely. Without also checking the
+    archive, that same posting would look brand-new to this function on
+    the next search run, get a fresh date_added/review_status="pending",
+    and silently re-enter Zahir's review queue with zero memory of the
+    prior verdict - including ones he explicitly rejected.
+
+    Design decision: a (source, job_id) match against the archive is
+    skipped entirely (never re-added to jobs.json at all), not re-added
+    and then immediately re-archived/re-hidden - either way the job
+    shouldn't reappear for Zahir's attention, and actually resurrecting it
+    into the live store first would be pure churn (a write, plus a second
+    archive pass to remove it again) for no visible benefit. The archive
+    holds two different kinds of "already decided" (an explicit
+    reject/not-interested pass, and a low fit_score the scoring pipeline
+    already judged) - both cash out to the same real intent Zahir stated:
+    "don't make me review something I already passed on."
+
+    Open judgment call, deliberately NOT resolved silently here: if a
+    still-live posting gets reposted with materially different content
+    (e.g. a changed pay range, a rewritten description, a different req
+    ID under the same source/job_id), skipping it forever means that
+    changed posting never gets a second look, even though the original
+    verdict may no longer apply. This function does not attempt to detect
+    "changed since archived" - doing so would need a content-hash/diff
+    comparison against the archived copy, which is a real feature, not a
+    one-line addition, and content changes were not part of this fix's
+    brief. Flagging this explicitly rather than deciding it silently: the
+    safer default (skip) is implemented now; a "detect meaningfully
+    changed content and let it back through for review" enhancement is a
+    separate, later decision if Zahir wants it.
+
+    Every skip is logged to data/jobs/archive_dedup_skip_log.json (see
+    log_archive_dedup_skips() below) - same non-negotiable "never
+    silently dropped" rule as the exclusion filter below, and the same
+    dedupe-against-already-logged shape, so a still-open archived posting
+    that resurfaces in every daily search doesn't grow that log
+    unboundedly either.
+
+    Performance: jobs-archive.json (2,652 records as of 2026-08-13 and
+    growing) is loaded ONCE per save_jobs() call, not once per job in
+    new_jobs - same pattern already used for existing/seen above.
 
     Search-time exclusion (2026-08-12, search.exclusion_filter) runs as an
     earlier gate before the (source, job_id) dedup check below, which is
@@ -85,21 +134,45 @@ def save_jobs(new_jobs: list[dict], apply_exclusion: bool = True, review_require
     of this field must treat a missing key as "accepted" (the implicit
     historical default), never as "pending", or every job ever saved
     before 2026-08-13 would silently vanish behind an unintended review
-    gate."""
-    to_log: list[tuple[dict, dict]] = []
+    gate.
+
+    apply_exclusion also gates the archive-dedup check added 2026-08-13
+    (see this docstring's "Archive dedup" section above): add_manual_job()'s
+    two callers (Zahir's own paste UI, job_alert_scan.py's email-digest
+    extraction) are both a considered, explicit choice to (re-)add a
+    specific posting, same reasoning CLAUDE.md already states for the
+    exclusion filter - silently refusing to save something Zahir just
+    pasted in himself, because it happens to match something archived
+    days or weeks ago, would be exactly the kind of confusing, unexplained
+    UI failure that section already rules out. Reusing the same flag
+    rather than adding a second one keeps "apply_exclusion=False" meaning
+    one consistent thing: this is a considered add, skip every intake-time
+    skip check, not just the title-pattern one."""
+    to_log_excluded: list[tuple[dict, dict]] = []
+    to_log_archived: list[dict] = []
     with locked("jobs"):
         existing = load_jobs()
         seen = {(j.get("source"), j.get("job_id")) for j in existing}
+        # Loaded once per save_jobs() call (not per job) - jobs-archive.json
+        # is already 2,652 records and growing, so re-reading/re-scanning it
+        # inside the loop below would be an O(n) file load per incoming job.
+        archived_keys = (
+            {(j.get("source"), j.get("job_id")) for j in load_archived_jobs()}
+            if apply_exclusion else set()
+        )
 
         added = 0
         for job in new_jobs:
             if apply_exclusion:
                 exclusion = exclusion_filter.check_exclusion(job)
                 if exclusion:
-                    to_log.append((job, exclusion))
+                    to_log_excluded.append((job, exclusion))
                     continue
             key = (job.get("source"), job.get("job_id"))
             if key in seen:
+                continue
+            if apply_exclusion and key in archived_keys:
+                to_log_archived.append(job)
                 continue
             job.setdefault("date_added", datetime.now(timezone.utc).isoformat())
             job.setdefault("review_status", "pending" if review_required else "accepted")
@@ -109,8 +182,84 @@ def save_jobs(new_jobs: list[dict], apply_exclusion: bool = True, review_require
 
         write_json(JOBS_PATH, existing)
 
-    exclusion_filter.log_exclusions(to_log)
+    exclusion_filter.log_exclusions(to_log_excluded)
+    log_archive_dedup_skips(to_log_archived)
     return added
+
+
+def _archive_dedup_log_entry(job: dict) -> dict:
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "source": job.get("source"),
+        "job_id": job.get("job_id"),
+        "title": job.get("title"),
+        "organization": job.get("organization"),
+        "location": job.get("location"),
+        "skip_reason": "matched an archived (source, job_id) - previously reviewed/scored and moved out of "
+                        "the live store, not re-added or re-surfaced for review",
+    }
+
+
+def log_archive_dedup_skips(jobs: list[dict]) -> None:
+    """Batch-appends a real, inspectable record of every job save_jobs()
+    silently declined to re-add because it matched something already in
+    jobs-archive.json - same "never silently dropped" rule and log shape as
+    exclusion_filter.log_exclusions() above, just for a different reason
+    (already-archived, not a title-pattern exclusion at intake).
+
+    A no-op on an empty list, same as log_exclusions() (avoids an
+    unnecessary locked read/write on every save_jobs() call that skips
+    nothing - the common case, since most search results aren't archived).
+
+    De-dupes against records already logged for the same (source, job_id) -
+    same reasoning as log_exclusions(): a still-open archived posting keeps
+    surfacing in every search channel's results for as long as it stays
+    live, so without this the log would grow by one duplicate entry per
+    skipped job per search run, forever - the unbounded-growth pattern
+    CLAUDE.md's performance principle warns against."""
+    if not jobs:
+        return
+    with locked("archive_dedup_skip_log"):
+        existing = read_json(ARCHIVE_DEDUP_LOG_PATH, default=[])
+        seen = {(e.get("source"), e.get("job_id")) for e in existing}
+        changed = False
+        for job in jobs:
+            key = (job.get("source"), job.get("job_id"))
+            if key in seen:
+                continue
+            existing.append(_archive_dedup_log_entry(job))
+            seen.add(key)
+            changed = True
+        if changed:
+            write_json(ARCHIVE_DEDUP_LOG_PATH, existing)
+
+
+def list_archive_dedup_skips(days_back: int | None = 30) -> list[dict]:
+    """Read-only query over the archive-dedup skip log, same shape/defaults
+    as exclusion_filter.list_exclusions() - days_back=30 is the default
+    "don't show stale noise" view, days_back=None returns full history.
+    Malformed/missing timestamps are treated as outside the window rather
+    than raising or being silently included, same conservative default as
+    list_exclusions()."""
+    entries = read_json(ARCHIVE_DEDUP_LOG_PATH, default=[])
+    if days_back is None:
+        return entries
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
+    result = []
+    for entry in entries:
+        timestamp = entry.get("timestamp")
+        if not timestamp:
+            continue
+        try:
+            logged_at = datetime.fromisoformat(timestamp)
+        except ValueError:
+            continue
+        if logged_at.tzinfo is None:
+            logged_at = logged_at.replace(tzinfo=timezone.utc)
+        if logged_at >= cutoff:
+            result.append(entry)
+    return result
 
 
 def add_manual_job(

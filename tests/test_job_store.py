@@ -1,7 +1,7 @@
 import search.exclusion_filter as exclusion_filter
 import search.job_store as job_store
 import tailoring.applications as applications
-from security.crypto_store import read_json
+from security.crypto_store import read_json, write_json
 
 
 def test_save_jobs_dedupes_by_source_and_job_id(isolated_data):
@@ -477,3 +477,113 @@ def test_archive_stale_jobs_never_deletes_appends_to_archive_across_runs(isolate
 
     archived = job_store.load_archived_jobs()
     assert {j["job_id"] for j in archived} == {"1", "2"}
+
+
+# --- Archive dedup (2026-08-13, save_jobs() checking jobs-archive.json too) -
+
+def test_save_jobs_skips_job_matching_archived_source_and_job_id(isolated_data):
+    write_json(job_store.ARCHIVE_PATH, [
+        {"source": "Dice", "job_id": "1", "title": "Rejected Long Ago", "review_status": "rejected"},
+    ])
+    added = job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Rejected Long Ago (repost)"}])
+    assert added == 0
+    # Never resurrected into the live store at all - not added-then-hidden.
+    assert job_store.load_jobs() == []
+
+
+def test_save_jobs_still_adds_a_genuinely_new_job_alongside_an_archived_one(isolated_data):
+    write_json(job_store.ARCHIVE_PATH, [
+        {"source": "Dice", "job_id": "1", "title": "Archived One"},
+    ])
+    added = job_store.save_jobs([
+        {"source": "Dice", "job_id": "1", "title": "Archived One (repost)"},
+        {"source": "Dice", "job_id": "2", "title": "Director, Genuinely New"},
+    ])
+    assert added == 1
+    jobs = job_store.load_jobs()
+    assert len(jobs) == 1
+    assert jobs[0]["job_id"] == "2"
+
+
+def test_save_jobs_logs_archive_dedup_skip(isolated_data):
+    write_json(job_store.ARCHIVE_PATH, [
+        {"source": "Indeed", "job_id": "99", "title": "Director of IT", "organization": "AbbVie", "location": "Remote"},
+    ])
+    job_store.save_jobs([{
+        "source": "Indeed", "job_id": "99", "title": "Director of IT",
+        "organization": "AbbVie", "location": "Remote",
+    }])
+    entries = read_json(job_store.ARCHIVE_DEDUP_LOG_PATH, default=[])
+    assert len(entries) == 1
+    assert entries[0]["source"] == "Indeed"
+    assert entries[0]["job_id"] == "99"
+    assert entries[0]["title"] == "Director of IT"
+    assert "skip_reason" in entries[0] and entries[0]["skip_reason"]
+
+
+def test_save_jobs_archive_dedup_skip_log_does_not_grow_unboundedly_across_runs(isolated_data):
+    # Same reasoning as exclusion_filter.log_exclusions()'s own test: a
+    # still-open archived posting keeps surfacing in every search run, so
+    # the log must de-dupe against what's already logged, not grow by one
+    # entry per run forever.
+    write_json(job_store.ARCHIVE_PATH, [{"source": "Dice", "job_id": "1", "title": "Archived"}])
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Archived"}])
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Archived"}])
+    entries = read_json(job_store.ARCHIVE_DEDUP_LOG_PATH, default=[])
+    assert len(entries) == 1
+
+
+def test_save_jobs_no_archive_skip_log_written_when_nothing_matches(isolated_data):
+    write_json(job_store.ARCHIVE_PATH, [{"source": "Dice", "job_id": "999", "title": "Unrelated"}])
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Director, Genuinely New"}])
+    assert read_json(job_store.ARCHIVE_DEDUP_LOG_PATH, default=[]) == []
+
+
+def test_save_jobs_apply_exclusion_false_bypasses_archive_dedup_too(isolated_data):
+    # add_manual_job() below relies on this: Zahir's own manual paste UI
+    # (and job_alert_scan.py's email-digest extraction) must be able to
+    # re-add a specific posting even if it matches something archived -
+    # same reasoning as the exclusion-filter bypass, a considered explicit
+    # add should never be silently refused.
+    write_json(job_store.ARCHIVE_PATH, [{"source": "linkedin", "job_id": "1", "title": "Archived"}])
+    added = job_store.save_jobs(
+        [{"source": "linkedin", "job_id": "1", "title": "Archived (Zahir re-adding on purpose)"}],
+        apply_exclusion=False,
+    )
+    assert added == 1
+    assert len(job_store.load_jobs()) == 1
+    assert read_json(job_store.ARCHIVE_DEDUP_LOG_PATH, default=[]) == []
+
+
+def test_add_manual_job_can_re_add_a_job_that_matches_the_archive(isolated_data):
+    write_json(job_store.ARCHIVE_PATH, [{"source": "linkedin", "job_id": "4123456789", "title": "Old"}])
+    job = job_store.add_manual_job(
+        title="Head of IT", organization="Aerospike", location="Remote",
+        description="Reconsidering this one.", posting_url="https://www.linkedin.com/jobs/view/4123456789/",
+    )
+    assert job["job_id"] == "4123456789"
+    assert len(job_store.load_jobs()) == 1
+
+
+def test_save_jobs_loads_archive_once_per_batch_not_once_per_job(isolated_data, monkeypatch):
+    # Performance sanity check (CLAUDE.md's perf-review rule, and this
+    # fix's own brief): jobs-archive.json is 2,652+ real records and
+    # growing - loading/scanning it once per incoming job in a batch would
+    # be an O(n) file load per job instead of one load for the whole call.
+    write_json(job_store.ARCHIVE_PATH, [{"source": "Dice", "job_id": "999", "title": "Archived"}])
+    call_count = {"n": 0}
+    real_load_archived_jobs = job_store.load_archived_jobs
+
+    def counting_load_archived_jobs():
+        call_count["n"] += 1
+        return real_load_archived_jobs()
+
+    monkeypatch.setattr(job_store, "load_archived_jobs", counting_load_archived_jobs)
+
+    job_store.save_jobs([
+        {"source": "Dice", "job_id": "1", "title": "Director One"},
+        {"source": "Dice", "job_id": "2", "title": "Director Two"},
+        {"source": "Dice", "job_id": "3", "title": "Director Three"},
+        {"source": "Dice", "job_id": "999", "title": "Archived (repost)"},
+    ])
+    assert call_count["n"] == 1

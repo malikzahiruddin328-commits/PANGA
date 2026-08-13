@@ -84,6 +84,12 @@ def isolated_data(tmp_path, monkeypatch):
 
     monkeypatch.setattr(job_store, "JOBS_PATH", tmp_path / "jobs.json")
     monkeypatch.setattr(job_store, "ARCHIVE_PATH", tmp_path / "jobs-archive.json")
+    # Archive-dedup skip log (2026-08-13, save_jobs()'s archive-check fix) -
+    # same class of gap as EXCLUSION_LOG_PATH below, isolated so a test
+    # exercising log_archive_dedup_skips()/list_archive_dedup_skips()
+    # (directly, or indirectly via job_store.save_jobs()) can't touch the
+    # real data/jobs/archive_dedup_skip_log.json.
+    monkeypatch.setattr(job_store, "ARCHIVE_DEDUP_LOG_PATH", tmp_path / "archive_dedup_skip_log.json")
     monkeypatch.setattr(applications, "APPLICATIONS_PATH", tmp_path / "applications.json")
     monkeypatch.setattr(target_accounts, "TARGET_ACCOUNTS_PATH", tmp_path / "target_accounts.json")
     monkeypatch.setattr(target_accounts, "WEBSITE_LOOKUP_COST_PATH", tmp_path / "website_lookup_cost.json")
