@@ -62,6 +62,35 @@ call) to be cheap enough to run at that volume. Four layers:
    position, and must not be caught; plain intern postings ("Intern -
    Biotechnologist (Protein)," "Fall 2026 IT Intern (...)") carry no such
    qualifier and are excluded.
+5. Information-security-domain exclusion (added 2026-08-13, Zahir's
+   explicit request after manually rejecting "VP, Information Security
+   and Compliance" (Veritone Corp) and "Director of Information Security
+   (Hybrid)" (SAGE Dining Services) from the live review queue and saying
+   "add that to the filter as well"). Security-domain-focused titles
+   ("Director of Information Security," "VP, Information Security,"
+   "Information Security Manager/Analyst/Specialist," and the "InfoSec"
+   abbreviation - a real live-store variant, e.g. "IT Spec (Infosec),
+   GS-2210-14") are a different domain focus from Zahir's IT-leadership
+   target even at Director/VP level, same reasoning as layer 3's PM-track
+   carve-out. This is deliberately narrower than "title contains
+   information or security" - it only matches the literal "information
+   security"/"infosec" domain phrase, so it never touches an unrelated
+   title like "Director, IT Service Continuity." It also has its own
+   exemption, separate from layer 1/4's _EXEC_QUALIFIER_PATTERN: a title
+   is a CIO/CISO chief-executive title, not a security-domain-focus
+   title, when it's the literal "Chief Information Security Officer"
+   phrase or the bare "CISO" abbreviation (both real, validated-KEEP
+   titles in the live store, e.g. "SVP, Chief Information Security
+   Officer," "VP/CISO, Information Security") - Zahir's real target-role
+   set (`data/profile/structured/master_profile.json`) confirms CIO
+   titles as a genuine target ("Chief Information Officer (CIO) at
+   National Endowment for the Humanities" is discussed as a real role of
+   interest), which this layer never touches anyway since "Chief
+   Information Officer" contains no "security" substring at all. A plain
+   "Director of Information Security" or "VP of Information Security"
+   carries neither "Chief Information Security Officer" nor "CISO" and is
+   excluded, same as a "Service Information Security Officer (SISO)" -
+   a domain security-officer title, not a chief-executive one.
 
 Non-negotiable per Zahir's standing "never silently dropped" rule (the
 same one tailoring.fit_score_prefilter follows): an excluded job is never
@@ -135,6 +164,20 @@ _PM_TRACK_PATTERN = re.compile(
 # mistaken for an intern position itself.
 _INTERN_PATTERN = re.compile(r"\bintern\b|\binternship\b", re.I)
 
+# Layer 5: information-security-domain exclusion. Scoped to the literal
+# "information security" domain phrase (plus the real "infosec" live-store
+# variant) - deliberately NOT just "information" or "security" individually,
+# so it never touches an unrelated title. Has its own exemption pattern
+# (not layer 1/4's _EXEC_QUALIFIER_PATTERN, since a bare "Director"/"VP"
+# qualifier is NOT enough here - "VP of Information Security" still
+# excludes) for the literal CISO chief-executive title/abbreviation, which
+# is a different thing (a chief-executive title in the security domain)
+# from a security-domain-focus title.
+_INFO_SECURITY_PATTERN = re.compile(r"\binformation security\b|\binfosec\b", re.I)
+_CISO_EXEMPT_PATTERN = re.compile(
+    r"\bchief information security officer\b|\bciso\b", re.I
+)
+
 
 def _seniority_exclude(title: str) -> str | None:
     if _IC_TIER_PATTERN.search(title) and not _EXEC_QUALIFIER_PATTERN.search(title):
@@ -162,10 +205,20 @@ def _intern_exclude(title: str) -> str | None:
     return None
 
 
+def _information_security_exclude(title: str) -> str | None:
+    if _INFO_SECURITY_PATTERN.search(title) and not _CISO_EXEMPT_PATTERN.search(title):
+        return (
+            "information security domain role (title contains "
+            '"information security"/"infosec" without a CISO chief-executive '
+            "title/abbreviation present)"
+        )
+    return None
+
+
 def check_exclusion(job: dict) -> dict | None:
     """Returns {"rule": ..., "reason": ...} if this job should never be
     persisted, or None if it should go through job_store.save_jobs()'s
-    normal path. All four layers are independent checks (not short-
+    normal path. All five layers are independent checks (not short-
     circuited on an earlier layer's verdict) - see this module's own
     docstring on why "Medical Director" needs layer 2 to fire regardless
     of layer 1. check_exclusion() returns the first rule that matches, in
@@ -190,6 +243,10 @@ def check_exclusion(job: dict) -> dict | None:
     reason = _intern_exclude(title)
     if reason:
         return {"rule": "intern_role", "reason": reason}
+
+    reason = _information_security_exclude(title)
+    if reason:
+        return {"rule": "information_security_domain", "reason": reason}
 
     return None
 

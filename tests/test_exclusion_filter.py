@@ -191,6 +191,70 @@ def test_intern_layer_does_not_catch_a_role_directing_an_internship_program():
     assert result is None or result["rule"] != "intern_role"
 
 
+# --- Layer 5: information-security-domain exclusion -------------------------
+
+@pytest.mark.parametrize("title", [
+    "VP, Information Security and Compliance",  # real title, Veritone Corp
+    "Director of Information Security (Hybrid)",  # real title, SAGE Dining Services
+    "Information Security Manager",
+    "VP of Information Security",
+    "Vice President, Information Security",
+    "Director, IT, Information Security & Data Privacy",
+    "Service Information Security Officer (SISO)",  # real title - domain officer, not chief-executive
+])
+def test_information_security_layer_excludes_domain_titles(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is not None
+    assert result["rule"] == "information_security_domain"
+
+
+@pytest.mark.parametrize("title", [
+    # "Analyst"/"Specialist" are also layer 1 IC-tier nouns with no
+    # executive qualifier - same "which label wins the race doesn't matter,
+    # both layers agree to exclude" situation as "Clinical Scientist" above.
+    "Information Security Analyst",
+    "Information Security Specialist",
+    "IT Spec (Infosec), GS-2210-14, FPL 14 (DH) (Open-Continuous)",  # real title, "infosec" variant
+])
+def test_information_security_layer_excludes_even_when_another_layer_would_win_the_label(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is not None
+    assert result["rule"] in ("seniority_mismatch", "information_security_domain")
+
+
+@pytest.mark.parametrize("title", [
+    "Chief Information Officer (CIO)",
+    "Chief Information Officer",
+    "Chief Information Security Officer",  # real title - CISO chief-executive title, must survive
+    "Chief Information Security Officer, NB-2210-VIII",  # real title
+    "Group Chief Information Security Officer",  # real title
+    "SVP, Chief Information Security Officer",  # real title
+    "VP, Infrastructure & Chief Information Security Officer",  # real title
+    "Chief Information Security Officer (CISO) - AI Trainer",  # real title
+    "VP/CISO, Information Security",  # real title - bare CISO abbreviation exempts it
+])
+def test_information_security_layer_does_not_catch_cio_or_ciso_titles(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is None or result["rule"] != "information_security_domain"
+
+
+def test_information_security_layer_does_not_match_unrelated_titles():
+    # Neither "information" nor "security" alone should trip this layer -
+    # it's scoped to the literal "information security" domain phrase.
+    assert exclusion_filter.check_exclusion(_job("Director, IT Service Continuity")) is None
+    assert exclusion_filter.check_exclusion(_job("VP Information Technology")) is None
+    assert exclusion_filter.check_exclusion(_job("Director of Security Operations")) is None
+
+
+def test_information_security_layer_fires_even_when_seniority_would_have_kept_it():
+    # "Director of Information Security" carries "Director", which would
+    # satisfy the seniority layer's exec-qualifier check on its own - layer
+    # 5 must still exclude it independently, same shape as layer 2's
+    # "Medical Director" regression guard.
+    result = exclusion_filter.check_exclusion(_job("Director of Information Security (Hybrid)"))
+    assert result["rule"] == "information_security_domain"
+
+
 # --- Logging: the non-negotiable "never silently dropped" requirement ------
 
 def test_log_exclusions_appends_full_record(isolated_data):
