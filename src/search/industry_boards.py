@@ -79,17 +79,34 @@ def fetch_planet_pharma_jobs(limit: int = 25) -> list[dict]:
     return jobs
 
 
-def fetch_biospace_jobs(limit: int = 25) -> list[dict]:
+def fetch_biospace_jobs(limit: int = 25, keywords: str = "information technology") -> list[dict]:
     """Real job board (not a staffing firm) - each listing's "recruiter" meta
     field is the actual hiring company, unlike the staffing-firm sources
     below. Clean ?countrycode=US&Page=N pagination confirmed 2026-07-29, so
-    this pages through as needed instead of a single fetch like Planet Pharma."""
+    this pages through as needed instead of a single fetch like Planet Pharma.
+
+    keywords (added 2026-08-12): the unfiltered default listing is almost
+    pure noise for this project's IT/executive focus - real batch checked
+    2026-08-12 found ~46% of a real search's total volume came from this
+    one source, with only ~2 of 25 sampled records plausibly IT-relevant.
+    Confirmed live the same day that jobs.biospace.com/searchjobs/ accepts
+    a real server-side `Keywords` query param (same lister__item HTML, but
+    the actual result set changes - unfiltered top results were generic
+    "Medical Representative"/"Associate Director, Government Pricing"
+    roles, "information technology" narrowed to results like "Sr
+    Information Technology Operations Analyst"/"Information Technology
+    Program Manager"), not a param the site silently ignores. Default value
+    keeps existing callers working unchanged; pass keywords="" to restore
+    the old unfiltered behavior if ever needed."""
     jobs = []
     page = 1
     while len(jobs) < limit:
+        params = {"countrycode": "US", "Page": page}
+        if keywords:
+            params["Keywords"] = keywords
         response = requests.get(
             "https://jobs.biospace.com/searchjobs/",
-            params={"countrycode": "US", "Page": page},
+            params=params,
             headers=HEADERS,
             timeout=20,
         )

@@ -223,7 +223,13 @@ def test_search_ats_boards_records_greenhouse_and_lever_companies_independently(
         "greenhouse": [{"company_name": "Stripe", "board_token": "stripe", "limit": 10}],
         "lever": [{"company_name": "Palantir", "company_slug": "palantir", "limit": 10}],
     })
-    monkeypatch.setattr(company_sites, "search_greenhouse_jobs", lambda company_name, board_token, limit: [{"source": "Stripe", "job_id": "1", "title": "Engineer"}])
+    # "Senior Director of Engineering" (not a bare "Engineer") so this fixture
+    # doesn't incidentally trip search.exclusion_filter's seniority_mismatch
+    # rule - this test is about source_activity tracking for Greenhouse/Lever
+    # boards, not exclusion-filter behavior, and a bare "Engineer" title would
+    # now get caught by check_exclusion() inside job_store.save_jobs() before
+    # ever incrementing the "added" count this test asserts on (2026-08-12).
+    monkeypatch.setattr(company_sites, "search_greenhouse_jobs", lambda company_name, board_token, limit: [{"source": "Stripe", "job_id": "1", "title": "Senior Director of Engineering"}])
     monkeypatch.setattr(company_sites, "search_lever_jobs", lambda company_name, company_slug, limit: [])
 
     run_search.search_ats_boards()

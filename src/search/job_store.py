@@ -9,6 +9,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from search import exclusion_filter
 from security.crypto_store import read_json, write_json
 from security.file_lock import locked
 
@@ -22,7 +23,7 @@ def load_jobs() -> list[dict]:
     return read_json(JOBS_PATH, default=[])
 
 
-def save_jobs(new_jobs: list[dict], review_required: bool = True) -> int:
+def save_jobs(new_jobs: list[dict], apply_exclusion: bool = True, review_required: bool = True) -> int:
     """Merges new_jobs into the store, keyed by (source, job_id). Returns the
     number of genuinely new jobs added (existing ones are left untouched).
 
@@ -32,6 +33,35 @@ def save_jobs(new_jobs: list[dict], review_required: bool = True) -> int:
     date_added and are counted in totals but not in any date-based slice -
     there's no real discovery date to recover for them.
 
+    Search-time exclusion (2026-08-12, search.exclusion_filter) runs as an
+    earlier gate before the (source, job_id) dedup check below, which is
+    otherwise unchanged: a job matching a predictably-poor-fit title
+    pattern (IC-tier seniority with no executive qualifier, or a
+    clinical/medical domain role) is never written to jobs.json at all, so
+    it never reaches tailoring.fit_score's paid call. Per Zahir's
+    non-negotiable "never silently dropped" rule, every exclusion is still
+    logged to data/jobs/search_exclusion_log.json - see
+    exclusion_filter.log_exclusions() - logged AFTER the "jobs" lock is
+    released below, under its own separate lock, so this never holds two
+    locks at once.
+
+    apply_exclusion=False (used by add_manual_job() below) deliberately
+    bypasses all of the above. This module already has a standing, explicit
+    rule for one add_manual_job() caller - scripts/job_alert_scan.py's
+    email-digest extraction - that every listing found must be added, never
+    skipped for looking like the wrong industry/vertical/domain (Zahir's
+    explicit 2026-08-06 instruction; see this repo's CLAUDE.md,
+    "Processing job-alert emails into job records"): a dropped-at-intake
+    job never reaches him to evaluate at all, unlike a merely low-scored
+    one. The title-pattern exclusion this module adds is exactly that kind
+    of intake-time skip, so it must never apply to add_manual_job()'s path
+    (email-digest listings AND Zahir's own manual LinkedIn-paste UI, which
+    has the same problem for a different reason - he chose that specific
+    posting himself, so silently refusing to save it would be a confusing,
+    unexplained UI failure). It's scoped to apply only to the automated
+    search channels (USAJOBS, ZipRecruiter, Dice, Indeed, company sites,
+    industry boards) that this feature was built for.
+
     review_required (2026-08-13, basket/review-gate build): stamps
     review_status="pending" on genuinely new records when True (the
     default - every source connector, USAJOBS/Dice/company-sites/etc.,
@@ -40,21 +70,29 @@ def save_jobs(new_jobs: list[dict], review_required: bool = True) -> int:
     tab's review UI - see ui/app.py's "Review new search result(s)"
     section and scripts/run_search.py's score_unscored_jobs(), both of
     which only score review_status == "accepted" jobs).
-    add_manual_job() below passes review_required=False and stamps
-    "accepted" instead - a job Zahir pastes in himself is already a
-    considered choice, not a broad-net search hit, so gating it behind a
-    second manual accept click would be pure friction with no real
-    review value. A job saved before this field existed has no
-    review_status at all - every reader of this field must treat a
-    missing key as "accepted" (the implicit historical default), never as
-    "pending", or every job ever saved before 2026-08-13 would silently
-    vanish behind an unintended review gate."""
+    add_manual_job() below passes both apply_exclusion=False and
+    review_required=False - a job Zahir pastes in himself (or
+    job_alert_scan.py extracts) is already a considered choice, not a
+    broad-net search hit, so gating it behind a second manual accept
+    click would be pure friction with no real review value, on top of
+    it already being exempt from the exclusion filter above. A job saved
+    before this field existed has no review_status at all - every reader
+    of this field must treat a missing key as "accepted" (the implicit
+    historical default), never as "pending", or every job ever saved
+    before 2026-08-13 would silently vanish behind an unintended review
+    gate."""
+    to_log: list[tuple[dict, dict]] = []
     with locked("jobs"):
         existing = load_jobs()
         seen = {(j.get("source"), j.get("job_id")) for j in existing}
 
         added = 0
         for job in new_jobs:
+            if apply_exclusion:
+                exclusion = exclusion_filter.check_exclusion(job)
+                if exclusion:
+                    to_log.append((job, exclusion))
+                    continue
             key = (job.get("source"), job.get("job_id"))
             if key in seen:
                 continue
@@ -65,7 +103,9 @@ def save_jobs(new_jobs: list[dict], review_required: bool = True) -> int:
             added += 1
 
         write_json(JOBS_PATH, existing)
-        return added
+
+    exclusion_filter.log_exclusions(to_log)
+    return added
 
 
 def add_manual_job(
@@ -120,7 +160,11 @@ def add_manual_job(
         "description": description,
         "posting_url": posting_url,
     }
-    save_jobs([job], review_required=False)
+    # apply_exclusion=False, review_required=False: see save_jobs()'s own
+    # docstring - this path (Zahir's manual paste UI AND job_alert_scan.py's
+    # email-digest extraction) is explicitly exempt from both search-time
+    # exclusion and the review gate.
+    save_jobs([job], apply_exclusion=False, review_required=False)
     return job
 
 
