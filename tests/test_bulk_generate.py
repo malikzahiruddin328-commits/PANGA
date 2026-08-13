@@ -129,3 +129,59 @@ def test_generate_for_basket_continues_past_a_locked_job(monkeypatch):
 
 def test_generate_for_basket_empty_basket_returns_empty_results(monkeypatch):
     assert bulk_generate.generate_for_basket([], PROFILE, ["resume"]) == {}
+
+
+# --- 2026-08-13 additions (feature/in-app-subscription-qa): on_progress
+# passthrough (needed for the "Fire final API build" button's real
+# progress) and the resume_draft_source="paid" stamp that distinguishes
+# this pipeline's output from the new subscription path's. ---
+
+
+def test_generate_for_job_passes_on_progress_through_to_generate_documents(monkeypatch):
+    monkeypatch.setattr(bulk_generate, "try_acquire_generation_lock", lambda source, job_id: True)
+    monkeypatch.setattr(bulk_generate, "release_generation_lock", lambda source, job_id: None)
+    seen_progress = []
+
+    def _fake_generate_documents(job, profile, doc_keys, existing_resume_text=None, on_progress=None):
+        seen_progress.append(on_progress)
+        if on_progress:
+            on_progress(1, 1, "resume", "thinking...")
+        return {
+            "resume": {"text": "t", "ats_score": 50, "ats_rationale": "r", "ats_next_actions": [], "clarifying_questions": [], "suggested_strategy_tag": "tag"},
+            "_errors": {},
+        }
+    monkeypatch.setattr(bulk_generate, "generate_documents", _fake_generate_documents)
+    _patch_persist(monkeypatch)
+
+    fired = []
+    bulk_generate.generate_for_job(JOB, PROFILE, ["resume"], on_progress=lambda *a: fired.append(a))
+
+    assert seen_progress[0] is not None
+    assert fired == [(1, 1, "resume", "thinking...")]
+
+
+def test_generate_for_job_stamps_resume_draft_source_paid(monkeypatch):
+    monkeypatch.setattr(bulk_generate, "try_acquire_generation_lock", lambda source, job_id: True)
+    monkeypatch.setattr(bulk_generate, "release_generation_lock", lambda source, job_id: None)
+    monkeypatch.setattr(bulk_generate, "generate_documents", lambda *a, **k: {
+        "resume": {"text": "t", "ats_score": 50, "ats_rationale": "r", "ats_next_actions": [], "clarifying_questions": [], "suggested_strategy_tag": "tag"},
+        "_errors": {},
+    })
+    upserts = []
+    _patch_persist(monkeypatch, upserts=upserts)
+
+    bulk_generate.generate_for_job(JOB, PROFILE, ["resume"])
+
+    assert upserts[0][1]["resume_draft_source"] == "paid"
+
+
+def test_generate_for_job_no_resume_draft_source_when_resume_not_requested(monkeypatch):
+    monkeypatch.setattr(bulk_generate, "try_acquire_generation_lock", lambda source, job_id: True)
+    monkeypatch.setattr(bulk_generate, "release_generation_lock", lambda source, job_id: None)
+    monkeypatch.setattr(bulk_generate, "generate_documents", lambda *a, **k: {"cover_letter": "text", "_errors": {}})
+    upserts = []
+    _patch_persist(monkeypatch, upserts=upserts)
+
+    bulk_generate.generate_for_job(JOB, PROFILE, ["cover_letter"])
+
+    assert upserts[0][1]["resume_draft_source"] is None
