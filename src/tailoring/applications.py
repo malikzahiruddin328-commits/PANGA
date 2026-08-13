@@ -386,6 +386,64 @@ def get_applications_with_open_clarifying_questions() -> list[dict]:
     return [a for a in load_applications() if a.get("resume_clarifying_questions")]
 
 
+
+# "Discuss & draft" basket operation (2026-08-13, docs/resume-hybrid-
+# execution-design.md §1b, confirmed hybrid design - tailoring.
+# discuss_and_draft owns the actual flow, this module just tracks state on
+# the application record, same "stamp state on the record itself" pattern
+# already used for the generation lock / skip_reason_reviewed above).
+DISCUSSION_STATUSES = {"awaiting_discussion", "drafting_final", "done", "failed"}
+
+
+def set_discussion_status(
+    source: str, job_id: str, status: str | None,
+    board_message_id: str | None = None, error: str | None = None,
+) -> None:
+    """Tracks where a job's live gap-question discussion is in its
+    lifecycle - "awaiting_discussion" (questions posted to the shared
+    message board, waiting on Zahir to resolve them in a live, free
+    Claude Code conversation - never another paid API round), "drafting_
+    final" (answers confirmed, the one final generate_documents() call is
+    in flight - visible to a second browser tab/session polling this
+    record while a multi-minute self-correction draft is running),
+    "done" (that final draft persisted successfully), "failed" (it
+    didn't - `error` carries the real message, same as generate_for_job()'s
+    own errors dict, so a stuck job is distinguishable from "not yet
+    picked up" rather than looking indistinguishable forever), or None
+    (no discussion ever started for this job). Real progress visibility
+    per the hybrid-design ask - "not a black box" - not a single opaque
+    flag.
+
+    Get-or-creates the application record (same shape upsert_application()
+    would create) rather than requiring one to already exist first - a job
+    can be sent to "Discuss & draft" straight from the basket before it's
+    ever had a resume drafted, so there may be no application record yet.
+
+    board_message_id, once set, is left alone unless a new value or an
+    explicit status=None (discussion reset/cleared) is passed - so
+    "drafting_final"/"done"/"failed" transitions for the SAME discussion
+    keep pointing at the same message-board entry without the caller
+    having to re-pass it every time."""
+    if status is not None and status not in DISCUSSION_STATUSES:
+        raise ValueError(f"status must be one of {DISCUSSION_STATUSES} or None, got {status!r}")
+    if get_application(source, job_id) is None:
+        upsert_application(source, job_id, status="under review")
+    with locked("applications"):
+        applications = load_applications()
+        for app in applications:
+            if app["source"] == source and app["job_id"] == job_id:
+                app["discussion_status"] = status
+                app["discussion_error"] = error
+                if board_message_id is not None:
+                    app["discussion_board_message_id"] = board_message_id
+                elif status is None:
+                    app["discussion_board_message_id"] = None
+                _save_all(applications)
+                _write_dossier(source, job_id)
+                return
+        raise KeyError(f"no application record for ({source!r}, {job_id!r}) even after creation")
+
+
 def confirm_status_suggestion(source: str, job_id: str, accept: bool) -> None:
     """accept=True applies the suggested_status as the real status; either
     way, clears the suggestion so it isn't asked about again."""

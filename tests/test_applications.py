@@ -204,3 +204,53 @@ def test_try_acquire_generation_lock_still_blocks_a_recent_lock(isolated_data):
     applications._save_all(apps)
 
     assert applications.try_acquire_generation_lock("Dice", "1") is False
+
+
+# --- set_discussion_status() (2026-08-13, "Discuss & draft" basket op) ---
+
+
+def test_set_discussion_status_creates_record_when_none_exists(isolated_data):
+    applications.set_discussion_status("Dice", "1", "awaiting_discussion", board_message_id="abc-123")
+    app = applications.get_application("Dice", "1")
+    assert app is not None
+    assert app["status"] == "under review"  # get-or-created default
+    assert app["discussion_status"] == "awaiting_discussion"
+    assert app["discussion_board_message_id"] == "abc-123"
+
+
+def test_set_discussion_status_rejects_unknown_status(isolated_data):
+    import pytest
+    with pytest.raises(ValueError):
+        applications.set_discussion_status("Dice", "1", "not_a_real_status")
+
+
+def test_set_discussion_status_none_clears_status_and_board_message_id(isolated_data):
+    applications.set_discussion_status("Dice", "1", "awaiting_discussion", board_message_id="abc-123")
+    applications.set_discussion_status("Dice", "1", None)
+    app = applications.get_application("Dice", "1")
+    assert app["discussion_status"] is None
+    assert app["discussion_board_message_id"] is None
+
+
+def test_set_discussion_status_keeps_board_message_id_across_transitions(isolated_data):
+    applications.set_discussion_status("Dice", "1", "awaiting_discussion", board_message_id="abc-123")
+    applications.set_discussion_status("Dice", "1", "drafting_final")
+    app = applications.get_application("Dice", "1")
+    # board_message_id wasn't re-passed on this call - must not be wiped.
+    assert app["discussion_board_message_id"] == "abc-123"
+    assert app["discussion_status"] == "drafting_final"
+
+
+def test_set_discussion_status_failed_stores_error(isolated_data):
+    applications.set_discussion_status("Dice", "1", "failed", error="cover_letter: web search failed")
+    app = applications.get_application("Dice", "1")
+    assert app["discussion_status"] == "failed"
+    assert app["discussion_error"] == "cover_letter: web search failed"
+
+
+def test_set_discussion_status_does_not_disturb_existing_application_fields(isolated_data):
+    applications.upsert_application("Dice", "1", status="applied", resume_text="draft v1")
+    applications.set_discussion_status("Dice", "1", "awaiting_discussion")
+    app = applications.get_application("Dice", "1")
+    assert app["status"] == "applied"
+    assert app["resume_text"] == "draft v1"

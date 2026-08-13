@@ -84,6 +84,7 @@ from tailoring.cta_emails import get_active_cta_emails, request_archive, request
 from tailoring.interview_prep import load_interview_prep, get_interview_prep, record_round_outcome, build_prep_context, generate_prep, start_round, save_round
 from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
 from tailoring.bulk_generate import generate_for_job, generate_for_basket
+from tailoring.discuss_and_draft import start_discussion, finish_discussion, MessageBoardUnavailable
 from tailoring.ats_score import detect_matched_keyword_regressions
 from tailoring.unconfirmed_claims import find_unconfirmed_markers, resolve_unconfirmed_claim
 from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed, analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_impact as _check_regenerate_impact, request_additional_gap_questions as _request_additional_gap_questions, reextract_ats_keywords_and_rescore as _reextract_ats_keywords_and_rescore, rescore_against_cached_keywords as _rescore_against_cached_keywords, gap_scan_is_current as _gap_scan_is_current, gap_scan_baseline_fingerprint as _gap_scan_baseline_fingerprint, _report_drafting_failure
@@ -393,7 +394,20 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
     support (the Results tab's own per-job "Generate documents" section,
     inside each job's detail panel, already covers the per-job case there
     too - this is a second, basket-scoped way to reach the same per-job
-    action without leaving the basket panel)."""
+    action without leaving the basket panel).
+
+    Each item also gets a "Discuss & draft" button (2026-08-13, tailoring.
+    discuss_and_draft, docs/resume-hybrid-execution-design.md §1b) - a
+    genuinely distinct action from "Generate", not a rename of it: it
+    posts the job's real open clarifying questions to the shared
+    cross-session message board so Zahir can resolve them in a live, free
+    Claude Code conversation instead of repeated paid "Answer more
+    questions" rounds, then swaps to a "Finish draft" button once that
+    discussion is marked resolved - clicking that fires the one final
+    paid draft call. discussion_status on the application record
+    ("awaiting_discussion"/"drafting_final"/"done"/"failed") drives which
+    button/badge shows, so this is never a silent black box between the
+    two clicks."""
     basket_jobs = [j for j in all_jobs if j.get("in_basket")]
 
     with st.container(key="panga_basket_bar"):
@@ -406,14 +420,16 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                     st.markdown(f"**{len(basket_jobs)} job(s) in your basket**")
                     for job in basket_jobs:
                         source, job_id = job.get("source"), job.get("job_id")
-                        item_cols = st.columns([4, 1.4, 1])
+                        app_record = applications_by_key.get((source, job_id)) or {}
+                        discussion_status = app_record.get("discussion_status")
+                        item_cols = st.columns([3, 1.3, 1.7, 1])
                         with item_cols[0]:
                             st.markdown(f"{job_label(job)}")
                         with item_cols[1]:
                             if st.button(
                                 "Generate", key=f"basket_item_gen_{source}_{job_id}",
                                 disabled=not drafting_is_configured(),
-                                help="Generates the same document types picked below, for just this one job.",
+                                help="Generates the same document types picked below, for just this one job - right now, direct paid API call.",
                             ):
                                 doc_keys = [k for k, _ in BASKET_DOC_TYPES if st.session_state.get(f"basket_doc_{k}", k in ("resume", "cover_letter"))]
                                 if not doc_keys:
@@ -429,9 +445,53 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                                         st.toast(f"{job_label(job)}: {failed} failed to draft - see the Results tab for detail.", icon=":material/warning:")
                                     st.rerun()
                         with item_cols[2]:
+                            if discussion_status in (None, "failed"):
+                                if st.button(
+                                    "Discuss & draft", key=f"basket_item_discuss_{source}_{job_id}",
+                                    disabled=not drafting_is_configured(),
+                                    help="Posts this job's real open questions to the shared message board so you can resolve them live, for free, in a Claude Code conversation - the final draft only happens once, after you're done discussing. Not another instant paid draft.",
+                                ):
+                                    try:
+                                        outcome = start_discussion(job, load_profile())
+                                    except MessageBoardUnavailable as exc:
+                                        st.toast(str(exc), icon=":material/error:")
+                                    else:
+                                        if outcome["posted"]:
+                                            st.toast(f"{outcome['question_count']} open question(s) posted to the message board for {job_label(job)}.", icon=":material/forum:")
+                                        else:
+                                            st.toast(f"No open questions found for {job_label(job)} - nothing to discuss, use Generate directly.", icon=":material/check_circle:")
+                                        st.rerun()
+                            elif discussion_status == "awaiting_discussion":
+                                if st.button(
+                                    "Finish draft", key=f"basket_item_finish_{source}_{job_id}",
+                                    disabled=not drafting_is_configured(),
+                                    help="Only click once you've actually resolved the posted questions in a live conversation and the answers are saved - this fires the one final paid draft call.",
+                                ):
+                                    doc_keys = [k for k, _ in BASKET_DOC_TYPES if st.session_state.get(f"basket_doc_{k}", k in ("resume", "cover_letter"))]
+                                    if not doc_keys:
+                                        st.toast("Pick at least one document type below first.", icon=":material/warning:")
+                                    else:
+                                        result = finish_discussion(job, load_profile(), doc_keys)
+                                        if result.get("locked"):
+                                            st.toast(f"A generation is already in progress for {job_label(job)} - try again shortly.", icon=":material/warning:")
+                                        elif result["ok"]:
+                                            st.toast(f"Discussion resolved - documents drafted for {job_label(job)}.", icon=":material/check_circle:")
+                                        else:
+                                            failed = ", ".join(result["errors"].keys())
+                                            st.toast(f"{job_label(job)}: {failed} failed to draft - see the Results tab for detail.", icon=":material/warning:")
+                                        st.rerun()
+                            elif discussion_status == "drafting_final":
+                                st.markdown(":material/hourglass_top: Drafting...")
+                            elif discussion_status == "done":
+                                st.markdown(":material/check_circle: Discussed & drafted")
+                        with item_cols[3]:
                             if st.button(":material/close:", key=f"basket_item_remove_{source}_{job_id}", help="Remove from basket"):
                                 remove_from_basket(source, job_id)
                                 st.rerun()
+                        if discussion_status == "awaiting_discussion":
+                            st.markdown(":material/forum: Awaiting your discussion - open questions are on the shared message board. Resolve them live, then click Finish draft.")
+                        elif discussion_status == "failed":
+                            st.markdown(f":material/error: Final draft failed after discussion: {app_record.get('discussion_error', 'unknown error')} - Discuss & draft again to retry.")
                     st.divider()
                     st.markdown("**Document types** (used by both per-item Generate above and Generate all below)")
                     doc_cols = st.columns(len(BASKET_DOC_TYPES))
