@@ -66,31 +66,45 @@ call) to be cheap enough to run at that volume. Four layers:
    explicit request after manually rejecting "VP, Information Security
    and Compliance" (Veritone Corp) and "Director of Information Security
    (Hybrid)" (SAGE Dining Services) from the live review queue and saying
-   "add that to the filter as well"). Security-domain-focused titles
-   ("Director of Information Security," "VP, Information Security,"
-   "Information Security Manager/Analyst/Specialist," and the "InfoSec"
-   abbreviation - a real live-store variant, e.g. "IT Spec (Infosec),
-   GS-2210-14") are a different domain focus from Zahir's IT-leadership
-   target even at Director/VP level, same reasoning as layer 3's PM-track
-   carve-out. This is deliberately narrower than "title contains
-   information or security" - it only matches the literal "information
-   security"/"infosec" domain phrase, so it never touches an unrelated
-   title like "Director, IT Service Continuity." It also has its own
-   exemption, separate from layer 1/4's _EXEC_QUALIFIER_PATTERN: a title
-   is a CIO/CISO chief-executive title, not a security-domain-focus
-   title, when it's the literal "Chief Information Security Officer"
-   phrase or the bare "CISO" abbreviation (both real, validated-KEEP
-   titles in the live store, e.g. "SVP, Chief Information Security
-   Officer," "VP/CISO, Information Security") - Zahir's real target-role
-   set (`data/profile/structured/master_profile.json`) confirms CIO
-   titles as a genuine target ("Chief Information Officer (CIO) at
-   National Endowment for the Humanities" is discussed as a real role of
-   interest), which this layer never touches anyway since "Chief
-   Information Officer" contains no "security" substring at all. A plain
-   "Director of Information Security" or "VP of Information Security"
-   carries neither "Chief Information Security Officer" nor "CISO" and is
-   excluded, same as a "Service Information Security Officer (SISO)" -
-   a domain security-officer title, not a chief-executive one.
+   "add that to the filter as well"). Originally scoped narrowly to the
+   literal "information security"/"infosec" phrase; broadened the same
+   day (Zahir's explicit option-B choice on a direct two-option question)
+   to match ANY title containing the word "security" at all - including
+   combined IT+Security leadership titles like "Director, IT & Security"
+   and "Head of Infrastructure & Security," not just pure
+   security-specialist titles. Verified against the real live job store:
+   35 real titles containing "security" but not "information security"
+   were being missed under the old narrow pattern (examples: "API
+   Security Engineer," "Director of IT Platforms & Security," "Director,
+   IT & Security," "Head of Cyber Security," "Head of Infrastructure &
+   Security," "IT Security Director," "SVP, Network Security Engineering
+   Lead," "Transportation Security Officer," "VP HR, Safety & Security,"
+   "Vice President, Software Supply Chain Security") - all now excluded
+   under the broadened pattern.
+
+   This layer originally exempted the literal "Chief Information Security
+   Officer" phrase and the bare "CISO" abbreviation from exclusion, on the
+   reasoning that fit_score (not search-time filtering) should be the
+   layer that scores CISO roles low. Zahir explicitly overrode that
+   2026-08-13: "ciso and security... must be excluded from the initial
+   fetch" - he wants CISO excluded at search/fetch time too, not just
+   scored low later. This matches his own real profile data
+   (`data/profile/structured/master_profile.json`): "Zahir does NOT
+   consider himself qualified for CISO-titled roles specifically...
+   Score/recommend CISO-titled roles low regardless of subject-matter
+   proximity - this is a real disqualifier, not just a preference." The
+   CISO exemption is therefore removed - "ciso" titles are now caught
+   directly by the broadened "security" pattern anyway (every real CISO
+   title contains the literal word "security" - "Chief Information
+   Security Officer"), so there's no longer a separate ciso-specific term
+   in the pattern at all.
+
+   CIO must still survive - this is the one boundary that does NOT
+   change. "Chief Information Officer" and its variants (Zahir's real
+   target role - confirmed via his profile's discussion of "Chief
+   Information Officer (CIO) at National Endowment for the Humanities" as
+   a genuine role of interest) contain no "security" substring, so a
+   CIO-only title is never touched by this layer either way.
 
 Non-negotiable per Zahir's standing "never silently dropped" rule (the
 same one tailoring.fit_score_prefilter follows): an excluded job is never
@@ -164,18 +178,27 @@ _PM_TRACK_PATTERN = re.compile(
 # mistaken for an intern position itself.
 _INTERN_PATTERN = re.compile(r"\bintern\b|\binternship\b", re.I)
 
-# Layer 5: information-security-domain exclusion. Scoped to the literal
-# "information security" domain phrase (plus the real "infosec" live-store
-# variant) - deliberately NOT just "information" or "security" individually,
-# so it never touches an unrelated title. Has its own exemption pattern
-# (not layer 1/4's _EXEC_QUALIFIER_PATTERN, since a bare "Director"/"VP"
-# qualifier is NOT enough here - "VP of Information Security" still
-# excludes) for the literal CISO chief-executive title/abbreviation, which
-# is a different thing (a chief-executive title in the security domain)
-# from a security-domain-focus title.
-_INFO_SECURITY_PATTERN = re.compile(r"\binformation security\b|\binfosec\b", re.I)
-_CISO_EXEMPT_PATTERN = re.compile(
-    r"\bchief information security officer\b|\bciso\b", re.I
+# Layer 5: information-security-domain exclusion. Broadened 2026-08-13
+# (Zahir's explicit option-B choice on a direct two-option question) from
+# the original narrow "information security"/"infosec" phrase match to
+# ANY title containing the standalone word "security" - this deliberately
+# now catches combined IT+Security leadership titles ("Director, IT &
+# Security," "Head of Infrastructure & Security") as well as pure
+# security-specialist titles, not just an "information security" domain
+# phrase. Still word-boundary matched so it never fires on "security"
+# appearing as part of a different word. Keeps the "infosec" alternative
+# alongside the broad "security" match - "infosec" (a real live-store
+# abbreviation, e.g. "IT Spec (Infosec), GS-2210-14") doesn't contain the
+# literal substring "security", so it would otherwise be silently dropped
+# by the broadening. "Chief Information Security Officer"/"CISO" titles
+# are caught by the "security" alternative now (every real CISO title
+# contains the literal word "security"), so there is no separate
+# ciso-specific term needed. CIO must still survive - "Chief Information
+# Officer" and its variants contain no "security"/"infosec" substring, so
+# this layer never touches a CIO-only title either way.
+_INFO_SECURITY_PATTERN = re.compile(
+    r"\bsecurity\b|\binfosec\b",
+    re.I,
 )
 
 
@@ -206,11 +229,15 @@ def _intern_exclude(title: str) -> str | None:
 
 
 def _information_security_exclude(title: str) -> str | None:
-    if _INFO_SECURITY_PATTERN.search(title) and not _CISO_EXEMPT_PATTERN.search(title):
+    match = _INFO_SECURITY_PATTERN.search(title)
+    if match:
         return (
-            "information security domain role (title contains "
-            '"information security"/"infosec" without a CISO chief-executive '
-            "title/abbreviation present)"
+            "security-domain role (matched "
+            f'"{match.group(0)}" - broadened 2026-08-13 to any title'
+            " containing \"security\", including combined IT+Security"
+            " leadership titles and CISO titles, a real disqualifier"
+            " per Zahir's own profile data, not just a lower-fit-score"
+            " preference)"
         )
     return None
 
