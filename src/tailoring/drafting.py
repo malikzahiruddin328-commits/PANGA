@@ -2512,7 +2512,23 @@ def request_additional_gap_questions(
     uses for its own deterministic scoring, so a job with no resume yet
     still gets a real, non-empty comparison instead of scanning against
     an empty string (which would just report every requirement as
-    "missing" with no useful free-form gaps found)."""
+    "missing" with no useful free-form gaps found).
+
+    Prompt-caches the profile (2026-08-13, same real-data-driven fix as
+    score_job() and generate_documents()'s shared_context, 2026-08-11):
+    real cost_log data showed 15 real production calls to this function
+    averaging 54,990 input tokens each ($5.35 total across those 15 calls)
+    with zero cache_creation_input_tokens/cache_read_input_tokens ever
+    logged - the full profile JSON was being re-sent at full price on
+    every single call. The profile now lives in its own system content
+    block marked cache_control: ephemeral (identical shape to score_job's
+    fix), so it's billed once per 5-minute cache window (a write, 1.25x
+    input rate) and reused at 0.1x input rate on every call within that
+    window. The job posting and the "already covered" list (both
+    genuinely different per call - the latter depends on this job's own
+    existing_questions/score_result) stay in user_content, appended after
+    the cached block, matching generate_documents()'s job-invariant-only
+    caching split so distinct jobs' calls can still share a cache read."""
     client = _client()
     required_keywords = job.get("ats_required_keywords") or []
     preferred_keywords = job.get("ats_preferred_keywords") or []
@@ -2530,9 +2546,16 @@ def request_additional_gap_questions(
     )
 
     job_key = (job["source"], job["job_id"]) if job.get("source") and job.get("job_id") else None
+    system = [
+        {"type": "text", "text": _ANSWER_MORE_SYSTEM_PROMPT},
+        {
+            "type": "text",
+            "text": "CANDIDATE'S MASTER PROFILE:\n" + json.dumps(profile, indent=2, default=str),
+            "cache_control": {"type": "ephemeral"},
+        },
+    ]
     content = (
         "JOB POSTING:\n" + json.dumps(job, indent=2, default=str) +
-        "\n\nCANDIDATE'S MASTER PROFILE:\n" + json.dumps(profile, indent=2, default=str) +
         "\n\nALREADY COVERED (do not repeat any of these, even reworded):\n" +
         json.dumps(sorted(set(already_covered)), indent=2)
     )
@@ -2540,7 +2563,7 @@ def request_additional_gap_questions(
         try:
             data = call_structured(
                 client,
-                system=_ANSWER_MORE_SYSTEM_PROMPT,
+                system=system,
                 user_content=content,
                 schema=_answer_more_schema(),
                 max_tokens=max_tokens,
