@@ -120,6 +120,63 @@ def test_search_jobs_by_series_and_grade_optional_location(monkeypatch, configur
     assert captured["params"]["LocationName"] == "Washington, DC"
 
 
+def test_search_jobs_by_series_and_grade_default_does_not_fetch_executive_grades(monkeypatch, configured):
+    call_count = {"n": 0}
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        call_count["n"] += 1
+        return _FakeResponse(_search_result([_item(position_id="P1")]))
+
+    monkeypatch.setattr(usajobs.requests, "get", fake_get)
+    jobs = usajobs.search_jobs_by_series_and_grade(["2210"], "12", "15")
+
+    assert call_count["n"] == 1
+    assert len(jobs) == 1
+
+
+def test_search_jobs_by_series_and_grade_executive_grades_issues_second_call(monkeypatch, configured):
+    calls = []
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        calls.append(params)
+        if "JobGrade" in params:
+            return _FakeResponse(_search_result([_item(position_id="EXEC1", title="Chief Information Security Officer")]))
+        return _FakeResponse(_search_result([_item(position_id="P1")]))
+
+    monkeypatch.setattr(usajobs.requests, "get", fake_get)
+    jobs = usajobs.search_jobs_by_series_and_grade(
+        ["2210"], "12", "15", include_executive_grades=True,
+    )
+
+    assert len(calls) == 2
+    # first call: the existing GS-band query, unchanged
+    assert calls[0]["PayGradeLow"] == "12"
+    assert calls[0]["PayGradeHigh"] == "15"
+    assert "JobGrade" not in calls[0]
+    # second call: JobGrade-based, semicolon-joined executive codes, no PayGrade band
+    assert calls[1]["JobGrade"] == ";".join(usajobs._EXECUTIVE_GRADE_CODES)
+    assert "PayGradeLow" not in calls[1]
+
+    assert {j["job_id"] for j in jobs} == {"P1", "EXEC1"}
+
+
+def test_search_jobs_by_series_and_grade_executive_grades_dedupes_overlap(monkeypatch, configured):
+    # A posting returned by BOTH the GS-band query and the JobGrade query
+    # (real observed case: some AD/ZP/SL/FP-graded postings already carry
+    # an equivalent GS 12-15 classification) must only appear once.
+    def fake_get(url, headers=None, params=None, timeout=None):
+        if "JobGrade" in params:
+            return _FakeResponse(_search_result([_item(position_id="P1"), _item(position_id="EXEC1")]))
+        return _FakeResponse(_search_result([_item(position_id="P1")]))
+
+    monkeypatch.setattr(usajobs.requests, "get", fake_get)
+    jobs = usajobs.search_jobs_by_series_and_grade(
+        ["2210"], "12", "15", include_executive_grades=True,
+    )
+
+    assert sorted(j["job_id"] for j in jobs) == ["EXEC1", "P1"]
+
+
 def test_search_jobs_unaffected_by_new_function_existing(monkeypatch, configured):
     # search_jobs() itself must remain unchanged/callable - the new function
     # is additive, not a replacement (task's explicit requirement).
