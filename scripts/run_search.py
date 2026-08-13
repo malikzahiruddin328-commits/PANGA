@@ -354,9 +354,23 @@ def score_unscored_jobs(profile: dict) -> list[dict]:
     paid Opus score_job() call. A skipped job is NEVER dropped: it stays in
     jobs.json exactly as unscored as before (identical to any job that
     fails to score for any other reason), and every skip is logged via
-    log_prefilter_skip() for spot-check - non-negotiable per Zahir."""
+    log_prefilter_skip() for spot-check - non-negotiable per Zahir.
+
+    Review gate (2026-08-13, basket/review-gate build): also excludes any
+    job with review_status == "pending" or "rejected" - job_store.
+    save_jobs() now stamps every freshly-found search result "pending" by
+    default, and this scoring step is exactly the "STEP 2/step 5
+    fit_score" auto-scoring the review UI (ui/app.py's Results tab) exists
+    to gate. A job missing review_status entirely (every job saved before
+    this field existed) is treated as "accepted" - the implicit historical
+    default, per save_jobs()'s own docstring - so this change never
+    silently stops scoring anything that was already flowing through the
+    pipeline before today."""
     jobs = job_store.load_jobs()
-    unscored = [j for j in jobs if "fit_score" not in j]
+    unscored = [
+        j for j in jobs
+        if "fit_score" not in j and j.get("review_status", "accepted") == "accepted"
+    ]
     if not unscored:
         return []
 

@@ -4,6 +4,12 @@ wiring itself (prefiltered jobs never reach score_job, non-prefiltered
 jobs still do, every skip gets logged, the job record itself is never
 touched) - the prefilter module's own logic is covered in
 test_fit_score_prefilter.py.
+
+Every save_jobs() call below passes review_required=False (2026-08-13
+review-gate build) - these tests are about the prefilter/scoring wiring
+specifically, not the review gate itself (see test_run_search_review_
+gate.py for that), so every job here is set up already-"accepted" the
+same way it always implicitly was before review_status existed at all.
 """
 
 import sys
@@ -25,7 +31,7 @@ PROFILE = {"target_title_framings": [{"summary": "IT/data/cybersecurity executiv
 def test_prefiltered_job_never_reaches_score_job(isolated_data, monkeypatch):
     job_store.save_jobs([
         {"source": "linkedin", "job_id": "1", "title": "Registered Nurse", "organization": "Big Health"},
-    ])
+    ], review_required=False)
     score_calls = []
     monkeypatch.setattr(run_search, "score_job", lambda job, profile: score_calls.append(job) or {"fit_score": 99, "fit_rationale": "x"})
 
@@ -39,7 +45,7 @@ def test_prefiltered_job_never_reaches_score_job(isolated_data, monkeypatch):
 def test_prefiltered_job_gets_logged_for_spot_check(isolated_data, monkeypatch):
     job_store.save_jobs([
         {"source": "linkedin", "job_id": "1", "title": "Registered Nurse", "organization": "Big Health"},
-    ])
+    ], review_required=False)
     monkeypatch.setattr(run_search, "score_job", lambda job, profile: {"fit_score": 99, "fit_rationale": "x"})
 
     run_search.score_unscored_jobs(PROFILE)
@@ -53,7 +59,7 @@ def test_prefiltered_job_gets_logged_for_spot_check(isolated_data, monkeypatch):
 def test_non_prefiltered_job_still_gets_scored_normally(isolated_data, monkeypatch):
     job_store.save_jobs([
         {"source": "linkedin", "job_id": "2", "title": "VP Information Technology", "organization": "Acme"},
-    ])
+    ], review_required=False)
     monkeypatch.setattr(fit_score_prefilter, "should_skip_scoring", lambda job, profile: None)
     monkeypatch.setattr(run_search, "score_job", lambda job, profile: {"fit_score": 77, "fit_rationale": "solid match"})
 
@@ -69,7 +75,7 @@ def test_mixed_batch_only_skips_the_prefiltered_ones(isolated_data, monkeypatch)
     job_store.save_jobs([
         {"source": "linkedin", "job_id": "1", "title": "Registered Nurse", "organization": "Big Health"},
         {"source": "linkedin", "job_id": "2", "title": "VP Information Technology", "organization": "Acme"},
-    ])
+    ], review_required=False)
     scored_ids = []
 
     def _fake_score_job(job, profile):

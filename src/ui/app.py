@@ -73,7 +73,7 @@ import tomllib
 import yaml
 
 from search.usajobs import search_jobs, USAJobsNotConfigured
-from search.job_store import load_jobs, flag_freshness_check_downgraded
+from search.job_store import load_jobs, flag_freshness_check_downgraded, set_review_status, add_to_basket, remove_from_basket
 from search.job_sources import load_job_sources, save_job_sources
 from search.job_alert_senders import load_job_alert_senders, save_job_alert_senders
 from search.aggregators import ADZUNA_COUNTRIES, is_configured as adzuna_is_configured
@@ -83,6 +83,7 @@ from tailoring.applications import load_applications, upsert_application, get_ap
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
 from tailoring.interview_prep import load_interview_prep, get_interview_prep, record_round_outcome, build_prep_context, generate_prep, start_round, save_round
 from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
+from tailoring.bulk_generate import generate_for_job, generate_for_basket
 from tailoring.ats_score import detect_matched_keyword_regressions
 from tailoring.unconfirmed_claims import find_unconfirmed_markers, resolve_unconfirmed_claim
 from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed, analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_impact as _check_regenerate_impact, request_additional_gap_questions as _request_additional_gap_questions, reextract_ats_keywords_and_rescore as _reextract_ats_keywords_and_rescore, rescore_against_cached_keywords as _rescore_against_cached_keywords, gap_scan_is_current as _gap_scan_is_current, gap_scan_baseline_fingerprint as _gap_scan_baseline_fingerprint, _report_drafting_failure
@@ -246,6 +247,95 @@ st.html(
     unsafe_allow_javascript=True,
 )
 
+# Basket bar: sticky-at-top-of-page CSS + a scroll-triggered "compact" class
+# (2026-08-13 basket build). Pure CSS handles the actual sticking
+# (position: sticky needs no JS at all) - the JS below only toggles a
+# lighter/denser style once the page has scrolled past the top, per
+# Zahir's spec ("switch to a lighter/more compact styling once the page
+# has scrolled past the top, not a heavy bar taking space the whole
+# time"). Targets `.st-key-panga_basket_bar`, the real class Streamlit
+# gives `st.container(key="panga_basket_bar")` - same selector convention
+# progress_shimmer_css() already uses elsewhere in this file, confirmed
+# working there.
+#
+# Streamlit's main content scrolls inside an internal container (not the
+# document/window) in most deployments, but that container's exact
+# data-testid has changed across Streamlit versions before - rather than
+# hardcode one, findScrollParent() walks up from the bar itself looking
+# for the first real scrollable ancestor (overflow-y auto/scroll AND
+# scrollHeight > clientHeight), falling back to window if none is found.
+# Re-runs on every DOM mutation (same MutationObserver-on-document.body
+# pattern as the icon a11y fix just above) since Streamlit can replace the
+# bar's own DOM node across reruns, which would otherwise leave a stale
+# scroll listener bound to an element no longer on the page.
+st.html(
+    """
+    <style>
+    .st-key-panga_basket_bar {
+        position: sticky;
+        top: 0;
+        z-index: 999;
+        background-color: var(--background-color, #fff);
+        border: 1px solid rgba(128, 128, 128, 0.3);
+        border-radius: 8px;
+        padding: 0.75rem 1rem;
+        margin-bottom: 0.5rem;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+        transition: padding 0.15s ease, box-shadow 0.15s ease;
+    }
+    .st-key-panga_basket_bar.panga-basket-compact {
+        padding: 0.2rem 0.75rem;
+        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
+    }
+    .st-key-panga_basket_bar .panga-basket-subtitle {
+        transition: opacity 0.15s ease, max-height 0.15s ease;
+        max-height: 3rem;
+        opacity: 1;
+        overflow: hidden;
+    }
+    .st-key-panga_basket_bar.panga-basket-compact .panga-basket-subtitle {
+        max-height: 0;
+        opacity: 0;
+        margin: 0;
+    }
+    .st-key-panga_basket_bar.panga-basket-compact [data-testid="stMarkdownContainer"] p {
+        font-size: 0.85rem;
+        margin: 0;
+    }
+    </style>
+    <script>
+    (function () {
+        // Live-verified this needed a rewrite (2026-08-13): the first version
+        // walked up from the bar element ONCE to find its scrollable
+        // ancestor and captured it in a closure - looked right, but a live
+        // browser check showed the toggle silently never fired. Root cause:
+        // Streamlit's rerun cycle can replace the bar's own DOM node (and
+        // its ancestors) often enough that a closure captured at bind time
+        // goes stale almost immediately, with no error, just a dead
+        // listener. A single document-level, capture-phase listener sidesteps
+        // this entirely - scroll events don't bubble, but capture-phase
+        // listeners on an ancestor DO still see them fire on any scrollable
+        // descendant (the standard technique for this exact problem) - and
+        // by re-querying both elements fresh on every event instead of
+        // caching either, it self-heals across any DOM replacement rather
+        // than needing a MutationObserver to detect and rebind. Bound
+        // exactly once per page load (window.__pangaBasketScrollBound
+        // guard), never per-element, so no rebinding logic is needed at all.
+        if (window.__pangaBasketScrollBound) return;
+        window.__pangaBasketScrollBound = true;
+        document.addEventListener('scroll', function () {
+            var bar = document.querySelector('.st-key-panga_basket_bar');
+            if (!bar) return;
+            var main = document.querySelector('[data-testid="stMain"]');
+            var scrollTop = main ? main.scrollTop : window.scrollY;
+            bar.classList.toggle('panga-basket-compact', scrollTop > 40);
+        }, true);
+    })();
+    </script>
+    """,
+    unsafe_allow_javascript=True,
+)
+
 
 def load_settings() -> dict:
     return yaml.safe_load(SETTINGS_PATH.read_text(encoding="utf-8"))
@@ -273,6 +363,116 @@ def application_status(job: dict) -> str | None:
 
 def job_label(job: dict) -> str:
     return f"{job.get('title')} - {job.get('organization')}"
+
+
+BASKET_DOC_TYPES = [
+    ("resume", "Resume"),
+    ("cover_letter", "Cover letter"),
+    ("exec_bio", "Executive bio"),
+    ("leadership_summary", "Leadership summary"),
+    ("apply_answers", "Apply Assist packet"),
+]
+
+
+def render_basket_bar(all_jobs: list[dict]) -> None:
+    """The basket bar, rendered once at the true top of the page (above the
+    tab bar, so it's visible no matter which tab is open) per Zahir's spec.
+    Sticks to the top of the viewport while scrolling (CSS position:
+    sticky, no JS needed for that part) and switches to a lighter/more
+    compact style once scrolled past the top (the scroll-triggered CSS
+    class toggle injected once near the top of this file).
+
+    Basket membership lives on the job record itself (job_store.
+    add_to_basket()/remove_from_basket() - an `in_basket` flag), not in
+    Streamlit session_state, so it survives page reloads. "Expandable" is
+    a real st.popover, not a fake collapse/expand - clicking it opens an
+    actual floating panel listing every basket job with a per-item remove
+    action and a per-item "Generate" button, plus one bulk "Generate for
+    all N" action for the whole basket - covering both the per-job and
+    bulk document-generation actions the spec asked the basket itself to
+    support (the Results tab's own per-job "Generate documents" section,
+    inside each job's detail panel, already covers the per-job case there
+    too - this is a second, basket-scoped way to reach the same per-job
+    action without leaving the basket panel)."""
+    basket_jobs = [j for j in all_jobs if j.get("in_basket")]
+
+    with st.container(key="panga_basket_bar"):
+        bar_cols = st.columns([3, 2, 2])
+        with bar_cols[0]:
+            with st.popover(f":material/shopping_basket: Basket ({len(basket_jobs)})", width="stretch"):
+                if not basket_jobs:
+                    st.markdown("Nothing in your basket yet. Add a job from the Results tab.")
+                else:
+                    st.markdown(f"**{len(basket_jobs)} job(s) in your basket**")
+                    for job in basket_jobs:
+                        source, job_id = job.get("source"), job.get("job_id")
+                        item_cols = st.columns([4, 1.4, 1])
+                        with item_cols[0]:
+                            st.markdown(f"{job_label(job)}")
+                        with item_cols[1]:
+                            if st.button(
+                                "Generate", key=f"basket_item_gen_{source}_{job_id}",
+                                disabled=not drafting_is_configured(),
+                                help="Generates the same document types picked below, for just this one job.",
+                            ):
+                                doc_keys = [k for k, _ in BASKET_DOC_TYPES if st.session_state.get(f"basket_doc_{k}", k in ("resume", "cover_letter"))]
+                                if not doc_keys:
+                                    st.toast("Pick at least one document type below first.", icon=":material/warning:")
+                                else:
+                                    result = generate_for_job(job, load_profile(), doc_keys)
+                                    if result.get("locked"):
+                                        st.toast(f"A generation is already in progress for {job_label(job)} - try again shortly.", icon=":material/warning:")
+                                    elif result["ok"]:
+                                        st.toast(f"Documents drafted for {job_label(job)}.", icon=":material/check_circle:")
+                                    else:
+                                        failed = ", ".join(result["errors"].keys())
+                                        st.toast(f"{job_label(job)}: {failed} failed to draft - see the Results tab for detail.", icon=":material/warning:")
+                                    st.rerun()
+                        with item_cols[2]:
+                            if st.button(":material/close:", key=f"basket_item_remove_{source}_{job_id}", help="Remove from basket"):
+                                remove_from_basket(source, job_id)
+                                st.rerun()
+                    st.divider()
+                    st.markdown("**Document types** (used by both per-item Generate above and Generate all below)")
+                    doc_cols = st.columns(len(BASKET_DOC_TYPES))
+                    for col, (doc_key, doc_label) in zip(doc_cols, BASKET_DOC_TYPES):
+                        with col:
+                            st.checkbox(doc_label, value=doc_key in ("resume", "cover_letter"), key=f"basket_doc_{doc_key}")
+                    if not drafting_is_configured():
+                        st.markdown("No Anthropic API key configured - add one to `.env` and restart to generate documents.")
+                    if st.button(f"Generate for all {len(basket_jobs)} job(s)", type="primary", disabled=not drafting_is_configured()):
+                        doc_keys = [k for k, _ in BASKET_DOC_TYPES if st.session_state.get(f"basket_doc_{k}", k in ("resume", "cover_letter"))]
+                        if not doc_keys:
+                            st.toast("Pick at least one document type first.", icon=":material/warning:")
+                        else:
+                            with st.container(key="basket_bulk_progress_bar"):
+                                bulk_bar = st.progress(0, text=f"Drafting 1 of {len(basket_jobs)}: {job_label(basket_jobs[0])}...")
+                            st.html(progress_shimmer_css("basket_bulk_progress_bar"))
+
+                            def _update_bulk_progress(i, total, job):
+                                bulk_bar.progress((i - 1) / total, text=f"Drafting {i} of {total}: {job_label(job)}...")
+
+                            results = generate_for_basket(basket_jobs, load_profile(), doc_keys, on_progress=_update_bulk_progress)
+                            bulk_bar.progress(1.0, text=":material/check_circle: Done.")
+                            succeeded = sum(1 for r in results.values() if r["ok"])
+                            locked = sum(1 for r in results.values() if r.get("locked"))
+                            failed = len(results) - succeeded - locked
+                            summary = f"{succeeded} of {len(results)} job(s) drafted."
+                            if locked:
+                                summary += f" {locked} skipped (already generating elsewhere)."
+                            if failed:
+                                summary += f" {failed} had at least one document fail - see the Results tab for detail."
+                            st.toast(summary, icon=":material/check_circle:" if not failed else ":material/warning:")
+                            st.rerun()
+        with bar_cols[1]:
+            st.html(
+                '<div class="panga-basket-subtitle">'
+                '<p style="margin: 0.4rem 0 0 0; opacity: 0.75; font-size: 0.85rem;">'
+                "Add jobs from the Results tab, generate documents for one or all at once."
+                "</p></div>"
+            )
+        with bar_cols[2]:
+            pass
 
 
 # Shared with the Results tab's own filtering pipeline below, so a status
@@ -1882,6 +2082,12 @@ gaps_count = len(get_applications_with_open_clarifying_questions())
 
 st.session_state.setdefault("active_tab", "cta")
 
+# --- Basket bar: TOP of the page, above even the alert strip (Zahir's
+# explicit spec, 2026-08-13 basket build) - sticks while scrolling, on
+# every tab, not just Results. See render_basket_bar()'s own docstring for
+# the sticky/compact-on-scroll and popover-expand mechanics. ---
+render_basket_bar(jobs)
+
 # --- Persistent alert strip: shown above the tabs on every tab, since these
 # are time-sensitive and easy to miss if buried under whichever tab happens
 # to be open (design decision 2026-07-30, see module docstring). ---
@@ -3219,6 +3425,66 @@ elif active_tab == "results":
             st.session_state["manual_job_clear_pending"] = True
             st.rerun()
 
+    # --- Review gate for fresh search results (2026-08-13 basket/review
+    # build): search.job_store.save_jobs() now stamps every freshly-found
+    # source-connector result review_status="pending" - the daily search
+    # (scheduled task + this tab's own "Run now (USAJOBS)" button) no
+    # longer auto-scores anything until Zahir explicitly accepts it here.
+    # Same screen/flow as the basket, per spec - accepted jobs flow
+    # straight into the normal ranked list below (once scored), not a
+    # separate tab. A job Zahir pastes in himself via "Add a job manually"
+    # above skips this gate entirely (add_manual_job() passes
+    # review_required=False) - that's already a considered, one-at-a-time
+    # choice, not a broad-net search hit. ---
+    pending_review_jobs = [j for j in jobs if j.get("review_status") == "pending"]
+    if pending_review_jobs:
+        with st.expander(f"Review {len(pending_review_jobs)} new search result(s)", expanded=True):
+            st.markdown(
+                "Freshly found by a source connector (USAJOBS, Dice, company "
+                "sites, etc.) - not compatibility-scored yet. Accept the ones "
+                "worth scoring, or reject ones you can tell aren't a fit at a "
+                "glance. Nothing here is deleted either way, and accepting "
+                "doesn't score it immediately (no paid API call happens just "
+                "from clicking Accept) - it just clears it to be scored on the "
+                "next scoring pass."
+            )
+            # Capped render (CLAUDE.md's O(n) render-cost guidance) - a
+            # single broad-net daily run can plausibly add hundreds of new
+            # results at once; rendering every one as its own card+buttons
+            # would be a real page-weight problem. Bulk accept-all/
+            # reject-all below covers the "just clear the whole batch"
+            # case without needing to scroll a huge list first.
+            REVIEW_DISPLAY_CAP = 40
+            shown = pending_review_jobs[:REVIEW_DISPLAY_CAP]
+            if len(pending_review_jobs) > REVIEW_DISPLAY_CAP:
+                st.markdown(f"Showing the first {REVIEW_DISPLAY_CAP} of {len(pending_review_jobs)} - use Accept/Reject all below to clear the rest, or review the rest next time this list is shorter.")
+            bulk_cols = st.columns([1, 1, 4])
+            with bulk_cols[0]:
+                if st.button(f"Accept all {len(pending_review_jobs)} shown", key="review_accept_all"):
+                    for job in pending_review_jobs:
+                        set_review_status(job["source"], job["job_id"], "accepted")
+                    st.rerun()
+            with bulk_cols[1]:
+                if st.button(f"Reject all {len(pending_review_jobs)} shown", key="review_reject_all"):
+                    for job in pending_review_jobs:
+                        set_review_status(job["source"], job["job_id"], "rejected")
+                    st.rerun()
+            for job in shown:
+                with st.container(border=True):
+                    row_cols = st.columns([3, 1, 1])
+                    with row_cols[0]:
+                        st.markdown(f"**{job.get('title')}** - {job.get('organization')}  \n{job.get('location') or 'Location not listed'} · {job.get('source')}")
+                        if job.get("posting_url"):
+                            st.markdown(f"[View posting]({job['posting_url']})")
+                    with row_cols[1]:
+                        if st.button("Accept", key=f"review_accept_{job['source']}_{job['job_id']}", type="primary"):
+                            set_review_status(job["source"], job["job_id"], "accepted")
+                            st.rerun()
+                    with row_cols[2]:
+                        if st.button("Reject", key=f"review_reject_{job['source']}_{job['job_id']}"):
+                            set_review_status(job["source"], job["job_id"], "rejected")
+                            st.rerun()
+
     target_roles = settings.get("target_roles", [])
 
     def sort_key(job):
@@ -3227,7 +3493,14 @@ elif active_tab == "results":
 
     ranked = sorted(jobs, key=sort_key, reverse=True)
 
-    unscored_count = sum(1 for j in jobs if "fit_score" not in j)
+    # Excludes "rejected" jobs (2026-08-13) - those were deliberately
+    # passed on in the review step above and were never going to be
+    # scored regardless of a scoring pass running; counting them here
+    # would wrongly suggest they're just waiting their turn.
+    unscored_count = sum(
+        1 for j in jobs
+        if "fit_score" not in j and j.get("review_status") != "rejected" and j.get("review_status") != "pending"
+    )
     scored_count = len(jobs) - unscored_count
     # Explicit, stable keys (rather than the auto-generated ones these had
     # before) so compute_results_ranked() can read each filter's current
@@ -3410,6 +3683,13 @@ elif active_tab == "results":
                     "Status": status_cell,
                     "JD": "✓" if _job_has_captured_jd_text(job) else "–",
                     "Posting": job.get("posting_url"),
+                    # ButtonColumn's label comes from the cell value itself
+                    # (2026-08-13 basket build, same mechanism "Pass" below
+                    # already uses) - the explicit, visible "add to basket"
+                    # action the spec asked every job's row/card to have,
+                    # with the label itself reflecting current membership
+                    # rather than a separate status column.
+                    "Basket": "In basket" if job.get("in_basket") else "Add to basket",
                     "Pass": "Pass",  # ButtonColumn's label comes from the cell value itself - same word every row on purpose
                 })
             df = pd.DataFrame(table_rows)
@@ -3460,6 +3740,23 @@ elif active_tab == "results":
                         "label": job_label(clicked_job),
                     }
 
+            # Same ButtonColumn on_click pattern as _trigger_pass above -
+            # unlike "Pass" this needs no confirmation dialog (adding/
+            # removing from the basket is trivially reversible, right from
+            # this same table on the very next click), so the toggle
+            # happens directly in the callback rather than deferring to a
+            # session_state flag read after the loop.
+            basket_click_key = f"basketclick_{channel}"
+
+            def _trigger_basket_toggle(basket_click_key=basket_click_key, channel_deduped=deduped):
+                click = st.session_state.get(basket_click_key)
+                if click:
+                    clicked_job = channel_deduped[click["row"]]
+                    if clicked_job.get("in_basket"):
+                        remove_from_basket(clicked_job.get("source"), clicked_job.get("job_id"))
+                    else:
+                        add_to_basket(clicked_job.get("source"), clicked_job.get("job_id"))
+
             st.dataframe(
                 df,
                 hide_index=True,
@@ -3473,6 +3770,11 @@ elif active_tab == "results":
                     "JD": st.column_config.TextColumn(
                         "JD", alignment="left", width="small",
                         help="Whether Panga has this posting's job description text to score and tailor against.",
+                    ),
+                    "Basket": st.column_config.ButtonColumn(
+                        "Basket", type="tertiary", alignment="left", width="small",
+                        help="Add or remove this job from the basket - generate documents for it later, alone or together with everything else in the basket.",
+                        on_click=_trigger_basket_toggle, key=basket_click_key,
                     ),
                     "Pass": st.column_config.ButtonColumn(
                         "Pass", type="tertiary", alignment="left", width="small",

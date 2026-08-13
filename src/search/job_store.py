@@ -22,7 +22,7 @@ def load_jobs() -> list[dict]:
     return read_json(JOBS_PATH, default=[])
 
 
-def save_jobs(new_jobs: list[dict]) -> int:
+def save_jobs(new_jobs: list[dict], review_required: bool = True) -> int:
     """Merges new_jobs into the store, keyed by (source, job_id). Returns the
     number of genuinely new jobs added (existing ones are left untouched).
 
@@ -30,7 +30,25 @@ def save_jobs(new_jobs: list[dict]) -> int:
     §16c - the Prospector KPI dashboard needs a discovery timestamp to
     report "jobs found this week"). Jobs saved before this date have no
     date_added and are counted in totals but not in any date-based slice -
-    there's no real discovery date to recover for them."""
+    there's no real discovery date to recover for them.
+
+    review_required (2026-08-13, basket/review-gate build): stamps
+    review_status="pending" on genuinely new records when True (the
+    default - every source connector, USAJOBS/Dice/company-sites/etc.,
+    calls save_jobs() with no override, so a fresh search result never
+    reaches scoring until Zahir explicitly accepts it in the Results
+    tab's review UI - see ui/app.py's "Review new search result(s)"
+    section and scripts/run_search.py's score_unscored_jobs(), both of
+    which only score review_status == "accepted" jobs).
+    add_manual_job() below passes review_required=False and stamps
+    "accepted" instead - a job Zahir pastes in himself is already a
+    considered choice, not a broad-net search hit, so gating it behind a
+    second manual accept click would be pure friction with no real
+    review value. A job saved before this field existed has no
+    review_status at all - every reader of this field must treat a
+    missing key as "accepted" (the implicit historical default), never as
+    "pending", or every job ever saved before 2026-08-13 would silently
+    vanish behind an unintended review gate."""
     with locked("jobs"):
         existing = load_jobs()
         seen = {(j.get("source"), j.get("job_id")) for j in existing}
@@ -41,6 +59,7 @@ def save_jobs(new_jobs: list[dict]) -> int:
             if key in seen:
                 continue
             job.setdefault("date_added", datetime.now(timezone.utc).isoformat())
+            job.setdefault("review_status", "pending" if review_required else "accepted")
             existing.append(job)
             seen.add(key)
             added += 1
@@ -101,7 +120,7 @@ def add_manual_job(
         "description": description,
         "posting_url": posting_url,
     }
-    save_jobs([job])
+    save_jobs([job], review_required=False)
     return job
 
 
@@ -237,6 +256,62 @@ def flag_freshness_check_downgraded(targets: list[tuple[str, str]], reason: str)
                 flagged += 1
         write_json(JOBS_PATH, jobs)
     return flagged
+
+
+def set_review_status(source: str, job_id: str, status: str) -> None:
+    """Moves a job out of the "pending" review gate save_jobs() puts every
+    fresh source-connector result into (2026-08-13). `status` is
+    "accepted" (proceeds to the normal scoring/ranking pipeline the next
+    time score_unscored_jobs() runs) or "rejected" (stays in the store -
+    same hide-but-never-delete pattern as
+    application_status "not interested"/"closed by employer" - but is
+    permanently excluded from scoring and from the Results tab's ranked
+    list, since a rejected job was never even judged worth scoring in the
+    first place). Silently a no-op if the (source, job_id) pair no longer
+    exists - same defensive shape as update_job_score()/update_job_
+    address() above, not an error, since a job could theoretically be
+    reviewed from a stale page render after being removed some other way."""
+    with locked("jobs"):
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("source") == source and job.get("job_id") == job_id:
+                job["review_status"] = status
+                break
+        write_json(JOBS_PATH, jobs)
+
+
+def add_to_basket(source: str, job_id: str) -> None:
+    """Marks a job as in the basket (2026-08-13 basket build). Basket
+    membership is stored on the job record itself, not in Streamlit
+    session_state, so it survives page reloads/app restarts the same way
+    every other piece of job state does (fit_score, employer_attribution_
+    uncertain, etc.) - a session-state-only basket would silently empty
+    itself on every browser refresh, which is a real, easy-to-hit trap for
+    anything meant to hold state across a "come back to this later"
+    workflow like generating documents for several jobs at once."""
+    with locked("jobs"):
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("source") == source and job.get("job_id") == job_id:
+                job["in_basket"] = True
+                break
+        write_json(JOBS_PATH, jobs)
+
+
+def remove_from_basket(source: str, job_id: str) -> None:
+    """Inverse of add_to_basket() above. Deletes the key entirely rather
+    than setting it False - keeps every basket-membership check a plain
+    `job.get("in_basket")` truthy check (matches this store's existing
+    convention: employer_attribution_uncertain/freshness_check_downgraded
+    are also only ever set True and otherwise simply absent, never set
+    False)."""
+    with locked("jobs"):
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("source") == source and job.get("job_id") == job_id:
+                job.pop("in_basket", None)
+                break
+        write_json(JOBS_PATH, jobs)
 
 
 def update_job_score(source: str, job_id: str, fit_score: int, fit_rationale: str) -> None:
