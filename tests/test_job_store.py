@@ -1,5 +1,6 @@
 import search.exclusion_filter as exclusion_filter
 import search.job_store as job_store
+import tailoring.applications as applications
 from security.crypto_store import read_json
 
 
@@ -369,3 +370,110 @@ def test_add_manual_job_is_never_excluded(isolated_data):
     assert len(jobs) == 1
     assert jobs[0]["job_id"] == job["job_id"]
     assert read_json(exclusion_filter.EXCLUSION_LOG_PATH, default=[]) == []
+
+
+def _seed_application(source, job_id, status, resume_text=""):
+    applications.upsert_application(source, job_id, status=status, resume_text=resume_text)
+
+
+def test_archive_stale_jobs_dry_run_does_not_write(isolated_data):
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Director"}])
+    job_store.set_review_status("Dice", "1", "rejected")
+    result = job_store.archive_stale_jobs(dry_run=True)
+    assert result["candidate_count"] == 1
+    assert len(job_store.load_jobs()) == 1
+    assert job_store.load_archived_jobs() == []
+
+
+def test_archive_stale_jobs_moves_rejected_jobs(isolated_data):
+    job_store.save_jobs([
+        {"source": "Dice", "job_id": "1", "title": "Rejected One"},
+        {"source": "Dice", "job_id": "2", "title": "Still Live"},
+    ])
+    job_store.set_review_status("Dice", "1", "rejected")
+    result = job_store.archive_stale_jobs(dry_run=False)
+    assert result["candidate_count"] == 1
+    remaining = job_store.load_jobs()
+    assert len(remaining) == 1
+    assert remaining[0]["job_id"] == "2"
+    archived = job_store.load_archived_jobs()
+    assert len(archived) == 1
+    assert archived[0]["job_id"] == "1"
+
+
+def test_archive_stale_jobs_moves_not_interested_applications(isolated_data):
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Passed"}])
+    job_store.set_review_status("Dice", "1", "accepted")
+    _seed_application("Dice", "1", status="not interested")
+    result = job_store.archive_stale_jobs(dry_run=False)
+    assert result["candidate_count"] == 1
+    assert job_store.load_jobs() == []
+
+
+def test_archive_stale_jobs_moves_low_fit_score_regardless_of_age(isolated_data):
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Poor Fit"}])
+    job_store.set_review_status("Dice", "1", "accepted")
+    job_store.update_job_score("Dice", "1", 32, "Not a fit")
+    result = job_store.archive_stale_jobs(dry_run=False)
+    assert result["candidate_count"] == 1
+    assert job_store.load_jobs() == []
+
+
+def test_archive_stale_jobs_never_touches_unscored_jobs(isolated_data):
+    # Missing fit_score ("never scored") must never be conflated with
+    # "scored below 60" - only a real numeric score under 60 qualifies.
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Unscored"}])
+    result = job_store.archive_stale_jobs(dry_run=False)
+    assert result["candidate_count"] == 0
+    assert len(job_store.load_jobs()) == 1
+
+
+def test_archive_stale_jobs_protects_in_basket(isolated_data):
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "In Basket"}])
+    job_store.update_job_score("Dice", "1", 10, "Low score")
+    job_store.add_to_basket("Dice", "1")
+    result = job_store.archive_stale_jobs(dry_run=False)
+    assert result["candidate_count"] == 0
+    assert len(job_store.load_jobs()) == 1
+
+
+def test_archive_stale_jobs_protects_pending_review(isolated_data):
+    # save_jobs() stamps review_status="pending" by default.
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Awaiting review"}])
+    job_store.update_job_score("Dice", "1", 10, "Low score")
+    result = job_store.archive_stale_jobs(dry_run=False)
+    assert result["candidate_count"] == 0
+    assert len(job_store.load_jobs()) == 1
+
+
+def test_archive_stale_jobs_protects_real_engagement_over_low_score(isolated_data):
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Applied Anyway"}])
+    job_store.set_review_status("Dice", "1", "accepted")
+    job_store.update_job_score("Dice", "1", 20, "Low score")
+    _seed_application("Dice", "1", status="applied")
+    result = job_store.archive_stale_jobs(dry_run=False)
+    assert result["candidate_count"] == 0
+    assert len(job_store.load_jobs()) == 1
+
+
+def test_archive_stale_jobs_protects_a_real_generated_resume(isolated_data):
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Has Resume"}])
+    job_store.set_review_status("Dice", "1", "accepted")
+    job_store.update_job_score("Dice", "1", 20, "Low score")
+    _seed_application("Dice", "1", status="not interested", resume_text="Real drafted resume text.")
+    result = job_store.archive_stale_jobs(dry_run=False)
+    assert result["candidate_count"] == 0
+    assert len(job_store.load_jobs()) == 1
+
+
+def test_archive_stale_jobs_never_deletes_appends_to_archive_across_runs(isolated_data):
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "First"}])
+    job_store.set_review_status("Dice", "1", "rejected")
+    job_store.archive_stale_jobs(dry_run=False)
+
+    job_store.save_jobs([{"source": "Dice", "job_id": "2", "title": "Second"}])
+    job_store.set_review_status("Dice", "2", "rejected")
+    job_store.archive_stale_jobs(dry_run=False)
+
+    archived = job_store.load_archived_jobs()
+    assert {j["job_id"] for j in archived} == {"1", "2"}

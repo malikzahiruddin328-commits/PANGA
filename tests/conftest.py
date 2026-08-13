@@ -83,6 +83,7 @@ def isolated_data(tmp_path, monkeypatch):
     import search.exclusion_filter as exclusion_filter
 
     monkeypatch.setattr(job_store, "JOBS_PATH", tmp_path / "jobs.json")
+    monkeypatch.setattr(job_store, "ARCHIVE_PATH", tmp_path / "jobs-archive.json")
     monkeypatch.setattr(applications, "APPLICATIONS_PATH", tmp_path / "applications.json")
     monkeypatch.setattr(target_accounts, "TARGET_ACCOUNTS_PATH", tmp_path / "target_accounts.json")
     monkeypatch.setattr(target_accounts, "WEBSITE_LOOKUP_COST_PATH", tmp_path / "website_lookup_cost.json")

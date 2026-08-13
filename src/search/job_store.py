@@ -6,6 +6,7 @@ Encrypted at rest (PRD §7) via security.crypto_store.
 
 import hashlib
 import re
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,6 +18,10 @@ LINKEDIN_JOB_ID_RE = re.compile(r"/jobs/view/(\d+)")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 JOBS_PATH = PROJECT_ROOT / "data" / "jobs" / "jobs.json"
+ARCHIVE_PATH = PROJECT_ROOT / "data" / "jobs" / "jobs-archive.json"
+
+PASSED_APPLICATION_STATUSES = {"not interested", "not-interested"}
+PROTECTED_APPLICATION_STATUSES = {"applied", "under review", "closed by employer"}
 
 
 def load_jobs() -> list[dict]:
@@ -372,3 +377,147 @@ def update_job_score(source: str, job_id: str, fit_score: int, fit_rationale: st
                 job["fit_rationale"] = fit_rationale
                 break
         write_json(JOBS_PATH, jobs)
+
+
+def load_archived_jobs() -> list[dict]:
+    """The `jobs-archive.json` sibling store - jobs moved out of the live
+    `jobs.json` by archive_stale_jobs() below. Archive-not-delete (Zahir's
+    explicit standing preference, 2026-08-13 store cleanup): a job here is
+    fully intact, just out of the live working set, and could in principle
+    be restored by moving its record back."""
+    return read_json(ARCHIVE_PATH, default=[])
+
+
+def backup_jobs_file(suffix: str) -> Path:
+    """Timestamped copy of jobs.json before a bulk mutation - same pattern
+    as the existing jobs.bak-YYYYMMDD-HHMMSS.json files already in data/jobs/
+    (see e.g. jobs.bak-20260813-140502.json from the Dice-dedup cleanup),
+    just factored into a reusable function instead of a one-off shell copy
+    so archive_stale_jobs() below always takes one automatically. Copies the
+    file as-is (still encrypted) - restoring it is just copying it back over
+    JOBS_PATH, no decrypt/re-encrypt round-trip needed."""
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    backup_path = JOBS_PATH.parent / f"jobs.bak-{suffix}-{timestamp}.json"
+    if JOBS_PATH.exists():
+        shutil.copy2(JOBS_PATH, backup_path)
+    return backup_path
+
+
+def archive_stale_jobs(cutoff_days: int = 14, dry_run: bool = True) -> dict:
+    """2026-08-13 store cleanup (Zahir's explicit "archive not delete" ask,
+    after the live store grew past 3,400 records with no cleanup mechanism).
+    Moves (not copies) qualifying jobs from jobs.json into jobs-archive.json.
+    Never deletes a record outright - see load_archived_jobs() above for how
+    to get one back.
+
+    A job qualifies for archiving if EITHER of these is true, independent of
+    age:
+      - review_status == "rejected" (an explicit pass via the basket/review
+        UI)
+      - it has a matching applications.json record whose status is
+        "not interested"/"not-interested" (an explicit pass via the older
+        application-status flow)
+    OR it has fit_score set (not None) and fit_score < 60, regardless of
+    age - a real, considered "not a fit" judgment from the scoring
+    pipeline, not an unscored job sitting in the queue. (2026-08-13:
+    deliberately no age gate on this branch, per the coordinating session's
+    explicit decision - a low fit_score is itself the signal, independent
+    of how long ago the job was found. cutoff_days/date_added still governs
+    nothing else in this function today since the original "old + never
+    touched" branch was decided against for this run - see the module's
+    call site/backlog note for why - but the parameter is kept for a future
+    run that does want an age-gated sweep of untouched jobs.)
+
+    Protected regardless of the above (never archived):
+      - in_basket == True (Zahir may still act on it)
+      - review_status == "pending" (awaiting his review right now)
+      - a matching applications.json record with real engagement
+        (status in "applied"/"under review"/"closed by employer") - real
+        activity always outranks a low fit_score or an old date
+      - a matching applications.json record with genuinely populated
+        resume_text - a real generated resume exists for this job, so
+        archiving it would orphan real work product from the live view.
+
+    A missing fit_score (never scored) is NEVER swept by the low-score
+    branch - only a real numeric score below 60 counts; "not yet scored"
+    and "scored poorly" are different things and conflating them would
+    silently archive jobs Zahir hasn't even seen a score for yet.
+
+    dry_run=True (the default) computes and returns the candidate list
+    without writing anything - callers doing a real archive pass should
+    call once with dry_run=True to sanity-check the count/sample, then
+    again with dry_run=False to execute. Returns a dict with candidate
+    jobs, counts, and a reasons breakdown either way, so a dry run and a
+    real run report identically."""
+    from tailoring.applications import load_applications
+
+    del cutoff_days  # not used by any branch in the current run - see docstring
+
+    with locked("jobs"):
+        jobs = load_jobs()
+        apps = load_applications()
+        apps_by_key = {(a.get("source"), a.get("job_id")): a for a in apps}
+
+        candidates = []
+        remaining = []
+        reasons: dict[str, int] = {}
+
+        def bump(reason):
+            reasons[reason] = reasons.get(reason, 0) + 1
+
+        for job in jobs:
+            key = (job.get("source"), job.get("job_id"))
+            app = apps_by_key.get(key)
+            review_status = job.get("review_status")
+            fit_score = job.get("fit_score")
+
+            passed_explicit = review_status == "rejected" or (
+                app is not None and app.get("status") in PASSED_APPLICATION_STATUSES
+            )
+
+            if job.get("in_basket"):
+                remaining.append(job)
+                bump("protected:in_basket")
+                continue
+            if review_status == "pending":
+                remaining.append(job)
+                bump("protected:review_status_pending")
+                continue
+            if app is not None and app.get("status") in PROTECTED_APPLICATION_STATUSES:
+                remaining.append(job)
+                bump("protected:application_engaged")
+                continue
+            if app is not None and app.get("resume_text") and str(app.get("resume_text")).strip():
+                remaining.append(job)
+                bump("protected:real_resume_generated")
+                continue
+
+            if passed_explicit:
+                candidates.append(job)
+                bump("archived:explicit_pass")
+                continue
+
+            if fit_score is not None and fit_score < 60:
+                candidates.append(job)
+                bump("archived:low_fit_score")
+                continue
+
+            remaining.append(job)
+            bump("kept:no_matching_criterion")
+
+        result = {
+            "candidates": candidates,
+            "candidate_count": len(candidates),
+            "remaining_count": len(remaining),
+            "total_before": len(jobs),
+            "reasons": reasons,
+        }
+
+        if not dry_run and candidates:
+            archived = load_archived_jobs()
+            archived.extend(candidates)
+            write_json(ARCHIVE_PATH, archived)
+            write_json(JOBS_PATH, remaining)
+            result["archived_total_after"] = len(archived)
+
+    return result
