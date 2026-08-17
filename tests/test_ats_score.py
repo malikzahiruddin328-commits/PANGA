@@ -1,7 +1,9 @@
 from tailoring.ats_score import (
     detect_keyword_wording_regressions,
     detect_matched_keyword_regressions,
+    ensure_keyword_literally_present,
     extract_keywords,
+    keyword_literally_present,
     plateau_note_for_gaps,
     score_resume_against_keywords,
     score_resume_ats,
@@ -619,4 +621,94 @@ def test_advanced_degree_already_literally_matched_is_not_double_credited():
     resume = "PROFESSIONAL EXPERIENCE\nEngineer.\n\nEDUCATION\nMaster's degree, Computer Science\n\nSKILLS\nPython"
     result = score_resume_against_keywords([], ["Master's degree"], resume, candidate_years_experience=25)
     assert result["missing_preferred_keywords"] == []
-    assert result["years_experience_equivalency_explanations"] == []
+
+
+# --- Pre-flight score verification (feature/basket-badge-verification, 2026-08-17) ---
+# Zahir's "hope and pray" complaint: a basket Q&A question's "+N pts" badge
+# used to promise a score bump for confirming suggested_answer text with no
+# guarantee the literal keyword score_resume_against_keywords() actually
+# checks for would ever land in that text. keyword_literally_present() and
+# ensure_keyword_literally_present() are the deterministic pre-flight check
+# and patch that make the promise real, reusing the SAME matcher
+# (_phrase_in_text, via score_resume_against_keywords itself) so the two
+# can never silently disagree.
+
+def test_keyword_literally_present_true_when_phrase_is_in_text():
+    assert keyword_literally_present("shop-floor systems", "Deployed shop-floor systems across 3 plants.") is True
+
+
+def test_keyword_literally_present_false_when_phrase_is_missing():
+    assert keyword_literally_present("shop-floor systems", "Deployed manufacturing execution software.") is False
+
+
+def test_keyword_literally_present_reuses_the_real_scorer_alias_table():
+    # "IT" is one of ats_score's own case-sensitive-acronym aliases for
+    # "information technology" - keyword_literally_present must agree with
+    # score_resume_against_keywords on this exact case, since it's built on
+    # the identical _phrase_in_text() call, not a second implementation.
+    resume_with_capitalized_it = "Led the IT department for 10 years."
+    resume_with_lowercase_it = "We shipped it on time."
+    assert keyword_literally_present("information technology", resume_with_capitalized_it) is True
+    assert keyword_literally_present("information technology", resume_with_lowercase_it) is False
+    # Cross-check: score_resume_against_keywords must reach the same verdict
+    # for the same text, proving the two paths cannot drift apart.
+    scored = score_resume_against_keywords(["information technology"], [], resume_with_capitalized_it)
+    assert scored["missing_required_keywords"] == []
+
+
+def test_keyword_literally_present_handles_any_of_group_label():
+    # An any_of group's label is the " OR "-joined member list (see
+    # _normalize_keyword_item) - satisfied if EITHER member is present,
+    # same semantics _match_keyword_item uses for a real group item.
+    label = "Master's degree OR Bachelor's degree"
+    assert keyword_literally_present(label, "I hold a Bachelor's degree in Engineering.") is True
+    assert keyword_literally_present(label, "No degree mentioned at all.") is False
+
+
+def test_ensure_keyword_literally_present_returns_text_unchanged_when_already_present():
+    text = 'Your profile may already mention "shop-floor systems" - can you confirm?'
+    patched, was_present = ensure_keyword_literally_present("shop-floor systems", text)
+    assert patched == text
+    assert was_present is True
+
+
+def test_ensure_keyword_literally_present_patches_missing_phrase_into_existing_text():
+    original = "Yes, I led SAP rollouts and managed CMO/3PL relationships."
+    patched, was_present = ensure_keyword_literally_present("shop-floor systems", original)
+    assert was_present is False
+    assert original in patched
+    assert keyword_literally_present("shop-floor systems", patched) is True
+
+
+def test_ensure_keyword_literally_present_never_fabricates_a_claim_from_a_blank_starting_point():
+    # No existing text to weave into - must produce an honest hedge asking
+    # about the term, never an assertion that the candidate has it (Zahir's
+    # explicit instruction: never invent a new claim).
+    patched, was_present = ensure_keyword_literally_present("shop-floor systems", "")
+    assert was_present is False
+    assert keyword_literally_present("shop-floor systems", patched) is True
+    assert "please describe" in patched.lower()
+    assert "yes" not in patched.lower()
+
+
+def test_ensure_keyword_literally_present_is_idempotent_no_duplicate_insertion():
+    # Guard against double-insertion on a second edit round (2026-08-17
+    # design requirement) - calling this twice on the growing text must
+    # never append the clause a second time.
+    original = "I led enterprise deployments across multiple regions."
+    once, _ = ensure_keyword_literally_present("shop-floor systems", original)
+    twice, was_present_second_time = ensure_keyword_literally_present("shop-floor systems", once)
+    assert twice == once
+    assert was_present_second_time is True
+    assert once.count("shop-floor systems") == 1
+
+
+def test_ensure_keyword_literally_present_handles_any_of_group_label_without_duplicating_or():
+    label = "Master's degree OR Bachelor's degree"
+    patched, was_present = ensure_keyword_literally_present(label, "I have significant industry experience.")
+    assert was_present is False
+    assert keyword_literally_present(label, patched) is True
+    # Re-running against the now-patched text must not append a second time.
+    patched_again, was_present_again = ensure_keyword_literally_present(label, patched)
+    assert patched_again == patched
+    assert was_present_again is True

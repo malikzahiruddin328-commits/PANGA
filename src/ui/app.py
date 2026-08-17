@@ -1093,6 +1093,16 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                                             tier_label = "Preferred" if q.get("is_preferred") else "Required"
                                             tier_color = "blue" if q.get("is_preferred") else "green"
                                             st.badge(f"{tier_label} +{q['point_value']:g} pts", color=tier_color)
+                                            if q.get("keyword_verified"):
+                                                # Pre-flight score verification (2026-08-17): this
+                                                # exact suggested_answer text was checked (and
+                                                # patched if needed) to literally contain the
+                                                # keyword the deterministic scorer requires, before
+                                                # this badge was ever shown - Zahir's "hope and
+                                                # pray" fix. Small note, not a new visual state.
+                                                # markdown, not the low-contrast caption widget -
+                                                # this project's standing UI-readability rule.
+                                                st.markdown(":material/check_circle: exact phrasing included")
                                         else:
                                             st.badge("value not yet known", color="gray")
                                     with text_col:
@@ -2528,6 +2538,14 @@ def render_analyze_fit_section(job: dict, app_record: dict, analysis: dict | Non
                         st.badge("standing pref", color="gray")
                     elif q.get("point_value") is not None:
                         st.badge(f"+{q['point_value']:g} pts", color="green")
+                        if q.get("keyword_verified"):
+                            # Same pre-flight verification note as the basket-wide
+                            # panel above (2026-08-17, feature/basket-badge-
+                            # verification) - the suggested_answer shown below is
+                            # already guaranteed to contain the literal keyword.
+                            # st.markdown, not st.caption - this project's standing
+                            # UI-readability rule (see test_ui_readability_standard.py).
+                            st.markdown(":material/check_circle: exact phrasing included")
                     else:
                         # Real gap General caught Zahir hit live 2026-08-09:
                         # free-form AI-generated questions (team size,

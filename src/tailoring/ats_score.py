@@ -302,6 +302,108 @@ def _phrase_in_text(phrase: str, text_lower: str, text_original: str) -> bool:
     return False
 
 
+# Pre-flight score verification (feature/basket-badge-verification,
+# 2026-08-17) - Zahir's "hope and pray" complaint: the basket Q&A's "+N pts"
+# badge on a clarifying question comes straight from missing_required_
+# keywords/missing_preferred_keywords' point_value below, but nothing ever
+# guaranteed that CONFIRMING the question's suggested_answer text would
+# actually make that literal keyword phrase present in the eventual
+# redrafted resume - an AI redraft is free to paraphrase instead of using
+# the literal phrase, silently missing this same deterministic matcher
+# later with zero visible warning. Since the matcher itself
+# (score_resume_against_keywords, via _phrase_in_text above) is pure
+# deterministic text comparison - not an AI call - a question's confirmed
+# answer text can be test-checked (and, if it fails, patched) against the
+# EXACT SAME matcher before the badge is ever shown, so the promise is
+# actually true by construction instead of hoped for after the fact.
+def keyword_literally_present(term: str, candidate_text: str) -> bool:
+    """Does `candidate_text` already literally contain the keyword phrase
+    `term` - a missing_required_keywords/missing_preferred_keywords "label"
+    (see score_resume_against_keywords below), including an any_of group's
+    " OR "-joined label (see _normalize_keyword_item) - using the EXACT SAME
+    phrase-matching logic (equivalence aliases, the "IT"/"CS"/degree-
+    abbreviation case-sensitive-acronym backstop, word-boundary matching)
+    score_resume_against_keywords() itself uses via _phrase_in_text(), so
+    this check and the real deterministic ATS score computed from the
+    eventual resume text can never silently disagree about whether a fact
+    is present. Reuses _phrase_in_text() rather than reimplementing
+    matching - the two paths literally cannot drift apart, they're the same
+    function.
+
+    An any_of group's label is satisfied if candidate_text contains ANY ONE
+    member (same "any alternative matches" semantics _match_keyword_item
+    uses for a real group item - this just recovers the member list by
+    splitting the joined label, since callers here only ever have the
+    label string, not the original item dict, by the time a question's
+    point_value has been computed)."""
+    if not term or not candidate_text:
+        return False
+    text_lower = candidate_text.lower()
+    members = term.split(" OR ") if " OR " in term else [term]
+    return any(_phrase_in_text(m.strip().lower(), text_lower, candidate_text) for m in members)
+
+
+def ensure_keyword_literally_present(term: str, candidate_text: str) -> tuple[str, bool]:
+    """Guarantees `term` is literally present in the returned text BY
+    CONSTRUCTION, rather than leaving it to chance that a later AI redraft
+    happens to phrase it that way (see keyword_literally_present's docstring
+    for the "hope and pray" problem this closes). Returns
+    (text_to_use, was_already_present).
+
+    If `candidate_text` already contains the literal phrase, returns it
+    completely unchanged (True) - never rewrites text that's already
+    honest and correct. This also makes the function idempotent /
+    duplicate-insertion-safe (2026-08-17, same principle skill_label_match.
+    py's own dedup backstops use: check presence before acting, never
+    assume state) - calling this twice on the same text, e.g. once when a
+    question is first generated and again after the user edits their
+    answer, never appends the clause a second time once the term is
+    already there, whether that's because this function put it there or
+    the user's own edit already covers it.
+
+    Otherwise, deterministically weaves the literal term in:
+    - If there's no existing text (a genuinely blank/no-basis starting
+      point), the result is an honest hedge asking about the term by name
+      ("Please describe your real experience (if any) with ...") - NEVER
+      an assertion that the candidate has it. Fabricating a claim from
+      nothing would be worse than the "hope and pray" bug this exists to
+      fix (Zahir's explicit instruction: rephrase/append using terms
+      consistent with what's actually being confirmed, never invent a new
+      claim).
+    - If there's existing substantive text (a hedged AI guess, or a
+      deterministic starting guess), the term is appended as a short,
+      natural-reading parenthetical naming it explicitly - the same "short
+      clause append, not obvious keyword-stuffing" shape as the design
+      spec's own example ("... via SAP and CMO/3PL relationships
+      (shop-floor systems).").
+
+    Re-verifies the patched text against keyword_literally_present() before
+    returning - this function's whole reason to exist is to make the
+    guarantee actually true, not just plausible, so it never returns text
+    it hasn't itself confirmed satisfies the check."""
+    if keyword_literally_present(term, candidate_text):
+        return candidate_text, True
+
+    clause_term = term if " OR " not in term else " or ".join(
+        m.strip() for m in term.split(" OR ")
+    )
+    base = (candidate_text or "").strip()
+    if not base:
+        patched = f'Please describe your real experience (if any) with "{clause_term}".'
+    else:
+        if not base.endswith((".", "!", "?")):
+            base += "."
+        patched = f'{base} (specifically: "{clause_term}")'
+
+    if not keyword_literally_present(term, patched):
+        # Defensive fallback - shouldn't be reachable (the clause above
+        # literally contains clause_term's own text), but this function
+        # never claims a guarantee it hasn't actually verified.
+        patched = f'{patched} "{clause_term}"'.strip()
+
+    return patched, False
+
+
 # Score-first-resume-flow spec (docs/score-first-resume-flow-spec.md, item
 # 2): a JD routinely phrases a requirement as a substitutable either/or -
 # "Master's degree, OR Bachelor's degree plus 8+ years of experience." The

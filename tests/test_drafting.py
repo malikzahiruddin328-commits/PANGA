@@ -23,6 +23,7 @@ from tailoring.drafting import (
     request_additional_gap_questions,
     save_gap_answers,
 )
+from tailoring.ats_score import keyword_literally_present
 
 
 def test_ats_keywords_prompt_excludes_years_of_experience_title_lists_and_soft_skills():
@@ -1350,6 +1351,94 @@ def test_merge_keyword_gap_questions_previously_answered_dedup_is_case_insensiti
 def test_merge_keyword_gap_questions_still_asks_about_a_different_unanswered_skill():
     merged = _merge_keyword_gap_questions([], _missing("Databricks", "Terraform"), previously_answered_skills=["Databricks"])
     assert {q["skill"] for q in merged} == {"Terraform"}
+
+
+# --- Pre-flight score verification (feature/basket-badge-verification, 2026-08-17) ---
+# Zahir's "hope and pray" complaint: a question's "+N pts" badge used to be
+# shown with no guarantee that confirming its suggested_answer would make
+# the literal required/preferred keyword phrase actually present anywhere -
+# an eventual AI redraft could paraphrase instead of using it. Every
+# question this function generates for a real missing keyword must now be
+# guaranteed, by construction, to already contain the literal phrase.
+
+def test_merge_keyword_gap_questions_generated_suggested_answer_literally_contains_the_keyword_no_profile_signal():
+    # The "no real basis at all" branch (candidate's profile never mentions
+    # the term anywhere) - historically just said "Unknown - please
+    # describe..." with no mention of the actual term at all.
+    merged = _merge_keyword_gap_questions([], _missing("shop-floor systems"))
+    assert len(merged) == 1
+    q = merged[0]
+    assert keyword_literally_present("shop-floor systems", q["suggested_answer"])
+    assert q["keyword_verified"] is True
+    # Never fabricates a claim the candidate has it - still an honest ask.
+    assert "yes" not in q["suggested_answer"].lower()
+
+
+def test_merge_keyword_gap_questions_generated_suggested_answer_literally_contains_the_keyword_with_profile_signal():
+    profile = {"notes": "Owned shop-floor systems integration in 2022."}
+    merged = _merge_keyword_gap_questions([], _missing("shop-floor systems"), profile=profile)
+    assert len(merged) == 1
+    q = merged[0]
+    assert keyword_literally_present("shop-floor systems", q["suggested_answer"])
+    assert q["keyword_verified"] is True
+
+
+def test_merge_keyword_gap_questions_preferred_keyword_suggested_answer_is_also_verified():
+    merged = _merge_keyword_gap_questions([], [], missing_preferred_keywords=_missing("clinical-stage organizations"))
+    assert len(merged) == 1
+    q = merged[0]
+    assert q["is_preferred"] is True
+    assert keyword_literally_present("clinical-stage organizations", q["suggested_answer"])
+    assert q["keyword_verified"] is True
+
+
+def test_merge_keyword_gap_questions_backfilled_ai_question_suggested_answer_gets_patched_and_verified():
+    # The AI's own free-form question/suggested_answer, backfilled with a
+    # real point_value because it matches a missing keyword by skill label -
+    # this is the genuinely at-risk case (real AI text, no guarantee it
+    # happened to use the literal phrase the scorer checks for).
+    existing = [{
+        "type": "skill_gap", "skill": "shop-floor systems", "question": "?",
+        "suggested_answer": "Likely yes, based on your SAP and CMO/3PL relationships - can you confirm?",
+    }]
+    merged = _merge_keyword_gap_questions(existing, _missing("shop-floor systems"))
+    assert len(merged) == 1
+    q = merged[0]
+    assert q["point_value"] == 5.0
+    assert q["keyword_verified"] is True
+    assert keyword_literally_present("shop-floor systems", q["suggested_answer"])
+    # Original AI text preserved, not thrown away - only the literal term
+    # was woven in.
+    assert "SAP and CMO/3PL relationships" in q["suggested_answer"]
+
+
+def test_merge_keyword_gap_questions_backfilled_ai_question_already_containing_keyword_is_untouched():
+    existing = [{
+        "type": "skill_gap", "skill": "shop-floor systems", "question": "?",
+        "suggested_answer": 'Yes, I directly built and owned "shop-floor systems" for two plants.',
+    }]
+    merged = _merge_keyword_gap_questions(existing, _missing("shop-floor systems"))
+    assert merged[0]["suggested_answer"] == existing[0]["suggested_answer"]
+    assert merged[0]["keyword_verified"] is True
+
+
+def test_merge_keyword_gap_questions_does_not_set_keyword_verified_when_no_point_value_backfilled():
+    # A free-form AI question with no corresponding keyword gap at all -
+    # nothing to verify, must not falsely claim a guarantee it never made.
+    existing = [{"type": "skill_gap", "skill": "team size", "question": "?", "suggested_answer": "Roughly 8-10?"}]
+    merged = _merge_keyword_gap_questions(existing, [])
+    assert merged == existing
+    assert "keyword_verified" not in merged[0]
+
+
+def test_merge_keyword_gap_questions_does_not_double_insert_on_a_second_pass():
+    # Guards the real duplicate-insertion risk called out in the design:
+    # running the same missing keyword through this function twice (e.g.
+    # re-merging on a later round) must never append the clause twice.
+    first_pass = _merge_keyword_gap_questions([], _missing("shop-floor systems"))
+    second_pass = _merge_keyword_gap_questions(first_pass, _missing("shop-floor systems"))
+    assert len(second_pass) == 1
+    assert second_pass[0]["suggested_answer"].lower().count("shop-floor systems") == 1
 
 
 def _sample_profile():
