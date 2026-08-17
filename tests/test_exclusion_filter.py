@@ -707,9 +707,23 @@ def test_non_it_commercial_layer_real_jpmorgan_examples():
     assert exclusion_filter.check_exclusion(
         _job("Senior VP Sales", organization="Dynamic Drain Technologies")
     )["rule"] == "non_it_commercial_role"
-    assert exclusion_filter.check_exclusion(
+    # Corrected 2026-08-17 (feature/exclusion-filter-csv-patterns): this
+    # assertion previously expected layer 9's "cio" exemption to keep this
+    # title. Real evidence from Zahir's own hand-marked pending-review-queue
+    # CSV shows he actually excluded this exact title - at JPMorganChase
+    # (and the other big-bank employers layer 13 covers), "CIO" collides
+    # with "Chief Investment Officer," not "Chief Information Officer" (see
+    # the real "Wealth Management, Quantitative Portfolio Manager, Equities
+    # CIO" title layer 9's own comment already documents as the same
+    # collision). Layer 13's employer-scoped big-bank title-inflation check
+    # now correctly excludes it instead. A non-bank employer's "CIO" title
+    # is unaffected - see test_commercial_tech_qualifier_exemption below,
+    # none of which use a big-bank organization.
+    result = exclusion_filter.check_exclusion(
         _job("Vice President, Finance – CIO North America", organization="JPMorganChase")
-    ) is None
+    )
+    assert result is not None
+    assert result["rule"] == "big_bank_title_inflation"
 
 
 # --- Layer 6: project/program/product management track exclusion -----------
@@ -1026,3 +1040,239 @@ def test_list_exclusions_boundary_entry_just_inside_30_days_is_included(isolated
     result = exclusion_filter.list_exclusions(days_back=30)
 
     assert [e["job_id"] for e in result] == ["boundary"]
+
+
+# --- Layer 12: organization-level exclusion (custom_organization_exclusions) -
+
+def test_organization_exclusion_matches_case_insensitive_substring():
+    # Title deliberately passes every earlier layer (no IC-tier noun, no
+    # clinical/admin/PM/intern/security/commercial match) so the
+    # organization layer is the one actually observed firing here - a real
+    # GForce Life Sciences title, "Program Integration & Technical
+    # Oversight Lead," has this same non-triggering shape.
+    result = exclusion_filter.check_exclusion(
+        _job("Program Integration & Technical Oversight Lead", organization="GForce Life Sciences (staffing)"),
+        custom_exclusions=[],
+        custom_org_exclusions=["GForce Life Sciences"],
+    )
+    assert result == {
+        "rule": "custom_organization_exclusion",
+        "reason": 'matched custom excluded organization "GForce Life Sciences"',
+    }
+
+
+def test_organization_exclusion_empty_list_has_no_effect():
+    assert exclusion_filter.check_exclusion(
+        _job("Director, IT Service Continuity", organization="GForce Life Sciences (staffing)"),
+        custom_exclusions=[],
+        custom_org_exclusions=[],
+    ) is None
+
+
+def test_organization_exclusion_does_not_touch_unrelated_orgs():
+    # Real collision risk this layer must not trip on: "Kforce Technology
+    # Staffing" and "Air Force ..." commands are real orgs in the live
+    # store that share no substring with "GForce Life Sciences".
+    for org in ["Kforce Technology Staffing", "Air Force Global Strike Command"]:
+        assert exclusion_filter.check_exclusion(
+            _job("Director, IT Service Continuity", organization=org),
+            custom_exclusions=[],
+            custom_org_exclusions=["GForce Life Sciences"],
+        ) is None
+
+
+def test_load_custom_organization_exclusions_missing_file_returns_empty_list(isolated_data):
+    assert exclusion_filter.load_custom_organization_exclusions() == []
+
+
+def test_load_custom_organization_exclusions_missing_key_returns_empty_list(isolated_data):
+    exclusion_filter.SETTINGS_PATH.write_text("industries:\n- Pharma\n", encoding="utf-8")
+    assert exclusion_filter.load_custom_organization_exclusions() == []
+
+
+def test_load_custom_organization_exclusions_reads_configured_terms(isolated_data):
+    exclusion_filter.SETTINGS_PATH.write_text(
+        "custom_organization_exclusions:\n- GForce Life Sciences\n", encoding="utf-8",
+    )
+    assert exclusion_filter.load_custom_organization_exclusions() == ["GForce Life Sciences"]
+
+
+def test_check_exclusion_defaults_to_loading_custom_organization_exclusions_from_settings(isolated_data):
+    exclusion_filter.SETTINGS_PATH.write_text(
+        "custom_organization_exclusions:\n- GForce Life Sciences\n", encoding="utf-8",
+    )
+    result = exclusion_filter.check_exclusion(
+        _job("Program Integration & Technical Oversight Lead", organization="GForce Life Sciences (staffing)"),
+    )
+    assert result["rule"] == "custom_organization_exclusion"
+
+
+# --- Layer 13: big-bank VP/SVP/Director title-inflation exclusion -----------
+
+@pytest.mark.parametrize(("title", "organization"), [
+    ("SVP, Engineering Lead - IB Technology", "Jefferies"),  # real Jefferies job
+    ("Director of Software Engineering - Secure Web Platform", "JPMorganChase"),  # real
+    ("Applied AI/ML - Vice President", "JPMorganChase"),  # real
+    ("Vice President, Finance – CIO North America", "JPMorganChase"),  # real - CIO here is Chief Investment Officer collision, not IT
+    ("SVP - Cyber Technology Engineer", "Bank Of New York Mellon"),  # real
+    ("Global Unified Communications Engineering Lead, SVP - Enterprise Technology", "Blackstone"),  # real
+    ("Internal Audit, Cloud Technology Audit, Sr. Vice President, New York", "Goldman Sachs"),  # real
+    ("Apps Development Group Manager Sr Vice President", "Citi"),  # real
+])
+def test_big_bank_layer_excludes_real_title_inflation_examples(title, organization):
+    result = exclusion_filter.check_exclusion(_job(title, organization=organization))
+    assert result is not None
+    assert result["rule"] == "big_bank_title_inflation"
+
+
+def test_big_bank_layer_excludes_real_wealth_cio_example_even_though_layer_9_wins_the_label():
+    # Real JPMorganChase title - trips layer 9's "wealth management" phrase
+    # first (checked earlier in check_exclusion()'s layer order), so the
+    # returned label is non_it_commercial_role, not big_bank_title_inflation
+    # - same "which layer's label wins doesn't matter, both agree to
+    # exclude" situation documented elsewhere in this file. What matters is
+    # this real title (which also independently matches layer 13's pattern,
+    # with no C-suite survivor phrase - "Chief Investment Officer" is not
+    # "Chief Information/Technology Officer") is excluded either way.
+    result = exclusion_filter.check_exclusion(
+        _job(
+            "Wealth Management, Chief Investment Officer Equities Team, Associate / Vice President",
+            organization="JPMorganChase",
+        )
+    )
+    assert result is not None
+    assert result["rule"] in ("non_it_commercial_role", "big_bank_title_inflation")
+
+
+def test_big_bank_layer_keeps_the_one_real_known_good_survivor():
+    # The one real survivor across all six employers in Zahir's own
+    # hand-marked CSV: a genuine CIO's-own-office leadership title, not a
+    # bare "Technology"/"Engineering" keyword match.
+    result = exclusion_filter.check_exclusion(
+        _job("VP, Chief of Staff - Information Technology", organization="Jefferies")
+    )
+    assert result is None
+
+
+@pytest.mark.parametrize("title", [
+    "Chief Information Officer",
+    "Chief Technology Officer",
+])
+def test_big_bank_layer_keeps_literal_c_suite_titles(title):
+    for organization in ["JPMorganChase", "Citi", "Goldman Sachs", "Bank Of New York Mellon", "Jefferies", "Blackstone"]:
+        result = exclusion_filter.check_exclusion(_job(title, organization=organization))
+        assert result is None
+
+
+def test_big_bank_layer_does_not_touch_non_bank_employers():
+    # The exact same title excluded at JPMorganChase (see the parametrized
+    # test above) must survive at any organization not in the big-bank
+    # allowlist - this layer is deliberately employer-scoped, not a global
+    # VP/Director rule.
+    result = exclusion_filter.check_exclusion(
+        _job("Applied AI/ML - Vice President", organization="Acme Robotics")
+    )
+    assert result is None
+
+
+@pytest.mark.parametrize("organization", [
+    "Citigroup Inc.",  # real live-store variant of "Citi"
+    "CitiusTech",  # real, unrelated IT consulting firm - must NOT match
+    "Citizenship and Immigration Services",  # real, unrelated - must NOT match
+    "First Citizens Bank",  # real, different bank - must NOT match
+])
+def test_big_bank_layer_org_matching_avoids_real_substring_collisions(organization):
+    result = exclusion_filter.check_exclusion(
+        _job("Vice President, Engineering", organization=organization)
+    )
+    if organization == "Citigroup Inc.":
+        assert result is not None
+        assert result["rule"] == "big_bank_title_inflation"
+    else:
+        assert result is None or result["rule"] != "big_bank_title_inflation"
+
+
+def test_big_bank_layer_no_false_positive_on_real_cio_cto_ciso_admin_titles():
+    # Real false-positive check re-confirmed against every real
+    # CIO/CTO/CISO/Administrator-shaped title actually observed at these
+    # six employers in the live+archive store - none carry a VP/SVP/
+    # Director marker, so this layer never touches them either way.
+    safe_titles = [
+        "Wealth Management, Quantitative Portfolio Manager, Equities CIO",
+        "Senior Principal Software Engineer - Treasury/CIO Technology",
+        "CIO Equities Team, Program Analyst",
+        "Business Execution Lead - CIO/Functions & Enterprise Change, MD",
+    ]
+    for title in safe_titles:
+        result = exclusion_filter.check_exclusion(_job(title, organization="JPMorganChase"))
+        assert result is None or result["rule"] != "big_bank_title_inflation"
+
+
+# --- Layer 14 extension: sales/marketing/finance-function VP/Director titles -
+
+@pytest.mark.parametrize("title", [
+    "Vice President of Marketing",  # real Adamson Ahdoot job
+    "Vice President of Sales and Marketing",  # real Car Keys Express job
+    "Director of Economic Development",  # real Larned Area Chamber of Commerce job
+])
+def test_non_it_commercial_layer_extended_marketing_and_econ_dev_examples(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is not None
+    assert result["rule"] == "non_it_commercial_role"
+
+
+def test_non_it_commercial_layer_marketing_exempted_by_tech_qualifier():
+    # Real live-store title - "IT" qualifier keeps it, same shared-exemption
+    # tradeoff layers 4/9 already accept for "digital"/"technology" words.
+    result = exclusion_filter.check_exclusion(
+        _job("Director, Product & Solutions Marketing - Autonomous IT & AI-Native Workflows")
+    )
+    assert result is None or result["rule"] != "non_it_commercial_role"
+
+
+def test_non_it_commercial_layer_economic_development_does_not_catch_business_development():
+    # Real BAE Systems titles in the live store - "Business Development"/
+    # "Software Development" must not be caught by the narrower "economic
+    # development" phrase.
+    for title in [
+        "Director I, IT Service Owner - Software Development & Integrations",
+        "Director II, IT Service Owner - Legal, Contracts & Business Development",
+    ]:
+        result = exclusion_filter.check_exclusion(_job(title))
+        assert result is None or result["rule"] != "non_it_commercial_role"
+
+
+# --- Layer 15 extension: non-pharma clinical/healthcare titles --------------
+
+@pytest.mark.parametrize("title", [
+    "Director of Radiology- North Dakota-",  # real American Consultants job
+    "Director Radiology",  # real Avera Health job
+    "Registered Dietitian - Director of Nutritional Services",  # real Brothers of Mercy job
+    "Sr Director, Nursing Services",  # real IQVIA job
+])
+def test_clinical_layer_extended_radiology_dietitian_nursing_examples(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is not None
+    assert result["rule"] == "clinical_domain"
+
+
+def test_clinical_layer_radiology_phrase_does_not_catch_diagnostic_radiologic_technologist():
+    # Real Veterans Health Administration title - a different title shape
+    # with no "director" word, must not collide with the narrower "director
+    # (of) radiology" phrase.
+    result = exclusion_filter.check_exclusion(
+        _job("Diagnostic Radiologic Technologist (MRI)")
+    )
+    assert result is None or result["rule"] != "clinical_domain"
+
+
+def test_clinical_layer_nursing_services_phrase_does_not_catch_unrelated_nursing_titles():
+    # Real, unrelated titles already in the live store that share the bare
+    # word "nursing" but not the phrase "nursing services".
+    for title in [
+        "Nursing Graduate Program Track Director",
+        "Director of Nursing",
+        "SVP & Chief Nursing Officer",
+    ]:
+        result = exclusion_filter.check_exclusion(_job(title))
+        assert result is None or result["rule"] != "clinical_domain"

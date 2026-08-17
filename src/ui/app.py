@@ -3620,6 +3620,35 @@ if active_tab == "settings":
                 st.toast("Saved title clusters.", icon=":material/check_circle:")
             st.rerun()
 
+    st.subheader("Custom organization exclusions")
+    st.markdown(
+        "Comma-separated employer/organization names to skip during "
+        "search, checked against every job's organization before it's "
+        "saved - e.g. a staffing agency whose postings are never "
+        "relevant. Applies alongside the built-in filters."
+    )
+    custom_org_exclusions_settings = load_settings()
+    custom_organization_exclusions_text = st.text_area(
+        "Custom organization exclusions",
+        value=", ".join(custom_org_exclusions_settings.get("custom_organization_exclusions", [])),
+        key="custom_organization_exclusions_text",
+        label_visibility="collapsed",
+    )
+    if st.button("Save custom organization exclusions"):
+        cleaned_org_terms = [
+            term.strip()
+            for term in custom_organization_exclusions_text.split(",")
+            if term.strip()
+        ]
+        custom_org_exclusions_settings["custom_organization_exclusions"] = cleaned_org_terms
+        try:
+            save_settings(custom_org_exclusions_settings)
+        except Exception as exc:
+            st.error(f"Failed to save custom organization exclusions: {exc}")
+        else:
+            st.toast("Saved custom organization exclusions.", icon=":material/check_circle:")
+            st.rerun()
+
     if bhangi_create_issue is not None:
         # Same "no Bhangi checkout -> feature quietly absent, not an error"
         # rule as the Support tab above - this is a convenience on top of

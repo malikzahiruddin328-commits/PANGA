@@ -178,7 +178,15 @@ def test_gap_question_suggested_answer_prefilled_inline(results_app_with_gap_que
     at.run(timeout=30)
 
     box = next(t for t in at.text_area if "Databricks" in t.label)
-    assert box.value == "Unknown - please describe your real experience (if any) with this."
+    # Pre-flight score verification (2026-08-17, feature/basket-badge-
+    # verification): this fixture's resume_clarifying_questions entry
+    # already carries a real point_value, exactly the "persisted before
+    # this guarantee existed" shape _merge_keyword_gap_questions' own
+    # retroactive-backfill branch targets - the literal keyword must now
+    # be woven in by construction, not left as the old bare "Unknown -
+    # please describe..." text with no guarantee it ever gets answered
+    # with the actual required phrase (Zahir's "hope and pray" complaint).
+    assert box.value == 'Unknown - please describe your real experience (if any) with this. (specifically: "Databricks")'
 
 
 def test_skill_gap_question_shows_a_point_badge(results_app_with_gap_questions):
