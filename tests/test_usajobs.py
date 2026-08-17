@@ -26,7 +26,15 @@ def _search_result(items):
     return {"SearchResult": {"SearchResultItems": items, "SearchResultCountAll": len(items)}}
 
 
-def _item(position_id="P1", title="IT Specialist"):
+def _item(position_id="P1", title="IT Specialist", job_category=None):
+    # Defaults to a real-shaped, matching JobCategory (verified live
+    # 2026-08-17 against JobCategoryCode=2210:
+    # MatchedObjectDescriptor.JobCategory = [{"Name": ..., "Code": ...}])
+    # so existing tests that don't care about category validation keep
+    # passing unchanged. Pass job_category=[] or a mismatched code to
+    # exercise the validation itself.
+    if job_category is None:
+        job_category = [{"Name": "Information Technology Management", "Code": "2210"}]
     return {
         "MatchedObjectDescriptor": {
             "PositionID": position_id,
@@ -38,6 +46,7 @@ def _item(position_id="P1", title="IT Specialist"):
             "ApplyURI": ["https://example.gov/apply"],
             "PositionURI": "https://example.gov/job",
             "QualificationSummary": "Some summary",
+            "JobCategory": job_category,
         }
     }
 
@@ -186,3 +195,85 @@ def test_search_jobs_unaffected_by_new_function_existing(monkeypatch, configured
     monkeypatch.setattr(usajobs.requests, "get", fake_get)
     jobs = usajobs.search_jobs(keyword="CIO")
     assert len(jobs) == 1
+
+
+# --- Real bug (2026-08-17): USAJOBS' own JobCategoryCode server-side
+# filter is looser than expected - real production evidence returned
+# "Cook" (Bureau of Indian Education), "Staff Accountant" (Army National
+# Guard), and "Social Worker" (Air National Guard) from a
+# JobCategoryCode=2210 request. USAJOBS' real behavior doesn't reproduce
+# the bug on every call (a live re-check 2026-08-17 came back clean), so
+# these synthetic MatchedObjectDescriptors with a mismatched JobCategory
+# are what actually exercises the fix deterministically, per the task's
+# explicit instruction to cover that case.
+
+def test_search_jobs_drops_job_whose_actual_category_does_not_match_requested_code(monkeypatch, configured):
+    off_domain_job = _item(
+        position_id="BAD1",
+        title="Cook",
+        job_category=[{"Name": "Food Preparation And Cooking", "Code": "7404"}],
+    )
+    matching_job = _item(position_id="GOOD1", title="IT Specialist")
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        return _FakeResponse(_search_result([off_domain_job, matching_job]))
+
+    monkeypatch.setattr(usajobs.requests, "get", fake_get)
+    jobs = usajobs.search_jobs(job_category_code="2210")
+
+    assert [j["job_id"] for j in jobs] == ["GOOD1"]
+
+
+def test_search_jobs_drops_job_with_no_job_category_at_all_when_code_requested(monkeypatch, configured):
+    no_category_job = _item(position_id="BAD2", job_category=[])
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        return _FakeResponse(_search_result([no_category_job]))
+
+    monkeypatch.setattr(usajobs.requests, "get", fake_get)
+    jobs = usajobs.search_jobs(job_category_code="2210")
+
+    assert jobs == []
+
+
+def test_search_jobs_matches_any_of_several_semicolon_joined_requested_codes(monkeypatch, configured):
+    job = _item(job_category=[{"Name": "Accounting", "Code": "0510"}])
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        return _FakeResponse(_search_result([job]))
+
+    monkeypatch.setattr(usajobs.requests, "get", fake_get)
+    jobs = usajobs.search_jobs(job_category_code="2210;0510;1550")
+
+    assert len(jobs) == 1
+
+
+def test_search_jobs_keyword_only_search_is_unaffected_by_category_validation(monkeypatch, configured):
+    # No job_category_code passed -> nothing to validate against, must
+    # pass through unchanged even with no JobCategory field at all.
+    job = _item(job_category=[])
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        return _FakeResponse(_search_result([job]))
+
+    monkeypatch.setattr(usajobs.requests, "get", fake_get)
+    jobs = usajobs.search_jobs(keyword="Director")
+
+    assert len(jobs) == 1
+
+
+def test_search_jobs_by_series_and_grade_drops_off_series_job(monkeypatch, configured):
+    off_domain_job = _item(
+        position_id="BAD1",
+        title="Staff Accountant",
+        job_category=[{"Name": "Accounting", "Code": "0510"}],
+    )
+    matching_job = _item(position_id="GOOD1")
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        return _FakeResponse(_search_result([off_domain_job, matching_job]))
+
+    monkeypatch.setattr(usajobs.requests, "get", fake_get)
+    jobs = usajobs.search_jobs_by_series_and_grade(["2210"], "12", "15")
+
+    assert [j["job_id"] for j in jobs] == ["GOOD1"]

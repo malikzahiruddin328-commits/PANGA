@@ -21,6 +21,46 @@ class USAJobsNotConfigured(Exception):
     pass
 
 
+def _log(message: str) -> None:
+    # Same print(..., flush=True) convention as job_sources.py's/
+    # run_search.py's own _log() - keeps this module's stdout visible in
+    # whatever captures it (scheduled script, Streamlit console, etc.)
+    # without adding a logging dependency this file didn't already have.
+    print(f"[usajobs] {message}", flush=True)
+
+
+def _requested_category_codes(job_category_code: str) -> set[str]:
+    """job_category_code may be a single code ("2210") or several
+    semicolon-joined (confirmed live 2026-08-12 in
+    search_jobs_by_series_and_grade()'s docstring - that's the real
+    USAJOBS separator, not a repeated param). Split defensively either
+    way so a single code still works."""
+    return {code.strip() for code in job_category_code.split(";") if code.strip()}
+
+
+def _actual_category_codes(descriptor: dict) -> set[str]:
+    """USAJOBS' real response (live-verified 2026-08-17 against
+    JobCategoryCode=2210) puts a job's true category/series in
+    MatchedObjectDescriptor.JobCategory - a list of {"Name": ..., "Code":
+    ...} objects, e.g. [{"Name": "Information Technology Management",
+    "Code": "2210"}]. USAJOBS' own server-side JobCategoryCode filter is
+    looser than the name implies: real production evidence (2026-08-17)
+    showed "Cook" (Bureau of Indian Education), "Staff Accountant" (Army
+    National Guard), and "Social Worker" (Air National Guard) coming back
+    from a JobCategoryCode=2210 request despite JobCategory not containing
+    2210 at all. This reads the field the API actually returns so callers
+    can reject those instead of trusting the request filter alone."""
+    return {
+        entry.get("Code")
+        for entry in descriptor.get("JobCategory") or []
+        if entry.get("Code")
+    }
+
+
+def _category_matches(descriptor: dict, requested_codes: set[str]) -> bool:
+    return bool(_actual_category_codes(descriptor) & requested_codes)
+
+
 def _headers() -> dict:
     api_key = os.environ.get("USAJOBS_API_KEY")
     user_agent_email = os.environ.get("USAJOBS_USER_AGENT_EMAIL")
@@ -66,9 +106,23 @@ def search_jobs(
     response.raise_for_status()
     data = response.json()
 
+    # job_category_code was sent as a *request* filter above, but USAJOBS'
+    # own server-side filtering is looser than that implies (real
+    # production evidence 2026-08-17: off-domain jobs like "Cook" and
+    # "Staff Accountant" came back from a JobCategoryCode=2210 request).
+    # Validate each returned job's actual JobCategory against what was
+    # requested and drop anything that doesn't really match - deterministic,
+    # no AI involved. Keyword-only searches (no job_category_code) have
+    # nothing to validate against and pass through unchanged, same as today.
+    requested_codes = _requested_category_codes(job_category_code) if job_category_code else None
+
     jobs = []
+    skipped = 0
     for item in data.get("SearchResult", {}).get("SearchResultItems", []):
         d = item.get("MatchedObjectDescriptor", {})
+        if requested_codes is not None and not _category_matches(d, requested_codes):
+            skipped += 1
+            continue
         remuneration = d.get("PositionRemuneration") or [{}]
         pay = remuneration[0]
         apply_uris = d.get("ApplyURI") or [None]
@@ -85,6 +139,12 @@ def search_jobs(
             "apply_url": apply_uris[0],
             "qualification_summary": d.get("QualificationSummary"),
         })
+    if skipped:
+        _log(
+            f"search_jobs(job_category_code={job_category_code!r}): skipped "
+            f"{skipped} of {skipped + len(jobs)} returned job(s) whose actual "
+            f"JobCategory didn't match the requested code(s)"
+        )
     return jobs
 
 
@@ -195,6 +255,8 @@ def search_jobs_by_series_and_grade(
     level) are genuinely new - and those 5 are exactly the real gap this
     was built to close, including both confirmed examples above (CISO
     EM-2210-00, CIO CP-graded)."""
+    requested_codes = set(job_category_codes)
+
     def _fetch(extra_params: dict) -> list[dict]:
         params: dict = {
             "ResultsPerPage": results_per_page,
@@ -210,8 +272,15 @@ def search_jobs_by_series_and_grade(
         data = response.json()
 
         results = []
+        skipped = 0
         for item in data.get("SearchResult", {}).get("SearchResultItems", []):
             d = item.get("MatchedObjectDescriptor", {})
+            # Same real-world mismatch as search_jobs() - validate the
+            # returned job's actual JobCategory against the requested
+            # series instead of trusting USAJOBS' server-side filter.
+            if not _category_matches(d, requested_codes):
+                skipped += 1
+                continue
             remuneration = d.get("PositionRemuneration") or [{}]
             pay = remuneration[0]
             apply_uris = d.get("ApplyURI") or [None]
@@ -228,6 +297,12 @@ def search_jobs_by_series_and_grade(
                 "apply_url": apply_uris[0],
                 "qualification_summary": d.get("QualificationSummary"),
             })
+        if skipped:
+            _log(
+                f"search_jobs_by_series_and_grade(job_category_codes={job_category_codes!r}): "
+                f"skipped {skipped} of {skipped + len(results)} returned job(s) whose actual "
+                f"JobCategory didn't match the requested series"
+            )
         return results
 
     jobs = _fetch({"PayGradeLow": pay_grade_low, "PayGradeHigh": pay_grade_high})
