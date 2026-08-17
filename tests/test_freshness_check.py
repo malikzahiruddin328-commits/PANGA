@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 import search.freshness_check as freshness_check
 import search.job_store as job_store
+import search.usajobs as usajobs
 import tailoring.applications as applications
 
 _JOB = {
@@ -175,3 +176,37 @@ def test_legacy_closed_job_with_no_state_entry_is_rechecked_and_defaults_on_reop
     assert (checked, reopened) == (1, 1)
     # No prior_status was ever recorded - falls back to "under review".
     assert applications.get_application(job["source"], job["job_id"])["status"] == "under review"
+
+
+# _check_usajobs() - the real call site of the fixed usajobs.check_position_open().
+# Previously untested at both this layer and usajobs.py's own (see
+# tests/test_usajobs.py's new tests) - this is the gap that let the
+# search-API-based bug (usajobs.py rewritten 2026-08-17) sit unnoticed:
+# every test in this file mocks freshness_check.check_posting_open()
+# itself, so none of them ever exercised the real integration between this
+# module and usajobs.check_position_open().
+
+def test_check_usajobs_returns_true_when_position_open(monkeypatch):
+    job = {"source": "USAJOBS", "job_id": "DH-13024454-26-VJ"}
+    monkeypatch.setattr(usajobs, "check_position_open", lambda position_id: True)
+    assert freshness_check._check_usajobs(job) is True
+
+
+def test_check_usajobs_returns_false_when_position_closed(monkeypatch):
+    job = {"source": "USAJOBS", "job_id": "req806"}
+    monkeypatch.setattr(usajobs, "check_position_open", lambda position_id: False)
+    assert freshness_check._check_usajobs(job) is False
+
+
+def test_check_usajobs_returns_none_on_position_not_found(monkeypatch):
+    """usajobs.check_position_open() raises USAJobsPositionNotFound when the
+    Historic JOA API has no record for a given id (a real, observed
+    outcome - see test_usajobs.py) - this must become None (couldn't tell,
+    fail-safe toward still-open), never a false "closed"."""
+    job = {"source": "USAJOBS", "job_id": "GARBAGE-NOT-REAL"}
+
+    def raise_not_found(position_id):
+        raise usajobs.USAJobsPositionNotFound(position_id)
+
+    monkeypatch.setattr(usajobs, "check_position_open", raise_not_found)
+    assert freshness_check._check_usajobs(job) is None
