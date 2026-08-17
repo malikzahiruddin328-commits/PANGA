@@ -374,20 +374,22 @@ def score_unscored_jobs(profile: dict) -> list[dict]:
     if not unscored:
         return []
 
-    _log(f"Scoring {len(unscored)} new job(s)...")
+    total = len(unscored)
+    _log(f"Scoring {total} new job(s)...")
     strong_matches = []
-    for job in unscored:
+    for i, job in enumerate(unscored, start=1):
         skip = fit_score_prefilter.should_skip_scoring(job, profile)
         if skip:
             fit_score_prefilter.log_prefilter_skip(job, skip)
-            _log(f"  [prefilter:{skip['layer']}] skipped {job.get('title')!r} at {job.get('organization')!r}: {skip['reason']}")
+            _log(f"  [{i}/{total}] [prefilter:{skip['layer']}] skipped {job.get('title')!r} at {job.get('organization')!r}: {skip['reason']}")
             continue
         try:
             result = score_job(job, profile)
         except (DraftingNotConfigured, DraftingFailed) as exc:
-            _log(f"  [score] failed for {job.get('title')!r} at {job.get('organization')!r}: {exc}")
+            _log(f"  [{i}/{total}] [score] failed for {job.get('title')!r} at {job.get('organization')!r}: {exc}")
             continue
         job_store.update_job_score(job.get("source"), job.get("job_id"), result["fit_score"], result["fit_rationale"])
+        _log(f"  [{i}/{total}] scored {job.get('title')!r} at {job.get('organization')!r}: {result['fit_score']}")
         if result["fit_score"] >= 60:
             strong_matches.append({**job, **result})
     return strong_matches
