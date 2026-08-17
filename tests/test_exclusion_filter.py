@@ -101,9 +101,16 @@ def test_title_matching_both_layers_is_still_excluded():
     "Senior Lab Tech",
 ])
 def test_clinical_layer_excludes_lab_technician_titles(title):
+    # Since experiment/filter-quality-improvements added "technician" to
+    # layer 1's IC-tier noun list (2026-08-17), every one of these titles
+    # now also matches layer 1 (no exec qualifier present) and layer 1 runs
+    # first in check_exclusion() - same "excluded either way, rule label
+    # isn't the point" situation as test_title_matching_both_layers_is_still_excluded()
+    # and test_front_desk_coordinator_excluded_by_seniority_layer_first()
+    # elsewhere in this file. What matters is the job is still excluded.
     result = exclusion_filter.check_exclusion(_job(title))
     assert result is not None
-    assert result["rule"] == "clinical_domain"
+    assert result["rule"] in ("seniority_mismatch", "clinical_domain")
 
 
 @pytest.mark.parametrize("title", [
@@ -404,6 +411,206 @@ def test_ic_engineer_layer_real_bny_mellon_and_citi_examples():
     assert exclusion_filter.check_exclusion(
         _job("SVP Lead Full Stack Engineer", organization="Citi")
     )["rule"] == "ic_engineer_title"
+
+
+# --- Layer 1 extension (2026-08-17): administrator/technician/IT-SPEC ------
+
+@pytest.mark.parametrize("title", [
+    "Operational Technology Systems Administrator",  # real, via Dice
+    "Cloud/Infrastructure Technician - DHA",  # real USAJOBS job
+    "Operating Systems Technician",  # real USAJOBS job
+    "IT Support Technician I",  # real U.S. Courts job
+    "IT Technician II",  # real U.S. Courts job
+    "Temporary Information Technology Technician II  1 Year Term",  # real U.S. Courts job
+    "IT SPEC (INFOSEC)",  # real Air National Guard Units job
+    "IT SPEC (INFOSEC/NETWORK) - TITLE 32",  # real Air National Guard Units job
+    "ITSPEC (INFOSEC/NETWORK) (Title 32)",  # real Air National Guard Units job - unspaced variant
+    "ITSPEC (NETWORK)",  # real Air National Guard Units job - unspaced variant
+])
+def test_seniority_layer_excludes_new_ic_tier_nouns(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is not None
+    assert result["rule"] == "seniority_mismatch"
+
+
+@pytest.mark.parametrize("title", [
+    "Director, IT Service Continuity",
+    "Chief Information Officer",
+    "VP Information Technology",
+    "Director, Systems Administration",  # "Administration" != "Administrator", also Director-qualified
+])
+def test_seniority_layer_new_nouns_still_exempt_exec_qualified_titles(title):
+    assert exclusion_filter.check_exclusion(_job(title)) is None
+
+
+@pytest.mark.parametrize("title", [
+    "Systems Administrator",
+    "Database Administrator",
+    "Network Administrator",
+])
+def test_seniority_layer_bare_administrator_now_excluded_same_as_engineer_analyst(title):
+    # Deliberate behavior change from master, not a bug: on master, a bare
+    # "Administrator" title with no seniority prefix at all was silently
+    # KEPT (never in layer 1's noun list), while an equally IC-tier bare
+    # "Systems Engineer"/"Business Analyst"/"IT Specialist" was already
+    # excluded - an inconsistency in what "IC-tier, no leadership signal"
+    # meant depending only on which noun the posting happened to use.
+    # "Administrator" now gets the identical treatment: excluded only when
+    # BOTH true (IC-tier noun present AND no exec qualifier), same as
+    # every other noun in this list, so "FVP/SVP, Credit Administrator"-
+    # shaped titles (qualifier present) are unaffected. Validated against
+    # the full live store (2026-08-17): only 3 real bare "Administrator"
+    # titles with no exec qualifier exist ("Operational Technology Systems
+    # Administrator" via Dice, "Cloud Systems Administrator"/"Database
+    # Administrator-DHA" at Social Security Administration/USAJOBS), all
+    # genuinely non-leadership IC roles - zero real titles lose leadership-
+    # relevant coverage from this change.
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is not None
+    assert result["rule"] == "seniority_mismatch"
+
+
+def test_seniority_layer_pre_existing_cio_exec_qualifier_gap_unaffected_by_this_branch():
+    # "Associate CIO, Administrative Applications" (real AbbVie job) was
+    # ALREADY excluded on master before this branch touched anything -
+    # "CIO" was never in _EXEC_QUALIFIER_PATTERN, so "Associate" (an
+    # IC-tier noun) has no qualifying word to exempt it against. This is a
+    # pre-existing false-exclusion risk in the seven layers this branch
+    # inherited, not something introduced here - flagged, not silently
+    # fixed, since it's an orthogonal false-POSITIVE-risk bug (over-
+    # filtering a real CIO-tier title) rather than a noise-reduction gap,
+    # and touching the shared _EXEC_QUALIFIER_PATTERN affects every layer
+    # that uses it, which is out of this branch's scope without Zahir's
+    # explicit sign-off. Confirmed identical on master via a direct diff
+    # check (2026-08-17) before this test was added - see branch report.
+    result = exclusion_filter.check_exclusion(_job("Associate CIO, Administrative Applications"))
+    assert result == {
+        "rule": "seniority_mismatch",
+        "reason": "individual-contributor-tier title with no executive-qualifying word present",
+    }
+
+
+def test_non_it_commercial_layer_catches_real_credit_administrator_role_previously_missed():
+    # "FVP/SVP, Credit Administrator" (real Cathay Bank job, live store) is
+    # a bank credit/lending-operations role, not IT - it used to slip
+    # through every one of the seven prior layers untouched (confirmed
+    # against master directly: check_exclusion() returned None). Layer 6's
+    # new \bcredit\b match now correctly catches it.
+    result = exclusion_filter.check_exclusion(_job("FVP/SVP, Credit Administrator", organization="Cathay Bank"))
+    assert result is not None
+    assert result["rule"] == "non_it_commercial_role"
+
+
+# --- Layer 2 extension (2026-08-17): pharma CMC / clinical-operations ------
+
+@pytest.mark.parametrize("title", [
+    "Scientific Technical Lead, Early Stage PDST CMC",  # real AbbVie job
+    "Director of CMC, External Operations",  # real AbbVie job
+    "Associate Director, RA CMC",  # real AbbVie job
+    "Scientific Technical Lead, Late Stage CMC",  # real AbbVie job
+    "Clinical Site Lead",  # real GForce Life Sciences job
+    "Associate Director, Clinical Operations Compliance & Training",  # real NexInfo Solutions job
+    "Director, Country Clinical Operations Management",  # real AbbVie job
+    "Director, Clinical Process Excellence",  # real AbbVie job
+    "Clinical Psychologist / Director of Clinical Services",  # real Project Vida job
+])
+def test_clinical_layer_excludes_cmc_and_clinical_ops_titles(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is not None
+    assert result["rule"] == "clinical_domain"
+
+
+@pytest.mark.parametrize("title", [
+    "Director, IT Service Continuity",
+    "Vice President, Clinical Technology and Integration",  # real Nuvodia job - health-IT adjacent, kept deliberately
+    "Chief Information Officer",
+])
+def test_clinical_layer_cmc_extension_does_not_catch_unrelated_titles(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is None or result["rule"] != "clinical_domain"
+
+
+# --- Layer 5 extension (2026-08-17): bare "developer" role noun ------------
+
+@pytest.mark.parametrize("title", [
+    "Senior Java Developer, FX eCommerce, Vice President",  # real Citi job
+    "Lead Java Developer - Senior Vice President",  # real Citi job
+    "COBOL Developer",  # real USAJOBS job
+    "Python Developer",  # real USAJOBS job
+    "PEGA Developer- DHA",  # real USAJOBS job
+    "Business Intelligence Platform Developer",  # real USAJOBS job
+    "Node-React Full Stack Web Application Developer",  # real USAJOBS job
+])
+def test_ic_engineer_layer_excludes_developer_titles(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is not None
+    assert result["rule"] in ("seniority_mismatch", "ic_engineer_title")
+
+
+def test_ic_engineer_layer_developer_manager_exemption():
+    # "SVP, Senior Oracle AML Manager/Developer" (real Jefferies job) -
+    # carries both "Developer" and "Manager" - the existing
+    # _PEOPLE_MANAGEMENT_PATTERN exemption keeps it, same as it already
+    # does for "Software Engineering Manager"-shaped titles.
+    result = exclusion_filter.check_exclusion(_job("SVP, Senior Oracle AML Manager/Developer"))
+    assert result is None or result["rule"] != "ic_engineer_title"
+
+
+def test_ic_engineer_layer_developer_vp_prefix_layer_1_would_miss():
+    # Isolates layer 5 specifically: "Vice President" is an exec qualifier
+    # that would make layer 1 keep this title, so only layer 5's new
+    # "developer" noun (no VP/SVP exemption) catches it.
+    result = exclusion_filter.check_exclusion(
+        _job("Senior Java Developer, FX eCommerce, Vice President", organization="Citi")
+    )
+    assert result["rule"] == "ic_engineer_title"
+
+
+# --- Layer 6 (new, 2026-08-17): non-IT commercial/finance leadership -------
+
+@pytest.mark.parametrize("title", [
+    "Senior VP Sales",  # real Dynamic Drain Technologies job
+    "Vice President of Sales and Marketing",  # real Car Keys Express job
+    "SVP, Channel & Independent Agency Sales",  # real Genius Sports job
+    "VP of Finance",  # real Hutton job
+    "Vice President Finance",  # real SESLOC Credit Union job
+    "Director, Finance Internal Audit",  # real AbbVie job
+    "SVP, Bond Quant (Corporate Credit) - Risk Management",  # real Jefferies job
+    "Senior VP Credit Portfolio Manager",  # real SouthPoint Bank job
+    "J.P. Morgan Wealth Management - Vice President, Private Wealth Planner",  # real JPMorganChase job
+    "Business Strategy Wealth Management Operations - Vice President",  # real JPMorganChase job
+    "Commercial Card Product Solutions Manager- Payments - Vice President",  # real JPMorganChase job
+    "Card Fraud Strategy - Vice President",  # real JPMorganChase job
+])
+def test_non_it_commercial_layer_excludes_pure_commercial_titles(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is not None
+    assert result["rule"] == "non_it_commercial_role"
+
+
+@pytest.mark.parametrize("title", [
+    "Vice President, Finance – CIO North America",  # real JPMorganChase job - genuine Finance-division CIO
+    "IT Infrastructure Managed Services - Sales Director",  # real PwC job
+    "Sr. Director, IT Product Management – Post Sales and Partner Technology",  # real MongoDB job
+    "IT Director - Finance and Procurement App",  # real Novolex job
+    "Vice President of Finance & IT",  # real Grupo Mariposa job
+    "Director II, IT Service Owner - ERP & Finance Services",  # real BAE Systems job
+    "VP Technology - Finance",  # real Crawford & Company job
+    "Chief Information Officer",
+    "Director, IT Service Continuity",
+])
+def test_non_it_commercial_layer_does_not_catch_it_qualified_titles(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is None or result["rule"] != "non_it_commercial_role"
+
+
+def test_non_it_commercial_layer_real_jpmorgan_examples():
+    assert exclusion_filter.check_exclusion(
+        _job("Senior VP Sales", organization="Dynamic Drain Technologies")
+    )["rule"] == "non_it_commercial_role"
+    assert exclusion_filter.check_exclusion(
+        _job("Vice President, Finance – CIO North America", organization="JPMorganChase")
+    ) is None
 
 
 # --- Logging: the non-negotiable "never silently dropped" requirement ------
