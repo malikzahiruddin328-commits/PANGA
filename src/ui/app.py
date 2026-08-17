@@ -391,13 +391,27 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
     Streamlit session_state, so it survives page reloads. "Expandable" is
     a real st.popover, not a fake collapse/expand - clicking it opens an
     actual floating panel listing every basket job with a per-item remove
-    action and a per-item "Generate" button, plus one bulk "Generate for
-    all N" action for the whole basket - covering both the per-job and
-    bulk document-generation actions the spec asked the basket itself to
-    support (the Results tab's own per-job "Generate documents" section,
-    inside each job's detail panel, already covers the per-job case there
-    too - this is a second, basket-scoped way to reach the same per-job
-    action without leaving the basket panel).
+    action and one bulk "Generate for all N" action for the whole basket
+    (the Results tab's own per-job "Generate documents" section, inside
+    each job's detail panel, already covers the per-job case there too -
+    this basket panel is a bulk-scoped way to reach the same underlying
+    pipeline without leaving the basket panel).
+
+    A standalone per-item "Generate" button used to live here too (left
+    of "Draft & score"), calling generate_for_job() directly - a paid API
+    call with no gate. Removed 2026-08-17 (real bug, flagged by Zahir off
+    a screenshot): it was a leftover from before the 2026-08-13 step-4
+    redesign below, sat in the first/leftmost column ahead of "Draft &
+    score" so it read as step 1 of the sequence when it was actually a
+    shortcut that bypassed the entire $0 subscription draft/score/Q&A
+    loop and spent real money immediately. "Fire final API build" below
+    is now the sole per-item path to generate_for_job(), gated behind at
+    least one completed subscription round. NOTE: the bulk "Generate for
+    all N job(s)" button further down this panel has the same
+    direct-paid-API-bypass shape (it calls generate_for_basket() with no
+    subscription-round gate) but was left as-is here - Zahir's report was
+    specifically about the per-item button from the screenshot, not this
+    one; flagged in the build report instead of changed.
 
     Each item also gets the in-app subscription build/refine loop
     (2026-08-13, tailoring.subscription_resume_qa - Zahir's confirmed real
@@ -456,29 +470,10 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                         qa_round = app_record.get("subscription_qa_round", 0)
                         qa_score = app_record.get("resume_ats_score")
                         open_questions = app_record.get("resume_clarifying_questions") or []
-                        item_cols = st.columns([3, 1.2, 1.9, 1.6, 1])
+                        item_cols = st.columns([3, 2.2, 1.8, 1])
                         with item_cols[0]:
                             st.markdown(f"{job_label(job)}")
                         with item_cols[1]:
-                            if st.button(
-                                "Generate", key=f"basket_item_gen_{source}_{job_id}",
-                                disabled=not drafting_is_configured(),
-                                help="Generates the same document types picked below, for just this one job - direct paid API call, skips the free subscription draft/refine loop below.",
-                            ):
-                                doc_keys = [k for k, _ in BASKET_DOC_TYPES if st.session_state.get(f"basket_doc_{k}", k in ("resume", "cover_letter"))]
-                                if not doc_keys:
-                                    st.toast("Pick at least one document type below first.", icon=":material/warning:")
-                                else:
-                                    result = generate_for_job(job, load_profile(), doc_keys)
-                                    if result.get("locked"):
-                                        st.toast(f"A generation is already in progress for {job_label(job)} - try again shortly.", icon=":material/warning:")
-                                    elif result["ok"]:
-                                        st.toast(f"Documents drafted for {job_label(job)}.", icon=":material/check_circle:")
-                                    else:
-                                        failed = ", ".join(result["errors"].keys())
-                                        st.toast(f"{job_label(job)}: {failed} failed to draft - see the Results tab for detail.", icon=":material/warning:")
-                                    st.rerun()
-                        with item_cols[2]:
                             if qa_status == "drafting":
                                 st.markdown(":material/hourglass_top: Drafting initial resume (subscription)...")
                             elif qa_status == "generating_questions":
@@ -514,7 +509,7 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                             else:
                                 score_text = f"{qa_score}/100" if qa_score is not None else "not yet scored"
                                 st.markdown(f":material/check_circle: Round {qa_round} - ATS {score_text}")
-                        with item_cols[3]:
+                        with item_cols[2]:
                             if st.button(
                                 "Fire final API build", key=f"basket_item_finalbuild_{source}_{job_id}",
                                 disabled=not drafting_is_configured() or qa_round == 0,
@@ -548,7 +543,7 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                                         failed = ", ".join(result["errors"].keys())
                                         st.toast(f"{job_label(job)}: {failed} failed to draft - see the Results tab for detail.", icon=":material/warning:")
                                     st.rerun()
-                        with item_cols[4]:
+                        with item_cols[3]:
                             if st.button(":material/close:", key=f"basket_item_remove_{source}_{job_id}", help="Remove from basket"):
                                 remove_from_basket(source, job_id)
                                 st.rerun()
@@ -611,7 +606,7 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                                             st.toast(f"Subscription re-draft failed: {outcome['error']}", icon=":material/error:")
                                         st.rerun()
                     st.divider()
-                    st.markdown("**Document types** (used by both per-item Generate above and Generate all below)")
+                    st.markdown("**Document types** (used by both \"Fire final API build\" above and \"Generate for all\" below)")
                     doc_cols = st.columns(len(BASKET_DOC_TYPES))
                     for col, (doc_key, doc_label) in zip(doc_cols, BASKET_DOC_TYPES):
                         with col:
