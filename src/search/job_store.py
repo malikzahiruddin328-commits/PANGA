@@ -82,6 +82,12 @@ def save_jobs(new_jobs: list[dict], apply_exclusion: bool = True, review_require
     before 2026-08-13 would silently vanish behind an unintended review
     gate."""
     to_log: list[tuple[dict, dict]] = []
+    # Loaded once per batch, not once per job - custom_exclusions is the
+    # user's Settings-tab list (config/settings.yaml, see
+    # exclusion_filter.load_custom_title_exclusions()); re-reading that
+    # file inside the per-job loop below would mean one extra file read
+    # per job on a large multi-source search result.
+    custom_exclusions = exclusion_filter.load_custom_title_exclusions() if apply_exclusion else []
     with locked("jobs"):
         existing = load_jobs()
         seen = {(j.get("source"), j.get("job_id")) for j in existing}
@@ -89,7 +95,7 @@ def save_jobs(new_jobs: list[dict], apply_exclusion: bool = True, review_require
         added = 0
         for job in new_jobs:
             if apply_exclusion:
-                exclusion = exclusion_filter.check_exclusion(job)
+                exclusion = exclusion_filter.check_exclusion(job, custom_exclusions)
                 if exclusion:
                     to_log.append((job, exclusion))
                     continue

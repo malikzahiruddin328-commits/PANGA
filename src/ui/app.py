@@ -2782,6 +2782,38 @@ if active_tab == "settings":
                 st.toast("Saved job-alert senders.", icon=":material/check_circle:")
                 st.rerun()
 
+    st.subheader("Custom title exclusions")
+    st.markdown(
+        "Comma-separated titles to skip during search, checked against "
+        "every job title before it's saved. Applies alongside the "
+        "built-in filters."
+    )
+    custom_exclusions_settings = load_settings()
+    custom_title_exclusions_text = st.text_area(
+        "Custom title exclusions",
+        value=", ".join(custom_exclusions_settings.get("custom_title_exclusions", [])),
+        key="custom_title_exclusions_text",
+        label_visibility="collapsed",
+    )
+    if st.button("Save custom title exclusions"):
+        # Split on commas, trim whitespace, drop empty entries - handles
+        # extra commas/whitespace in free-form input gracefully (e.g.
+        # "Intern,, CISO ,  " -> ["Intern", "CISO"]) rather than erroring
+        # or saving blank terms that would never match anything.
+        cleaned_terms = [
+            term.strip()
+            for term in custom_title_exclusions_text.split(",")
+            if term.strip()
+        ]
+        custom_exclusions_settings["custom_title_exclusions"] = cleaned_terms
+        try:
+            save_settings(custom_exclusions_settings)
+        except Exception as exc:
+            st.error(f"Failed to save custom title exclusions: {exc}")
+        else:
+            st.toast("Saved custom title exclusions.", icon=":material/check_circle:")
+            st.rerun()
+
     if bhangi_create_issue is not None:
         # Same "no Bhangi checkout -> feature quietly absent, not an error"
         # rule as the Support tab above - this is a convenience on top of
