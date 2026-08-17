@@ -92,6 +92,36 @@ def test_title_matching_both_layers_is_still_excluded():
     assert result["rule"] in ("seniority_mismatch", "clinical_domain")
 
 
+@pytest.mark.parametrize("title", [
+    "Laboratory Technician",
+    "Veterinary Laboratory Technician",  # real Beacon Hill Life Sciences job
+    "Quality Control Laboratory Technician",  # real Beacon Hill Life Sciences job
+    "Lab Technician – Powdered Metals",  # real Beacon Hill Life Sciences job
+    "Engineering Lab Technician",  # real Beacon Hill Life Sciences job
+    "Senior Lab Tech",
+])
+def test_clinical_layer_excludes_lab_technician_titles(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is not None
+    assert result["rule"] == "clinical_domain"
+
+
+@pytest.mark.parametrize("title", [
+    "Lab Compute Analyst (all genders)",  # real AbbVie job - IT role, not a technician
+    "Lab Compute Senior Analyst (all genders)",  # real AbbVie job
+    "Cloud/Infrastructure Technician - DHA",  # real USAJOBS job
+    "Operating Systems Technician",  # real USAJOBS job
+    "IT Support Technician I",  # real U.S. Courts job
+    "IT Technician II",  # real U.S. Courts job
+    "R&D Engineering Technician",  # real Beacon Hill job - technician, but not lab-titled
+    "Technician, Equipment Engineering",  # real AbbVie job
+    "Scientist I - Laboratory Staff - Analytical Development",  # real AbbVie job - "Laboratory Staff", not "Laboratory Technician"
+])
+def test_clinical_layer_does_not_catch_non_lab_technician_titles(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is None or result["rule"] != "clinical_domain"
+
+
 def test_clinical_layer_fires_even_when_seniority_would_have_kept_it():
     # "Medical Director" carries "Director", which would satisfy the
     # seniority layer's exec-qualifier check on its own - layer 2 must

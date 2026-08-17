@@ -26,14 +26,23 @@ call) to be cheap enough to run at that volume. Four layers:
    "Senior").
 2. Clinical/medical domain exclusion: Medical Director, Physician, Nurse
    Practitioner, Registered Nurse, Clinical Research/Development/
-   Scientist/Pharmacology, Medical Science Liaison, Medical Advisor -
-   verified: "Senior Medical Director, Hematology Clinical Development" at
-   AbbVie scored 0 four separate times with an identical "clinical role,
-   no domain overlap" rationale. This layer is deliberately independent of
-   layer 1 - "Medical Director" carries an executive-qualifying word
-   ("Director") that would otherwise keep it, so the clinical check must
-   run regardless of the seniority verdict, not only when seniority
-   already excluded it.
+   Scientist/Pharmacology, Medical Science Liaison, Medical Advisor,
+   Laboratory/Lab Technician - verified: "Senior Medical Director,
+   Hematology Clinical Development" at AbbVie scored 0 four separate times
+   with an identical "clinical role, no domain overlap" rationale. This
+   layer is deliberately independent of layer 1 - "Medical Director"
+   carries an executive-qualifying word ("Director") that would otherwise
+   keep it, so the clinical check must run regardless of the seniority
+   verdict, not only when seniority already excluded it. Extended
+   2026-08-17 with lab/technician phrase matching ("laboratory
+   technician", "lab technician", "lab tech") after two real Beacon Hill
+   Life Sciences (industry board) jobs - "Veterinary Laboratory
+   Technician" and "Quality Control Laboratory Technician" - slipped
+   through: neither carried an IC-tier noun from layer 1 ("Technician"
+   isn't in that list) nor matched any prior clinical phrase. See the
+   pattern definition below for the false-positive check against real
+   "Lab Compute Analyst" (AbbVie) and "IT/Cloud Technician" (USAJOBS/U.S.
+   Courts) titles already in the live store.
 3. Custom title exclusions (added 2026-08-13): the user's own free-text
    terms from the Settings tab, stored in config/settings.yaml's
    "custom_title_exclusions" key (see load_custom_title_exclusions() and
@@ -128,7 +137,25 @@ _CLINICAL_PATTERN = re.compile(
     r"|\bclinical scientist\b"
     r"|\bclinical pharmacology\b"
     r"|\bmedical science liaison\b"
-    r"|\bmedical advisor\b",
+    r"|\bmedical advisor\b"
+    # Added 2026-08-17: two real Beacon Hill Life Sciences (industry
+    # staffing board) jobs - "Veterinary Laboratory Technician" and
+    # "Quality Control Laboratory Technician" - slipped through unfiltered.
+    # Neither carries an IC-tier noun from layer 1's pattern ("Technician"
+    # isn't in that list) and neither matched any existing clinical phrase
+    # above, so both reached Zahir unfiltered. Deliberately phrase-matching
+    # "lab/laboratory technician", not a bare "\blab\b" or "\btechnician\b"
+    # substring: validated against the full live job store (2026-08-17) -
+    # "Lab Compute Analyst"/"Lab Compute Senior Analyst" (AbbVie, real IT
+    # roles managing lab computing systems), "Cloud/Infrastructure
+    # Technician", "IT Support Technician I", "IT Technician II" (all real
+    # USAJOBS/U.S. Courts IT roles) all contain "lab" or "technician" in
+    # isolation but never the contiguous "lab/laboratory technician"
+    # phrase, so a narrower substring would have false-positived on real
+    # IT-relevant titles where this phrase-match does not.
+    r"|\blaboratory technician\b"
+    r"|\blab technician\b"
+    r"|\blab tech\b",
     re.I,
 )
 
