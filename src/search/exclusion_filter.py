@@ -19,11 +19,21 @@ call) to be cheap enough to run at that volume. Eight layers:
    (Engineer, Analyst, Specialist, Consultant, Scientist, Representative,
    Coordinator, Associate) almost always means a near-zero fit_score
    regardless of domain match - UNLESS the title is also Director-level or
-   above (Director, VP, Vice President, Head, Chief, President, SVP,
-   EVP), which qualifies it back in. "Senior Systems Engineer" excludes
-   (Engineer, no qualifier); "Senior Director" and "Associate Director"
-   both keep (Director qualifies "Associate" the same way it qualifies
-   "Senior").
+   above (Director, VP, Vice President, Head, Chief, President, SVP, EVP,
+   CIO, CISO, CTO), which qualifies it back in. "Senior Systems Engineer"
+   excludes (Engineer, no qualifier); "Senior Director" and "Associate
+   Director" both keep (Director qualifies "Associate" the same way it
+   qualifies "Senior"). Fixed 2026-08-17: the bare abbreviations "CIO"/
+   "CISO"/"CTO" were missing from the qualifier list - only spelled-out
+   words and other abbreviations (VP, SVP, EVP) were recognized, so a
+   real production title, "Associate CIO, Administrative Applications"
+   (Princeton University, via Dice), was wrongly excluded here:
+   "Associate" alone doesn't qualify, and "CIO" wasn't recognized as an
+   exec-qualifying word, so the IC-tier "Associate" noun went unchallenged
+   (confirmed in the live exclusion log, 2026-08-13 and 2026-08-17
+   occurrences of the exact same title). Added with \b word boundaries so
+   they only match as standalone abbreviations (e.g. never as a substring
+   of an unrelated word).
 2. Clinical/medical domain exclusion: Medical Director, Physician, Nurse
    Practitioner, Registered Nurse, Clinical Research/Development/
    Scientist/Pharmacology, Medical Science Liaison, Medical Advisor,
@@ -225,13 +235,17 @@ SETTINGS_PATH = PROJECT_ROOT / "config" / "settings.yaml"
 # Layer 1: seniority-tier exclusion. \b word boundaries throughout so e.g.
 # "head" never matches inside "headquarters"/"overhead" and "chief" never
 # matches inside an unrelated word - both real risks with naive substring
-# matching.
+# matching. "cio"/"ciso"/"cto" carry the same \b protection - each only
+# matches as a standalone abbreviation (e.g. "Associate CIO," or "VP/CTO"),
+# never as a substring inside an unrelated word (verified against the full
+# live job store 2026-08-17 - no real title contains "cio"/"ciso"/"cto" as
+# a false abbreviation match inside a longer word).
 _IC_TIER_PATTERN = re.compile(
     r"\b(engineer|analyst|specialist|consultant|scientist|representative|coordinator|associate)\b",
     re.I,
 )
 _EXEC_QUALIFIER_PATTERN = re.compile(
-    r"\b(director|vice president|vp|head|chief|president|svp|evp)\b",
+    r"\b(director|vice president|vp|head|chief|president|svp|evp|cio|ciso|cto)\b",
     re.I,
 )
 
