@@ -65,7 +65,7 @@ import os
 import sys
 from pathlib import Path
 
-from skill_label_match import skills_match
+from skill_label_match import build_already_known_units, filter_questions_evidenced_in_profile, skills_match
 from tailoring.applications import get_application, set_discussion_status, upsert_application
 from tailoring.ats_score import score_resume_against_keywords
 from tailoring.baseline_resume import select_baseline_resume_text
@@ -239,6 +239,15 @@ def _generate_questions_via_subscription(job: dict, profile: dict, app_record: d
         q for q in data.get("clarifying_questions", [])
         if q.get("skill") and not any(skills_match(q["skill"], covered) for covered in already_covered)
     ]
+    # Same deterministic backstop as drafting.py's _finalize_resume_draft/
+    # request_additional_gap_questions (2026-08-17, real production
+    # incident - see skill_label_match.py's own docstring item 3): the
+    # already_covered check above only matches a proposed question's
+    # "skill" LABEL against prior skill LABELS, so it can't catch a fact
+    # already confirmed inside the free-text ANSWER of a differently-
+    # labeled gap entry, or stated directly in a work_history/
+    # client_engagements bullet that was never a "gap" question at all.
+    new_questions = filter_questions_evidenced_in_profile(new_questions, build_already_known_units(profile))
     return {
         "added_count": len(new_questions),
         "new_questions": new_questions,
