@@ -77,6 +77,41 @@ call) to be cheap enough to run at that volume. Four layers:
    Assistant" and "Senior Administrative Assistant, IMCO, Eyecare &
    Specialty," both genuinely non-technical - zero false positives against
    every real "Administrator"/"CIO"/"Director"/"VP" title in the store).
+5. Hands-on IC engineering/architecture title exclusion (added 2026-08-17,
+   Zahir's explicit request after four real jobs - "SVP, Full-Stack Engr"/
+   "VP, Full-Stack Engr II" (Bank of New York Mellon, via Dice), "Senior
+   Full Stack Engineer, ATM Platforms - VP" (Citi, via SimplyHired), "SVP
+   Lead Full Stack Engineer" (Citi) - none of which match his IT-
+   leadership/CIO-track profile despite senior-sounding titles. In
+   banking, "VP"/"SVP" is very often a PAY-GRADE prefix, not an
+   org-leadership title - these are genuinely hands-on individual-
+   contributor engineering roles. Matches "full-stack engineer"/"full
+   stack engineer" (including the "Full-Stack Engr"/"Engr II" abbreviation
+   BNY Mellon's Dice postings actually use), "software engineer",
+   "backend engineer"/"back-end engineer", "frontend engineer"/"front-end
+   engineer", "platform engineer", and "atm architect" - as the literal
+   role noun, regardless of any VP/SVP/Senior/Principal/Lead prefix.
+   Deliberately anchored on "engineer"/"architect" as the role noun with a
+   trailing \b, not "engineering"/"architecture" - this alone is what
+   keeps a real leadership title like "VP of Engineering", "Director of
+   Software Engineering", or "Head of Platform Engineering" out: none of
+   them contain the bare noun "engineer"/"architect" followed by a word
+   boundary ("engineering" fails the \b check after "engineer" since "ing"
+   continues the word). Also exempts any title containing "manager" as a
+   whole word (e.g. "Software Engineering Manager", "Engineering
+   Manager") - genuine people-management roles Zahir still wants surfaced,
+   not hands-on IC work, even though the "engineering" vs. "engineer"
+   distinction above already excludes the two concrete examples found in
+   the live store. Validated 2026-08-17 against the full live+archive job
+   store (see check_exclusion() call site history): 9 real live-store
+   matches (all Dice/SimplyHired/Built In banking postings with VP/SVP
+   prefixes, e.g. the four titles above plus "SVP Senior KDB+ Platform
+   Engineer", "SVP, Principal Full Stack Engineer - Performance Product
+   Engineering", "ATM Architect"), zero false positives against every
+   real "VP of Engineering"/"Director of Software Engineering"/"Head of
+   Platform Engineering"/"CIO"/"CTO"/"Engineering Manager"-shaped title in
+   the store - none of those 100+ leadership titles contain the bare
+   "engineer"/"architect" noun this layer keys on.
 
 Non-negotiable per Zahir's standing "never silently dropped" rule (the
 same one tailoring.fit_score_prefilter follows): an excluded job is never
@@ -186,6 +221,35 @@ _TECH_QUALIFIER_PATTERN = re.compile(
     re.I,
 )
 
+# Layer 5: hands-on IC engineering/architecture title exclusion. Anchored on
+# the bare role noun "engineer"/"architect" with a trailing \b - this is
+# deliberately what keeps "...Engineering"/"...Architecture" leadership
+# titles (VP of Engineering, Director of Software Engineering, Head of
+# Platform Engineering, Head of Enterprise Architecture) out without any
+# separate exemption list: \bengineer\b never matches inside "engineering"
+# (the "ing" continues the word, failing the trailing boundary), same for
+# \barchitect\b inside "architecture". "Full-Stack Engr"/"Full-Stack Engr II"
+# is BNY Mellon's own Dice-posting abbreviation for "Full-Stack Engineer" -
+# matched explicitly since \bengineer\b alone would miss it.
+_IC_ENGINEER_ROLE_PATTERN = re.compile(
+    r"\bfull[- ]stack\s+engr\.?\b"
+    r"|\bfull[- ]stack\s+engineer\b"
+    r"|\bsoftware engineer\b"
+    r"|\bback[- ]?end engineer\b"
+    r"|\bfront[- ]?end engineer\b"
+    r"|\bplatform engineer\b"
+    r"|\batm architect\b",
+    re.I,
+)
+
+# Exemption: "Manager" appearing anywhere in the title signals genuine
+# people-management (e.g. "Software Engineering Manager", "Engineering
+# Manager") - Zahir still wants these surfaced, they are not hands-on IC
+# work. Belt-and-suspenders alongside the engineer/engineering \b
+# distinction above, which already excludes every concrete "Manager" title
+# found in the live store on its own.
+_PEOPLE_MANAGEMENT_PATTERN = re.compile(r"\bmanager\b", re.I)
+
 
 def _seniority_exclude(title: str) -> str | None:
     if _IC_TIER_PATTERN.search(title) and not _EXEC_QUALIFIER_PATTERN.search(title):
@@ -243,16 +307,28 @@ def _admin_support_exclude(title: str) -> str | None:
     return f"generic non-technical administrative/clerical/demo-support role (matched \"{match.group(0)}\")"
 
 
+def _ic_engineer_exclude(title: str) -> str | None:
+    match = _IC_ENGINEER_ROLE_PATTERN.search(title)
+    if not match:
+        return None
+    if _PEOPLE_MANAGEMENT_PATTERN.search(title):
+        return None
+    return (
+        "hands-on IC engineering/architecture title - VP/SVP prefix is a banking "
+        f"pay-grade, not org leadership (matched \"{match.group(0)}\")"
+    )
+
+
 def check_exclusion(job: dict, custom_exclusions: list[str] | None = None) -> dict | None:
     """Returns {"rule": ..., "reason": ...} if this job should never be
     persisted, or None if it should go through job_store.save_jobs()'s
-    normal path. All four layers are checked independently (not
+    normal path. All five layers are checked independently (not
     short-circuit on an earlier layer's verdict) - see this module's own
     docstring on why "Medical Director" needs layer 2 to fire regardless
-    of layer 1; layers 3 (the user's own custom terms) and 4 (generic
-    administrative/support titles) are likewise checked even when earlier
-    layers already passed, so either can catch a title the others
-    wouldn't.
+    of layer 1; layers 3 (the user's own custom terms), 4 (generic
+    administrative/support titles), and 5 (hands-on IC engineering/
+    architecture titles) are likewise checked even when earlier layers
+    already passed, so any of them can catch a title the others wouldn't.
 
     custom_exclusions=None (the default) makes this call
     load_custom_title_exclusions() itself, for any caller that doesn't
@@ -279,6 +355,10 @@ def check_exclusion(job: dict, custom_exclusions: list[str] | None = None) -> di
     reason = _admin_support_exclude(title)
     if reason:
         return {"rule": "administrative_support_role", "reason": reason}
+
+    reason = _ic_engineer_exclude(title)
+    if reason:
+        return {"rule": "ic_engineer_title", "reason": reason}
 
     return None
 

@@ -291,6 +291,121 @@ def test_admin_support_layer_real_slipped_through_examples():
     )["rule"] == "administrative_support_role"
 
 
+# --- Layer 5: hands-on IC engineering/architecture title exclusion ---------
+
+# These carry a VP/SVP/Vice-President exec-qualifying word, so layer 1
+# (seniority_mismatch) does NOT claim them first - only layer 5 catches
+# them, so the rule label itself is the thing under test here (this is
+# exactly the real gap: a bare "Software Engineer" is already caught by
+# layer 1, but "SVP, Full-Stack Engr" bypasses layer 1 entirely because
+# "SVP" is an exec-qualifying word, so without this layer it would have
+# reached Zahir unfiltered).
+@pytest.mark.parametrize("title", [
+    "SVP, Full-Stack Engr",  # real BNY Mellon job, via Dice
+    "VP, Full-Stack Engr II",  # real BNY Mellon job, via Dice
+    "Senior Full Stack Engineer, ATM Platforms - VP",  # real Citi job, via SimplyHired
+    "SVP Lead Full Stack Engineer (M&A Technology & AI)",  # real Citi job
+    "SVP, Principal Full Stack Engineer - Performance Product Engineering",  # real, via Dice
+    "SVP, Infra Engineering (Mainframe Comms Systems Software Engineer)",  # real, via Dice
+    "Senior Front End Engineer, VP",  # real Citi job, via SimplyHired
+    "SVP Senior KDB+ Platform Engineer",  # real, via Dice
+    "Corporate Vice President - Google Cloud Platform Engineer",  # real, via Built In
+    "Lead .Net Platform Engineer (Payments Ingestion) - Senior Vice President",  # real, via SimplyHired
+    "ATM Architect",  # real Dice job - "architect" isn't an IC-tier noun for layer 1, so layer 5 is the only layer that ever catches this one, prefix or not
+    "VP Full Stack Engineer",
+    "VP Backend Engineer",
+    "VP Frontend Engineer",
+    "VP Platform Engineer",
+])
+def test_ic_engineer_layer_excludes_vp_prefixed_titles_layer_1_would_miss(title):
+    # custom_exclusions=[] isolates this from Zahir's real Settings-tab
+    # list (config/settings.yaml already has "Mainframe" configured, which
+    # would otherwise claim "SVP, Infra Engineering (Mainframe Comms
+    # Systems Software Engineer)" via layer 3 before layer 5 ever runs -
+    # a real environment-state leak, not a layer 5 bug).
+    result = exclusion_filter.check_exclusion(_job(title), custom_exclusions=[])
+    assert result is not None
+    assert result["rule"] == "ic_engineer_title"
+
+
+# These have no VP/SVP/exec-qualifying prefix, so layer 1
+# (seniority_mismatch, pre-existing) already excludes them - still
+# confirms the layer 5 phrase pattern itself matches every named role
+# noun (full-stack, software, backend, frontend, platform engineer),
+# independent of which layer's label ends up claiming the exclusion.
+@pytest.mark.parametrize("title", [
+    "Full Stack Engineer",
+    "Full-Stack Engineer",
+    "Software Engineer",
+    "Backend Engineer",
+    "Back-End Engineer",
+    "Frontend Engineer",
+    "Front-End Engineer",
+    "Platform Engineer",
+])
+def test_ic_engineer_role_pattern_matches_every_named_phrase_directly(title):
+    assert exclusion_filter._IC_ENGINEER_ROLE_PATTERN.search(title) is not None
+    # And the title is excluded end-to-end either way (via layer 1 or 5).
+    assert exclusion_filter.check_exclusion(_job(title)) is not None
+
+
+@pytest.mark.parametrize("title", [
+    "VP of Engineering",
+    "Vice President of Engineering",
+    "Director of Software Engineering",
+    "Head of Platform Engineering",
+    "Head of Engineering",
+    "SVP of Engineering",
+    "Chief Technology Officer",
+    "CTO",
+    "Engineering Manager",
+    "Software Engineering Manager",
+    "Software Engineering Manager, SVP - AI Platform Development",  # real, via Dice
+    "Senior Engineering Manager, AI Agents",  # real, via Dice
+    "Corporate Vice President - Cloud and Integrations Engineering Manager - Field Experience",  # real
+    "Director, Software Engineering",
+    "Global Head of Data Platform Engineering, SVP",  # real, via Dice - "Platform Engineering" != "Platform Engineer"
+    "Sr. Director, Platform Engineering",  # real, via SimplyHired
+    "Executive Director, Digital Transformation & Platform Engineering",  # real, via Indeed
+    "Chief Architect, Decision Intelligence (Remote)",  # real - generic "architect", not "atm architect"
+    "Salesforce CTO Architect",  # real - generic "architect", not "atm architect"
+    "Solutions Architect",  # real - generic "architect", not "atm architect"
+    "Enterprise Architect",
+    "Director IT Architecture",
+    "Chief Information Officer",
+    "Vice President, Information Technology",
+    "IT Director, Software Engineering & Integration",  # real, via Dice - "Software Engineering" != "Software Engineer"
+])
+def test_ic_engineer_layer_does_not_catch_leadership_titles(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is None or result["rule"] != "ic_engineer_title"
+
+
+def test_ic_engineer_layer_manager_exemption_even_if_engineer_noun_present():
+    # Belt-and-suspenders: even a hypothetical title carrying the bare
+    # "engineer" noun AND "Manager" is exempted, since "Manager" signals
+    # people-management, not hands-on IC work.
+    result = exclusion_filter.check_exclusion(_job("Software Engineer Manager, SVP"))
+    assert result is None or result["rule"] != "ic_engineer_title"
+
+
+def test_ic_engineer_layer_real_bny_mellon_and_citi_examples():
+    # The exact four real jobs Zahir flagged as slipping through despite
+    # senior-sounding VP/SVP prefixes - banking pay-grade, not leadership.
+    assert exclusion_filter.check_exclusion(
+        _job("SVP, Full-Stack Engr", organization="Bank of New York Mellon")
+    )["rule"] == "ic_engineer_title"
+    assert exclusion_filter.check_exclusion(
+        _job("VP, Full-Stack Engr II", organization="Bank of New York Mellon")
+    )["rule"] == "ic_engineer_title"
+    assert exclusion_filter.check_exclusion(
+        _job("Senior Full Stack Engineer, ATM Platforms - VP", organization="Citi")
+    )["rule"] == "ic_engineer_title"
+    assert exclusion_filter.check_exclusion(
+        _job("SVP Lead Full Stack Engineer", organization="Citi")
+    )["rule"] == "ic_engineer_title"
+
+
 # --- Logging: the non-negotiable "never silently dropped" requirement ------
 
 def test_log_exclusions_appends_full_record(isolated_data):
