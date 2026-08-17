@@ -38,7 +38,7 @@ from skill_label_match import (
     skill_evidenced_in_text,
     skills_match,
 )
-from tailoring.ats_score import STANDARD_HEADERS, detect_keyword_wording_regressions, detect_matched_keyword_regressions, plateau_note_for_gaps, score_resume_against_keywords, score_resume_ats
+from tailoring.ats_score import STANDARD_HEADERS, detect_keyword_wording_regressions, detect_matched_keyword_regressions, ensure_keyword_literally_present, plateau_note_for_gaps, score_resume_against_keywords, score_resume_ats
 from tailoring.baseline_resume import select_baseline_resume_text
 from tailoring.claim_verification import flag_unverified_resume_claims
 
@@ -1309,7 +1309,47 @@ def _merge_keyword_gap_questions(
         # through untouched (the common case: most free-form questions
         # have no corresponding keyword at all) get the exact same object
         # back, not an unnecessary clone.
-        merged.append({**q, "point_value": match["point_value"]} if match is not None else q)
+        if match is not None:
+            # Pre-flight score verification (2026-08-17): this is the AI's
+            # own free-form suggested_answer, not one this module generated
+            # itself - genuinely unverified, unlike the two loops below.
+            # Once this question gets a real point_value/badge, it needs
+            # the same guarantee they get: the literal keyword the scorer
+            # actually checks for must really be present in the text a
+            # confirmation would carry forward, not left to whether the AI
+            # happened to phrase it that way.
+            patched_answer, was_present = ensure_keyword_literally_present(
+                match["label"], q.get("suggested_answer") or ""
+            )
+            merged.append({
+                **q,
+                "point_value": match["point_value"],
+                "suggested_answer": patched_answer,
+                "keyword_verified": True,
+            })
+        elif q.get("point_value") is not None and q.get("skill") and not q.get("keyword_verified"):
+            # Retroactive backfill (2026-08-17) for records PERSISTED
+            # before this verification guarantee existed. Real gap: this
+            # function isn't only called on a fresh AI draft's raw
+            # clarifying_questions (point_value always None there, always
+            # hits the branch above) - analyze_fit_before_drafting() (see
+            # its own call site) re-runs this SAME function against the
+            # job's already-STORED resume_clarifying_questions on every
+            # score refresh, without a new drafting round. A question
+            # that already carries a real point_value/badge from before
+            # this fix shipped has "point_value is None" false, so it
+            # would otherwise fall straight to the untouched pass-through
+            # below and never get patched - not just once, but forever,
+            # since nothing about a stored, already-scored question ever
+            # naturally re-enters the branch above. Self-heals here
+            # instead: q["skill"] is exactly the literal term this module
+            # (or the backfill branch above, on some earlier round) used
+            # to justify this question's point_value in the first place,
+            # so it's the right term to verify/patch against.
+            patched_answer, _ = ensure_keyword_literally_present(q["skill"], q.get("suggested_answer") or "")
+            merged.append({**q, "suggested_answer": patched_answer, "keyword_verified": True})
+        else:
+            merged.append(q)
     for item in missing_required_keywords:
         term = item["label"]
         # 2026-08-10, real gap Zahir hit live (Merck 4449005464, "Customer
@@ -1324,6 +1364,17 @@ def _merge_keyword_gap_questions(
         # engagement" - that needs real judgment, not string matching).
         if any(_same_skill(term, skill) for skill in already_asked) or _profile_supports_skill(term, profile):
             continue
+        # Pre-flight score verification (2026-08-17, feature/basket-badge-
+        # verification): _suggested_answer_for_keyword_gap() already weaves
+        # `term` into its "profile may already mention" branch, but its "no
+        # basis at all" branch historically didn't name the term -
+        # ensure_keyword_literally_present() is the single, generic, tested
+        # guarantee for both branches (and any future change to that
+        # function) rather than relying on two independently-written
+        # f-strings to each happen to stay correct.
+        suggested_answer, _ = ensure_keyword_literally_present(
+            term, _suggested_answer_for_keyword_gap(term, profile)
+        )
         merged.append({
             "type": "skill_gap",
             "skill": term,
@@ -1332,14 +1383,18 @@ def _merge_keyword_gap_questions(
                 "experience with it? If so, briefly describe it so it can be "
                 "added to your resume."
             ),
-            "suggested_answer": _suggested_answer_for_keyword_gap(term, profile),
+            "suggested_answer": suggested_answer,
             "point_value": item["point_value"],
+            "keyword_verified": True,
         })
     for item in missing_preferred_keywords or []:
         term = item["label"]
         # Same profile-support check as the required-keyword loop above.
         if any(_same_skill(term, skill) for skill in already_asked_for_preferred) or _profile_supports_skill(term, profile):
             continue
+        suggested_answer, _ = ensure_keyword_literally_present(
+            term, _suggested_answer_for_keyword_gap(term, profile)
+        )
         merged.append({
             "type": "skill_gap",
             "skill": term,
@@ -1349,8 +1404,9 @@ def _merge_keyword_gap_questions(
                 "real, genuine experience with it? If so, briefly describe it so it "
                 "can be added to your resume."
             ),
-            "suggested_answer": _suggested_answer_for_keyword_gap(term, profile),
+            "suggested_answer": suggested_answer,
             "point_value": item["point_value"],
+            "keyword_verified": True,
         })
     return merged
 
