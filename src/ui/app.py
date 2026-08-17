@@ -555,7 +555,15 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
         return _on_progress
 
     with st.container(key="panga_basket_bar"):
-        bar_cols = st.columns([3, 2, 2])
+        # bar_cols[0] holds the basket trigger button + its popover (widened
+        # 2026-08-17, Zahir's explicit ask: the popover was only stretching
+        # to match this column's width, cutting question text/badges off
+        # well before the page's own nav buttons on the right - see
+        # st.popover(..., width="stretch") below, which sizes to this
+        # column, not the page). bar_cols[2] is otherwise unused (see the
+        # `pass` below) so its share was reclaimed here rather than shrinking
+        # bar_cols[1]'s subtitle text.
+        bar_cols = st.columns([7, 2, 1])
         with bar_cols[0]:
             with st.popover(f":material/shopping_basket: Basket ({len(basket_jobs)})", width="stretch"):
                 if not basket_jobs:
