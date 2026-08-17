@@ -13,7 +13,8 @@ out of EVERY search channel (USAJOBS, ZipRecruiter, Dice, Indeed, company
 sites, industry boards) before search.job_store.save_jobs() ever writes a
 record - so it must stay purely deterministic (no AI call, no network
 call) to be cheap enough to run at that volume. Nine layers (plus a
-pharma/clinical/regulatory extension merged in on top, see below):
+pharma/clinical/regulatory extension and a new layer 10, both merged in on
+top, see below):
 
 1. Seniority-tier exclusion: the candidate (Zahir) is a 25-year VP/CIO/
    Head-of-IT executive. An individual-contributor-tier noun in the title
@@ -229,11 +230,79 @@ frequency real remaining patterns got built here as three more layers:
    hands-on-IC, just the wrong domain, the same class of gap layer 2
    already exists to close for medical roles.
 
-See docs on each pattern below for the full validation detail. This
-branch is exploratory/accumulating and is NOT merged to master - held for
-Zahir's explicit review per his standing instruction, same as every
-change in this repo (see docs/release-manager.md), but deliberately not
-routed through that process yet.
+See docs on each pattern below for the full validation detail. Renumbered
+"9" here (was "6" in the branch's own numbering) after merging with
+master's own layers 6-8 (PM-track/intern/infosec), which were built
+independently on master the same week this branch was held for review -
+see the merge commit for the resolution.
+
+Merged into feature/pharma-regulatory-exclusions (2026-08-17) after Zahir
+live-reviewed the pending queue and flagged specific remaining noise: real
+GForce Life Sciences staffing titles (Medical Writer II, Site In-House CRA,
+Clinical Data Manager) and a broader pharma Regulatory Affairs category
+(Regulatory Affairs Supervisor, Director of Regulatory Affairs, etc.) -
+none of layers 1-9 above catch these. Two more changes:
+
+10. Extended layer 2's clinical/medical pattern with "medical writer",
+    "clinical research associate", the bare "cra" abbreviation, and
+    "clinical data manager". Validated against the full live+archive
+    store (4,278 jobs): 3 real "medical writer" matches (GForce Life
+    Sciences x2, Sanofi), 2 real bare-"cra" matches (both "Site In-House
+    CRA," GForce Life Sciences), 2 real "clinical data manager" matches
+    (GForce Life Sciences, Ocugen). Bare \bcra\b was flagged as a
+    collision risk (an abbreviation could in principle appear inside an
+    unrelated word/acronym) before adding it - checked every real title
+    in the store containing the substring "cra" anywhere: "Aircraft
+    Survival Flight Equipment Repairer" (Air National Guard),
+    "Spacecraft Electric Propulsion Systems" (Orbital Arc), "SVP,
+    Spacecraft Operations" (EchoStar), and "CCRADD" inside "Vice
+    President, MFG Client Due Diligence, CCRADD" (Wells Fargo) - none of
+    these have "cra" at a word boundary (it's embedded mid-word in every
+    case: "air-CRA-ft", "space-CRA-ft", "C-CRA-DD"), so \bcra\b's word
+    boundaries never fire on any of them. Zero real collisions found;
+    the only two real bare-"CRA" titles in the entire store are the
+    genuine "Site In-House CRA" staffing postings this was built to
+    catch.
+11. New layer (see _REGULATORY_AFFAIRS_PATTERN below): pharma Regulatory
+    Affairs domain exclusion, deliberately separate from layer 2's
+    clinical pattern (which has no tech-qualifier exemption by design -
+    see layer 2's CMC-extension comment) because "regulatory" is a much
+    more IT-collision-prone word than "clinical" or "CMC" ever were -
+    exempted via the same _COMMERCIAL_TECH_QUALIFIER_PATTERN layer 9
+    already defines (includes cio/cto/ciso alongside the base IT/tech
+    words). Matches "regulatory affairs" and "regulatory & quality"/
+    "regulatory and quality" as phrases. Validated against the full
+    live+archive store: 20 real "regulatory affairs" matches (all
+    AbbVie/BioNTech/Beeline Medicines/IQVIA/Planet Pharma/GForce Life
+    Sciences pharma roles, e.g. "Regulatory Affairs Supervisor,"
+    "Director of Regulatory Affairs," "Executive Director, Regulatory
+    Affairs"), 0 real "regulatory & quality"/"regulatory and quality"
+    matches currently in the store (added defensively per Zahir's
+    explicit ask even with no current live example). Explicit
+    false-positive check: the real Amgen title "Information Systems Sr.
+    Manager - Technology Regulatory Compliance Lead" contains "Regulatory
+    Compliance," not "Regulatory Affairs" - it was already safe from the
+    phrase-only match without the exemption, but the
+    _COMMERCIAL_TECH_QUALIFIER_PATTERN exemption is kept anyway as a
+    forward-looking hedge (it independently exempts on "information
+    systems"/"technology" if a future title ever combines both phrases).
+    Broader single-word `\bregulatory\b` was checked and rejected as too
+    broad - 38 real matches include clearly non-pharma titles
+    ("Consumer Risk and Regulatory Reporting - Vice President" at
+    JPMorganChase, "Senior Regulatory Reporting & Accounting Lead" at
+    PNC) that must stay kept; the phrase-scoped "regulatory affairs"/
+    "regulatory & quality" match avoids all of these.
+
+Audited (not added): "Creative/Marketing-Analyst, Sourcing" (a real
+GForce Life Sciences title Zahir also showed) is already excluded by
+layer 1 - it carries "Analyst" (an IC-tier noun) with no executive
+qualifier present, confirmed via a direct check_exclusion() call before
+concluding no new pattern was needed for it.
+
+This branch is exploratory/accumulating and is NOT merged to master -
+held for Zahir's explicit review per his standing instruction, same as
+every change in this repo (see docs/release-manager.md), but
+deliberately not routed through that process yet.
 
 Non-negotiable per Zahir's standing "never silently dropped" rule (the
 same one tailoring.fit_score_prefilter follows): an excluded job is never
@@ -379,7 +448,49 @@ _CLINICAL_PATTERN = re.compile(
     r"|\bclinical operations\b"
     r"|\bclinical process excellence\b"
     r"|\bclinical services\b"
-    r"|\bclinical psychologist\b",
+    r"|\bclinical psychologist\b"
+    # Added 2026-08-17 (feature/pharma-regulatory-exclusions, merged on top
+    # of experiment/filter-quality-improvements): three more real GForce
+    # Life Sciences staffing titles Zahir flagged live - "Medical Writer
+    # II," "Site In-House CRA," "Clinical Data Manager" - none matched by
+    # any phrase above. "cra" is deliberately bare (not scoped to a
+    # "site"/"clinical" context phrase): validated against the full
+    # live+archive store (4,278 jobs) that no real title has "cra" at a
+    # word boundary except the two genuine "Site In-House CRA" postings -
+    # every other title containing the substring "cra" ("Aircraft Survival
+    # Flight Equipment Repairer," "Spacecraft Electric Propulsion
+    # Systems," "SVP, Spacecraft Operations," "CCRADD" inside a Wells
+    # Fargo title) has it embedded mid-word with no boundary on either
+    # side, so \bcra\b never fires on any of them.
+    r"|\bmedical writer\b"
+    r"|\bclinical research associate\b"
+    r"|\bcra\b"
+    r"|\bclinical data manager\b",
+    re.I,
+)
+
+# Layer 11 (added 2026-08-17, feature/pharma-regulatory-exclusions): pharma
+# Regulatory Affairs domain exclusion. Deliberately a SEPARATE pattern from
+# layer 2's clinical pattern (which has no tech-qualifier exemption by
+# design, per its own CMC-extension comment above) because "regulatory" is
+# a much more IT-collision-prone word than "clinical"/"CMC" - a real IT
+# title can plausibly mention "regulatory compliance" as part of an
+# Information Systems/technology function, so this layer is exempted the
+# same way layer 9's commercial pattern is.
+#
+# Matches "regulatory affairs" and "regulatory & quality"/"regulatory and
+# quality" as phrases (checked both "&" and "and" forms against the real
+# store; only the "affairs" phrase currently has real live examples, but
+# Zahir named "Regulatory & Quality Lead" explicitly so the "quality" form
+# is added defensively). Deliberately NOT a bare \bregulatory\b substring -
+# validated against the full live+archive store: 38 real titles contain
+# bare "regulatory," including clearly non-pharma roles that must stay kept
+# ("Consumer Risk and Regulatory Reporting - Vice President" at
+# JPMorganChase, "Senior Regulatory Reporting & Accounting Lead" at PNC) -
+# the phrase-scoped match avoids all of these entirely on its own.
+_REGULATORY_AFFAIRS_PATTERN = re.compile(
+    r"\bregulatory affairs\b"
+    r"|\bregulatory\s*(?:&|and)\s*quality\b",
     re.I,
 )
 
@@ -671,18 +782,28 @@ def _non_it_commercial_exclude(title: str) -> str | None:
     return f"non-IT sales/finance/wealth/credit commercial role (matched \"{match.group(0)}\")"
 
 
+def _regulatory_affairs_exclude(title: str) -> str | None:
+    match = _REGULATORY_AFFAIRS_PATTERN.search(title)
+    if not match:
+        return None
+    if _COMMERCIAL_TECH_QUALIFIER_PATTERN.search(title):
+        return None
+    return f"pharma regulatory affairs domain role (matched \"{match.group(0)}\")"
+
+
 def check_exclusion(job: dict, custom_exclusions: list[str] | None = None) -> dict | None:
     """Returns {"rule": ..., "reason": ...} if this job should never be
     persisted, or None if it should go through job_store.save_jobs()'s
-    normal path. All nine layers are checked independently (not
+    normal path. All eleven layers are checked independently (not
     short-circuit on an earlier layer's verdict) - see this module's own
     docstring on why "Medical Director" needs layer 2 to fire regardless
     of layer 1; layers 3 (the user's own custom terms), 4 (generic
     administrative/support titles), 5 (hands-on IC engineering/
     architecture titles), 6 (PM/PgM/ProdM track), 7 (intern/internship),
-    8 (information-security domain), and 9 (non-IT commercial/finance
-    leadership titles) are likewise checked even when earlier layers
-    already passed, so any of them can catch a title the others wouldn't.
+    8 (information-security domain), 9 (non-IT commercial/finance
+    leadership titles), and 11 (pharma Regulatory Affairs domain) are
+    likewise checked even when earlier layers already passed, so any of
+    them can catch a title the others wouldn't.
     check_exclusion() returns the first rule that matches, in layer order,
     purely for a single deterministic label per job - a title can trip more
     than one layer (e.g. "IT PMO Consultant..." matches both layer 1's
@@ -734,6 +855,10 @@ def check_exclusion(job: dict, custom_exclusions: list[str] | None = None) -> di
     reason = _non_it_commercial_exclude(title)
     if reason:
         return {"rule": "non_it_commercial_role", "reason": reason}
+
+    reason = _regulatory_affairs_exclude(title)
+    if reason:
+        return {"rule": "regulatory_affairs_domain", "reason": reason}
 
     return None
 

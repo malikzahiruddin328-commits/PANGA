@@ -526,6 +526,109 @@ def test_clinical_layer_cmc_extension_does_not_catch_unrelated_titles(title):
     assert result is None or result["rule"] != "clinical_domain"
 
 
+# --- Layer 2 extension (2026-08-17, feature/pharma-regulatory-exclusions): -
+# --- medical writer / CRA / clinical data manager ---------------------------
+
+@pytest.mark.parametrize("title", [
+    "Medical Writer II",  # real GForce Life Sciences job
+    "Senior Medical Writer - Vaccine",  # real Sanofi job
+    "Site In-House CRA",  # real GForce Life Sciences job
+    "Clinical Data Manager",  # real GForce Life Sciences job
+    "Senior Clinical Data Manager",  # real Ocugen, Inc. job
+])
+def test_clinical_layer_excludes_medical_writer_cra_data_manager_titles(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is not None
+    assert result["rule"] == "clinical_domain"
+
+
+@pytest.mark.parametrize("title", [
+    # Bare "cra" collision risk - validated against the full live+archive
+    # store (4,278 jobs): none of these real titles have "cra" at a word
+    # boundary, so \bcra\b never fires on any of them.
+    "Aircraft Survival Flight Equipment Repairer",  # real Air National Guard job
+    "Director/VP of Engineering - Spacecraft Electric Propulsion Systems",  # real Orbital Arc job
+    "SVP, Spacecraft Operations",  # real EchoStar job
+    "Vice President, MFG Client Due Diligence, CCRADD",  # real Wells Fargo job
+])
+def test_clinical_layer_bare_cra_does_not_collide_with_unrelated_words(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is None or result["rule"] != "clinical_domain"
+
+
+# --- Layer 11 (new, 2026-08-17, feature/pharma-regulatory-exclusions): -----
+# --- pharma Regulatory Affairs domain exclusion -----------------------------
+
+@pytest.mark.parametrize("title", [
+    "Regulatory Affairs Supervisor",  # real AbbVie job
+    "Director of Regulatory Affairs",  # real Planet Pharma job
+    "Executive Director, Regulatory Affairs",  # real Beeline Medicines job
+    "Vice President, MedTech Cardiovascular Regulatory Affairs",  # real IQVIA job
+    "Associate Director, Regulatory Affairs Medical Writing",  # real Beeline Medicines job
+    "Regulatory & Quality Lead",  # Zahir-flagged title, "&" form
+    "Regulatory and Quality Lead",  # same title, "and" form
+])
+def test_regulatory_affairs_layer_excludes_pharma_titles(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is not None
+    assert result["rule"] == "regulatory_affairs_domain"
+
+
+@pytest.mark.parametrize("title", [
+    # "Associate"/"Coordinator" are also layer 1 IC-tier nouns with no
+    # executive qualifier - layer 1 (checked first) wins the label here,
+    # same "which rule wins the race doesn't matter, both agree to
+    # exclude" situation used throughout this file. What matters is the
+    # job is excluded either way.
+    "Regulatory Affairs Associate",  # real GForce Life Sciences job
+    "Regulatory Affairs Coordinator",  # real GForce Life Sciences job
+])
+def test_regulatory_affairs_layer_excludes_even_when_seniority_wins_the_label(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is not None
+    assert result["rule"] in ("seniority_mismatch", "regulatory_affairs_domain")
+
+
+@pytest.mark.parametrize("title", [
+    # Critical false-positive check: this real Amgen title contains
+    # "Regulatory Compliance," not "Regulatory Affairs" - it's a genuine
+    # Information Systems/IT role and must never be excluded.
+    "Information Systems Sr. Manager - Technology Regulatory Compliance Lead",
+    "Chief Information Officer",
+    "Director, IT Service Continuity",
+    # Bare "regulatory" titles that are NOT pharma Regulatory Affairs and
+    # must stay kept - the phrase-scoped match must not broaden to catch
+    # these.
+    "Consumer Risk and Regulatory Reporting - Vice President",  # real JPMorganChase job
+    "Senior Regulatory Reporting & Accounting Lead",  # real PNC job
+])
+def test_regulatory_affairs_layer_does_not_catch_it_or_unrelated_titles(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is None or result["rule"] != "regulatory_affairs_domain"
+
+
+def test_regulatory_affairs_layer_real_amgen_and_abbvie_examples():
+    assert exclusion_filter.check_exclusion(
+        _job("Information Systems Sr. Manager - Technology Regulatory Compliance Lead", organization="Amgen")
+    ) is None
+    assert exclusion_filter.check_exclusion(
+        _job("Regulatory Affairs Supervisor", organization="AbbVie")
+    )["rule"] == "regulatory_affairs_domain"
+
+
+# --- Audited, not added: "Creative/Marketing-Analyst, Sourcing" is already -
+# --- caught by layer 1 (IC-tier "Analyst," no exec qualifier) --------------
+
+def test_creative_marketing_analyst_sourcing_already_excluded_by_seniority_layer():
+    # Real GForce Life Sciences title Zahir also showed alongside the
+    # pharma/regulatory noise - confirmed here it needs no new pattern.
+    result = exclusion_filter.check_exclusion(
+        _job("Creative/Marketing-Analyst, Sourcing – Individual Contributor")
+    )
+    assert result is not None
+    assert result["rule"] == "seniority_mismatch"
+
+
 # --- Layer 5 extension (2026-08-17): bare "developer" role noun ------------
 
 @pytest.mark.parametrize("title", [
