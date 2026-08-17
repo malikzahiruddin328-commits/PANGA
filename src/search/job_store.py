@@ -156,6 +156,10 @@ def save_jobs(new_jobs: list[dict], apply_exclusion: bool = True, review_require
     # file inside the per-job loop below would mean one extra file read
     # per job on a large multi-source search result.
     custom_exclusions = exclusion_filter.load_custom_title_exclusions() if apply_exclusion else []
+    # Same "load once per batch" reasoning as custom_exclusions above -
+    # layer 12's organization-level counterpart (config/settings.yaml's
+    # "custom_organization_exclusions" key).
+    custom_org_exclusions = exclusion_filter.load_custom_organization_exclusions() if apply_exclusion else []
     with locked("jobs"):
         existing = load_jobs()
         seen = {(j.get("source"), j.get("job_id")) for j in existing}
@@ -170,7 +174,7 @@ def save_jobs(new_jobs: list[dict], apply_exclusion: bool = True, review_require
         added = 0
         for job in new_jobs:
             if apply_exclusion:
-                exclusion = exclusion_filter.check_exclusion(job, custom_exclusions)
+                exclusion = exclusion_filter.check_exclusion(job, custom_exclusions, custom_org_exclusions)
                 if exclusion:
                     to_log_excluded.append((job, exclusion))
                     continue

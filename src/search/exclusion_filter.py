@@ -304,6 +304,165 @@ held for Zahir's explicit review per his standing instruction, same as
 every change in this repo (see docs/release-manager.md), but
 deliberately not routed through that process yet.
 
+Merged into feature/exclusion-filter-csv-patterns (2026-08-17) after the hub
+hand-marked Zahir's real 534-row pending-review-queue CSV export
+(Keep/Exclude, ~200 of 534 rows marked) and identified four more real,
+generalizable patterns from his own marks - none of layers 1-11 above catch
+these:
+
+12. Organization-level exclusion (see _custom_organization_exclude() below
+    and the new "custom_organization_exclusions" Settings-tab list, same
+    UI/storage pattern as layer 3's "custom_title_exclusions"): all 11 real
+    GForce Life Sciences (staffing) rows in the CSV are marked Exclude, zero
+    Keep - a staffing agency specializing in life-sciences/clinical
+    placements, not a title pattern, a whole irrelevant company (its real
+    live+archive postings include non-clinical-sounding titles too, e.g.
+    "Data Scientist III," "Senior Engineer, Software Engineer," "Program
+    Integration & Technical Oversight Lead" - all still genuinely irrelevant
+    staffing-agency placements, confirming this needs an organization-level
+    rule, not a smarter title pattern). Seeded with "GForce Life Sciences"
+    (org field's real live value is "GForce Life Sciences (staffing)" -
+    substring match catches it). Built as a reusable Settings-tab list
+    (not a hardcoded pattern) so Zahir can add another staffing
+    agency/irrelevant employer himself later without a code change, same
+    reasoning as why layer 3 exists as a user-editable list rather than a
+    fixed pattern. Validated against the full live+archive store (4,278
+    jobs): exactly 67 real "GForce Life Sciences (staffing)" jobs match,
+    zero collision risk against similarly-spelled real orgs in the store
+    ("Kforce Technology Staffing," various "Air Force ..." commands,
+    "United States Fleet Forces Command" - none contain the substring
+    "GForce Life Sciences").
+13. Big-bank VP/SVP/Director title-inflation exclusion (see
+    _BIG_BANK_TITLE_INFLATION_PATTERN/_is_big_bank_employer() below): real
+    evidence from the CSV - at JPMorganChase, Citi, Goldman Sachs, Bank of
+    New York Mellon (BNY), Jefferies, and Blackstone, Zahir excluded nearly
+    every VP/SVP/Director-titled posting, INCLUDING ones containing
+    "Technology"/"Engineering" that the existing _TECH_QUALIFIER_PATTERN-
+    style exemption would otherwise save (e.g. "SVP, Engineering Lead - IB
+    Technology" at Jefferies, "Director of Software Engineering - Secure Web
+    Platform" at JPMorganChase, "Applied AI/ML - Vice President" at
+    JPMorganChase - all real Exclude marks). The one real survivor across
+    all six employers combined: "VP, Chief of Staff - Information
+    Technology" at Jefferies (Keep). This is the known real-world "bank
+    title inflation" pattern - VP/SVP/Director is a pay-grade at these
+    employers, not a real seniority/leadership signal, so the normal
+    tech-qualifier exemption (which would keep anything mentioning
+    "Technology"/"Engineering") is too permissive for this employer class
+    specifically. Scoped to an exact-match organization allowlist (not a
+    substring check) after finding real substring-collision risk in the
+    live store: a bare "citi" substring would have also matched
+    "CitiusTech" (an unrelated IT consulting firm), "Citizenship and
+    Immigration Services," "First Citizens"/"First Citizens Bank" (a
+    different bank), and "Twin Cities & Western Railroad Company" - exact
+    org-string matching (case-insensitive) avoids all of these entirely.
+    Morgan Stanley, Bank of America, and Capital One each showed the same
+    Exclude-leaning shape in the CSV but only 1 real marked row each (vs.
+    12-46 for the six employers above) - too thin a data point to justify
+    the same systemic assumption (Morgan Stanley's own live+archive store
+    entries include several "Principal AI Engineer - Vice President"/"VP of
+    ... Engineering" titles that could just as easily be genuine IT-adjacent
+    postings), so these three are deliberately NOT included - flagged in the
+    build report instead of guessed into the pattern.
+
+    Survivor condition is deliberately narrow: only a literal "Chief
+    Information Officer"/"Chief Technology Officer" phrase, or "Chief of
+    Staff" appearing near "Information Technology" (either order, within 60
+    chars) survives - NOT a bare "cio"/"cto" abbreviation, unlike layer 9's
+    _COMMERCIAL_TECH_QUALIFIER_PATTERN. This is a deliberate divergence:
+    real evidence shows Zahir excluded "Vice President, Finance - CIO North
+    America" (JPMorganChase) even though it contains "CIO" - at these
+    employers "CIO" collides with "Chief Investment Officer" (confirmed by
+    layer 9's own comment on "Wealth Management, Quantitative Portfolio
+    Manager, Equities CIO" being a real Chief Investment Officer title, not
+    IT), so a bare-abbreviation exemption here would have wrongly kept a
+    title Zahir explicitly excluded. Validated against the full live+archive
+    store: 220 real matches (every one a genuine VP/SVP/EVP/Director-level
+    title with no C-suite/CIO's-own-office survivor phrase present),
+    exactly 1 real survivor ("VP, Chief of Staff - Information Technology,"
+    Jefferies - the known real Keep). Explicit false-positive check across
+    every real CIO/CTO/CISO/Administrator-mentioning title at these six
+    employers: "Wealth Management, Quantitative Portfolio Manager, Equities
+    CIO" (JPMorganChase, kept - no VP/SVP/Director marker), "Senior
+    Principal Software Engineer - Treasury/CIO Technology" (JPMorganChase,
+    kept), "Quantitative Trading & Research - Credit - Treasury CIO -
+    Associate" (JPMorganChase, kept), "Business Execution Lead -
+    CIO/Functions & Enterprise Change, MD" (Citi, kept), "CIO Equities Team,
+    Program Analyst" (JPMorganChase, kept) - the only real title in this
+    false-positive check that IS excluded is "Vice President, Finance - CIO
+    North America," which matches Zahir's own real mark. No real
+    "Database/Network/Systems Administrator" title exists at any of these
+    six employers in the live+archive store.
+14. Non-IT sales/finance/wealth/credit commercial-role exclusion (layer 9,
+    _NON_IT_COMMERCIAL_PATTERN) extended with the bare "marketing" role
+    noun: real CSV Exclude examples "Vice President of Marketing" (Adamson
+    Ahdoot), "Vice President of Sales and Marketing" (Car Keys Express) -
+    "sales"/"finance" were already in the pattern (catching "Vice President
+    of Sales"/"Vice President of Finance"-shaped titles already), but
+    "marketing" was missing. Validated against the full live+archive store:
+    54 real matches (AbbVie/Regeneron/Eisai/Comcast/Air Force Global Strike
+    Command/etc., all genuine non-IT marketing roles), 5 real exemptions via
+    the shared _COMMERCIAL_TECH_QUALIFIER_PATTERN (e.g. "Director, Product &
+    Solutions Marketing - Autonomous IT & AI-Native Workflows" at
+    ServiceNow, kept on the "IT" qualifier - same shared-exemption tradeoff
+    layers 4/9 already accept, not a new risk introduced here).
+
+    Also extended with the narrow "economic development" phrase (not a bare
+    "development" substring, which would have false-positived on real
+    "Business Development"/"Software Development" IT-adjacent titles
+    already in the store, e.g. two real BAE Systems titles): one real CSV
+    Exclude example, "Director of Economic Development" (Larned Area
+    Chamber of Commerce) - a nonprofit/municipal economic-development role,
+    zero IT-collision risk on the narrower phrase.
+
+    Audited but NOT built: real CSV evidence shows "Vice President of
+    Sales" got BOTH verdicts from Zahir on the identical bare title -
+    Excluded at AFB Floors, Kept at Attala Steel Industries. This is a
+    genuine inconsistency in his own marks (not a pattern to resolve by
+    guessing), and worth flagging: the existing bare "\bsales\b" match in
+    _NON_IT_COMMERCIAL_PATTERN (already shipped, not new to this build)
+    would currently exclude both real titles the same way, which already
+    silently disagrees with the Attala Steel Keep mark - a pre-existing
+    risk surfaced during this audit, not something this build attempts to
+    fix, since there's no title-level signal that distinguishes the two
+    real cases.
+15. Non-pharma clinical/healthcare extension to layer 2's _CLINICAL_PATTERN:
+    "director of radiology"/"director radiology" (real CSV Exclude
+    examples: "Director of Radiology- North Dakota-" at American
+    Consultants, "Director Radiology" at Avera Health), "director of
+    nutritional services" (real CSV Exclude example: "Registered Dietitian
+    - Director of Nutritional Services" at Brothers of Mercy Nursing Home
+    Company), and "nursing services" (real CSV Exclude example: "Sr
+    Director, Nursing Services" at IQVIA). Each scoped to the literal
+    phrase actually found in the real data, not a broader bare-word
+    substring, after checking real collision risk in the live+archive
+    store: a bare "radiology" substring would have also matched eight real
+    "Diagnostic Radiologic Technologist" titles (Veterans Health
+    Administration) that are a different title shape with no real Zahir
+    mark either way; a bare "nursing" substring would have also matched
+    "Nursing Graduate Program Track Director" (Kentucky State University,
+    an academic administrative role), "Director of Nursing" (Treasure
+    Valley Community College), "Nursing Director" (Beacon Hill Life
+    Sciences staffing), "Executive Director - Licensed Nursing Home
+    Administrator" (Florence Health Services), and "SVP & Chief Nursing
+    Officer" (Luminis Health) - none of which carry any real Keep/Exclude
+    mark from the CSV either, so none of these adjacent real titles are
+    touched by the narrower phrase-only match.
+
+Also audited (not added, per the CSV): "Creative/Marketing-Analyst,
+Sourcing" (GForce Life Sciences) is already excluded by layer 1 (carries
+"Analyst," an IC-tier noun, no executive qualifier). Genuinely ambiguous
+cases found and deliberately left alone, not built into any rule: "Head of
+AI" (AssetWatch, Keep) vs. "Head of AI Enablement Engineering" (Deepgram,
+Exclude) - too fine a title distinction to regex safely; "Associate
+Director, Neuroscience Commercial Strategy" (AbbVie, Keep) despite
+AbbVie/commercial-strategy being excluded elsewhere in the same CSV - an
+apparent inconsistency in Zahir's own marks with no visible distinguishing
+signal; "Head of Infrastructure" (Arium Networks, Exclude) despite reading
+as IT-relevant on its face - likely company-specific context (e.g. a
+telecom/physical-infrastructure firm) not inferable from the title alone;
+and the "Vice President of Sales" AFB Floors/Attala Steel split noted under
+layer 14 above.
+
 Non-negotiable per Zahir's standing "never silently dropped" rule (the
 same one tailoring.fit_score_prefilter follows): an excluded job is never
 just gone. Every exclusion is appended to
@@ -465,7 +624,18 @@ _CLINICAL_PATTERN = re.compile(
     r"|\bmedical writer\b"
     r"|\bclinical research associate\b"
     r"|\bcra\b"
-    r"|\bclinical data manager\b",
+    r"|\bclinical data manager\b"
+    # Added 2026-08-17 (feature/exclusion-filter-csv-patterns): three more
+    # real CSV Exclude examples, each scoped to the literal phrase actually
+    # found in the real data rather than a broader bare-word substring - see
+    # this module's own header comment (layer 15) for the real collision
+    # risk a bare "radiology"/"nursing" substring would have introduced
+    # against real, unmarked adjacent titles already in the live+archive
+    # store (e.g. "Diagnostic Radiologic Technologist," "Nursing Graduate
+    # Program Track Director," "SVP & Chief Nursing Officer").
+    r"|\bdirector\s+(?:of\s+)?radiology\b"
+    r"|\bdirector of nutritional services\b"
+    r"|\bnursing services\b",
     re.I,
 )
 
@@ -491,6 +661,70 @@ _CLINICAL_PATTERN = re.compile(
 _REGULATORY_AFFAIRS_PATTERN = re.compile(
     r"\bregulatory affairs\b"
     r"|\bregulatory\s*(?:&|and)\s*quality\b",
+    re.I,
+)
+
+# Layer 12 (added 2026-08-17, feature/exclusion-filter-csv-patterns):
+# organization-level exclusion. Same storage/UI pattern as layer 3's
+# "custom_title_exclusions" (config/settings.yaml, plain case-insensitive
+# substring match), but checked against job["organization"] instead of
+# job["title"] - built as a reusable Settings-tab list rather than a
+# hardcoded company name so Zahir can add another irrelevant employer
+# himself later without a code change. Seeded with "GForce Life Sciences" -
+# see check_exclusion()'s docstring and this module's own header comment for
+# the real live+archive validation (67 real matches, zero collision risk).
+_CUSTOM_ORGANIZATION_EXCLUSIONS_KEY = "custom_organization_exclusions"
+
+# Layer 13 (added 2026-08-17, feature/exclusion-filter-csv-patterns):
+# big-bank VP/SVP/Director title-inflation exclusion. Exact-match (not
+# substring) organization allowlist - see this module's own header comment
+# for the real substring-collision risk this avoids ("citi" would have also
+# matched "CitiusTech," "Citizenship and Immigration Services," "First
+# Citizens Bank," "Twin Cities & Western Railroad Company" in the real live
+# store). Built from every real organization spelling for these six
+# employers actually observed in the live+archive store, lowercased for
+# case-insensitive comparison in _is_big_bank_employer() below.
+_BIG_BANK_EMPLOYERS = {
+    "jpmorganchase",
+    "citi",
+    "citigroup inc.",
+    "goldman sachs",
+    "goldman sachs group, inc.",
+    "goldman sachs services llc",
+    "the goldman sachs group",
+    "bny",
+    "bny mellon",
+    "bank of new york mellon",
+    "the bank of new york mellon",
+    "the bank of new york mellon corporation",
+    "the bank of new york mellon co",
+    "jefferies",
+    "jefferies & company, inc.",
+    "blackstone",
+    "the blackstone group lp",
+}
+
+_BIG_BANK_TITLE_INFLATION_PATTERN = re.compile(
+    r"\b(vice president|vp|svp|evp|director)\b",
+    re.I,
+)
+
+# Survivor condition, deliberately narrower than layer 9's
+# _COMMERCIAL_TECH_QUALIFIER_PATTERN: only a literal "Chief Information
+# Officer"/"Chief Technology Officer" phrase, or "Chief of Staff" near
+# "Information Technology" (either order, within 60 chars - matches the one
+# real known-good survivor, "VP, Chief of Staff - Information Technology" at
+# Jefferies), counts as genuine C-suite/CIO's-own-office leadership at these
+# employers. Deliberately does NOT exempt on a bare "cio"/"cto" abbreviation
+# - real evidence shows Zahir excluded "Vice President, Finance - CIO North
+# America" (JPMorganChase) despite the "CIO" substring, because "CIO" at
+# these banks collides with "Chief Investment Officer" (see layer 9's own
+# comment on "Equities CIO" being a real Chief Investment Officer title).
+_BIG_BANK_CSUITE_SURVIVOR_PATTERN = re.compile(
+    r"\bchief information officer\b"
+    r"|\bchief technology officer\b"
+    r"|\bchief of staff\b.{0,60}\binformation technology\b"
+    r"|\binformation technology\b.{0,60}\bchief of staff\b",
     re.I,
 )
 
@@ -652,7 +886,19 @@ _NON_IT_COMMERCIAL_PATTERN = re.compile(
     r"|\bcredit\b"
     r"|\bwealth management\b"
     r"|\bprivate wealth\b"
-    r"|\bcard\b",
+    r"|\bcard\b"
+    # Added 2026-08-17 (feature/exclusion-filter-csv-patterns): bare
+    # "marketing" role noun - real CSV Exclude examples "Vice President of
+    # Marketing" (Adamson Ahdoot), "Vice President of Sales and Marketing"
+    # (Car Keys Express). Governed by the same _COMMERCIAL_TECH_QUALIFIER_
+    # PATTERN exemption below as every other noun in this layer.
+    r"|\bmarketing\b"
+    # Narrow phrase (not a bare "development" substring - would have
+    # false-positived on real IT-adjacent "Business Development"/"Software
+    # Development" titles already in the live store): one real CSV Exclude
+    # example, "Director of Economic Development" (Larned Area Chamber of
+    # Commerce, a nonprofit/municipal role).
+    r"|\beconomic development\b",
     re.I,
 )
 
@@ -725,6 +971,50 @@ def _custom_exclude(title: str, custom_exclusions: list[str]) -> str | None:
     return None
 
 
+def load_custom_organization_exclusions() -> list[str]:
+    """Layer 12's organization-level counterpart to
+    load_custom_title_exclusions() above - same file, same fallback
+    behavior (missing file/key both resolve to an empty list, not an
+    error), same "load once per save_jobs() batch, not once per job"
+    calling convention."""
+    if not SETTINGS_PATH.exists():
+        return []
+    with open(SETTINGS_PATH, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    return data.get(_CUSTOM_ORGANIZATION_EXCLUSIONS_KEY) or []
+
+
+def _custom_organization_exclude(organization: str, custom_org_exclusions: list[str]) -> str | None:
+    """Case-insensitive substring match against job["organization"], same
+    free-text-friendly semantics as _custom_exclude() above (not the \\b
+    word-boundary regex the built-in layers use)."""
+    org_lower = (organization or "").lower()
+    for term in custom_org_exclusions:
+        term_clean = (term or "").strip()
+        if term_clean and term_clean.lower() in org_lower:
+            return f"matched custom excluded organization \"{term_clean}\""
+    return None
+
+
+def _is_big_bank_employer(organization: str) -> bool:
+    return (organization or "").strip().lower() in _BIG_BANK_EMPLOYERS
+
+
+def _big_bank_title_inflation_exclude(job: dict) -> str | None:
+    if not _is_big_bank_employer(job.get("organization")):
+        return None
+    title = job.get("title") or ""
+    match = _BIG_BANK_TITLE_INFLATION_PATTERN.search(title)
+    if not match:
+        return None
+    if _BIG_BANK_CSUITE_SURVIVOR_PATTERN.search(title):
+        return None
+    return (
+        "big-bank VP/SVP/Director title inflation - pay-grade, not org "
+        f'leadership, at this employer (matched "{match.group(0)}")'
+    )
+
+
 def _admin_support_exclude(title: str) -> str | None:
     match = _ADMIN_SUPPORT_PATTERN.search(title)
     if not match:
@@ -791,31 +1081,37 @@ def _regulatory_affairs_exclude(title: str) -> str | None:
     return f"pharma regulatory affairs domain role (matched \"{match.group(0)}\")"
 
 
-def check_exclusion(job: dict, custom_exclusions: list[str] | None = None) -> dict | None:
+def check_exclusion(
+    job: dict,
+    custom_exclusions: list[str] | None = None,
+    custom_org_exclusions: list[str] | None = None,
+) -> dict | None:
     """Returns {"rule": ..., "reason": ...} if this job should never be
     persisted, or None if it should go through job_store.save_jobs()'s
-    normal path. All eleven layers are checked independently (not
+    normal path. All fifteen layers are checked independently (not
     short-circuit on an earlier layer's verdict) - see this module's own
     docstring on why "Medical Director" needs layer 2 to fire regardless
-    of layer 1; layers 3 (the user's own custom terms), 4 (generic
+    of layer 1; layers 3 (the user's own custom title terms), 4 (generic
     administrative/support titles), 5 (hands-on IC engineering/
     architecture titles), 6 (PM/PgM/ProdM track), 7 (intern/internship),
     8 (information-security domain), 9 (non-IT commercial/finance
-    leadership titles), and 11 (pharma Regulatory Affairs domain) are
-    likewise checked even when earlier layers already passed, so any of
-    them can catch a title the others wouldn't.
+    leadership titles), 11 (pharma Regulatory Affairs domain), 12 (the
+    user's own custom organization terms), and 13 (big-bank VP/SVP/Director
+    title inflation) are likewise checked even when earlier layers already
+    passed, so any of them can catch a job the others wouldn't.
     check_exclusion() returns the first rule that matches, in layer order,
     purely for a single deterministic label per job - a title can trip more
     than one layer (e.g. "IT PMO Consultant..." matches both layer 1's
     IC-tier "Consultant" and layer 6's PM-track pattern) and is excluded
     either way.
 
-    custom_exclusions=None (the default) makes this call
-    load_custom_title_exclusions() itself, for any caller that doesn't
-    already have the list on hand (e.g. a one-off/test call). Real
-    per-job callers in a loop (job_store.save_jobs()) should load once and
-    pass the same list to every check_exclusion() call instead, to avoid
-    re-reading settings.yaml once per job."""
+    custom_exclusions=None/custom_org_exclusions=None (the defaults) make
+    this call load_custom_title_exclusions()/load_custom_organization_
+    exclusions() itself, for any caller that doesn't already have the
+    lists on hand (e.g. a one-off/test call). Real per-job callers in a
+    loop (job_store.save_jobs()) should load once and pass the same lists
+    to every check_exclusion() call instead, to avoid re-reading
+    settings.yaml twice per job."""
     title = job.get("title") or ""
 
     reason = _seniority_exclude(title)
@@ -831,6 +1127,12 @@ def check_exclusion(job: dict, custom_exclusions: list[str] | None = None) -> di
     reason = _custom_exclude(title, custom_exclusions)
     if reason:
         return {"rule": "custom_user_exclusion", "reason": reason}
+
+    if custom_org_exclusions is None:
+        custom_org_exclusions = load_custom_organization_exclusions()
+    reason = _custom_organization_exclude(job.get("organization") or "", custom_org_exclusions)
+    if reason:
+        return {"rule": "custom_organization_exclusion", "reason": reason}
 
     reason = _admin_support_exclude(title)
     if reason:
@@ -859,6 +1161,10 @@ def check_exclusion(job: dict, custom_exclusions: list[str] | None = None) -> di
     reason = _regulatory_affairs_exclude(title)
     if reason:
         return {"rule": "regulatory_affairs_domain", "reason": reason}
+
+    reason = _big_bank_title_inflation_exclude(job)
+    if reason:
+        return {"rule": "big_bank_title_inflation", "reason": reason}
 
     return None
 

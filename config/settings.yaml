@@ -27,3 +27,5 @@ custom_title_exclusions:
 - Data Solutions Developer
 - UX Practitioner
 - Volunteer
+custom_organization_exclusions:
+- GForce Life Sciences
