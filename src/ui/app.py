@@ -79,12 +79,12 @@ from search.job_alert_senders import load_job_alert_senders, save_job_alert_send
 from search.aggregators import ADZUNA_COUNTRIES, is_configured as adzuna_is_configured
 from search.source_activity import all_tracked_sources, is_source_stale
 from ranking.prioritize import weight_for, dedupe_across_sources, find_freshness_downgrade_targets
-from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion, set_strategy_tag, needs_edit_review, record_document_edit_review, get_applications_with_open_clarifying_questions, try_acquire_generation_lock, release_generation_lock
+from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion, set_strategy_tag, needs_edit_review, record_document_edit_review, get_applications_with_open_clarifying_questions, try_acquire_generation_lock, release_generation_lock, is_qa_status_stale
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
 from tailoring.interview_prep import load_interview_prep, get_interview_prep, record_round_outcome, build_prep_context, generate_prep, start_round, save_round
 from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
 from tailoring.bulk_generate import generate_for_job, generate_for_basket
-from tailoring.subscription_resume_qa import run_subscription_round, generate_questions_via_subscription, submit_answers_and_redraft
+from tailoring.subscription_resume_qa import run_subscription_round, generate_questions_via_subscription, submit_answers_and_redraft, recover_stale_qa_and_retry
 from tailoring.reasoner_cli import ReasonerUnavailable
 from tailoring.task_monitor import get_active_tasks, reset_stalled_task
 from tailoring.ats_score import detect_matched_keyword_regressions
@@ -465,11 +465,37 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
         k: v for k, v in st.session_state["panga_basket_finalbuild_results"].items() if k in basket_keys
     }
 
+    def _status_line(placeholder, text: str) -> None:
+        """Renders a transient status/progress line at a smaller,
+        proportionate size (2026-08-17, Zahir live-usage report: the basket
+        progress line "looks too large" next to everything else in the
+        popover). Deliberately NOT Streamlit's caption widget - this
+        project's standing readability rule (docs/backlog-log.md, "UI
+        visual polish pass", 2026-07-30; enforced by tests/
+        test_ui_readability_standard.py) converted every caption-widget
+        call in Panga to `st.markdown()` specifically because captions
+        render as
+        unreadably-light gray for text a user actually needs to read, and a
+        "job N/M is drafting" line is exactly that (not decorative). So
+        this shrinks the font via inline style instead, at FULL opacity/
+        contrast, via `st.markdown(..., unsafe_allow_html=True)` rather
+        than `st.html()` - `st.html()` is raw passthrough HTML with no
+        Material-icon shortcode processing, and every status line here
+        uses a `:material/...:` icon, which only `st.markdown()`'s own
+        markdown parser expands; `st.html()` would print the shortcode as
+        literal text instead of the icon."""
+        placeholder.markdown(
+            f'<p style="margin: 0.2rem 0; font-size: 0.85rem;">{text}</p>', unsafe_allow_html=True
+        )
+
     def _qa_progress_placeholder():
         placeholder = st.empty()
 
         def _on_progress(stage: str) -> None:
-            placeholder.markdown(f":material/hourglass_top: {stage.capitalize()}... (this can take 40-90+ seconds)")
+            _status_line(
+                placeholder,
+                f":material/hourglass_top: {stage.capitalize()}... typically takes 40-90 seconds per job, please wait.",
+            )
         return _on_progress
 
     with st.container(key="panga_basket_bar"):
@@ -504,7 +530,34 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                         with item_cols[0]:
                             st.markdown(f"{job_label(job)}")
                         with item_cols[1]:
-                            if qa_status == "drafting":
+                            # Real resilience fix (2026-08-17): a job can be
+                            # stuck showing "drafting"/etc. because the app
+                            # process that set it died mid-call (a real
+                            # incident that day required a manual DB-level
+                            # fix - see applications.is_qa_status_stale()'s
+                            # own docstring). Checked BEFORE the ordinary
+                            # in-progress branches below so a genuinely stale
+                            # status gets its own Retry rather than showing
+                            # an "hourglass" line forever with no way out.
+                            is_stale = is_qa_status_stale(app_record)
+                            stale_retries = app_record.get("subscription_qa_stale_retry_count", 0)
+                            if is_stale:
+                                st.markdown(
+                                    f":material/warning: Looks stuck ({qa_status}, no update for "
+                                    f"5+ min - the app likely died mid-call)."
+                                    + (f" Auto-retried {stale_retries}x already." if stale_retries else "")
+                                )
+                                if st.button("Retry (subscription, $0)", key=f"basket_item_stalertry_{source}_{job_id}"):
+                                    on_progress = _qa_progress_placeholder()
+                                    outcome = recover_stale_qa_and_retry(job, load_profile(), on_progress=on_progress)
+                                    if outcome.get("locked"):
+                                        st.toast(f"{job_label(job)} actually just finished (or is genuinely still running) - no retry needed.", icon=":material/info:")
+                                    elif outcome["ok"]:
+                                        st.toast(f"Stuck job reset and retried - round {outcome['round']} drafted, ATS {outcome['resume_draft']['ats_score']}/100.", icon=":material/refresh:")
+                                    else:
+                                        st.toast(f"Auto-retry failed: {outcome['error']}", icon=":material/error:")
+                                    st.rerun()
+                            elif qa_status == "drafting":
                                 st.markdown(":material/hourglass_top: Drafting initial resume (subscription)...")
                             elif qa_status == "generating_questions":
                                 st.markdown(":material/hourglass_top: Generating questions...")
@@ -598,12 +651,43 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                         help="Runs the $0 subscription draft+score round for every job in your basket, one at a time. Not a paid call. Can take 40-90+ seconds per job.",
                     ):
                         draftall_placeholder = st.empty()
+                        draftall_detail_placeholder = st.empty()
                         results = {}
+                        stale_recovered_count = 0
                         for i, job in enumerate(basket_jobs, start=1):
                             source, job_id = job.get("source"), job.get("job_id")
-                            draftall_placeholder.markdown(f":material/hourglass_top: [{i}/{len(basket_jobs)}] {job_label(job)}: drafting & scoring (subscription)...")
+                            _status_line(
+                                draftall_placeholder,
+                                f":material/hourglass_top: [{i}/{len(basket_jobs)}] {job_label(job)}: drafting & scoring (subscription)...",
+                            )
+                            # Real resilience fix (2026-08-17): re-read this job's OWN
+                            # current record (not the stale `applications_by_key` snapshot
+                            # this popover render started with - a prior job in THIS same
+                            # loop iteration could have changed it) right before deciding
+                            # whether it's stuck, so staleness is judged on real current
+                            # state, not a snapshot that can be many jobs old by the time
+                            # this iteration runs.
+                            current_record = get_application(source, job_id) or {}
+
+                            def _bulk_on_progress(stage: str, _ph=draftall_detail_placeholder) -> None:
+                                _status_line(
+                                    _ph,
+                                    f":material/hourglass_top: {stage.capitalize()}... typically takes 40-90 seconds per job, please wait.",
+                                )
+
                             try:
-                                outcome = run_subscription_round(job, load_profile())
+                                if is_qa_status_stale(current_record):
+                                    # Doesn't just skip a stuck job silently, and doesn't
+                                    # hang forever waiting on it either (Zahir's explicit
+                                    # ask) - reset + bounded auto-retry (max 2, see
+                                    # subscription_resume_qa.recover_stale_qa_and_retry())
+                                    # right here in the loop rather than leaving it for a
+                                    # separate manual pass.
+                                    outcome = recover_stale_qa_and_retry(job, load_profile(), on_progress=_bulk_on_progress)
+                                    if outcome.get("stale_recovered"):
+                                        stale_recovered_count += 1
+                                else:
+                                    outcome = run_subscription_round(job, load_profile(), on_progress=_bulk_on_progress)
                             except Exception as exc:
                                 # Defense in depth, matching generate_for_basket()'s own
                                 # "one item's failure shouldn't stop the rest" pattern
@@ -619,6 +703,7 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                                 # reasoner_cli.parse_json_reply(), this catch is the
                                 # belt-and-suspenders backstop for anything else like it).
                                 outcome = {"ok": False, "locked": False, "round": None, "resume_draft": None, "error": str(exc)}
+                            draftall_detail_placeholder.empty()
                             results[(source, job_id)] = outcome
                         draftall_placeholder.markdown(":material/check_circle: Done.")
                         st.session_state["panga_basket_draftall_results"] = results
@@ -630,6 +715,15 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                             summary += f" {locked} skipped (already generating elsewhere)."
                         if failed:
                             summary += f" {failed} failed - see below."
+                        # Visible evidence a stall-and-retry actually happened (Zahir's
+                        # explicit ask: "not just have it silently work or silently
+                        # fail") - a toast alone would vanish on the rerun below before
+                        # he could read it if it were the ONLY signal, so this is
+                        # folded into the same summary toast that already survives via
+                        # the existing draftall_results session_state, not a separate
+                        # one-off notification.
+                        if stale_recovered_count:
+                            summary += f" {stale_recovered_count} job(s) looked stuck (stalled) and were reset + retried automatically."
                         st.toast(summary, icon=":material/check_circle:" if not failed else ":material/warning:")
                         st.rerun()
                     draftall_results = st.session_state["panga_basket_draftall_results"]
@@ -697,7 +791,7 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                                 redraft_results = {}
                                 for i, (job_key, answer_entries) in enumerate(per_job_answers.items(), start=1):
                                     job = jobs_by_key[job_key]
-                                    submit_placeholder.markdown(f":material/hourglass_top: [{i}/{answered_job_count}] {job_label(job)}: applying your answers & redrafting...")
+                                    _status_line(submit_placeholder, f":material/hourglass_top: [{i}/{answered_job_count}] {job_label(job)}: applying your answers & redrafting...")
                                     try:
                                         redraft_results[job_key] = submit_answers_and_redraft(job, load_profile(), answer_entries)
                                     except Exception as exc:

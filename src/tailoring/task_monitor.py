@@ -17,9 +17,9 @@ exited or was killed) shows up as stalled, not as "still working".
 
 Two real, distinct classes of in-flight work, deliberately not conflated:
 
-1. Subscription rounds (subscription_qa_status in QA_STATUSES_WITH_PROCESS)
-   - a real, separately-launched `claude` CLI OS subprocess exists, with
-   its own PID this module can independently check with is_pid_alive().
+1. Subscription rounds (subscription_qa_status in _QA_ACTIVE_STATUSES) - a
+   real, separately-launched `claude` CLI OS subprocess exists, with its
+   own PID this module can independently check with is_pid_alive().
 
 2. The one paid final-build call (bulk_generate.generate_for_job() ->
    tailoring.drafting.generate_documents()) - a direct in-process
@@ -34,6 +34,17 @@ Two real, distinct classes of in-flight work, deliberately not conflated:
    running", which is a different, weaker guarantee than checking an
    independent subprocess and this view says so rather than papering over
    the distinction.
+
+Staleness detection for the subscription path deliberately REUSES
+applications.is_qa_status_stale() (the 5-minute, time-based check landed
+2026-08-17 by the companion "stale-drafting auto-recovery" fix, af2e974 -
+already tested and live-verified there) rather than re-implementing a
+second, parallel staleness algorithm - this module only adds what that fix
+didn't have: a real, independently-checkable OS PID, which typically
+confirms a genuine stall faster than the 5-minute time-only threshold
+alone (see is_pid_alive()/PID_DEAD_GRACE_SECONDS below). A row here is
+"stalled" if EITHER signal says so - the two are complementary evidence
+for the same underlying question, not competing implementations of it.
 """
 
 import os
@@ -42,24 +53,14 @@ from datetime import datetime, timezone
 
 from search.job_store import load_jobs
 from tailoring.applications import (
-    QA_STATUSES_WITH_PROCESS,
+    _QA_ACTIVE_STATUSES,
+    clear_stale_qa_status,
+    get_application,
+    is_qa_status_stale,
     load_applications,
     release_generation_lock,
     set_qa_status,
 )
-
-# Real ceiling, not a target: reasoner_cli.DEFAULT_TIMEOUT_SECONDS (300s) is
-# the CLI subprocess's own hard timeout, after which run_claude_cli() itself
-# raises and the caller marks the round "failed" - a round should never
-# still show "drafting" much past that under normal operation. Generous
-# buffer on top (not the bare 300s) because on_start() fires as soon as the
-# subprocess launches, slightly before the timeout clock inside
-# subprocess.communicate() effectively starts counting, and because a
-# legitimately slow real call already measured 39-63s on real full-profile
-# drafts elsewhere in this app - this is a "call this stale even if the PID
-# somehow still shows alive" backstop, not the primary detection mechanism
-# (is_pid_alive() below is that).
-SUBSCRIPTION_STALE_AFTER_SECONDS = 360
 
 # Real race found live-verifying this module (2026-08-17): once the
 # `claude` subprocess itself exits (success OR failure), there's a real,
@@ -179,7 +180,7 @@ def get_active_tasks() -> list[dict]:
         organization = job.get("organization") or "(unknown org)"
 
         qa_status = app.get("subscription_qa_status")
-        if qa_status in QA_STATUSES_WITH_PROCESS:
+        if qa_status in _QA_ACTIVE_STATUSES:
             pid = app.get("subscription_qa_pid")
             started_at = app.get("subscription_qa_started_at")
             elapsed = _elapsed_seconds(started_at)
@@ -193,14 +194,20 @@ def get_active_tasks() -> list[dict]:
             pid_confirmed_stalled = pid is not None and not alive and (
                 elapsed is not None and elapsed > PID_DEAD_GRACE_SECONDS
             )
-            stalled = pid_confirmed_stalled or (
-                elapsed is not None and elapsed > SUBSCRIPTION_STALE_AFTER_SECONDS
-            )
+            # is_qa_status_stale() is the companion stale-drafting fix's
+            # own 5-minute, time-based check (reused, not reimplemented -
+            # see this module's own top docstring) - a second, independent
+            # vote for "stalled" alongside the PID check above, for the
+            # case a PID was never recorded at all (a pre-2026-08-17 record,
+            # or on_start() hasn't fired yet) or the OS-level check itself
+            # couldn't run.
+            time_confirmed_stalled = is_qa_status_stale(app)
+            stalled = pid_confirmed_stalled or time_confirmed_stalled
             stall_reason = None
             if pid_confirmed_stalled:
                 stall_reason = f"PID {pid} is no longer running"
-            elif elapsed is not None and elapsed > SUBSCRIPTION_STALE_AFTER_SECONDS:
-                stall_reason = f"running longer than the {SUBSCRIPTION_STALE_AFTER_SECONDS}s reasoner timeout"
+            elif time_confirmed_stalled:
+                stall_reason = "no status update in over 5 minutes - the owning process likely died mid-call"
             rows.append({
                 "source": source, "job_id": job_id, "title": title, "organization": organization,
                 "kind": "subscription", "status": qa_status, "pid": pid, "started_at": started_at,
@@ -222,7 +229,7 @@ def get_active_tasks() -> list[dict]:
         # build when it's held WITHOUT a subscription round also active
         # for this job right now.
         lock_held_since = app.get("generation_lock_acquired_at")
-        if lock_held_since and qa_status not in QA_STATUSES_WITH_PROCESS:
+        if lock_held_since and qa_status not in _QA_ACTIVE_STATUSES:
             elapsed = _elapsed_seconds(lock_held_since)
             stalled = elapsed is not None and elapsed > PAID_BUILD_STALE_AFTER_MINUTES * 60
             rows.append({
@@ -262,10 +269,38 @@ def reset_stalled_task(source: str, job_id: str, kind: str) -> None:
     lock too - release_generation_lock() is a no-op if it isn't actually
     held (see that function's own docstring), so this is safe even when
     the lock genuinely belongs to an unrelated, still-active operation on
-    a DIFFERENT job (this only ever touches this one (source, job_id))."""
+    a DIFFERENT job (this only ever touches this one (source, job_id)).
+
+    For "subscription", tries applications.clear_stale_qa_status() FIRST -
+    the companion stale-drafting fix's own atomic, race-safe reset (re-
+    checks staleness under the SAME lock right before clearing, so a call
+    that genuinely just finished in the gap between this row rendering and
+    the click isn't clobbered - see that function's own docstring). That
+    only actually clears when its own 5-minute time-based bar is met,
+    though, and this module's PID check can confirm a stall well before
+    that bar via PID_DEAD_GRACE_SECONDS (the entire reason Part 1 - real
+    PID tracking - exists: faster, stronger evidence than time alone). If
+    clear_stale_qa_status() declines (not stale by ITS bar yet) but this
+    row was only offered as "stalled" here because of a confirmed-dead
+    PID - independently verified, real evidence, not a guess - this falls
+    back to a direct clear rather than leaving Zahir's click looking like
+    it did nothing."""
     if kind == "subscription":
-        set_qa_status(source, job_id, None)
-        release_generation_lock(source, job_id)
+        cleared = clear_stale_qa_status(source, job_id)
+        if not cleared:
+            app = get_application(source, job_id) or {}
+            pid = app.get("subscription_qa_pid")
+            if pid is not None and not is_pid_alive(pid):
+                set_qa_status(source, job_id, None)
+                cleared = True
+        # Only force-release the lock if this call actually cleared
+        # something - if neither path did (the round genuinely just
+        # finished on its own in the gap between this row rendering and
+        # the click), the lock may by now legitimately belong to a
+        # brand-new operation that started in that same gap, and
+        # force-releasing it here would be a real, if narrow, race.
+        if cleared:
+            release_generation_lock(source, job_id)
     elif kind == "paid_build":
         release_generation_lock(source, job_id)
     else:

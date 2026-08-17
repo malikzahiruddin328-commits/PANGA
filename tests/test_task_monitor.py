@@ -95,18 +95,25 @@ def test_get_active_tasks_does_not_flag_stalled_within_pid_dead_grace_window(iso
     assert tasks[0]["stalled"] is False    # but too soon to call it stalled yet
 
 
-def test_get_active_tasks_flags_stalled_when_elapsed_exceeds_timeout(isolated_data, monkeypatch):
+def test_get_active_tasks_flags_stalled_when_time_based_check_says_stale(isolated_data, monkeypatch):
     """Even a PID that (implausibly) still reports alive is treated as
-    stalled once it's run well past the reasoner's own hard timeout - a
-    real backstop, not the primary detection path."""
+    stalled once applications.is_qa_status_stale() - the companion stale-
+    drafting fix's own 5-minute, time-based check, reused here rather than
+    reimplemented - says so. Backdates subscription_qa_status_at directly
+    (the field that check actually reads, stamped automatically by
+    set_qa_status() to "now" regardless of the started_at this module's
+    own pid tracking was given) to simulate a status set long ago."""
     _write_job()
-    applications.set_qa_status("linkedin", "1", "drafting", pid=4242, started_at="2020-01-01T00:00:00+00:00")
+    applications.set_qa_status("linkedin", "1", "drafting", pid=4242, started_at=_now_iso())
+    apps = applications.load_applications()
+    apps[0]["subscription_qa_status_at"] = "2020-01-01T00:00:00+00:00"
+    applications._save_all(apps)
     monkeypatch.setattr(task_monitor, "is_pid_alive", lambda pid: True)
 
     tasks = task_monitor.get_active_tasks()
 
     assert tasks[0]["stalled"] is True
-    assert "reasoner timeout" in tasks[0]["stall_reason"]
+    assert "5 minutes" in tasks[0]["stall_reason"]
 
 
 def test_get_active_tasks_includes_paid_build_lock(isolated_data):
