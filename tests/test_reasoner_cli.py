@@ -30,6 +30,29 @@ def test_run_claude_cli_returns_result_text_on_success(monkeypatch):
     assert result == "hello from claude"
 
 
+def test_run_claude_cli_passes_utf8_encoding_to_subprocess_run(monkeypatch):
+    """Real bug found live 2026-08-17 (feature/jd-keyword-taxonomy-gaps):
+    a real scraped job posting containing a Unicode character outside
+    cp1252 (e.g. "○") crashed subprocess.run's stdin writer thread with
+    UnicodeEncodeError before the `claude` CLI ever ran, because plain
+    text=True let Python pick the console's own codepage instead of
+    UTF-8. Asserts the real fix (encoding="utf-8" passed explicitly) is
+    in place, not just that a mocked call succeeds - a test using ASCII-
+    only prompt text would pass identically whether or not encoding is
+    pinned, so it wouldn't actually catch a regression of this fix."""
+    captured_kwargs = {}
+
+    def _fake_run(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return _FakeCompletedProcess(0, json.dumps({"is_error": False, "result": "ok"}), "")
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    reasoner_cli.run_claude_cli("prompt with a real Unicode bullet: ○")
+
+    assert captured_kwargs.get("encoding") == "utf-8"
+
+
 def test_run_claude_cli_raises_reasoner_unavailable_when_cli_missing(monkeypatch):
     def _raise_not_found(*a, **k):
         raise FileNotFoundError("no such file")

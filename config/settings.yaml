@@ -22,3 +22,8 @@ usajobs_job_series:
 - '2210'
 search_cadence:
   scheduled_runs_per_day: 3
+custom_title_exclusions:
+- Mainframe
+- Data Solutions Developer
+- UX Practitioner
+- Volunteer
