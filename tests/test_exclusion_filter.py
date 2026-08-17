@@ -118,6 +118,66 @@ def test_no_exclusion_for_a_plausible_unrelated_title():
     assert exclusion_filter.check_exclusion(_job("Chief Information Officer")) is None
 
 
+# --- Layer 3: generic administrative/clerical/demo-support exclusion -------
+
+@pytest.mark.parametrize("title", [
+    "Administrative Assistant",
+    "Senior Administrative Assistant",
+    "Senior Administrative Assistant, IMCO, Eyecare & Specialty",  # real AbbVie job
+    "Executive Assistant",
+    "Executive Assistant to the CEO",
+    "Office Manager",
+    "Receptionist",
+    "Value Proposition and Demonstration Manager - Onco Solids",  # real AbbVie job
+    "Demonstration Manager",
+    "Value Proposition Manager",
+])
+def test_admin_support_layer_excludes_generic_non_technical_titles(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is not None
+    assert result["rule"] == "administrative_support_role"
+
+
+def test_front_desk_coordinator_excluded_by_seniority_layer_first():
+    # "Front Desk Coordinator" also matches this layer's own pattern, but
+    # layer 1 (Coordinator = IC-tier noun, no exec qualifier) runs first in
+    # check_exclusion() and claims it - same "excluded either way, rule
+    # label isn't the point" situation as the existing
+    # test_title_matching_both_layers_is_still_excluded() case above.
+    result = exclusion_filter.check_exclusion(_job("Front Desk Coordinator"))
+    assert result is not None
+    assert result["rule"] in ("seniority_mismatch", "administrative_support_role")
+
+
+@pytest.mark.parametrize("title", [
+    "Systems Administrator",
+    "Database Administrator",
+    "Network Administrator",
+    "Operational Technology Systems Administrator",  # real AbbVie job
+    "FVP/SVP, Credit Administrator",  # real AbbVie job - "Administrator" != "Administrative Assistant"
+    "Associate CIO, Administrative Applications",  # real AbbVie job - "Administrative Applications" != "Administrative Assistant"
+    "IT Office Manager",  # hedge: tech-qualified variant of a caught phrase
+    "Digital Demonstration Manager",  # hedge: tech-qualified variant of a caught phrase
+    "Chief Information Officer",
+    "Director, IT Service Continuity",
+    "VP Information Technology",
+])
+def test_admin_support_layer_does_not_catch_technical_or_unrelated_titles(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is None or result["rule"] != "administrative_support_role"
+
+
+def test_admin_support_layer_real_slipped_through_examples():
+    # The exact two real jobs Zahir flagged as having slipped through
+    # unfiltered from AbbVie's company-site pull.
+    assert exclusion_filter.check_exclusion(
+        _job("Value Proposition and Demonstration Manager - Onco Solids", organization="AbbVie")
+    )["rule"] == "administrative_support_role"
+    assert exclusion_filter.check_exclusion(
+        _job("Senior Administrative Assistant", organization="AbbVie")
+    )["rule"] == "administrative_support_role"
+
+
 # --- Logging: the non-negotiable "never silently dropped" requirement ------
 
 def test_log_exclusions_appends_full_record(isolated_data):

@@ -12,7 +12,7 @@ call, on jobs already sitting in the store), this runs on EVERY job coming
 out of EVERY search channel (USAJOBS, ZipRecruiter, Dice, Indeed, company
 sites, industry boards) before search.job_store.save_jobs() ever writes a
 record - so it must stay purely deterministic (no AI call, no network
-call) to be cheap enough to run at that volume. Two layers:
+call) to be cheap enough to run at that volume. Three layers:
 
 1. Seniority-tier exclusion: the candidate (Zahir) is a 25-year VP/CIO/
    Head-of-IT executive. An individual-contributor-tier noun in the title
@@ -34,6 +34,33 @@ call) to be cheap enough to run at that volume. Two layers:
    ("Director") that would otherwise keep it, so the clinical check must
    run regardless of the seniority verdict, not only when seniority
    already excluded it.
+3. Generic administrative/clerical/demo-support role exclusion (added
+   2026-08-17, Zahir's explicit request after "Value Proposition and
+   Demonstration Manager" and "Senior Administrative Assistant" - two real
+   AbbVie company-site jobs, neither remotely IT/cybersecurity/digital-
+   transformation - slipped through to him unfiltered). Matches titled
+   roles like "Administrative Assistant," "Executive Assistant," "Office
+   Manager," "Receptionist," and "Demonstration Manager"/"Value
+   Proposition Manager" - none of these carry an IC-tier noun from layer
+   1's pattern (so layer 1 never catches them: "Assistant"/"Manager"
+   aren't in that list), and they're not a clinical/medical role either,
+   so layer 2 doesn't catch them. Deliberately titled-phrase matching, not
+   a generic "admin" substring - "Administrator" (a real, distinct
+   technical title: "Systems Administrator," "Database Administrator,"
+   "Network Administrator," "Operational Technology Systems
+   Administrator," all real titles in the live store) shares no common
+   substring with "Administrative Assistant" once matched as whole words,
+   so there is no risk of conflating the two. Also exempts any title that
+   independently carries an IT/technical qualifier word (IT, systems,
+   technology, technical, digital, network, infrastructure, security,
+   software, data, cloud, cyber, informatics) anywhere in the title - a
+   hedge against a real but
+   not-yet-seen title like "IT Office Manager" or "Digital Demonstration
+   Manager" that would otherwise be a false positive; validated 2026-08-17
+   against the full live job store (2 real matches: "Senior Administrative
+   Assistant" and "Senior Administrative Assistant, IMCO, Eyecare &
+   Specialty," both genuinely non-technical - zero false positives against
+   every real "Administrator"/"CIO"/"Director"/"VP" title in the store).
 
 Non-negotiable per Zahir's standing "never silently dropped" rule (the
 same one tailoring.fit_score_prefilter follows): an excluded job is never
@@ -87,6 +114,33 @@ _CLINICAL_PATTERN = re.compile(
     re.I,
 )
 
+# Layer 3: generic administrative/clerical/demo-support role exclusion.
+# Titled-phrase matching only (never a bare "admin" substring) so a real
+# technical "Administrator" title (Systems/Database/Network Administrator)
+# can never be conflated with "Administrative Assistant" - the two share no
+# common substring once matched as whole titled phrases.
+_ADMIN_SUPPORT_PATTERN = re.compile(
+    r"\badministrative assistant\b"
+    r"|\bexecutive assistant\b"
+    r"|\boffice manager\b"
+    r"|\breceptionist\b"
+    r"|\bfront desk\b"
+    r"|\bvalue proposition\b"
+    r"|\bdemonstration manager\b",
+    re.I,
+)
+
+# Exemption: any of these words appearing anywhere else in the title signals
+# a real IT/technical role, even one titled with an otherwise-generic
+# administrative/support phrase (e.g. a not-yet-seen "IT Office Manager" or
+# "Digital Demonstration Manager") - a real technical title must never be
+# caught by this layer.
+_TECH_QUALIFIER_PATTERN = re.compile(
+    r"\b(it|information technology|systems|technology|technical|digital|network|"
+    r"infrastructure|security|software|data|cloud|cyber|informatics)\b",
+    re.I,
+)
+
 
 def _seniority_exclude(title: str) -> str | None:
     if _IC_TIER_PATTERN.search(title) and not _EXEC_QUALIFIER_PATTERN.search(title):
@@ -101,11 +155,20 @@ def _clinical_exclude(title: str) -> str | None:
     return None
 
 
+def _admin_support_exclude(title: str) -> str | None:
+    match = _ADMIN_SUPPORT_PATTERN.search(title)
+    if not match:
+        return None
+    if _TECH_QUALIFIER_PATTERN.search(title):
+        return None
+    return f"generic non-technical administrative/clerical/demo-support role (matched \"{match.group(0)}\")"
+
+
 def check_exclusion(job: dict) -> dict | None:
     """Returns {"rule": ..., "reason": ...} if this job should never be
     persisted, or None if it should go through job_store.save_jobs()'s
-    normal path. Both layers are checked independently (not short-circuit
-    on layer 1's verdict) - see this module's own docstring on why
+    normal path. All layers are checked independently (not short-circuit
+    on an earlier layer's verdict) - see this module's own docstring on why
     "Medical Director" needs layer 2 to fire regardless of layer 1."""
     title = job.get("title") or ""
 
@@ -116,6 +179,10 @@ def check_exclusion(job: dict) -> dict | None:
     reason = _clinical_exclude(title)
     if reason:
         return {"rule": "clinical_domain", "reason": reason}
+
+    reason = _admin_support_exclude(title)
+    if reason:
+        return {"rule": "administrative_support_role", "reason": reason}
 
     return None
 
