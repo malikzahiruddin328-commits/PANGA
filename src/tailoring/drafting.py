@@ -1560,74 +1560,96 @@ def _draft_one(
         break
 
     if doc_key == "resume":
-        resume_text = data.get("text", "")
-        if not data.get("target_seniority_at_least_vp", True):
-            # Deterministic safety net, not left to prompt compliance alone
-            # (see _strip_rank_prefixes docstring) - only for a below-VP
-            # posting; defaults to True (no stripping) if the field is
-            # somehow missing, so an absent judgment fails toward leaving
-            # the text untouched rather than silently mangling a title.
-            resume_text = _strip_rank_prefixes(resume_text)
-        # Deterministic safety net (2026-08-10) - see this function's own
-        # docstring for the real Merck case that motivated it. Runs before
-        # the unhedged-claims check below so that check (which already
-        # skips the EDUCATION section entirely - see claim_verification.py's
-        # module docstring) always sees the final, rendered text.
-        resume_text = _render_education_section_verbatim(resume_text, profile)
-        # Deterministic fact-check for UNHEDGED claims (2026-08-09, Zahir's
-        # explicit design) - the "?" hedge above only ever catches what the
-        # AI itself flagged as uncertain; this catches a confidently-stated
-        # fabrication (wrong employer, wrong dates, an invented
-        # certification) the same way, by folding it into the exact same
-        # "?" marker the AI's own hedges use - see claim_verification.py's
-        # own docstring for exactly what's checked and why it's scoped
-        # this narrowly. Runs AFTER rank-prefix stripping so the persisted
-        # resume_text is the fully-finalized text being checked.
-        resume_text, unverified_claims = flag_unverified_resume_claims(resume_text, profile or {})
-        job = job or {}
-        required_kw = job.get("ats_required_keywords")
-        preferred_kw = job.get("ats_preferred_keywords")
-        if required_kw is not None and preferred_kw is not None:
-            # AI-extracted keyword list already cached on the job record
-            # (generate_documents() ensures this before calling _draft_one) -
-            # the real-NLP-judgment path, see _extract_ats_keywords().
-            ats = score_resume_against_keywords(required_kw, preferred_kw, resume_text, candidate_years_experience=_total_years_of_experience(profile))
-        else:
-            # Extraction was never attempted/failed for this job (e.g. no
-            # posting text, or a transient API error) - fall back to the
-            # dependency-free regex heuristic rather than leaving the
-            # resume unscored.
-            posting_text = "\n".join(filter(None, [
-                job.get("title"), job.get("qualification_summary"), job.get("description"),
-            ]))
-            ats = score_resume_ats(posting_text, resume_text)
-        previously_answered_skills = [a.get("skill") for a in (profile or {}).get("gap_interview_answers", [])]
-        merged_questions = _merge_keyword_gap_questions(
-            data.get("clarifying_questions", []), ats.get("missing_required_keywords", []),
-            previously_answered_skills, profile,
-            missing_preferred_keywords=ats.get("missing_preferred_keywords", []),
-        )
-        return {
-            "text": resume_text,
-            "suggested_strategy_tag": data.get("suggested_strategy_tag", ""),
-            "ats_score": ats["ats_score"],
-            "ats_rationale": ats["ats_rationale"],
-            "ats_next_actions": ats["ats_next_actions"],
-            "clarifying_questions": _questions_worth_asking(merged_questions, ats["ats_score"]),
-            "ats_plateau_note": ats.get("plateau_note"),
-            "unconfirmed_claims": data.get("unconfirmed_claims", []) + unverified_claims,
-            # Raw missing-keyword lists (2026-08-09) - not folded into
-            # clarifying_questions here, unlike the questions above, since
-            # _draft_resume_with_self_correction() needs the exact labels/
-            # point_values themselves to build a targeted retry prompt and
-            # to detect "no progress" between attempts (identical missing
-            # set), not just a human-facing question about them.
-            "missing_required_keywords": ats.get("missing_required_keywords", []),
-            "missing_preferred_keywords": ats.get("missing_preferred_keywords", []),
-        }
+        return _finalize_resume_draft(data, job, profile)
     if doc_key == "apply_answers":
         return data.get("apply_answers", [])
     return data.get(doc_key, "")
+
+
+def _finalize_resume_draft(data: dict, job: dict | None, profile: dict | None) -> dict:
+    """Deterministic, code-level post-processing that turns a raw structured
+    resume draft (a dict shaped like _resume_schema()'s output - "text",
+    "target_seniority_at_least_vp", "suggested_strategy_tag",
+    "clarifying_questions", "unconfirmed_claims") into the finalized resume
+    dict generate_documents() returns (adds "ats_score"/"ats_rationale"/
+    "ats_next_actions"/etc., computed for real, never trusted from the
+    draft's own self-report).
+
+    Extracted (2026-08-13) from _draft_one()'s resume branch so it's a
+    reusable, standalone safety/validation step, not logic wired only to
+    the paid-API call path. This is the exact same code that always ran
+    here for the paid path - behavior is unchanged - but now any other
+    caller producing a raw draft dict in this same shape (e.g. tailoring.
+    subscription_resume_qa's subscription-covered in-app basket-document
+    build) can run its output through the SAME deterministic safety gates
+    (flag_unverified_resume_claims, real keyword-overlap ATS scoring)
+    rather than re-implementing or approximating them - the whole point
+    being that no execution model gets to skip or weaken these checks."""
+    resume_text = data.get("text", "")
+    if not data.get("target_seniority_at_least_vp", True):
+        # Deterministic safety net, not left to prompt compliance alone
+        # (see _strip_rank_prefixes docstring) - only for a below-VP
+        # posting; defaults to True (no stripping) if the field is
+        # somehow missing, so an absent judgment fails toward leaving
+        # the text untouched rather than silently mangling a title.
+        resume_text = _strip_rank_prefixes(resume_text)
+    # Deterministic safety net (2026-08-10) - see this function's own
+    # docstring for the real Merck case that motivated it. Runs before
+    # the unhedged-claims check below so that check (which already
+    # skips the EDUCATION section entirely - see claim_verification.py's
+    # module docstring) always sees the final, rendered text.
+    resume_text = _render_education_section_verbatim(resume_text, profile)
+    # Deterministic fact-check for UNHEDGED claims (2026-08-09, Zahir's
+    # explicit design) - the "?" hedge above only ever catches what the
+    # AI itself flagged as uncertain; this catches a confidently-stated
+    # fabrication (wrong employer, wrong dates, an invented
+    # certification) the same way, by folding it into the exact same
+    # "?" marker the AI's own hedges use - see claim_verification.py's
+    # own docstring for exactly what's checked and why it's scoped
+    # this narrowly. Runs AFTER rank-prefix stripping so the persisted
+    # resume_text is the fully-finalized text being checked.
+    resume_text, unverified_claims = flag_unverified_resume_claims(resume_text, profile or {})
+    job = job or {}
+    required_kw = job.get("ats_required_keywords")
+    preferred_kw = job.get("ats_preferred_keywords")
+    if required_kw is not None and preferred_kw is not None:
+        # AI-extracted keyword list already cached on the job record
+        # (generate_documents() ensures this before calling _draft_one) -
+        # the real-NLP-judgment path, see _extract_ats_keywords().
+        ats = score_resume_against_keywords(required_kw, preferred_kw, resume_text, candidate_years_experience=_total_years_of_experience(profile))
+    else:
+        # Extraction was never attempted/failed for this job (e.g. no
+        # posting text, or a transient API error) - fall back to the
+        # dependency-free regex heuristic rather than leaving the
+        # resume unscored.
+        posting_text = "\n".join(filter(None, [
+            job.get("title"), job.get("qualification_summary"), job.get("description"),
+        ]))
+        ats = score_resume_ats(posting_text, resume_text)
+    previously_answered_skills = [a.get("skill") for a in (profile or {}).get("gap_interview_answers", [])]
+    merged_questions = _merge_keyword_gap_questions(
+        data.get("clarifying_questions", []), ats.get("missing_required_keywords", []),
+        previously_answered_skills, profile,
+        missing_preferred_keywords=ats.get("missing_preferred_keywords", []),
+    )
+    return {
+        "text": resume_text,
+        "suggested_strategy_tag": data.get("suggested_strategy_tag", ""),
+        "ats_score": ats["ats_score"],
+        "ats_rationale": ats["ats_rationale"],
+        "ats_next_actions": ats["ats_next_actions"],
+        "clarifying_questions": _questions_worth_asking(merged_questions, ats["ats_score"]),
+        "ats_plateau_note": ats.get("plateau_note"),
+        "unconfirmed_claims": data.get("unconfirmed_claims", []) + unverified_claims,
+        # Raw missing-keyword lists (2026-08-09) - not folded into
+        # clarifying_questions here, unlike the questions above, since
+        # _draft_resume_with_self_correction() needs the exact labels/
+        # point_values themselves to build a targeted retry prompt and
+        # to detect "no progress" between attempts (identical missing
+        # set), not just a human-facing question about them.
+        "missing_required_keywords": ats.get("missing_required_keywords", []),
+        "missing_preferred_keywords": ats.get("missing_preferred_keywords", []),
+    }
 
 
 def _draft_group(

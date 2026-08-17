@@ -19,8 +19,25 @@ each turned out to be plain server-rendered HTML, no MCP needed - STEPs
 2c/2d/2e below cover them directly. USAJOBS + company-site ATS APIs +
 industry-board scraping + Adzuna (steps 1, 2b, 3, 4) are also unaffected,
 since none of those ever depended on MCP either.
+
+Normal invocation (full daily run - searches every source, then runs the
+cheap domain prefilter followed by the real paid fit_score on whatever
+survives it):
+
+    python scripts/run_search.py
+
+Prefilter-only invocation (2026-08-17, Zahir's explicit ask - observe/
+verify the cheap Haiku domain-relevance filter's real behavior on jobs
+already sitting unscored in the store, without incurring the far pricier
+Opus fit_score call it normally gates): skips all source searching, runs
+should_skip_scoring() only, logs each skip/pass, and leaves fit_score
+untouched (still unset) for every job that passes - a later normal run
+(no flag) still picks those up for full scoring.
+
+    python scripts/run_search.py --prefilter-only
 """
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -341,7 +358,7 @@ def search_industry_boards() -> int:
     return added
 
 
-def score_unscored_jobs(profile: dict) -> list[dict]:
+def score_unscored_jobs(profile: dict, prefilter_only: bool = False) -> list[dict]:
     """Scores every job missing a fit_score via the direct API (mirrors the
     exact rubric tailoring.drafting.score_job already uses for manually-added
     jobs, per docs/native-packaging-scope.md Phase 1). Returns the list of
@@ -365,7 +382,18 @@ def score_unscored_jobs(profile: dict) -> list[dict]:
     this field existed) is treated as "accepted" - the implicit historical
     default, per save_jobs()'s own docstring - so this change never
     silently stops scoring anything that was already flowing through the
-    pipeline before today."""
+    pipeline before today.
+
+    prefilter_only (2026-08-17, Zahir's explicit ask - run/observe the
+    cheap Haiku domain filter's real behavior before spending on the far
+    pricier Opus score_job() pass, see --prefilter-only below): when True,
+    still runs should_skip_scoring() on every unscored job exactly as
+    above (same logging, same log_prefilter_skip() spot-check trail), but
+    a job that PASSES the domain check is never handed to score_job() at
+    all - it's just logged as eligible and left with fit_score still
+    unset, so a later normal (non-prefilter-only) run still picks it up
+    for full scoring. Returns [] in this mode (nothing gets a real
+    fit_score, so there's nothing to notify strong-match on)."""
     jobs = job_store.load_jobs()
     unscored = [
         j for j in jobs
@@ -374,20 +402,25 @@ def score_unscored_jobs(profile: dict) -> list[dict]:
     if not unscored:
         return []
 
-    _log(f"Scoring {len(unscored)} new job(s)...")
+    total = len(unscored)
+    _log(f"Scoring {total} new job(s)...")
     strong_matches = []
-    for job in unscored:
+    for i, job in enumerate(unscored, start=1):
         skip = fit_score_prefilter.should_skip_scoring(job, profile)
         if skip:
             fit_score_prefilter.log_prefilter_skip(job, skip)
-            _log(f"  [prefilter:{skip['layer']}] skipped {job.get('title')!r} at {job.get('organization')!r}: {skip['reason']}")
+            _log(f"  [{i}/{total}] [prefilter:{skip['layer']}] skipped {job.get('title')!r} at {job.get('organization')!r}: {skip['reason']}")
+            continue
+        if prefilter_only:
+            _log(f"  [{i}/{total}] [prefilter:domain_check] PASSED {job.get('title')!r} at {job.get('organization')!r} - eligible for full scoring")
             continue
         try:
             result = score_job(job, profile)
         except (DraftingNotConfigured, DraftingFailed) as exc:
-            _log(f"  [score] failed for {job.get('title')!r} at {job.get('organization')!r}: {exc}")
+            _log(f"  [{i}/{total}] [score] failed for {job.get('title')!r} at {job.get('organization')!r}: {exc}")
             continue
         job_store.update_job_score(job.get("source"), job.get("job_id"), result["fit_score"], result["fit_rationale"])
+        _log(f"  [{i}/{total}] scored {job.get('title')!r} at {job.get('organization')!r}: {result['fit_score']}")
         if result["fit_score"] >= 60:
             strong_matches.append({**job, **result})
     return strong_matches
@@ -444,7 +477,31 @@ def notify(
     send_notification("Panga - Daily job search", message[:200])
 
 
-def run() -> None:
+def run(prefilter_only: bool = False) -> None:
+    """prefilter_only (2026-08-17, Zahir's explicit ask - see --prefilter-only
+    in this module's docstring/CLI help): runs ONLY the domain-relevance
+    prefilter over jobs already sitting unscored in the store - no new
+    source searching (STEPs 1-4 below are skipped entirely, so this makes
+    no new search-source calls), no real fit_score scoring, no
+    notification (there's nothing to notify - no job gets a real score in
+    this mode), no freshness check. Pure observe-the-filter mode: cheap
+    Haiku domain-check calls only, still logged via
+    fit_score_prefilter.log_prefilter_skip() for skips and the
+    [prefilter:domain_check] PASSED line for jobs that clear it, exactly
+    like a normal run's STEP 5 - just without ever reaching the far
+    pricier score_job() call."""
+    if prefilter_only:
+        _log("PREFILTER-ONLY MODE - skipping search STEPs 1-4 (no new source "
+             "searching); running the domain-relevance prefilter only over "
+             "jobs already unscored in the store. No job gets a real "
+             "fit_score in this mode.")
+        profile = load_profile()
+        score_unscored_jobs(profile, prefilter_only=True)
+        _log("Done (prefilter-only - fit_score left untouched for every job "
+             "that passed the domain check; see data/jobs/prefilter_log.json "
+             "for the skip trail).")
+        return
+
     settings = _load_settings()
     target_roles = settings.get("target_roles", [])
     job_series = settings.get("usajobs_job_series", [])
@@ -511,4 +568,22 @@ def run() -> None:
 
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--prefilter-only",
+        action="store_true",
+        help=(
+            "Run only the cheap Haiku domain-relevance prefilter "
+            "(fit_score_prefilter.should_skip_scoring()) over jobs already "
+            "unscored in the store - no new source searching, and no real "
+            "(paid Opus) fit_score scoring. A job that passes the domain "
+            "check is logged as eligible and left with fit_score still "
+            "unset, so a later normal run (no flag) still picks it up for "
+            "full scoring. Use this to observe/verify the domain filter's "
+            "real behavior on real jobs before spending on the full "
+            "scoring pass. Example: python scripts/run_search.py "
+            "--prefilter-only"
+        ),
+    )
+    args = parser.parse_args()
+    run(prefilter_only=args.prefilter_only)

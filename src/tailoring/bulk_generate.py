@@ -27,7 +27,7 @@ from tailoring.dossier import sync_workspace_documents
 from tailoring.drafting import DraftingFailed, DraftingNotConfigured, _report_drafting_failure, generate_documents
 
 
-def generate_for_job(job: dict, profile: dict, doc_keys: list[str]) -> dict:
+def generate_for_job(job: dict, profile: dict, doc_keys: list[str], on_progress=None) -> dict:
     """Drafts `doc_keys` for one job and persists the results (upserts the
     application record, syncs the per-application workspace .docx files) -
     the same two calls the Results tab's own inline "Generate documents"
@@ -51,7 +51,14 @@ def generate_for_job(job: dict, profile: dict, doc_keys: list[str]) -> dict:
     release_generation_lock() itself so callers (including
     generate_for_basket() below) never need to manage the lock directly -
     matches the existing per-(source, job_id) concurrent-generate guard
-    the Results tab's own button already relies on (2026-08-11)."""
+    the Results tab's own button already relies on (2026-08-11).
+
+    on_progress, if given, is passed straight through to generate_documents()
+    (2026-08-13, needed by the in-app subscription Q&A loop's "Fire final
+    API build" button - the one real paid call in that flow still needs
+    real "Drafting final version..." progress visibility, not a silent
+    multi-minute wait, same standing requirement every other call in this
+    app already meets)."""
     source, job_id = job.get("source"), job.get("job_id")
     if not try_acquire_generation_lock(source, job_id):
         return {"ok": False, "locked": True, "errors": {}}
@@ -61,6 +68,7 @@ def generate_for_job(job: dict, profile: dict, doc_keys: list[str]) -> dict:
             drafted = generate_documents(
                 job, profile, doc_keys,
                 existing_resume_text=app_record.get("resume_text") if "resume" not in doc_keys else None,
+                on_progress=on_progress,
             )
         except (DraftingNotConfigured, DraftingFailed) as exc:
             key = doc_keys[0] if len(doc_keys) == 1 else "generate"
@@ -75,6 +83,7 @@ def generate_for_job(job: dict, profile: dict, doc_keys: list[str]) -> dict:
             source, job_id, status=app_record.get("status", "under review"),
             documents_requested=doc_keys,
             resume_text=resume_draft["text"] if resume_is_scored else resume_draft,
+            resume_draft_source="paid" if "resume" in doc_keys else None,
             resume_ats_score=resume_draft["ats_score"] if resume_is_scored else None,
             resume_ats_rationale=resume_draft["ats_rationale"] if resume_is_scored else None,
             resume_ats_next_actions=resume_draft["ats_next_actions"] if resume_is_scored else None,

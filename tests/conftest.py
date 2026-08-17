@@ -118,6 +118,14 @@ def isolated_data(tmp_path, monkeypatch):
     # call_structured()/call_with_web_search() can ever write real cost
     # entries into the actual data/ folder.
     monkeypatch.setattr(cost_log, "COST_LOG_PATH", tmp_path / "cost_log.json")
+    # LOCK_DIR (2026-08-13, global-spend-cap-across-worktrees fix): cost_log
+    # now deliberately resolves its real lock directory to the MAIN
+    # checkout's data/.locks (see cost_log._resolve_shared_data_dir), not
+    # wherever this test happens to run from - without patching this too,
+    # every test that calls log_api_cost would write a real (harmless but
+    # real) lock file into the actual main-checkout data/.locks/ instead of
+    # tmp_path, same class of gap COST_LOG_PATH above exists to prevent.
+    monkeypatch.setattr(cost_log, "LOCK_DIR", tmp_path / ".locks")
     # Same class of gap as MASTER_PROFILE_PATH/PROJECT_ROOT above - found
     # 2026-08-08 while writing tests for the LinkedIn suggestion-persist
     # fix: linkedin.storage.LINKEDIN_PATH was never isolated either, so any
