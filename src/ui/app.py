@@ -482,6 +482,29 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
         k: v for k, v in st.session_state["panga_basket_finalbuild_results"].items() if k in basket_keys
     }
 
+    # One-time (per rerun) scoped CSS for _status_line below - see that
+    # function's docstring for why this exists instead of an inline
+    # `<p style=...>` wrapper. Targets any container whose Streamlit-
+    # generated key starts with "panga_status_line_" (there are several,
+    # one per distinct placeholder _status_line is used with) via a
+    # substring attribute selector, so a single shared rule covers all of
+    # them without needing a separate `<style>` block per call site. This
+    # `unsafe_allow_html=True` call is safe - the content is a static,
+    # hardcoded CSS rule with no interpolated user/job text in it, unlike
+    # the old per-call `<p style=...>{text}</p>` pattern this replaced.
+    st.markdown(
+        '<style>[class*="st-key-panga_status_line_"] p '
+        '{ margin: 0.2rem 0 !important; font-size: 0.85rem !important; }</style>',
+        unsafe_allow_html=True,
+    )
+    # Cache of placeholder id -> its inner st.empty(), so a placeholder
+    # used by multiple _status_line() calls within the same script run
+    # (e.g. every iteration of the draft-all progress loop) reuses the
+    # same underlying container/empty instead of re-creating one each
+    # time - see _status_line's docstring for why re-creating one per
+    # call breaks (StreamlitDuplicateElementKey).
+    _status_line_containers: dict = {}
+
     def _status_line(placeholder, text: str) -> None:
         """Renders a transient status/progress line at a smaller,
         proportionate size (2026-08-17, Zahir live-usage report: the basket
@@ -491,19 +514,34 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
         visual polish pass", 2026-07-30; enforced by tests/
         test_ui_readability_standard.py) converted every caption-widget
         call in Panga to `st.markdown()` specifically because captions
-        render as
-        unreadably-light gray for text a user actually needs to read, and a
-        "job N/M is drafting" line is exactly that (not decorative). So
-        this shrinks the font via inline style instead, at FULL opacity/
-        contrast, via `st.markdown(..., unsafe_allow_html=True)` rather
-        than `st.html()` - `st.html()` is raw passthrough HTML with no
-        Material-icon shortcode processing, and every status line here
-        uses a `:material/...:` icon, which only `st.markdown()`'s own
-        markdown parser expands; `st.html()` would print the shortcode as
-        literal text instead of the icon."""
-        placeholder.markdown(
-            f'<p style="margin: 0.2rem 0; font-size: 0.85rem;">{text}</p>', unsafe_allow_html=True
-        )
+        render as unreadably-light gray for text a user actually needs to
+        read, and a "job N/M is drafting" line is exactly that (not
+        decorative).
+
+        2026-08-17 (later same day): the first version of this shrank the
+        font by wrapping the whole line - icon shortcode included - in a
+        raw `<p style="font-size:...">{text}</p>` passed through
+        `st.markdown(..., unsafe_allow_html=True)`. That broke the
+        `:material/...:` icon shortcode every status line here uses -
+        confirmed live: Streamlit's markdown parser only expands
+        `:material/icon_name:` into a real icon when it appears in genuine
+        markdown text, not when it's embedded inside a literal HTML tag
+        under `unsafe_allow_html`, so it rendered as the literal
+        `:material/hourglass_top:` string instead of an hourglass glyph.
+        Fixed by keeping the text itself as plain, unwrapped
+        `st.markdown(text)` (so the icon shortcode expands normally) and
+        doing the font-size shrink via the scoped CSS class above instead
+        of inline HTML - verified live both ways: the inline-`<p>` version
+        prints the shortcode as text, this version renders the icon glyph
+        at the same 0.85rem size.
+        """
+        inner = _status_line_containers.get(id(placeholder))
+        if inner is None:
+            outer = placeholder.container(key=f"panga_status_line_{id(placeholder)}")
+            with outer:
+                inner = st.empty()
+            _status_line_containers[id(placeholder)] = inner
+        inner.markdown(text)
 
     def _qa_progress_placeholder():
         placeholder = st.empty()
