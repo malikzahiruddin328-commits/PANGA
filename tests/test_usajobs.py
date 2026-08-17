@@ -4,9 +4,14 @@ import search.usajobs as usajobs
 
 
 class _FakeResponse:
-    def __init__(self, json_data, status_code=200):
+    def __init__(self, json_data, status_code=200, text=None):
         self._json_data = json_data
         self.status_code = status_code
+        # check_position_open() checks .text for the 204-empty-body case
+        # the real Historic JOA API returns for an unmatched id (verified
+        # live 2026-08-17) - default to a non-empty stand-in unless a test
+        # explicitly wants the empty-body case.
+        self.text = "" if text is None and json_data is None else (text if text is not None else "x")
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -277,3 +282,104 @@ def test_search_jobs_by_series_and_grade_drops_off_series_job(monkeypatch, confi
     jobs = usajobs.search_jobs_by_series_and_grade(["2210"], "12", "15")
 
     assert [j["job_id"] for j in jobs] == ["GOOD1"]
+
+
+# check_position_open() - rewritten 2026-08-17. The old implementation
+# passed PositionID as a *search API* filter and was never actually tested
+# against real responses; live-verification that day found the parameter
+# was silently ignored (a real, a garbage, an empty, and an all-zeros
+# PositionID all returned the same 5 generic results), so this function
+# could never detect a real closure. These tests use response shapes
+# confirmed live against the real Historic JOA endpoint
+# (data.usajobs.gov/api/historicjoa) that day: a real open posting
+# (PositionID "DH-13024454-26-VJ") returned positionOpeningStatus
+# "Accepting applications"; a real closed posting already in Panga's own
+# job store (PositionID "req806") returned positionOpeningStatus "Job
+# closed"; a garbage/empty/all-zeros id returned HTTP 204 with an empty
+# body.
+
+def _historic_joa_record(position_opening_status="Accepting applications", position_close_date="2099-01-01"):
+    return {
+        "data": [
+            {
+                "usajobsControlNumber": 879297700,
+                "positionOpeningStatus": position_opening_status,
+                "positionCloseDate": position_close_date,
+            }
+        ]
+    }
+
+
+def test_check_position_open_true_for_accepting_applications(monkeypatch, configured):
+    # Shape confirmed live 2026-08-17 for PositionID "DH-13024454-26-VJ".
+    def fake_get(url, headers=None, params=None, timeout=None):
+        assert url == usajobs.HISTORIC_JOA_URL
+        assert params == {"AnnouncementNumbers": "DH-13024454-26-VJ"}
+        return _FakeResponse(_historic_joa_record("Accepting applications", "2026-08-18"))
+
+    monkeypatch.setattr(usajobs.requests, "get", fake_get)
+    assert usajobs.check_position_open("DH-13024454-26-VJ") is True
+
+
+def test_check_position_open_false_for_job_closed(monkeypatch, configured):
+    # Shape confirmed live 2026-08-17 for PositionID "req806" - a real
+    # closed posting already sitting in Panga's own job store.
+    def fake_get(url, headers=None, params=None, timeout=None):
+        return _FakeResponse(_historic_joa_record("Job closed", "2026-01-23"))
+
+    monkeypatch.setattr(usajobs.requests, "get", fake_get)
+    assert usajobs.check_position_open("req806") is False
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["Reviewing applications", "Hiring complete", "Job canceled"],
+)
+def test_check_position_open_false_for_other_non_accepting_statuses(monkeypatch, configured, status):
+    def fake_get(url, headers=None, params=None, timeout=None):
+        return _FakeResponse(_historic_joa_record(status, "2026-01-01"))
+
+    monkeypatch.setattr(usajobs.requests, "get", fake_get)
+    assert usajobs.check_position_open("SOME-ID") is False
+
+
+def test_check_position_open_raises_not_found_on_204(monkeypatch, configured):
+    # Confirmed live 2026-08-17: a garbage id, an all-zeros id, and an
+    # empty string each return HTTP 204 with an empty body - correctly
+    # distinguishable from both open and closed, unlike the old (broken)
+    # search-API-based implementation which returned the same fake "found"
+    # result regardless of what was passed.
+    def fake_get(url, headers=None, params=None, timeout=None):
+        return _FakeResponse(None, status_code=204, text="")
+
+    monkeypatch.setattr(usajobs.requests, "get", fake_get)
+    with pytest.raises(usajobs.USAJobsPositionNotFound):
+        usajobs.check_position_open("GARBAGE-NOT-REAL")
+
+
+def test_check_position_open_raises_not_found_on_empty_data_list(monkeypatch, configured):
+    def fake_get(url, headers=None, params=None, timeout=None):
+        return _FakeResponse({"data": []}, status_code=200, text='{"data": []}')
+
+    monkeypatch.setattr(usajobs.requests, "get", fake_get)
+    with pytest.raises(usajobs.USAJobsPositionNotFound):
+        usajobs.check_position_open("0000000000")
+
+
+def test_check_position_open_uses_close_date_fallback_when_status_blank(monkeypatch, configured):
+    def fake_get(url, headers=None, params=None, timeout=None):
+        return _FakeResponse(_historic_joa_record("", "2099-01-01"))
+
+    monkeypatch.setattr(usajobs.requests, "get", fake_get)
+    assert usajobs.check_position_open("SOME-ID") is True
+
+
+def test_check_position_open_regression_old_broken_behavior_would_have_returned_true_for_garbage():
+    """Documents the actual bug being fixed: the OLD implementation queried
+    API_URL (the search endpoint) with PositionID as a filter param, which
+    USAJOBS silently ignores - confirmed live 2026-08-17 that a garbage
+    PositionID returned the same non-empty SearchResultItems as a real one.
+    The new implementation queries a different endpoint
+    (HISTORIC_JOA_URL) entirely, which does not have this problem (see the
+    204-on-not-found tests above)."""
+    assert usajobs.HISTORIC_JOA_URL != usajobs.API_URL
