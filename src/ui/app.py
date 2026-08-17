@@ -118,6 +118,8 @@ from feedback.ui_feedback import get_open_feedback, mark_resolved
 from ui.feedback_widget import render_feedback_widget
 from profile.ingest import load_manifest_result, remove_document, ingest_uploaded_document, resume_text as ingested_resume_text
 from profile.storage import load_profile, update_profile_field
+from profile.interview import save_profile_gap_review_answers
+from skills.gap_frequency_analysis import analyze_recurring_gaps, build_review_questions, DEFAULT_MIN_RECURRENCE
 try:
     # Bhangi is a separate, standalone cross-project tool (see
     # _find_bhangi_src above) - not something this app ships or installs
@@ -1953,6 +1955,88 @@ def render_analyze_fit_section(job: dict, app_record: dict, analysis: dict | Non
                     # codebase's established pattern.
                     st.toast("Saved.", icon=":material/check_circle:")
                     st.rerun()
+
+
+def render_recurring_gap_review_panel() -> None:
+    """Phase 3 of Zahir's confirmed "final set of questions" taxonomy-gap
+    build (2026-08-17, feature/jd-keyword-taxonomy-gaps). His own words on
+    the goal: the system has "seen its fair share of jobs that apply to
+    me and knows the language of the JDs" - this is that final,
+    consolidated round, built to MINIMIZE future per-job re-asking, not
+    add another round on top of the existing per-job clarifying-questions
+    flow below on this same tab.
+
+    Standalone - not tied to any single job in the basket, per Zahir's
+    explicit call on placement (his own words: "a standalone 'Review
+    profile gaps' entry point, reachable from Settings or a dedicated
+    section"). Placed at the top of the existing Profile Gaps tab rather
+    than a new tab or a Settings subsection: this tab is already the
+    real, established "cross-job profile facts" section (see
+    render_answered_gap_questions() immediately below, and the per-job
+    loop above this function's own call site) - a second, differently-
+    located place for the same category of decision would be exactly the
+    kind of duplicate-surface HCI gap this repo's CLAUDE.md calls out
+    (\"are related decisions forced into separate clicks/buttons when
+    they're really one decision made at one moment? Consolidate.\").
+
+    Reuses skills.gap_frequency_analysis (pure Python, zero AI cost - the
+    analysis itself runs on every page load, no spinner needed) and
+    profile.interview.save_profile_gap_review_answers() (the SAME
+    resolve_or_create_canonical_id()/save_answer() write path every other
+    confirmed profile fact in this app already goes through) - no new
+    write path, no new AI call, per the phase's own design.
+
+    Same auto-save-on-edit + st.toast + st.rerun() pattern as
+    render_analyze_fit_section's per-job questions immediately above -
+    one real interaction model for "answer a gap question" across this
+    whole tab, not two."""
+    analysis = analyze_recurring_gaps()
+    questions = build_review_questions(analysis)
+
+    with st.container(border=True):
+        st.markdown("**Review recurring profile gaps**")
+        st.markdown(
+            "Real terms that keep showing up as required/preferred across "
+            f"{analysis['jobs_with_keywords']} of your saved job postings "
+            f"(out of {analysis['total_jobs']} total) that recur "
+            f"{analysis['min_recurrence']}+ times and aren't confirmed in "
+            "your profile yet - answer these once here instead of "
+            "re-answering the same underlying fact job by job. Nothing is "
+            "ever guessed on your behalf: every box below starts empty, "
+            "and leaving one blank changes nothing."
+        )
+        if not questions:
+            if analysis["jobs_with_keywords"] == 0:
+                st.markdown(
+                    "No jobs have extracted ATS keywords yet - run "
+                    "`scripts/batch_extract_jd_keywords.py` to build up "
+                    "real data for this analysis."
+                )
+            else:
+                st.markdown("Nothing recurring enough to ask about right now - nice place to be.")
+        else:
+            st.markdown(f"{len(questions)} real, recurring gap(s) found.")
+            for q in questions:
+                q_key = f"recurring_gap_{abs(hash(q['skill'] + '|' + q['type'])) % 10_000_000}"
+                with st.container(border=True):
+                    badge_col, text_col = st.columns([1, 5])
+                    with badge_col:
+                        if q["type"] == "new_concept":
+                            st.badge("new concept", color="orange")
+                        else:
+                            st.badge(f"{q['job_count']} postings", color="blue")
+                    with text_col:
+                        st_markdown_raw_text(q["question"])
+                    answer_value = st.text_area(
+                        q["question"], value="", key=q_key, height=68,
+                        label_visibility="collapsed", placeholder="Type your answer, or leave blank to skip...",
+                    )
+                    if answer_value and answer_value.strip():
+                        save_profile_gap_review_answers([{
+                            "skill": q["skill"], "answer": answer_value, "question": q["question"],
+                        }])
+                        st.toast("Saved.", icon=":material/check_circle:")
+                        st.rerun()
 
 
 def render_answered_gap_questions() -> None:
@@ -5278,6 +5362,8 @@ elif active_tab == "gaps":
         "A job drops off this list once its questions are answered and its "
         "resume regenerated."
     )
+
+    render_recurring_gap_review_panel()
 
     gap_apps = get_applications_with_open_clarifying_questions()
     if not gap_apps:

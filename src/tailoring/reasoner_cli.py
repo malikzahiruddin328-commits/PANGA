@@ -86,7 +86,28 @@ def run_claude_cli(prompt: str, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS) 
     try:
         proc = subprocess.run(
             ["claude", "-p", "--output-format", "json", "--permission-mode", "bypassPermissions"],
-            input=prompt, capture_output=True, text=True, timeout=timeout_seconds, check=False,
+            # Real bug found live 2026-08-17 (feature/jd-keyword-taxonomy-gaps,
+            # Phase 1 verification against real job posting text): plain
+            # text=True lets subprocess pick stdin's encoding from
+            # locale.getpreferredencoding() - on this Windows machine that's
+            # cp1252, not UTF-8. A real scraped JD containing an ordinary
+            # Unicode character outside cp1252 (e.g. "○" as a bullet point,
+            # confirmed live on a real Insmed posting) crashed the stdin
+            # writer thread with UnicodeEncodeError before the subprocess
+            # ever got a chance to run - not a `claude` CLI failure at all,
+            # a Python-side encode failure one layer before it. encoding=
+            # "utf-8" pins both the stdin write and stdout/stderr decode to
+            # UTF-8 regardless of the console's codepage, matching every
+            # other place in this codebase that already guards against a
+            # Windows console codepage choking on real Unicode job data
+            # (see scripts/run_search.py's sys.stdout.reconfigure()). This
+            # bug pre-dates this branch - every existing caller of
+            # run_claude_cli() (subscription_resume_qa.py,
+            # discuss_and_draft.py) was equally exposed to it on any real
+            # posting with non-Latin1 text; fixed here rather than worked
+            # around locally since it's the shared mechanism, not a bug in
+            # any one caller.
+            input=prompt, capture_output=True, text=True, encoding="utf-8", timeout=timeout_seconds, check=False,
         )
     except FileNotFoundError as exc:
         raise ReasonerUnavailable("The 'claude' CLI isn't installed or isn't on PATH on this machine.") from exc
