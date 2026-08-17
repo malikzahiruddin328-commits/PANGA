@@ -145,17 +145,18 @@ BHANGI_PROJECT = "panga"
 
 # Basket-wide "Draft & score all" concurrency (2026-08-17, Zahir's explicit
 # ask: "is it possible to make this draft and score to running in multiple
-# threads... 5 threads, for the sake of speed"). 5 is the target ceiling,
-# same pattern/style as tailoring.drafting.MAX_CONCURRENT_DRAFTS (the
-# concurrent per-document drafting pool that's this feature's real
+# threads... 5 threads, for the sake of speed"; bumped 5->6 same day after
+# Zahir reported no local performance degradation at 5). 6 is the target
+# ceiling, same pattern/style as tailoring.drafting.MAX_CONCURRENT_DRAFTS
+# (the concurrent per-document drafting pool that's this feature's real
 # precedent in this codebase - bulk_generate.generate_for_basket() itself
 # turned out to still be a plain sequential loop, not concurrent, when
 # checked against the real current code). The actual worker count used for
 # a given run is capped further, downward only, by concurrency.
 # adaptive_throttle.effective_worker_count() right before the pool starts,
-# so this constant is a ceiling ("never more than 5 at once"), not a
-# guarantee every run gets exactly 5.
-BASKET_DRAFTALL_MAX_WORKERS = 5
+# so this constant is a ceiling ("never more than 6 at once"), not a
+# guarantee every run gets exactly 6.
+BASKET_DRAFTALL_MAX_WORKERS = 6
 
 CATEGORY_LABELS = {
     "rejection": "Rejection",
@@ -757,7 +758,7 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                                     job_stage.pop(job_key, None)
                             return (source, job_id), outcome, stale_recovered
 
-                        # Ceiling of BASKET_DRAFTALL_MAX_WORKERS (5), backed off
+                        # Ceiling of BASKET_DRAFTALL_MAX_WORKERS (6), backed off
                         # downward by concurrency.adaptive_throttle if this machine
                         # is already under real CPU load right now (Zahir's explicit
                         # ask, 2026-08-17: throttle down under load rather than
