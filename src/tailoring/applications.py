@@ -473,6 +473,26 @@ def set_discussion_status(
 # the round/score history survives across sessions.
 QA_STATUSES = {"drafting", "generating_questions", "awaiting_answers", "redrafting", "failed"}
 
+# The subset of QA_STATUSES that represent an actual subscription call in
+# flight (as opposed to "awaiting_answers" - idle, waiting on the user to
+# fill in a form - or "failed" - a terminal state already surfaced to the
+# user with its own Retry). Real observed single-call duration is 40-90s
+# (Zahir, live production, 2026-08-17); 5 minutes is roughly 3-4x that, well
+# past any realistic legitimate call, so a job still showing one of these
+# after that long almost certainly means the process that set it (app
+# restart, killed subprocess, crash) never got to update it - not a call
+# that's merely running long. Kept deliberately much shorter than
+# _GENERATION_LOCK_STALE_AFTER_MINUTES (20) above: that constant is tuned
+# for the PAID generate_for_job() path, which can legitimately run several
+# minutes across its own self-correction retries: this subscription path is
+# a single `claude` CLI call with no such retry loop, so a much tighter
+# staleness bound is both safe and necessary here (a 20-minute wait to
+# recover a dead subscription draft is exactly the "no visible way to
+# recover" gap Zahir reported, 2026-08-17).
+_QA_ACTIVE_STATUSES = {"drafting", "generating_questions", "redrafting"}
+_QA_STATUS_STALE_AFTER_MINUTES = 5
+MAX_STALE_QA_AUTO_RETRIES = 2
+
 
 def set_qa_status(source: str, job_id: str, status: str | None, error: str | None = None) -> None:
     """Tracks where a job's in-app subscription draft/Q&A loop is right
@@ -487,7 +507,14 @@ def set_qa_status(source: str, job_id: str, status: str | None, error: str | Non
     get-or-create/lock-free stamping pattern as set_discussion_status()
     above, deliberately mirrored rather than reusing that function
     directly - this is a genuinely different state machine (an iterative
-    free loop with no message board involved), not the same one."""
+    free loop with no message board involved), not the same one.
+
+    Also stamps subscription_qa_status_at (2026-08-17) whenever status is
+    set to a real (non-None) value - the timestamp is_qa_status_stale()
+    below reads to tell a genuinely-still-running call apart from one whose
+    owning process died before it could ever clear its own status. Popped
+    (not left stale) when status clears to None, matching release_
+    generation_lock()'s own pop-on-clear convention just above."""
     if status is not None and status not in QA_STATUSES:
         raise ValueError(f"status must be one of {QA_STATUSES} or None, got {status!r}")
     if get_application(source, job_id) is None:
@@ -498,10 +525,106 @@ def set_qa_status(source: str, job_id: str, status: str | None, error: str | Non
             if app["source"] == source and app["job_id"] == job_id:
                 app["subscription_qa_status"] = status
                 app["subscription_qa_error"] = error
+                if status is not None:
+                    app["subscription_qa_status_at"] = datetime.now(timezone.utc).isoformat()
+                else:
+                    app.pop("subscription_qa_status_at", None)
                 _save_all(applications)
                 _write_dossier(source, job_id)
                 return
         raise KeyError(f"no application record for ({source!r}, {job_id!r}) even after creation")
+
+
+def is_qa_status_stale(app_record: dict) -> bool:
+    """True if this application's subscription_qa_status is an active
+    ("drafting"/"generating_questions"/"redrafting") state that's been set
+    for longer than _QA_STATUS_STALE_AFTER_MINUTES - a real signal the
+    owning process died mid-call rather than merely running long. Pure/no
+    store I/O (mirrors needs_edit_review() above) so callers can check an
+    already-loaded record cheaply, e.g. once per row on every basket
+    render, without a file read per job."""
+    status = app_record.get("subscription_qa_status")
+    if status not in _QA_ACTIVE_STATUSES:
+        return False
+    status_at = app_record.get("subscription_qa_status_at")
+    if not status_at:
+        # An active status with no timestamp can only be a pre-2026-08-17
+        # record (this field didn't exist before) - treat as stale rather
+        # than trusting it forever, since there's no way to tell its real
+        # age and a stuck-forever record is exactly the bug being fixed.
+        return True
+    age_minutes = (datetime.now(timezone.utc) - datetime.fromisoformat(status_at)).total_seconds() / 60
+    return age_minutes >= _QA_STATUS_STALE_AFTER_MINUTES
+
+
+def clear_stale_qa_status(source: str, job_id: str) -> bool:
+    """Atomically re-checks staleness under the SAME lock right before
+    clearing (not just trusting an earlier is_qa_status_stale() call made
+    while rendering the row) and, only if it's genuinely still stale at
+    that exact moment, resets subscription_qa_status to None AND force-
+    releases the paired generation lock (generation_lock_acquired_at) -
+    both fields get set together by the same dead call, so recovering one
+    without the other would leave try_acquire_generation_lock() still
+    reporting "locked" for up to another 20 minutes (_GENERATION_LOCK_
+    STALE_AFTER_MINUTES), defeating the whole point of a tighter,
+    subscription-specific staleness bound.
+
+    Returns True if it actually cleared something (caller should proceed
+    with a retry); False if the status was no longer stale by the time this
+    ran under lock (the real call finished, or another caller already
+    recovered it, in the gap between the caller's own check and this call)
+    - in that case nothing is touched and the caller must NOT retry, to
+    avoid two live drafts racing for the same job (the same "read-modify-
+    write safe if run twice" discipline CLAUDE.md requires for shared
+    state, applied here as a genuine check-then-act done entirely inside
+    one locked() section rather than two separate steps)."""
+    with locked("applications"):
+        applications = load_applications()
+        for app in applications:
+            if app["source"] == source and app["job_id"] == job_id:
+                if not is_qa_status_stale(app):
+                    return False
+                app["subscription_qa_status"] = None
+                app["subscription_qa_error"] = None
+                app.pop("subscription_qa_status_at", None)
+                app.pop("generation_lock_acquired_at", None)
+                _save_all(applications)
+                _write_dossier(source, job_id)
+                return True
+        return False
+
+
+def increment_qa_stale_retry_count(source: str, job_id: str) -> int:
+    """Bumps subscription_qa_stale_retry_count (bounded auto-retry counter
+    for a detected-stale draft, capped by callers at MAX_STALE_QA_AUTO_
+    RETRIES) and returns the new count. Same locked read-modify-write
+    pattern as record_subscription_qa_round() below - never a read-then-
+    separate-write from the caller."""
+    with locked("applications"):
+        applications = load_applications()
+        for app in applications:
+            if app["source"] == source and app["job_id"] == job_id:
+                count = app.get("subscription_qa_stale_retry_count", 0) + 1
+                app["subscription_qa_stale_retry_count"] = count
+                _save_all(applications)
+                return count
+        return 0
+
+
+def reset_qa_stale_retry_count(source: str, job_id: str) -> None:
+    """Clears the counter above once a round actually completes
+    successfully - a job that stalls once, gets auto-retried, and then
+    succeeds shouldn't have that history count against a LATER, unrelated
+    stall (the cap is "2 in a row without a real success between them", not
+    a lifetime limit)."""
+    with locked("applications"):
+        applications = load_applications()
+        for app in applications:
+            if app["source"] == source and app["job_id"] == job_id:
+                if app.get("subscription_qa_stale_retry_count"):
+                    app["subscription_qa_stale_retry_count"] = 0
+                    _save_all(applications)
+                return
 
 
 def record_subscription_qa_round(source: str, job_id: str, ats_score: int | None, draft_source: str = "subscription") -> int:

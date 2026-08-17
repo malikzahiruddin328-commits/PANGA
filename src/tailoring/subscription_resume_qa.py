@@ -66,9 +66,13 @@ import json
 
 from search.job_store import update_job_ats_keywords
 from tailoring.applications import (
+    MAX_STALE_QA_AUTO_RETRIES,
+    clear_stale_qa_status,
     get_application,
+    increment_qa_stale_retry_count,
     record_subscription_qa_round,
     release_generation_lock,
+    reset_qa_stale_retry_count,
     set_qa_status,
     try_acquire_generation_lock,
     upsert_application,
@@ -205,9 +209,70 @@ def run_subscription_round(job: dict, profile: dict, on_progress=None) -> dict:
         sync_workspace_documents(source, job_id, ["resume"], {"resume": resume_draft}, profile, job)
         round_number = record_subscription_qa_round(source, job_id, resume_draft["ats_score"])
         set_qa_status(source, job_id, None)
+        # A real completed round means this job isn't actually stuck -
+        # clear any stale-auto-retry history so a FUTURE, unrelated stall
+        # gets its own fresh 2 attempts rather than inheriting whatever was
+        # left over from a past incident (see reset_qa_stale_retry_count()'s
+        # own docstring for why this is "2 in a row", not a lifetime cap).
+        reset_qa_stale_retry_count(source, job_id)
         return {"ok": True, "locked": False, "round": round_number, "resume_draft": resume_draft, "error": None}
     finally:
         release_generation_lock(source, job_id)
+
+
+def recover_stale_qa_and_retry(job: dict, profile: dict, on_progress=None) -> dict:
+    """Real fix for the 2026-08-17 production incident: a job stuck at
+    subscription_qa_status == "drafting" after the app process was killed
+    mid-call, with no way to recover except a manual
+    `applications.set_qa_status(source, job_id, None)` outside the UI.
+    Bounded (CLAUDE.md "check for infinite loops", applied to retries, not
+    just loops) auto-recovery for a job whose status is genuinely stale
+    (applications.is_qa_status_stale() - active status held far longer than
+    any real single subscription call takes): resets it and retries the
+    draft/score round exactly once per call here, up to MAX_STALE_QA_AUTO_
+    RETRIES total before requiring manual attention.
+
+    Callers (the per-job Retry button once it detects a stale, not just a
+    "failed", status; the basket-wide "Draft & score all" loop before it
+    calls run_subscription_round() for each job) - never called
+    unconditionally, only once the caller has already confirmed via is_qa_
+    status_stale() that this job actually looks stuck, so a normal
+    genuinely-in-flight draft is never touched.
+
+    Returns the same shape as run_subscription_round() when it actually
+    retries, plus "stale_recovered": True/False so the caller can show a
+    real, visible "this looked stuck, retried automatically" message
+    instead of it happening silently. Two other real outcomes:
+    - retry cap already hit: sets subscription_qa_status to "failed" (so it
+      surfaces through the SAME existing failed-job UI/Retry path, not a
+      new one) with a message stating the real retry count and cap, and
+      returns that as an ordinary failed outcome.
+    - the status turned out not to be stale anymore by the time this ran
+      (clear_stale_qa_status()'s own atomic re-check under lock) - the real
+      call must have just finished, or another caller already recovered it
+      in the gap between this caller's own check and this call. Reported as
+      {"locked": True} (the same shape every OTHER genuine in-flight
+      collision already returns) rather than fabricating a retry that could
+      race the call that's actually still finishing."""
+    source, job_id = job.get("source"), job.get("job_id")
+    app_record = get_application(source, job_id) or {}
+    retry_count = app_record.get("subscription_qa_stale_retry_count", 0)
+    if retry_count >= MAX_STALE_QA_AUTO_RETRIES:
+        msg = (
+            f"Stalled while drafting/scoring and already auto-retried {retry_count} "
+            f"time(s) (max {MAX_STALE_QA_AUTO_RETRIES}) - needs manual attention."
+        )
+        set_qa_status(source, job_id, "failed", error=msg)
+        return {"ok": False, "locked": False, "round": None, "resume_draft": None, "error": msg, "stale_recovered": False}
+
+    cleared = clear_stale_qa_status(source, job_id)
+    if not cleared:
+        return {"ok": False, "locked": True, "round": None, "resume_draft": None, "error": None, "stale_recovered": False}
+
+    increment_qa_stale_retry_count(source, job_id)
+    outcome = run_subscription_round(job, profile, on_progress=on_progress)
+    outcome["stale_recovered"] = True
+    return outcome
 
 
 def generate_questions_via_subscription(job: dict, profile: dict, on_progress=None) -> dict:
