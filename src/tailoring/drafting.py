@@ -1327,6 +1327,27 @@ def _merge_keyword_gap_questions(
                 "suggested_answer": patched_answer,
                 "keyword_verified": True,
             })
+        elif q.get("point_value") is not None and q.get("skill") and not q.get("keyword_verified"):
+            # Retroactive backfill (2026-08-17) for records PERSISTED
+            # before this verification guarantee existed. Real gap: this
+            # function isn't only called on a fresh AI draft's raw
+            # clarifying_questions (point_value always None there, always
+            # hits the branch above) - analyze_fit_before_drafting() (see
+            # its own call site) re-runs this SAME function against the
+            # job's already-STORED resume_clarifying_questions on every
+            # score refresh, without a new drafting round. A question
+            # that already carries a real point_value/badge from before
+            # this fix shipped has "point_value is None" false, so it
+            # would otherwise fall straight to the untouched pass-through
+            # below and never get patched - not just once, but forever,
+            # since nothing about a stored, already-scored question ever
+            # naturally re-enters the branch above. Self-heals here
+            # instead: q["skill"] is exactly the literal term this module
+            # (or the backfill branch above, on some earlier round) used
+            # to justify this question's point_value in the first place,
+            # so it's the right term to verify/patch against.
+            patched_answer, _ = ensure_keyword_literally_present(q["skill"], q.get("suggested_answer") or "")
+            merged.append({**q, "suggested_answer": patched_answer, "keyword_verified": True})
         else:
             merged.append(q)
     for item in missing_required_keywords:

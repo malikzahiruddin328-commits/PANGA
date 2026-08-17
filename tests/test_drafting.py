@@ -1441,6 +1441,53 @@ def test_merge_keyword_gap_questions_does_not_double_insert_on_a_second_pass():
     assert second_pass[0]["suggested_answer"].lower().count("shop-floor systems") == 1
 
 
+def test_merge_keyword_gap_questions_retroactively_patches_a_pre_existing_scored_question():
+    # Real gap: this function is not only called on a fresh AI draft's raw
+    # clarifying_questions (point_value always None there) - analyze_fit_
+    # before_drafting() re-runs it against a job's already-STORED resume_
+    # clarifying_questions on every score refresh, with no new drafting
+    # round. A question persisted BEFORE this verification guarantee
+    # shipped already carries a real point_value, so it would otherwise
+    # skip the backfill branch (which only fires when point_value is None)
+    # and never get patched - not once, forever, since nothing about
+    # stored, already-scored data naturally re-enters that branch.
+    stale_stored_question = {
+        "type": "skill_gap", "skill": "shop-floor systems", "question": "?",
+        "suggested_answer": "Unknown - please describe your real experience (if any) with this.",
+        "point_value": 1.4,
+    }
+    merged = _merge_keyword_gap_questions([stale_stored_question], [])
+    assert len(merged) == 1
+    q = merged[0]
+    assert q["point_value"] == 1.4
+    assert q["keyword_verified"] is True
+    assert keyword_literally_present("shop-floor systems", q["suggested_answer"])
+
+
+def test_merge_keyword_gap_questions_retroactive_patch_is_idempotent():
+    stale_stored_question = {
+        "type": "skill_gap", "skill": "shop-floor systems", "question": "?",
+        "suggested_answer": "Unknown - please describe your real experience (if any) with this.",
+        "point_value": 1.4,
+    }
+    once = _merge_keyword_gap_questions([stale_stored_question], [])
+    twice = _merge_keyword_gap_questions(once, [])
+    assert twice[0]["suggested_answer"] == once[0]["suggested_answer"]
+    assert twice[0]["suggested_answer"].lower().count("shop-floor systems") == 1
+
+
+def test_merge_keyword_gap_questions_does_not_retroactively_touch_an_already_verified_question():
+    # Once keyword_verified is already True (this round or an earlier one),
+    # the retroactive branch must not re-run - same object/text preserved.
+    already_verified = {
+        "type": "skill_gap", "skill": "shop-floor systems", "question": "?",
+        "suggested_answer": 'Yes, direct ownership of "shop-floor systems" at two plants.',
+        "point_value": 1.4, "keyword_verified": True,
+    }
+    merged = _merge_keyword_gap_questions([already_verified], [])
+    assert merged == [already_verified]
+
+
 def _sample_profile():
     return {
         "skills": {"Technical": ["Databricks", "Python"]},
