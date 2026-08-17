@@ -23,7 +23,8 @@ visible no matter which tab is open.
 import os
 import re
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -523,14 +524,327 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                 else:
                     st.markdown(f"**{len(basket_jobs)} job(s) in your basket**")
 
-                    # --- Section 1: per-job rows (label, live status/score,
-                    # per-job "Generate final resume", remove). No per-item
-                    # "Draft & score" here any more - that's now the single
-                    # basket-wide action in section 2 below, per Zahir's
-                    # design point 1 ("ONE Draft & score action... not
-                    # per-item"). A per-job Retry survives for the "failed"
-                    # case only, so one stuck job doesn't force re-running
-                    # the whole basket to unstick it.
+                    # --- Section 1: single basket-wide "Draft & score all"
+                    # button (Zahir's design point 1, then narrowed further
+                    # 2026-08-17: Zahir confirmed he wants ONLY ONE draft/
+                    # score control for the whole basket - this button, at
+                    # the TOP of the panel - not a separate per-item trigger;
+                    # per-job rows below (section 2) are a READ-ONLY status
+                    # display, with Retry surviving only for the "stuck"/
+                    # "failed" case. Loops the SAME per-job
+                    # run_subscription_round() every per-item flow used to
+                    # call, now via a bounded thread pool (2026-08-17,
+                    # Zahir's explicit ask: "is it possible to make this
+                    # draft and score to running in multiple threads... 5
+                    # threads, for the sake of speed") instead of one job at
+                    # a time. Real wall-clock win because each call is a
+                    # real 40-90+ second `claude` CLI SUBPROCESS call
+                    # (subscription_resume_qa.run_subscription_round ->
+                    # reasoner_cli.run_claude_cli) that spends almost all of
+                    # that time blocked on I/O waiting for the CLI, not
+                    # holding the GIL doing local CPU work - several
+                    # genuinely overlap instead of fighting over one core.
+                    # Continues past one job's failure so it doesn't block
+                    # the rest of the batch (same pattern generate_for_
+                    # basket() already uses for the paid path).
+                    #
+                    # Moved to the TOP of the panel (2026-08-17, Zahir
+                    # live-usage report: the button sat near the top of the
+                    # popover while its progress line rendered far below,
+                    # past the whole per-job list and the Open Questions
+                    # section - the "does an action need scrolling to see
+                    # its result" anti-pattern this repo's own CLAUDE.md HCI
+                    # checklist documents). The button, its status text, and
+                    # its progress bar are now the very first things in the
+                    # panel and are created adjacent to each other in source
+                    # order, so clicking it and seeing feedback never needs
+                    # scrolling.
+                    #
+                    # Concurrency-safety notes (CLAUDE.md's race-condition
+                    # checklist, applied to genuinely new concurrent
+                    # access):
+                    # - Per-job isolation: run_subscription_round() and
+                    #   recover_stale_qa_and_retry() both acquire/release
+                    #   applications.try_acquire_generation_lock()/
+                    #   release_generation_lock() themselves, per (source,
+                    #   job_id) - two workers can never draft the SAME job
+                    #   at once, while DIFFERENT jobs proceed fully
+                    #   independently. That lock, and every applications.py
+                    #   read-modify-write these calls make (upsert_
+                    #   application, set_qa_status, record_subscription_
+                    #   qa_round, ...), is itself guarded by security.
+                    #   file_lock.locked("applications") - a real msvcrt
+                    #   byte-range lock Windows enforces per open file
+                    #   HANDLE, so it already serializes concurrent THREADS
+                    #   in this one process exactly the way it already
+                    #   serialized concurrent PROCESSES; no new locking was
+                    #   needed here.
+                    # - Stale-detection race: clear_stale_qa_status()
+                    #   re-checks staleness atomically UNDER that same lock
+                    #   immediately before clearing it (not just trusting an
+                    #   earlier is_qa_status_stale() read) - a job another
+                    #   worker is genuinely still drafting can't be
+                    #   misdetected as stale and double-retried; that
+                    #   guarantee was already independent of how many
+                    #   concurrent callers exist.
+                    # - UI updates: Streamlit's st.empty()/session_state
+                    #   writes are NOT thread-safe from worker threads (see
+                    #   tailoring.drafting.generate_documents()'s own
+                    #   concurrent per-document pool, which DOES call
+                    #   on_progress from inside worker threads for
+                    #   substatus text - an existing, unrelated gap, not
+                    #   repeated here). _draftall_worker below still never
+                    #   touches st.* directly - it returns a plain result
+                    #   tuple, and every UI/session_state write happens on
+                    #   THIS (main) thread, either right after a future
+                    #   completes, or during a timed poll of the thread-safe
+                    #   stage dict (see next note) - never from inside a
+                    #   worker thread.
+                    # - Live mid-run progress (2026-08-17, second Zahir
+                    #   live-usage report: the counter would jump to "9/10"
+                    #   almost instantly - already-done jobs are correctly
+                    #   skipped, not re-run - then sit frozen for the full
+                    #   40-90+ second duration of the LAST real job, with no
+                    #   visible sign anything was happening). Fixed by
+                    #   having _draftall_worker's on_progress callback
+                    #   (_record_stage) write its current stage ("drafting",
+                    #   "scoring", ...) into `job_stage`, a plain dict
+                    #   guarded by `stage_lock` (a threading.Lock). Writing
+                    #   to a lock-guarded dict from a worker thread IS safe
+                    #   (unlike st.*); only READING it and turning that into
+                    #   a st.* call happens on the main thread, inside the
+                    #   polling loop's `except FuturesTimeoutError` branch
+                    #   below - so the thread-safety rule above is respected
+                    #   exactly the same way it already was.
+                    st.markdown("**Draft & score the whole basket at once (subscription, $0)**")
+                    draftall_clicked = st.button(
+                        f"Draft & score all {len(basket_jobs)} job(s)", key="basket_draftall",
+                        help=(
+                            f"Runs the $0 subscription draft+score round for every job in your basket, "
+                            f"up to {BASKET_DRAFTALL_MAX_WORKERS} at a time (fewer if this machine is "
+                            f"already under heavy CPU load). Not a paid call. Each job can still take "
+                            f"40-90+ seconds, but several run at once."
+                        ),
+                    )
+                    draftall_placeholder = st.empty()
+                    draftall_progress_bar = st.empty()
+                    if draftall_clicked:
+                        profile = load_profile()
+                        stage_lock = threading.Lock()
+                        job_stage: dict[tuple, str] = {}
+
+                        def _draftall_worker(job: dict) -> tuple[tuple, dict, bool]:
+                            """Runs off the main thread inside the pool below - MUST
+                            NOT touch st.* or st.session_state (see the UI-updates
+                            note above). Returns (key, outcome, stale_recovered) so
+                            the caller does every bit of UI/session_state writing
+                            itself, only after this future completes or during a
+                            timed poll of job_stage. Its on_progress callback
+                            (_record_stage) only ever writes to the lock-guarded
+                            job_stage dict - never touches st.* - which is what
+                            makes it safe to call from this worker thread."""
+                            source, job_id = job.get("source"), job.get("job_id")
+                            job_key = (source, job_id)
+                            stale_recovered = False
+
+                            def _record_stage(stage: str) -> None:
+                                with stage_lock:
+                                    job_stage[job_key] = stage
+
+                            try:
+                                # Re-read this job's OWN current record here (a fresh
+                                # per-job read taken right before use, not a shared
+                                # snapshot several workers could see stale copies of)
+                                # - same "judge staleness on real current state" fix
+                                # the prior sequential loop already had, still correct
+                                # run concurrently since each worker only ever reads
+                                # its own job's record.
+                                current_record = get_application(source, job_id) or {}
+                                # 2026-08-17 target-driven QA loop hard-cap guard:
+                                # a job already "ready" (>= target ATS) or
+                                # "plateaued" (already hit MAX_QA_ROUNDS) has
+                                # nothing left this loop is supposed to do -
+                                # no new answers were submitted, so a further
+                                # round would neither raise the score nor ask
+                                # a genuinely new question, and would silently
+                                # push the round count PAST the 3-round hard
+                                # cap on every repeat click of this same bulk
+                                # button. "Draft & score all" only ever
+                                # advances a job that's still genuinely
+                                # in_progress (or never drafted at all) -
+                                # re-running a terminal job is the caller's
+                                # explicit job (per-job Retry after a real
+                                # answer, or the per-job "Generate final
+                                # resume" button), never this bulk action.
+                                loop_state = current_record.get("subscription_qa_loop_state")
+                                if loop_state in ("ready", "plateaued"):
+                                    outcome = {
+                                        "ok": True, "locked": False, "round": current_record.get("subscription_qa_round"),
+                                        "resume_draft": None, "error": None, "skipped_terminal": True,
+                                    }
+                                elif is_qa_status_stale(current_record):
+                                    # Doesn't just skip a stuck job silently, and
+                                    # doesn't hang forever waiting on it either
+                                    # (Zahir's explicit ask) - reset + bounded
+                                    # auto-retry (max 2, see subscription_resume_qa.
+                                    # recover_stale_qa_and_retry()) right here.
+                                    outcome = recover_stale_qa_and_retry(job, profile, on_progress=_record_stage)
+                                    stale_recovered = bool(outcome.get("stale_recovered"))
+                                else:
+                                    outcome = run_subscription_round(job, profile, on_progress=_record_stage)
+                            except Exception as exc:
+                                # Defense in depth, matching generate_for_basket()'s
+                                # own "one item's failure shouldn't stop the rest"
+                                # pattern (CLAUDE.md) - run_subscription_round() is
+                                # documented to only ever raise via its own
+                                # (ReasonerUnavailable, RuntimeError) handling, but a
+                                # whole-basket run with several real concurrent
+                                # subprocess calls is exactly the place an unexpected
+                                # exception type would otherwise take a worker down
+                                # silently (real bug hit live 2026-08-17 verifying the
+                                # prior sequential branch: a raw json.JSONDecodeError
+                                # escaped uncaught - fixed at its source in reasoner_
+                                # cli.parse_json_reply(), this catch is the
+                                # belt-and-suspenders backstop for anything else like
+                                # it).
+                                outcome = {"ok": False, "locked": False, "round": None, "resume_draft": None, "error": str(exc)}
+                            finally:
+                                # Done (success or failure) - clear this job's stage so a
+                                # stale "drafting" doesn't linger in job_stage after the
+                                # future has actually completed (the main thread also
+                                # drops it from `pending` right when it notices the
+                                # future finish, but this closes the window between
+                                # "worker finished" and "main thread noticed").
+                                with stage_lock:
+                                    job_stage.pop(job_key, None)
+                            return (source, job_id), outcome, stale_recovered
+
+                        # Ceiling of BASKET_DRAFTALL_MAX_WORKERS (5), backed off
+                        # downward by concurrency.adaptive_throttle if this machine
+                        # is already under real CPU load right now (Zahir's explicit
+                        # ask, 2026-08-17: throttle down under load rather than
+                        # always saturating the machine) - checked once, right
+                        # before this batch starts.
+                        worker_count = effective_worker_count(min(len(basket_jobs), BASKET_DRAFTALL_MAX_WORKERS))
+                        total = len(basket_jobs)
+                        jobs_by_key = {(j.get("source"), j.get("job_id")): j for j in basket_jobs}
+                        _status_line(
+                            draftall_placeholder,
+                            f":material/hourglass_top: Drafting & scoring {total} job(s) - "
+                            f"up to {worker_count} running concurrently...",
+                        )
+                        draftall_progress_bar.progress(0.0)
+                        results = {}
+                        stale_recovered_count = 0
+                        completed = 0
+                        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+                            future_to_job = {pool.submit(_draftall_worker, job): job for job in basket_jobs}
+                            pending = set(future_to_job.keys())
+                            while pending:
+                                try:
+                                    # timeout=2: if nothing finishes within 2s this raises
+                                    # FuturesTimeoutError, caught below, so we re-poll
+                                    # job_stage and refresh the display even while every
+                                    # remaining job is still mid-flight - this is what
+                                    # fixes the "frozen at 9/10 for 40-90s" gap (see the
+                                    # class-level comment above).
+                                    for future in as_completed(pending, timeout=2):
+                                        pending.discard(future)
+                                        job = future_to_job[future]
+                                        try:
+                                            key, outcome, stale_recovered = future.result()
+                                        except Exception as exc:
+                                            # Safety net only - _draftall_worker already
+                                            # catches every exception internally, this guards
+                                            # against a genuine bug in the pool/future
+                                            # machinery itself so one job's futures-level
+                                            # failure still can't take the whole batch down.
+                                            source, job_id = job.get("source"), job.get("job_id")
+                                            key = (source, job_id)
+                                            outcome = {"ok": False, "locked": False, "round": None, "resume_draft": None, "error": str(exc)}
+                                            stale_recovered = False
+                                        results[key] = outcome
+                                        if stale_recovered:
+                                            stale_recovered_count += 1
+                                        completed += 1
+                                        draftall_progress_bar.progress(completed / total)
+                                        _status_line(
+                                            draftall_placeholder,
+                                            f":material/hourglass_top: [{completed}/{total}] completed - "
+                                            f"just finished: {job_label(job)}...",
+                                        )
+                                except FuturesTimeoutError:
+                                    # No future finished in the last 2s - poll the
+                                    # thread-safe stage dict (main thread READS here;
+                                    # only workers WRITE, under stage_lock - see
+                                    # _draftall_worker/_record_stage above) and refresh
+                                    # the text so there's periodic, visible proof
+                                    # something is still happening even between
+                                    # completions - not just a static counter frozen
+                                    # for the full 40-90+ second duration of the last
+                                    # real job.
+                                    with stage_lock:
+                                        active_stages = dict(job_stage)
+                                    if active_stages:
+                                        detail = ", ".join(
+                                            f"{job_label(jobs_by_key[jk])}: {stage}"
+                                            for jk, stage in active_stages.items() if jk in jobs_by_key
+                                        )
+                                        _status_line(
+                                            draftall_placeholder,
+                                            f":material/hourglass_top: [{completed}/{total}] completed - "
+                                            f"still working - {detail}...",
+                                        )
+                                    # else: no per-stage detail reported yet this poll -
+                                    # leave the last-shown text as-is rather than
+                                    # blanking it, and loop back to wait again.
+                        draftall_progress_bar.progress(1.0)
+                        draftall_placeholder.markdown(":material/check_circle: Done.")
+                        st.session_state["panga_basket_draftall_results"] = results
+                        skipped_terminal = sum(1 for r in results.values() if r.get("skipped_terminal"))
+                        succeeded = sum(1 for r in results.values() if r["ok"] and not r.get("skipped_terminal"))
+                        locked = sum(1 for r in results.values() if r.get("locked"))
+                        failed = len(results) - succeeded - locked - skipped_terminal
+                        summary = f"{succeeded} of {len(results)} job(s) drafted & scored."
+                        if skipped_terminal:
+                            summary += f" {skipped_terminal} already at target or plateaued - not re-drafted."
+                        if locked:
+                            summary += f" {locked} skipped (already generating elsewhere)."
+                        if failed:
+                            summary += f" {failed} failed - see below."
+                        # Visible evidence a stall-and-retry actually happened (Zahir's
+                        # explicit ask: "not just have it silently work or silently
+                        # fail") - a toast alone would vanish on the rerun below before
+                        # he could read it if it were the ONLY signal, so this is
+                        # folded into the same summary toast that already survives via
+                        # the existing draftall_results session_state, not a separate
+                        # one-off notification.
+                        if stale_recovered_count:
+                            summary += f" {stale_recovered_count} job(s) looked stuck (stalled) and were reset + retried automatically."
+                        st.toast(summary, icon=":material/check_circle:" if not failed else ":material/warning:")
+                        st.rerun()
+                    draftall_results = st.session_state["panga_basket_draftall_results"]
+                    if draftall_results:
+                        failed_jobs = [
+                            job_label(j) for j in basket_jobs
+                            if (r := draftall_results.get((j.get("source"), j.get("job_id")))) and not r["ok"] and not r["locked"]
+                        ]
+                        if failed_jobs:
+                            st.markdown(f":material/error: Failed to draft: {', '.join(failed_jobs)} - use that job's Retry below.")
+
+                    st.divider()
+
+                    # --- Section 2: per-job rows (label, live status/score,
+                    # per-job "Generate final resume", remove). Purely a
+                    # READ-ONLY status display for the draft/score step -
+                    # there is no separate per-item "Draft & score" trigger
+                    # here (confirmed 2026-08-17, Zahir: only ONE draft/
+                    # score control for the whole basket, the button above).
+                    # A per-job Retry survives for the "stuck"/"failed" case
+                    # only, so one stuck job doesn't force re-running the
+                    # whole basket to unstick it. "Generate final resume" is
+                    # a separate, unrelated per-item action (the one real
+                    # paid call) and stays exactly as it was.
                     all_open_questions = []  # [(job, app_record, question), ...] across the whole basket, built while looping so section 3 doesn't need a second pass
                     for job in basket_jobs:
                         source, job_id = job.get("source"), job.get("job_id")
@@ -592,7 +906,7 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                                         st.toast(f"Subscription draft failed: {outcome['error']}", icon=":material/error:")
                                     st.rerun()
                             elif qa_round == 0:
-                                st.markdown(":material/pending: Not drafted yet - use \"Draft & score all\" below.")
+                                st.markdown(":material/pending: Not drafted yet - use \"Draft & score all\" above.")
                             else:
                                 # 2026-08-17 target-driven QA loop - real,
                                 # actionable per-job state (Zahir's design
@@ -677,220 +991,6 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                             else:
                                 st.markdown(f":material/error: Failed just now: {', '.join(bulk_final['errors'].keys()) or 'see Results tab'}.")
 
-                    st.divider()
-
-                    # --- Section 2: single basket-wide "Draft & score all"
-                    # (Zahir's design point 1) - loops the SAME per-job
-                    # run_subscription_round() every per-item button used to
-                    # call, now via a bounded thread pool (2026-08-17,
-                    # Zahir's explicit ask: "is it possible to make this
-                    # draft and score to running in multiple threads... 5
-                    # threads, for the sake of speed") instead of one job at
-                    # a time. Real wall-clock win because each call is a
-                    # real 40-90+ second `claude` CLI SUBPROCESS call
-                    # (subscription_resume_qa.run_subscription_round ->
-                    # reasoner_cli.run_claude_cli) that spends almost all of
-                    # that time blocked on I/O waiting for the CLI, not
-                    # holding the GIL doing local CPU work - several
-                    # genuinely overlap instead of fighting over one core.
-                    # Continues past one job's failure so it doesn't block
-                    # the rest of the batch (same pattern generate_for_
-                    # basket() already uses for the paid path).
-                    #
-                    # Concurrency-safety notes (CLAUDE.md's race-condition
-                    # checklist, applied to genuinely new concurrent
-                    # access):
-                    # - Per-job isolation: run_subscription_round() and
-                    #   recover_stale_qa_and_retry() both acquire/release
-                    #   applications.try_acquire_generation_lock()/
-                    #   release_generation_lock() themselves, per (source,
-                    #   job_id) - two workers can never draft the SAME job
-                    #   at once, while DIFFERENT jobs proceed fully
-                    #   independently. That lock, and every applications.py
-                    #   read-modify-write these calls make (upsert_
-                    #   application, set_qa_status, record_subscription_
-                    #   qa_round, ...), is itself guarded by security.
-                    #   file_lock.locked("applications") - a real msvcrt
-                    #   byte-range lock Windows enforces per open file
-                    #   HANDLE, so it already serializes concurrent THREADS
-                    #   in this one process exactly the way it already
-                    #   serialized concurrent PROCESSES; no new locking was
-                    #   needed here.
-                    # - Stale-detection race: clear_stale_qa_status()
-                    #   re-checks staleness atomically UNDER that same lock
-                    #   immediately before clearing it (not just trusting an
-                    #   earlier is_qa_status_stale() read) - a job another
-                    #   worker is genuinely still drafting can't be
-                    #   misdetected as stale and double-retried; that
-                    #   guarantee was already independent of how many
-                    #   concurrent callers exist.
-                    # - UI updates: Streamlit's st.empty()/session_state
-                    #   writes are NOT thread-safe from worker threads (see
-                    #   tailoring.drafting.generate_documents()'s own
-                    #   concurrent per-document pool, which DOES call
-                    #   on_progress from inside worker threads for
-                    #   substatus text - an existing, unrelated gap, not
-                    #   repeated here). _draftall_worker below deliberately
-                    #   takes no on_progress and touches no st.* - it
-                    #   returns a plain result tuple, and every UI/
-                    #   session_state write happens on THIS (main) thread,
-                    #   inside the as_completed() loop, only after each
-                    #   future has actually finished - same rule drafting.
-                    #   generate_documents() documents for its own pool
-                    #   ("results are written...only from this function's
-                    #   own thread...never from inside a worker thread").
-                    st.markdown("**Draft & score the whole basket at once (subscription, $0)**")
-                    if st.button(
-                        f"Draft & score all {len(basket_jobs)} job(s)", key="basket_draftall",
-                        help=(
-                            f"Runs the $0 subscription draft+score round for every job in your basket, "
-                            f"up to {BASKET_DRAFTALL_MAX_WORKERS} at a time (fewer if this machine is "
-                            f"already under heavy CPU load). Not a paid call. Each job can still take "
-                            f"40-90+ seconds, but several run at once."
-                        ),
-                    ):
-                        draftall_placeholder = st.empty()
-                        profile = load_profile()
-
-                        def _draftall_worker(job: dict) -> tuple[tuple, dict, bool]:
-                            """Runs off the main thread inside the pool below - MUST
-                            NOT touch st.* or st.session_state (see the UI-updates
-                            note above). Returns (key, outcome, stale_recovered) so
-                            the caller does every bit of UI/session_state writing
-                            itself, only after this future completes."""
-                            source, job_id = job.get("source"), job.get("job_id")
-                            stale_recovered = False
-                            try:
-                                # Re-read this job's OWN current record here (a fresh
-                                # per-job read taken right before use, not a shared
-                                # snapshot several workers could see stale copies of)
-                                # - same "judge staleness on real current state" fix
-                                # the prior sequential loop already had, still correct
-                                # run concurrently since each worker only ever reads
-                                # its own job's record.
-                                current_record = get_application(source, job_id) or {}
-                                # 2026-08-17 target-driven QA loop hard-cap guard:
-                                # a job already "ready" (>= target ATS) or
-                                # "plateaued" (already hit MAX_QA_ROUNDS) has
-                                # nothing left this loop is supposed to do -
-                                # no new answers were submitted, so a further
-                                # round would neither raise the score nor ask
-                                # a genuinely new question, and would silently
-                                # push the round count PAST the 3-round hard
-                                # cap on every repeat click of this same bulk
-                                # button. "Draft & score all" only ever
-                                # advances a job that's still genuinely
-                                # in_progress (or never drafted at all) -
-                                # re-running a terminal job is the caller's
-                                # explicit job (per-job Retry after a real
-                                # answer, or the per-job "Generate final
-                                # resume" button), never this bulk action.
-                                loop_state = current_record.get("subscription_qa_loop_state")
-                                if loop_state in ("ready", "plateaued"):
-                                    outcome = {
-                                        "ok": True, "locked": False, "round": current_record.get("subscription_qa_round"),
-                                        "resume_draft": None, "error": None, "skipped_terminal": True,
-                                    }
-                                elif is_qa_status_stale(current_record):
-                                    # Doesn't just skip a stuck job silently, and
-                                    # doesn't hang forever waiting on it either
-                                    # (Zahir's explicit ask) - reset + bounded
-                                    # auto-retry (max 2, see subscription_resume_qa.
-                                    # recover_stale_qa_and_retry()) right here.
-                                    outcome = recover_stale_qa_and_retry(job, profile)
-                                    stale_recovered = bool(outcome.get("stale_recovered"))
-                                else:
-                                    outcome = run_subscription_round(job, profile)
-                            except Exception as exc:
-                                # Defense in depth, matching generate_for_basket()'s
-                                # own "one item's failure shouldn't stop the rest"
-                                # pattern (CLAUDE.md) - run_subscription_round() is
-                                # documented to only ever raise via its own
-                                # (ReasonerUnavailable, RuntimeError) handling, but a
-                                # whole-basket run with several real concurrent
-                                # subprocess calls is exactly the place an unexpected
-                                # exception type would otherwise take a worker down
-                                # silently (real bug hit live 2026-08-17 verifying the
-                                # prior sequential branch: a raw json.JSONDecodeError
-                                # escaped uncaught - fixed at its source in reasoner_
-                                # cli.parse_json_reply(), this catch is the
-                                # belt-and-suspenders backstop for anything else like
-                                # it).
-                                outcome = {"ok": False, "locked": False, "round": None, "resume_draft": None, "error": str(exc)}
-                            return (source, job_id), outcome, stale_recovered
-
-                        # Ceiling of BASKET_DRAFTALL_MAX_WORKERS (5), backed off
-                        # downward by concurrency.adaptive_throttle if this machine
-                        # is already under real CPU load right now (Zahir's explicit
-                        # ask, 2026-08-17: throttle down under load rather than
-                        # always saturating the machine) - checked once, right
-                        # before this batch starts.
-                        worker_count = effective_worker_count(min(len(basket_jobs), BASKET_DRAFTALL_MAX_WORKERS))
-                        _status_line(
-                            draftall_placeholder,
-                            f":material/hourglass_top: Drafting & scoring {len(basket_jobs)} job(s) - "
-                            f"up to {worker_count} running concurrently...",
-                        )
-                        results = {}
-                        stale_recovered_count = 0
-                        completed = 0
-                        with ThreadPoolExecutor(max_workers=worker_count) as pool:
-                            future_to_job = {pool.submit(_draftall_worker, job): job for job in basket_jobs}
-                            for future in as_completed(future_to_job):
-                                job = future_to_job[future]
-                                try:
-                                    key, outcome, stale_recovered = future.result()
-                                except Exception as exc:
-                                    # Safety net only - _draftall_worker already
-                                    # catches every exception internally, this guards
-                                    # against a genuine bug in the pool/future
-                                    # machinery itself so one job's futures-level
-                                    # failure still can't take the whole batch down.
-                                    source, job_id = job.get("source"), job.get("job_id")
-                                    key = (source, job_id)
-                                    outcome = {"ok": False, "locked": False, "round": None, "resume_draft": None, "error": str(exc)}
-                                    stale_recovered = False
-                                results[key] = outcome
-                                if stale_recovered:
-                                    stale_recovered_count += 1
-                                completed += 1
-                                _status_line(
-                                    draftall_placeholder,
-                                    f":material/hourglass_top: [{completed}/{len(basket_jobs)}] completed - "
-                                    f"just finished: {job_label(job)}...",
-                                )
-                        draftall_placeholder.markdown(":material/check_circle: Done.")
-                        st.session_state["panga_basket_draftall_results"] = results
-                        skipped_terminal = sum(1 for r in results.values() if r.get("skipped_terminal"))
-                        succeeded = sum(1 for r in results.values() if r["ok"] and not r.get("skipped_terminal"))
-                        locked = sum(1 for r in results.values() if r.get("locked"))
-                        failed = len(results) - succeeded - locked - skipped_terminal
-                        summary = f"{succeeded} of {len(results)} job(s) drafted & scored."
-                        if skipped_terminal:
-                            summary += f" {skipped_terminal} already at target or plateaued - not re-drafted."
-                        if locked:
-                            summary += f" {locked} skipped (already generating elsewhere)."
-                        if failed:
-                            summary += f" {failed} failed - see below."
-                        # Visible evidence a stall-and-retry actually happened (Zahir's
-                        # explicit ask: "not just have it silently work or silently
-                        # fail") - a toast alone would vanish on the rerun below before
-                        # he could read it if it were the ONLY signal, so this is
-                        # folded into the same summary toast that already survives via
-                        # the existing draftall_results session_state, not a separate
-                        # one-off notification.
-                        if stale_recovered_count:
-                            summary += f" {stale_recovered_count} job(s) looked stuck (stalled) and were reset + retried automatically."
-                        st.toast(summary, icon=":material/check_circle:" if not failed else ":material/warning:")
-                        st.rerun()
-                    draftall_results = st.session_state["panga_basket_draftall_results"]
-                    if draftall_results:
-                        failed_jobs = [
-                            job_label(j) for j in basket_jobs
-                            if (r := draftall_results.get((j.get("source"), j.get("job_id")))) and not r["ok"] and not r["locked"]
-                        ]
-                        if failed_jobs:
-                            st.markdown(f":material/error: Failed to draft: {', '.join(failed_jobs)} - use that job's Retry above.")
 
                     st.divider()
 
