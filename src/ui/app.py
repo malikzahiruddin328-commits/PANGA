@@ -86,6 +86,7 @@ from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_e
 from tailoring.bulk_generate import generate_for_job, generate_for_basket
 from tailoring.subscription_resume_qa import run_subscription_round, generate_questions_via_subscription, submit_answers_and_redraft
 from tailoring.reasoner_cli import ReasonerUnavailable
+from tailoring.task_monitor import get_active_tasks, reset_stalled_task
 from tailoring.ats_score import detect_matched_keyword_regressions
 from tailoring.unconfirmed_claims import find_unconfirmed_markers, resolve_unconfirmed_claim
 from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed, analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_impact as _check_regenerate_impact, request_additional_gap_questions as _request_additional_gap_questions, reextract_ats_keywords_and_rescore as _reextract_ats_keywords_and_rescore, rescore_against_cached_keywords as _rescore_against_cached_keywords, gap_scan_is_current as _gap_scan_is_current, gap_scan_baseline_fingerprint as _gap_scan_baseline_fingerprint, _report_drafting_failure
@@ -923,6 +924,70 @@ def _cta_auto_refresh_watcher() -> None:
     st.session_state[watch_key] = sig
     if previous is not None and previous != sig:
         st.rerun()
+
+
+@st.fragment(run_every="10s")
+def _render_task_monitor() -> None:
+    """Task Monitor tab's live body (2026-08-17) - defined at module level,
+    same as _cta_auto_refresh_watcher above, rather than nested inside the
+    tab's elif block, so it's decorated with @st.fragment exactly once per
+    process rather than being redefined on every rerun. Auto-refreshes on
+    its own 10s timer so elapsed time and liveness stay current without
+    Zahir needing to manually reload, and because it's a fragment, a tick
+    here never disturbs any other tab's own in-progress interaction.
+    Reads task_monitor.get_active_tasks() fresh every tick - never cached -
+    "not a black box" is the entire point of this view."""
+    tasks = get_active_tasks()
+    if not tasks:
+        st.success("Nothing currently in flight - no subscription rounds or paid builds running right now.")
+        return
+
+    stalled_tasks = [t for t in tasks if t["stalled"]]
+    if stalled_tasks:
+        st.error(f"{len(stalled_tasks)} job(s) below look genuinely stalled - PID confirmed dead or well past a normal call's duration, not just slow.")
+
+    for task in tasks:
+        with st.container(border=True):
+            title_col, status_col, pid_col, action_col = st.columns([3, 2, 2, 2])
+            with title_col:
+                # st.markdown throughout, never st.caption - this app's
+                # standing readability rule (CLAUDE.md's HCI section,
+                # enforced by tests/test_ui_readability_standard.py):
+                # st.caption renders under WCAG 1.4.3's 4.5:1 contrast
+                # minimum against this app's theme colors.
+                st.markdown(f"**{task['title']}**")
+                st.markdown(task["organization"])
+            with status_col:
+                kind_label = "Subscription draft" if task["kind"] == "subscription" else "Paid final build"
+                st.markdown(f"{kind_label} · `{task['status']}`")
+                st.markdown(f"Running {task['elapsed_label']}")
+            with pid_col:
+                if task["pid"] is None:
+                    st.markdown("PID not recorded yet")
+                elif task["kind"] == "paid_build":
+                    st.markdown(f"App process PID {task['pid']} (in-process API call, not an independent subprocess)")
+                elif task["pid_alive"]:
+                    st.markdown(f":material/check_circle: PID {task['pid']} alive")
+                else:
+                    st.markdown(f":material/cancel: PID {task['pid']} not running")
+            with action_col:
+                if task["stalled"]:
+                    st.markdown(task["stall_reason"] or "stalled")
+                    if st.button(
+                        "Stalled - reset & retry", key=f"reset_stalled_{task['kind']}_{task['source']}_{task['job_id']}",
+                        type="primary", width="stretch",
+                    ):
+                        reset_stalled_task(task["source"], task["job_id"], task["kind"])
+                        # scope="app" (not the fragment default) - the Task
+                        # Monitor tab's own "(N)" count badge is computed
+                        # OUTSIDE this fragment (in TABS, before the tab-
+                        # button row), so a fragment-only rerun would clear
+                        # this job's stalled row but leave the badge
+                        # showing the stale count until some unrelated
+                        # interaction happened to trigger a full rerun.
+                        st.rerun(scope="app")
+                else:
+                    st.markdown("Looks genuinely active")
 
 
 _PROGRESS_CHAR_RE = re.compile(r"([\d,]+) characters")
@@ -2599,7 +2664,9 @@ TAB_ICONS = {
     "support": ":material/support_agent:",
     "settings": ":material/settings:",
     "ops": ":material/monitoring:",
+    "monitor": ":material/pending_actions:",
 }
+_active_task_count = len(get_active_tasks())
 TABS = [
     ("cta", f"Call to action ({cta_count})" if cta_count else "Call to action"),
     ("results", f"Results ({results_count})"),
@@ -2614,6 +2681,12 @@ TABS = [
     # this codebase's standing "no custom CSS for theming" rule (native
     # Streamlit only) applies here the same as everywhere else.
     ("ops", "Ops :material/fiber_new:"),
+    # Task Monitor (2026-08-17) - real PID/liveness view over every
+    # in-flight subscription draft/Q&A round and paid final-build lock, so
+    # a stuck-looking background job can be checked against real evidence
+    # instead of guessing from the stored status string alone. Count badge
+    # mirrors the same "(N)" pattern every other tab above already uses.
+    ("monitor", f"Task Monitor ({_active_task_count})" if _active_task_count else "Task Monitor"),
 ]
 tab_cols = st.columns(len(TABS))
 for col, (key, label) in zip(tab_cols, TABS):
@@ -5858,3 +5931,23 @@ elif active_tab == "ops":
                 hide_index=True,
                 column_config={"_duration_ms": None},
             )
+
+elif active_tab == "monitor":
+    # Task Monitor (2026-08-17) - real answer to a problem hit live twice
+    # today: a stuck/slow-looking background subscription draft call or a
+    # `claude` CLI subprocess had no way to be checked - subscription_qa_
+    # status just says a string like "drafting", with no PID, no start
+    # time, no real liveness check. This view reads task_monitor.
+    # get_active_tasks() fresh on every render/tick (never cached - "not a
+    # black box" is the entire point) and shows real elapsed time plus a
+    # genuine OS-level liveness check for every non-idle job, so a job
+    # that's actually hung shows up as stalled here even while its stored
+    # status string still claims it's working.
+    render_feedback_widget("monitor")
+    st.header("Task Monitor")
+    st.markdown(
+        "Every subscription draft/Q&A round and paid final build currently "
+        "in flight, with the real OS process behind it - not just the "
+        "stored status string."
+    )
+    _render_task_monitor()

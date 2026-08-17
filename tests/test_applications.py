@@ -308,6 +308,35 @@ def test_set_qa_status_does_not_disturb_existing_application_fields(isolated_dat
     assert app["resume_text"] == "draft v1"
 
 
+# --- set_qa_status() real PID/timing tracking (2026-08-17) ---
+
+
+def test_set_qa_status_stores_pid_and_started_at_for_a_process_status(isolated_data):
+    applications.set_qa_status("Dice", "1", "drafting", pid=4242, started_at="2026-08-17T10:00:00+00:00")
+    app = applications.get_application("Dice", "1")
+    assert app["subscription_qa_pid"] == 4242
+    assert app["subscription_qa_started_at"] == "2026-08-17T10:00:00+00:00"
+
+
+def test_set_qa_status_ignores_pid_for_non_process_status(isolated_data):
+    """awaiting_answers/failed/None have no real subprocess still running -
+    a pid/started_at passed for one of these is a caller bug, not
+    something this should ever persist and let the Task Monitor mistake
+    for a live process."""
+    applications.set_qa_status("Dice", "1", "awaiting_answers", pid=4242, started_at="2026-08-17T10:00:00+00:00")
+    app = applications.get_application("Dice", "1")
+    assert app["subscription_qa_pid"] is None
+    assert app["subscription_qa_started_at"] is None
+
+
+def test_set_qa_status_clears_stale_pid_when_status_moves_to_failed(isolated_data):
+    applications.set_qa_status("Dice", "1", "drafting", pid=4242, started_at="2026-08-17T10:00:00+00:00")
+    applications.set_qa_status("Dice", "1", "failed", error="boom")
+    app = applications.get_application("Dice", "1")
+    assert app["subscription_qa_pid"] is None
+    assert app["subscription_qa_started_at"] is None
+
+
 # --- record_subscription_qa_round() (2026-08-13, in-app subscription Q&A build) ---
 
 

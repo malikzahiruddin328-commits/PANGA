@@ -186,7 +186,7 @@ def _questions_prompt(job: dict, profile: dict, already_covered: list[str]) -> s
     ])
 
 
-def _generate_questions_via_subscription(job: dict, profile: dict, app_record: dict, on_progress=None) -> dict:
+def _generate_questions_via_subscription(job: dict, profile: dict, app_record: dict, on_progress=None, on_pid=None) -> dict:
     """Subscription-covered replacement for drafting.
     request_additional_gap_questions(), used ONLY by start_discussion()
     (2026-08-13, fix/discuss-draft-subscription-questions - see this
@@ -232,7 +232,7 @@ def _generate_questions_via_subscription(job: dict, profile: dict, app_record: d
 
     if on_progress:
         on_progress("generating questions")
-    reply = run_claude_cli(_questions_prompt(job, profile, already_covered))
+    reply = run_claude_cli(_questions_prompt(job, profile, already_covered), on_start=on_pid)
     data = parse_json_reply(reply)
 
     new_questions = [

@@ -473,8 +473,19 @@ def set_discussion_status(
 # the round/score history survives across sessions.
 QA_STATUSES = {"drafting", "generating_questions", "awaiting_answers", "redrafting", "failed"}
 
+# Which QA_STATUSES values actually have a real `claude` CLI subprocess in
+# flight right now (as opposed to "awaiting_answers"/"failed", where the
+# subprocess - if there ever was one for this round - has already exited).
+# Used by set_qa_status() below to decide whether a passed-in pid/started_at
+# should actually be kept or forced back to None, and by task_monitor.py to
+# decide which records are worth a real liveness check at all.
+QA_STATUSES_WITH_PROCESS = {"drafting", "generating_questions", "redrafting"}
 
-def set_qa_status(source: str, job_id: str, status: str | None, error: str | None = None) -> None:
+
+def set_qa_status(
+    source: str, job_id: str, status: str | None, error: str | None = None,
+    pid: int | None = None, started_at: str | None = None,
+) -> None:
     """Tracks where a job's in-app subscription draft/Q&A loop is right
     now - "drafting" (initial or re-draft subscription call in flight),
     "generating_questions" (subscription call generating this round's
@@ -487,9 +498,32 @@ def set_qa_status(source: str, job_id: str, status: str | None, error: str | Non
     get-or-create/lock-free stamping pattern as set_discussion_status()
     above, deliberately mirrored rather than reusing that function
     directly - this is a genuinely different state machine (an iterative
-    free loop with no message board involved), not the same one."""
+    free loop with no message board involved), not the same one.
+
+    pid/started_at (2026-08-17, real PID/timing tracking): the REAL OS
+    process ID of the `claude` CLI subprocess this round's call is
+    actually running as, and when it started - not just the status string
+    above. This is the concrete fix for a real problem hit live twice
+    today: with only a status string to go on, there was no way to tell
+    which of several concurrently-running `claude` OS processes
+    (`Get-Process claude` returned 16 unlabeled ones) belonged to this
+    job, or whether it was still genuinely alive vs. hung. Callers pass
+    these via reasoner_cli.run_claude_cli()'s on_start callback, right as
+    the subprocess actually starts - see subscription_resume_qa.py and
+    discuss_and_draft.py for the wiring.
+
+    Only ever stored when `status` is one of QA_STATUSES_WITH_PROCESS
+    (there's a real subprocess to point at); for every other status
+    (None, "awaiting_answers", "failed") pid/started_at are forced back to
+    None regardless of what's passed, so a stale PID from a previous round
+    can never linger and be mistaken for the current one - this is the
+    same "clear stale state, don't just stop updating it" principle
+    CLAUDE.md's HCI section calls out for Streamlit widgets, applied here
+    to persisted process state instead."""
     if status is not None and status not in QA_STATUSES:
         raise ValueError(f"status must be one of {QA_STATUSES} or None, got {status!r}")
+    if status not in QA_STATUSES_WITH_PROCESS:
+        pid, started_at = None, None
     if get_application(source, job_id) is None:
         upsert_application(source, job_id, status="under review")
     with locked("applications"):
@@ -498,6 +532,8 @@ def set_qa_status(source: str, job_id: str, status: str | None, error: str | Non
             if app["source"] == source and app["job_id"] == job_id:
                 app["subscription_qa_status"] = status
                 app["subscription_qa_error"] = error
+                app["subscription_qa_pid"] = pid
+                app["subscription_qa_started_at"] = started_at
                 _save_all(applications)
                 _write_dossier(source, job_id)
                 return
