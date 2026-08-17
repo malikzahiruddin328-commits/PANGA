@@ -369,3 +369,26 @@ def test_record_subscription_qa_round_raises_without_existing_record(isolated_da
     import pytest
     with pytest.raises(KeyError):
         applications.record_subscription_qa_round("Dice", "1", ats_score=72)
+
+
+def test_record_subscription_qa_round_stamps_loop_state(isolated_data):
+    applications.upsert_application("Dice", "1", status="under review")
+    applications.record_subscription_qa_round("Dice", "1", ats_score=94, loop_state="ready")
+    app = applications.get_application("Dice", "1")
+    assert app["subscription_qa_loop_state"] == "ready"
+
+
+def test_record_subscription_qa_round_accumulates_asked_question_texts_across_rounds(isolated_data):
+    applications.upsert_application("Dice", "1", status="under review")
+    applications.record_subscription_qa_round(
+        "Dice", "1", ats_score=60, loop_state="in_progress",
+        newly_asked_question_texts=["Do you have AWS experience?"],
+    )
+    applications.record_subscription_qa_round(
+        "Dice", "1", ats_score=78, loop_state="in_progress",
+        newly_asked_question_texts=["Have you owned a P&L?"],
+    )
+    app = applications.get_application("Dice", "1")
+    assert app["subscription_qa_asked_question_texts"] == [
+        "Do you have AWS experience?", "Have you owned a P&L?",
+    ]

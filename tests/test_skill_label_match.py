@@ -1,7 +1,9 @@
 from skill_label_match import (
     build_already_known_units,
     filter_questions_evidenced_in_profile,
+    filter_questions_not_asked_before,
     normalize_skill_label,
+    question_text_similarity,
     skill_evidenced_in_text,
     skills_match,
 )
@@ -175,3 +177,39 @@ def test_filter_questions_evidenced_in_profile_empty_corpus_keeps_everything():
 def test_build_already_known_units_handles_missing_profile():
     assert build_already_known_units(None) == []
     assert build_already_known_units({}) == []
+
+
+# --- question_text_similarity() / filter_questions_not_asked_before()
+# (2026-08-17, target-driven QA loop cross-round dedup) ---
+
+
+def test_question_text_similarity_high_for_reworded_same_question():
+    a = "Do you have real, hands-on Databricks experience you can describe for this role?"
+    b = "Can you describe your real, hands-on Databricks experience for this role?"
+    assert question_text_similarity(a, b) >= 0.6
+
+
+def test_question_text_similarity_low_for_genuinely_different_questions():
+    a = "Do you have real, genuine experience with Databricks?"
+    b = "Have you ever owned a P&L before?"
+    assert question_text_similarity(a, b) < 0.6
+
+
+def test_question_text_similarity_identical_is_one():
+    text = "Do you have real, genuine experience with Kubernetes?"
+    assert question_text_similarity(text, text) == 1.0
+
+
+def test_filter_questions_not_asked_before_drops_reworded_repeat():
+    prior = ["Do you have real, hands-on Databricks experience you can describe for this role?"]
+    questions = [
+        {"skill": "Databricks", "question": "Can you describe your real, hands-on Databricks experience for this role?"},
+        {"skill": "P&L ownership", "question": "Have you ever owned a P&L before?"},
+    ]
+    filtered = filter_questions_not_asked_before(questions, prior)
+    assert [q["skill"] for q in filtered] == ["P&L ownership"]
+
+
+def test_filter_questions_not_asked_before_empty_history_keeps_everything():
+    questions = [{"skill": "x", "question": "q"}]
+    assert filter_questions_not_asked_before(questions, []) == questions

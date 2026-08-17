@@ -671,7 +671,10 @@ def reset_qa_stale_retry_count(source: str, job_id: str) -> None:
                 return
 
 
-def record_subscription_qa_round(source: str, job_id: str, ats_score: int | None, draft_source: str = "subscription") -> int:
+def record_subscription_qa_round(
+    source: str, job_id: str, ats_score: int | None, draft_source: str = "subscription",
+    loop_state: str | None = None, newly_asked_question_texts: list[str] | None = None,
+) -> int:
     """Appends one entry to subscription_ats_score_history and bumps
     subscription_qa_round - called once per completed subscription draft
     round (the very first draft, and every re-draft after answers are
@@ -686,7 +689,24 @@ def record_subscription_qa_round(source: str, job_id: str, ats_score: int | None
     paid generate_for_job() draft (which never calls this - it's recorded
     via the ordinary resume_text/resume_ats_score fields, same as it
     always has been) - kept here mainly so a future reader of the raw JSON
-    can tell every history entry really was a $0 round."""
+    can tell every history entry really was a $0 round.
+
+    loop_state (2026-08-17, target-driven QA loop) - one of "ready"
+    (ats_score already >= the 90 target, no more questions), "plateaued"
+    (hit the 3-round hard cap still under 90 - the user's explicit call
+    whether to still build) or "in_progress" (below target, rounds
+    remain) - stamped onto the record in the SAME locked write as the
+    round bump so a reader never sees a round number that's ahead of the
+    state describing it. None leaves the existing value untouched.
+
+    newly_asked_question_texts (same feature) - the real, full question
+    text surfaced (or considered and ranked out) THIS round, appended to
+    subscription_qa_asked_question_texts so a LATER round's generation
+    prompt and skill_label_match.filter_questions_not_asked_before() can
+    both see the complete real history of what this exact job has already
+    been asked, not just this round's own output. Appended, never
+    replaced - each round's questions add to the running history, they
+    don't reset it."""
     with locked("applications"):
         applications = load_applications()
         for app in applications:
@@ -701,6 +721,12 @@ def record_subscription_qa_round(source: str, job_id: str, ats_score: int | None
                 })
                 app["subscription_ats_score_history"] = history
                 app["subscription_qa_round"] = round_number
+                if loop_state is not None:
+                    app["subscription_qa_loop_state"] = loop_state
+                if newly_asked_question_texts:
+                    asked = app.get("subscription_qa_asked_question_texts") or []
+                    asked = asked + [t for t in newly_asked_question_texts if t]
+                    app["subscription_qa_asked_question_texts"] = asked
                 _save_all(applications)
                 _write_dossier(source, job_id)
                 return round_number

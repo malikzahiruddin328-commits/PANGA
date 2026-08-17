@@ -85,7 +85,7 @@ from tailoring.cta_emails import get_active_cta_emails, request_archive, request
 from tailoring.interview_prep import load_interview_prep, get_interview_prep, record_round_outcome, build_prep_context, generate_prep, start_round, save_round
 from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
 from tailoring.bulk_generate import generate_for_job, generate_for_basket
-from tailoring.subscription_resume_qa import run_subscription_round, generate_questions_via_subscription, submit_answers_and_redraft, recover_stale_qa_and_retry
+from tailoring.subscription_resume_qa import run_subscription_round, generate_questions_via_subscription, submit_answers_and_redraft, recover_stale_qa_and_retry, TARGET_ATS_SCORE, MAX_QA_ROUNDS
 from concurrency.adaptive_throttle import effective_worker_count
 from tailoring.reasoner_cli import ReasonerUnavailable
 from tailoring.task_monitor import get_active_tasks, reset_stalled_task
@@ -594,10 +594,36 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                             elif qa_round == 0:
                                 st.markdown(":material/pending: Not drafted yet - use \"Draft & score all\" below.")
                             else:
+                                # 2026-08-17 target-driven QA loop - real,
+                                # actionable per-job state (Zahir's design
+                                # point 3: "Round 2/3, ATS 84, 3 more
+                                # high-value gaps identified" vs "Plateaued
+                                # at ATS 78 after 3 rounds - your call to
+                                # proceed" vs "ATS 94 - ready to build, no
+                                # more questions"). subscription_qa_loop_state
+                                # is stamped by run_subscription_round() the
+                                # SAME round this score was recorded, so the
+                                # two can never disagree/go stale relative
+                                # to each other.
                                 score_text = f"{qa_score}/100" if qa_score is not None else "not yet scored"
                                 history = app_record.get("subscription_ats_score_history") or []
                                 trend = (" (" + " → ".join(f"r{h['round']}: {h['ats_score']}" for h in history) + ")") if len(history) > 1 else ""
-                                st.markdown(f":material/check_circle: Round {qa_round} - ATS {score_text}{trend}")
+                                loop_state = app_record.get("subscription_qa_loop_state")
+                                gap_count = len(open_questions)
+                                if loop_state == "ready":
+                                    st.markdown(f":material/check_circle: ATS {score_text} - ready to build, no more questions{trend}.")
+                                elif loop_state == "plateaued":
+                                    st.markdown(
+                                        f":material/flag: Plateaued at ATS {score_text} after {qa_round} rounds "
+                                        f"(target {TARGET_ATS_SCORE}) - your call whether to still build{trend}."
+                                    )
+                                elif gap_count:
+                                    st.markdown(
+                                        f":material/check_circle: Round {qa_round}/{MAX_QA_ROUNDS} - ATS {score_text} - "
+                                        f"{gap_count} more high-value gap{'s' if gap_count != 1 else ''} identified{trend}."
+                                    )
+                                else:
+                                    st.markdown(f":material/check_circle: Round {qa_round}/{MAX_QA_ROUNDS} - ATS {score_text}{trend}.")
                         with item_cols[2]:
                             if st.button(
                                 "Generate final resume", key=f"basket_item_finalbuild_{source}_{job_id}",
@@ -743,7 +769,29 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                                 # run concurrently since each worker only ever reads
                                 # its own job's record.
                                 current_record = get_application(source, job_id) or {}
-                                if is_qa_status_stale(current_record):
+                                # 2026-08-17 target-driven QA loop hard-cap guard:
+                                # a job already "ready" (>= target ATS) or
+                                # "plateaued" (already hit MAX_QA_ROUNDS) has
+                                # nothing left this loop is supposed to do -
+                                # no new answers were submitted, so a further
+                                # round would neither raise the score nor ask
+                                # a genuinely new question, and would silently
+                                # push the round count PAST the 3-round hard
+                                # cap on every repeat click of this same bulk
+                                # button. "Draft & score all" only ever
+                                # advances a job that's still genuinely
+                                # in_progress (or never drafted at all) -
+                                # re-running a terminal job is the caller's
+                                # explicit job (per-job Retry after a real
+                                # answer, or the per-job "Generate final
+                                # resume" button), never this bulk action.
+                                loop_state = current_record.get("subscription_qa_loop_state")
+                                if loop_state in ("ready", "plateaued"):
+                                    outcome = {
+                                        "ok": True, "locked": False, "round": current_record.get("subscription_qa_round"),
+                                        "resume_draft": None, "error": None, "skipped_terminal": True,
+                                    }
+                                elif is_qa_status_stale(current_record):
                                     # Doesn't just skip a stuck job silently, and
                                     # doesn't hang forever waiting on it either
                                     # (Zahir's explicit ask) - reset + bounded
@@ -813,10 +861,13 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                                 )
                         draftall_placeholder.markdown(":material/check_circle: Done.")
                         st.session_state["panga_basket_draftall_results"] = results
-                        succeeded = sum(1 for r in results.values() if r["ok"])
+                        skipped_terminal = sum(1 for r in results.values() if r.get("skipped_terminal"))
+                        succeeded = sum(1 for r in results.values() if r["ok"] and not r.get("skipped_terminal"))
                         locked = sum(1 for r in results.values() if r.get("locked"))
-                        failed = len(results) - succeeded - locked
+                        failed = len(results) - succeeded - locked - skipped_terminal
                         summary = f"{succeeded} of {len(results)} job(s) drafted & scored."
+                        if skipped_terminal:
+                            summary += f" {skipped_terminal} already at target or plateaued - not re-drafted."
                         if locked:
                             summary += f" {locked} skipped (already generating elsewhere)."
                         if failed:
@@ -858,11 +909,13 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                             key="basket_shared_qa_expander", expanded=True, on_change="rerun",
                         ):
                             st.markdown(
-                                "Answer these to raise the score further on each job's next subscription "
-                                "round - only used if you confirm they're true, nothing is ever invented. "
-                                "Some boxes are pre-filled with a proposed guess - edit it to whatever's "
-                                "actually true, or leave it blank to skip. Only the jobs you actually answer "
-                                "get redrafted."
+                                f"Only the highest-value gaps for each job (required-keyword gaps first, "
+                                f"ranked by real score impact) - not every possible question, and capped at "
+                                f"{MAX_QA_ROUNDS} rounds per job. Answer these to raise the score further on "
+                                "each job's next subscription round - only used if you confirm they're true, "
+                                "nothing is ever invented. Some boxes are pre-filled with a proposed guess - "
+                                "edit it to whatever's actually true, or leave it blank to skip. Only the jobs "
+                                "you actually answer get redrafted."
                             )
                             # question -> answered entry, grouped by job so only jobs with a real
                             # edited answer get redrafted (per Zahir's "answered together" design,

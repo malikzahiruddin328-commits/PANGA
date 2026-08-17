@@ -249,3 +249,62 @@ def filter_questions_evidenced_in_profile(questions: list[dict], units) -> list[
         q for q in questions
         if not (q.get("skill") and skill_evidenced_in_text(q["skill"], units))
     ]
+
+
+# 2026-08-17 target-driven QA loop (feature/target-driven-qa-loop): a
+# real quality bar on top of the 3-round hard cap above - "if the
+# questions are correct and not duplicated or the same question being
+# asked in different ways then 2 rounds should be enough" (Zahir). The
+# dedup fixed by filter_questions_evidenced_in_profile() above only
+# catches a fact already stated in the candidate's own PROFILE text; it
+# says nothing about a LATER round's question restating an EARLIER
+# round's question for the SAME job, just reworded. A prompt instruction
+# alone ("do not repeat, even reworded") already proved unreliable once
+# today for a closely related problem (see this module's own docstring,
+# item 3) - same class of gap, so this is a real deterministic backstop,
+# not just better prompt wording.
+_CROSS_ROUND_SIMILARITY_THRESHOLD = 0.6
+
+
+def question_text_similarity(a: str, b: str) -> float:
+    """Jaccard overlap of normalized, stopword-stripped, plural-stemmed
+    significant tokens between two full question texts - a bounded,
+    deterministic measure of "these two questions are asking about the
+    same underlying gap, just worded differently". Not real semantic
+    understanding (paraphrases sharing few literal words can still slip
+    through) - deliberately the same class of small, mechanical backstop
+    as skill_evidenced_in_text() above, not an NLP component."""
+    tokens_a = {_stem(tok) for tok in _significant_tokens(a)}
+    tokens_b = {_stem(tok) for tok in _significant_tokens(b)}
+    if not tokens_a or not tokens_b:
+        return 0.0
+    intersection = tokens_a & tokens_b
+    union = tokens_a | tokens_b
+    return len(intersection) / len(union) if union else 0.0
+
+
+def filter_questions_not_asked_before(questions: list[dict], prior_question_texts: list[str]) -> list[dict]:
+    """Drops any proposed question whose full "question" text is a
+    near-duplicate (question_text_similarity() >= threshold) of a
+    question already asked in an EARLIER round of the same job's
+    target-driven QA loop. Compares full question WORDING, not just the
+    "skill" label - the same skill label is expected to legitimately
+    recur across rounds until it's actually answered, so it's the
+    QUESTION'S WORDING that must not repeat once a round has already put
+    it in front of the user, not the skill it's about.
+
+    Callers pass the accumulated real question text from every prior
+    round of THIS job (subscription_resume_qa.py's asked-question
+    history) - never another job's history, and never reset mid-loop."""
+    if not prior_question_texts:
+        return list(questions)
+    kept = []
+    for q in questions:
+        text = q.get("question") or ""
+        if text and any(
+            question_text_similarity(text, prior) >= _CROSS_ROUND_SIMILARITY_THRESHOLD
+            for prior in prior_question_texts
+        ):
+            continue
+        kept.append(q)
+    return kept
