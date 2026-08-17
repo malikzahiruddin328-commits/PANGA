@@ -188,4 +188,11 @@ def isolated_data(tmp_path, monkeypatch):
     # (directly, or indirectly via job_store.save_jobs()) can't touch the
     # real data/jobs/search_exclusion_log.json.
     monkeypatch.setattr(exclusion_filter, "EXCLUSION_LOG_PATH", tmp_path / "search_exclusion_log.json")
+    # Custom title exclusions (2026-08-13) read config/settings.yaml
+    # directly - isolated the same way, so a test writing/reading
+    # "custom_title_exclusions" can't touch the real repo settings.yaml
+    # (which has real target_roles/industries/etc. Zahir actually uses),
+    # and a test run against a settings.yaml with no custom terms
+    # configured can't accidentally pick up real ones.
+    monkeypatch.setattr(exclusion_filter, "SETTINGS_PATH", tmp_path / "settings.yaml")
     return tmp_path

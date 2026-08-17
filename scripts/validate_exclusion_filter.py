@@ -32,18 +32,29 @@ def main():
     jobs = read_json(jobs_path, default=[])
     print(f"Loaded {len(jobs)} real job records from {jobs_path}")
 
-    counts = {"seniority_mismatch": 0, "clinical_domain": 0}
+    counts = {"seniority_mismatch": 0, "clinical_domain": 0, "custom_user_exclusion": 0}
     total_excluded = 0
-    examples = {"seniority_mismatch": [], "clinical_domain": []}
+    examples = {"seniority_mismatch": [], "clinical_domain": [], "custom_user_exclusion": []}
+    # Loaded once here (2026-08-13, custom title exclusions build) rather
+    # than once per job - same "load once per batch" pattern
+    # job_store.save_jobs() uses, applied here for the same reason (this
+    # script runs against the full jobs.json, thousands of records).
+    custom_exclusions = exclusion_filter.load_custom_title_exclusions()
+    if custom_exclusions:
+        print(f"Custom title exclusions configured: {custom_exclusions}")
+    else:
+        print("No custom title exclusions configured (config/settings.yaml has no custom_title_exclusions key/empty list).")
 
     for job in jobs:
-        exclusion = exclusion_filter.check_exclusion(job)
+        exclusion = exclusion_filter.check_exclusion(job, custom_exclusions)
         if exclusion:
             total_excluded += 1
             rule = exclusion["rule"]
             counts[rule] = counts.get(rule, 0) + 1
+            if rule not in examples:
+                examples[rule] = []
             if len(examples[rule]) < 5:
-                examples[rule].append(f"{job.get('title')} @ {job.get('organization')}")
+                examples[rule].append(f"{job.get('title')} @ {job.get('organization')} -> {exclusion['reason']}")
 
     print()
     print(f"Total jobs: {len(jobs)}")

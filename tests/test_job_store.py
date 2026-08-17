@@ -355,6 +355,36 @@ def test_save_jobs_apply_exclusion_false_bypasses_the_filter(isolated_data):
     assert read_json(exclusion_filter.EXCLUSION_LOG_PATH, default=[]) == []
 
 
+def test_save_jobs_excludes_a_job_matching_a_custom_user_exclusion(isolated_data):
+    exclusion_filter.SETTINGS_PATH.write_text(
+        "custom_title_exclusions:\n- Program Director\n", encoding="utf-8",
+    )
+    added = job_store.save_jobs([{
+        "source": "Dice", "job_id": "1", "title": "Senior Program Director, Clinical Ops",
+    }])
+    assert added == 0
+    assert job_store.load_jobs() == []
+    entries = read_json(exclusion_filter.EXCLUSION_LOG_PATH, default=[])
+    assert len(entries) == 1
+    assert "custom_user_exclusion" in entries[0]["exclusion_reason"]
+
+
+def test_save_jobs_custom_exclusions_do_not_affect_jobs_that_do_not_match(isolated_data):
+    exclusion_filter.SETTINGS_PATH.write_text(
+        "custom_title_exclusions:\n- Program Director\n", encoding="utf-8",
+    )
+    added = job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Director, IT Service Continuity"}])
+    assert added == 1
+    assert len(job_store.load_jobs()) == 1
+
+
+def test_save_jobs_with_no_custom_exclusions_configured_is_unaffected(isolated_data):
+    # No settings.yaml at all (fresh install) must behave exactly like
+    # today - built-in layers only, no error from a missing custom list.
+    added = job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Director, IT Service Continuity"}])
+    assert added == 1
+
+
 def test_add_manual_job_is_never_excluded(isolated_data):
     # Real regression guard: add_manual_job() feeds both Zahir's own
     # manual-paste UI and job_alert_scan.py's email-digest intake, which has
