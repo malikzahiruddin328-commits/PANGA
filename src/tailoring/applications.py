@@ -489,12 +489,24 @@ QA_STATUSES = {"drafting", "generating_questions", "awaiting_answers", "redrafti
 # staleness bound is both safe and necessary here (a 20-minute wait to
 # recover a dead subscription draft is exactly the "no visible way to
 # recover" gap Zahir reported, 2026-08-17).
+#
+# Also reused (2026-08-17, real PID/timing tracking) by set_qa_status()
+# below to decide whether a passed-in pid/started_at should actually be
+# kept or forced back to None (there's only a real `claude` CLI subprocess
+# to point at while one of these is active), and by task_monitor.py to
+# decide which records are worth a real OS-level liveness check at all -
+# deliberately the SAME constant as the stale-drafting fix's own "which
+# statuses represent a real call in flight" set, not a second, parallel
+# one that could silently drift out of sync with it.
 _QA_ACTIVE_STATUSES = {"drafting", "generating_questions", "redrafting"}
 _QA_STATUS_STALE_AFTER_MINUTES = 5
 MAX_STALE_QA_AUTO_RETRIES = 2
 
 
-def set_qa_status(source: str, job_id: str, status: str | None, error: str | None = None) -> None:
+def set_qa_status(
+    source: str, job_id: str, status: str | None, error: str | None = None,
+    pid: int | None = None, started_at: str | None = None,
+) -> None:
     """Tracks where a job's in-app subscription draft/Q&A loop is right
     now - "drafting" (initial or re-draft subscription call in flight),
     "generating_questions" (subscription call generating this round's
@@ -514,9 +526,39 @@ def set_qa_status(source: str, job_id: str, status: str | None, error: str | Non
     below reads to tell a genuinely-still-running call apart from one whose
     owning process died before it could ever clear its own status. Popped
     (not left stale) when status clears to None, matching release_
-    generation_lock()'s own pop-on-clear convention just above."""
+    generation_lock()'s own pop-on-clear convention just above.
+
+    pid/started_at (2026-08-17, real PID/timing tracking - a separate,
+    complementary fix landed alongside the staleness/auto-retry work
+    above): the REAL OS process ID of the `claude` CLI subprocess this
+    round's call is actually running as, and when it started - not just a
+    status string or a "how long has it been" timestamp. This is the
+    concrete fix for a real problem hit live twice: with only a status
+    string to go on, there was no way to tell which of several
+    concurrently-running `claude` OS processes (`Get-Process claude`
+    returned 16 unlabeled ones) belonged to this job, or whether it was
+    still genuinely alive vs. hung. Callers pass these via reasoner_cli.
+    run_claude_cli()'s on_start callback, right as the subprocess actually
+    starts - see subscription_resume_qa.py and discuss_and_draft.py for
+    the wiring. tailoring.task_monitor's Task Monitor view is what
+    actually reads this real PID for a live liveness check, alongside
+    (not instead of) is_qa_status_stale()'s own time-based signal above -
+    together they catch both a dead-but-recent process (PID check, faster)
+    and a process this app simply has no PID record for yet or can't
+    verify (time-based fallback).
+
+    Only ever stored when `status` is one of _QA_ACTIVE_STATUSES (there's
+    a real subprocess to point at); for every other status (None,
+    "awaiting_answers", "failed") pid/started_at are forced back to None
+    regardless of what's passed, so a stale PID from a previous round can
+    never linger and be mistaken for the current one - this is the same
+    "clear stale state, don't just stop updating it" principle CLAUDE.md's
+    HCI section calls out for Streamlit widgets, applied here to persisted
+    process state instead."""
     if status is not None and status not in QA_STATUSES:
         raise ValueError(f"status must be one of {QA_STATUSES} or None, got {status!r}")
+    if status not in _QA_ACTIVE_STATUSES:
+        pid, started_at = None, None
     if get_application(source, job_id) is None:
         upsert_application(source, job_id, status="under review")
     with locked("applications"):
@@ -525,6 +567,8 @@ def set_qa_status(source: str, job_id: str, status: str | None, error: str | Non
             if app["source"] == source and app["job_id"] == job_id:
                 app["subscription_qa_status"] = status
                 app["subscription_qa_error"] = error
+                app["subscription_qa_pid"] = pid
+                app["subscription_qa_started_at"] = started_at
                 if status is not None:
                     app["subscription_qa_status_at"] = datetime.now(timezone.utc).isoformat()
                 else:

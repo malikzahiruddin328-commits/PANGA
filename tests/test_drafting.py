@@ -1415,6 +1415,59 @@ def test_profile_supports_skill_does_not_false_positive_across_unrelated_bullets
     assert _profile_supports_skill("design applications", profile) is False
 
 
+def test_profile_supports_skill_catches_a_fact_only_a_conjunctive_multi_word_match_can_see():
+    # Real production incident, 2026-08-17: skills_match()'s per-unit
+    # phrase-containment check (the loop this function already ran before
+    # this fix) genuinely cannot catch a multi-word term whose words are
+    # scattered differently within a real bullet - "onshore/offshore
+    # teams" (the AI's proposed label) vs. the real bullet "Led a team of
+    # 8 (onshore/offshore)." (singular "team", different word order).
+    # skill_evidenced_in_text()'s conjunctive-within-one-unit check closes
+    # this without reopening the cross-bullet false positive the sibling
+    # test above (test_profile_supports_skill_does_not_false_positive_
+    # across_unrelated_bullets) guards against - both must stay true at
+    # once, which is exactly what this pair of tests checks.
+    profile = {
+        "work_history": [
+            {"title": "Delivery Director", "bullets": ["Led a team of 8 (onshore/offshore)."]},
+        ],
+    }
+    assert _profile_supports_skill("onshore/offshore teams", profile) is True
+
+
+def test_profile_supports_skill_catches_a_fact_buried_in_a_gap_answers_free_text():
+    # Same real incident: the fact was ALSO confirmed inside the free-text
+    # "answer" of a gap_interview_answers entry stored under a completely
+    # different "skill" label ("si partner relationships") - previously
+    #_answered_skills-style label matching can never see this, since it
+    # only ever compares "skill" labels, never answer text.
+    profile = {
+        "gap_interview_answers": [
+            {
+                "skill": "si partner relationships",
+                "answer": "I coordinated onshore and offshore delivery teams across several engagements.",
+            },
+        ],
+    }
+    assert _profile_supports_skill("onshore/offshore teams", profile) is True
+
+
+def test_merge_keyword_gap_questions_does_not_re_ask_the_real_onshore_offshore_question():
+    # End-to-end version of the two tests above, through the actual
+    # merge/dedup entry point _finalize_resume_draft() and
+    # request_additional_gap_questions() both call.
+    profile = {
+        "gap_interview_answers": [
+            {"skill": "si partner relationships", "answer": "I coordinated onshore and offshore delivery teams."},
+        ],
+    }
+    merged = _merge_keyword_gap_questions(
+        [{"type": "skill_gap", "skill": "onshore/offshore teams", "question": "?", "suggested_answer": ""}],
+        [], profile=profile,
+    )
+    assert merged == []
+
+
 def test_merge_keyword_gap_questions_does_not_ask_about_a_profile_supported_keyword():
     merged = _merge_keyword_gap_questions([], _missing("Databricks"), profile=_sample_profile())
     assert merged == []

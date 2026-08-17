@@ -63,6 +63,7 @@ guarantee and no warning, exactly the class of bug the paid path's own
 a second, unguarded way to hit the same shared field."""
 
 import json
+from datetime import datetime, timezone
 
 from search.job_store import update_job_ats_keywords
 from tailoring.applications import (
@@ -124,7 +125,7 @@ def _resume_prompt(job: dict, profile: dict) -> str:
     ])
 
 
-def draft_resume_via_subscription(job: dict, profile: dict, on_progress=None) -> dict:
+def draft_resume_via_subscription(job: dict, profile: dict, on_progress=None, on_pid=None) -> dict:
     """The subscription-path equivalent of drafting.generate_documents()
     for the resume alone - same finalized-dict shape ("text", "ats_score",
     "ats_rationale", "ats_next_actions", "clarifying_questions",
@@ -137,6 +138,12 @@ def draft_resume_via_subscription(job: dict, profile: dict, on_progress=None) ->
     "real incremental state, not a silent multi-minute wait" requirement,
     same as every other subscription call in this app.
 
+    on_pid(pid: int), if given, is passed straight through to reasoner_cli.
+    run_claude_cli()'s own on_start callback - fires with the real OS
+    process ID of the `claude` subprocess this call just launched, as soon
+    as it's known (2026-08-17 real PID/timing tracking - see
+    applications.set_qa_status()'s own docstring for why).
+
     Raises ReasonerUnavailable if the `claude` CLI itself can't be invoked
     (not installed/not logged in), or RuntimeError on a genuine per-call
     failure (timeout, non-JSON reply, no JSON object found) - neither is
@@ -146,7 +153,7 @@ def draft_resume_via_subscription(job: dict, profile: dict, on_progress=None) ->
             on_progress(stage)
 
     _progress("drafting resume")
-    reply = run_claude_cli(_resume_prompt(job, profile))
+    reply = run_claude_cli(_resume_prompt(job, profile), on_start=on_pid)
     data = parse_json_reply(reply)
 
     if job.get("ats_required_keywords") is None:
@@ -187,9 +194,19 @@ def run_subscription_round(job: dict, profile: dict, on_progress=None) -> dict:
     if not try_acquire_generation_lock(source, job_id):
         return {"ok": False, "locked": True, "round": None, "resume_draft": None, "error": None}
     set_qa_status(source, job_id, "drafting")
+
+    def _on_pid(pid):
+        # Fires as soon as the real `claude` subprocess for this round has
+        # actually started - stamps its PID and a real start timestamp onto
+        # the application record (task_monitor.py's Task Monitor view and
+        # any future caller can read these) so this specific round is
+        # identifiable among however many other `claude` OS processes may
+        # be running concurrently, distinct from just re-showing "drafting".
+        set_qa_status(source, job_id, "drafting", pid=pid, started_at=datetime.now(timezone.utc).isoformat())
+
     try:
         try:
-            resume_draft = draft_resume_via_subscription(job, profile, on_progress=on_progress)
+            resume_draft = draft_resume_via_subscription(job, profile, on_progress=on_progress, on_pid=_on_pid)
         except (ReasonerUnavailable, RuntimeError) as exc:
             set_qa_status(source, job_id, "failed", error=str(exc))
             return {"ok": False, "locked": False, "round": None, "resume_draft": None, "error": str(exc)}
@@ -293,10 +310,14 @@ def generate_questions_via_subscription(job: dict, profile: dict, on_progress=No
     don't need a second call)."""
     source, job_id = job.get("source"), job.get("job_id")
     set_qa_status(source, job_id, "generating_questions")
+
+    def _on_pid(pid):
+        set_qa_status(source, job_id, "generating_questions", pid=pid, started_at=datetime.now(timezone.utc).isoformat())
+
     try:
         app_record = get_application(source, job_id) or {}
         try:
-            result = _generate_questions_via_subscription(job, profile, app_record, on_progress=on_progress)
+            result = _generate_questions_via_subscription(job, profile, app_record, on_progress=on_progress, on_pid=_on_pid)
         except (ReasonerUnavailable, RuntimeError) as exc:
             set_qa_status(source, job_id, "failed", error=str(exc))
             raise

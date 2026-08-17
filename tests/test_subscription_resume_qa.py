@@ -48,7 +48,7 @@ def test_resume_prompt_omits_keyword_request_when_job_already_has_them():
 def test_draft_resume_via_subscription_calls_cli_and_finalizes(monkeypatch):
     calls = []
 
-    def _fake_run_claude_cli(prompt, timeout_seconds=None):
+    def _fake_run_claude_cli(prompt, timeout_seconds=None, on_start=None):
         calls.append(prompt)
         return json.dumps({
             "text": "resume text", "target_seniority_at_least_vp": True,
@@ -77,7 +77,7 @@ def test_draft_resume_via_subscription_calls_cli_and_finalizes(monkeypatch):
 
 
 def test_draft_resume_via_subscription_does_not_overwrite_existing_keywords(monkeypatch):
-    monkeypatch.setattr(sqa, "run_claude_cli", lambda prompt, timeout_seconds=None: json.dumps({
+    monkeypatch.setattr(sqa, "run_claude_cli", lambda prompt, timeout_seconds=None, on_start=None: json.dumps({
         "text": "resume text", "target_seniority_at_least_vp": True,
         "suggested_strategy_tag": "tag", "clarifying_questions": [], "unconfirmed_claims": [],
     }))
@@ -92,7 +92,7 @@ def test_draft_resume_via_subscription_does_not_overwrite_existing_keywords(monk
 
 
 def test_draft_resume_via_subscription_propagates_reasoner_unavailable(monkeypatch):
-    def _boom(prompt, timeout_seconds=None):
+    def _boom(prompt, timeout_seconds=None, on_start=None):
         raise ReasonerUnavailable("claude CLI not on PATH")
     monkeypatch.setattr(sqa, "run_claude_cli", _boom)
 
@@ -137,7 +137,7 @@ def test_run_subscription_round_success_persists_records_round_and_releases_lock
         "clarifying_questions": [{"skill": "Budget", "question": "q", "suggested_answer": ""}],
         "suggested_strategy_tag": "tag", "unconfirmed_claims": [],
     }
-    monkeypatch.setattr(sqa, "draft_resume_via_subscription", lambda job, profile, on_progress=None: resume_draft)
+    monkeypatch.setattr(sqa, "draft_resume_via_subscription", lambda job, profile, on_progress=None, on_pid=None: resume_draft)
     upserts, statuses = _patch_round_persist(monkeypatch, round_number=1)
 
     result = sqa.run_subscription_round(dict(JOB), PROFILE)
@@ -159,7 +159,7 @@ def test_run_subscription_round_failure_stamps_failed_and_releases_lock(monkeypa
     released = []
     monkeypatch.setattr(sqa, "release_generation_lock", lambda source, job_id: released.append((source, job_id)))
 
-    def _boom(job, profile, on_progress=None):
+    def _boom(job, profile, on_progress=None, on_pid=None):
         raise ReasonerUnavailable("claude CLI not on PATH")
     monkeypatch.setattr(sqa, "draft_resume_via_subscription", _boom)
     statuses = []
@@ -181,7 +181,7 @@ def test_run_subscription_round_failure_stamps_failed_and_releases_lock(monkeypa
 def test_generate_questions_via_subscription_persists_and_stamps_awaiting_answers(monkeypatch):
     monkeypatch.setattr(sqa, "get_application", lambda source, job_id: {"resume_clarifying_questions": []})
     new_q = [{"skill": "Team size", "question": "How many direct reports?", "suggested_answer": ""}]
-    monkeypatch.setattr(sqa, "_generate_questions_via_subscription", lambda job, profile, app_record, on_progress=None: {
+    monkeypatch.setattr(sqa, "_generate_questions_via_subscription", lambda job, profile, app_record, on_progress=None, on_pid=None: {
         "added_count": 1, "new_questions": new_q, "merged_clarifying_questions": new_q,
     })
     upserts = []
@@ -199,7 +199,7 @@ def test_generate_questions_via_subscription_persists_and_stamps_awaiting_answer
 
 def test_generate_questions_via_subscription_honest_empty_clears_status(monkeypatch):
     monkeypatch.setattr(sqa, "get_application", lambda source, job_id: {})
-    monkeypatch.setattr(sqa, "_generate_questions_via_subscription", lambda job, profile, app_record, on_progress=None: {
+    monkeypatch.setattr(sqa, "_generate_questions_via_subscription", lambda job, profile, app_record, on_progress=None, on_pid=None: {
         "added_count": 0, "new_questions": [], "merged_clarifying_questions": [],
     })
     monkeypatch.setattr(sqa, "upsert_application", lambda *a, **k: None)
@@ -216,7 +216,7 @@ def test_generate_questions_via_subscription_honest_empty_clears_status(monkeypa
 def test_generate_questions_via_subscription_propagates_and_stamps_failed(monkeypatch):
     monkeypatch.setattr(sqa, "get_application", lambda source, job_id: {})
 
-    def _boom(job, profile, app_record, on_progress=None):
+    def _boom(job, profile, app_record, on_progress=None, on_pid=None):
         raise ReasonerUnavailable("claude CLI not on PATH")
     monkeypatch.setattr(sqa, "_generate_questions_via_subscription", _boom)
     statuses = []
