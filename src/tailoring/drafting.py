@@ -721,6 +721,8 @@ def rescore_against_cached_keywords(job: dict, app_record: dict, profile: dict) 
         app_record.get("resume_clarifying_questions") or [], ats.get("missing_required_keywords", []),
         previously_answered_skills, profile,
         missing_preferred_keywords=ats.get("missing_preferred_keywords", []),
+        cluster_known_skills=_cluster_known_skills_for_job(job),
+        cluster_known_units=_cluster_known_units_for_job(job),
     )
     return {
         "ats_score": ats["ats_score"],
@@ -1091,6 +1093,50 @@ def _profile_narrative_units(profile: dict | None) -> list[str]:
     return [u for u in units if u]
 
 
+def _cluster_known_skills_for_job(job: dict | None) -> list[str]:
+    """Feature 2 (title-cluster keyword-coverage sharing, 2026-08-17):
+    resolves this job's title to a configured title cluster (search.
+    title_cluster.resolve_title_cluster - deterministic phrase match
+    against the user-edited Settings list, no AI inference) and returns
+    that cluster's confirmed keyword facts (title_cluster_profiles.
+    get_cluster_known_skills) - [] if the title matches no configured
+    cluster, or no cluster has any confirmed facts yet.
+
+    Pure read, deliberately not locked - same "reads don't need the
+    critical-section lock, only read-modify-write does" convention every
+    other store in this app already follows (applications.load_
+    applications(), profile.storage.load_profile(), ...). The write side,
+    title_cluster_profiles.record_cluster_fact(), is what's locked.
+
+    Feeds ONLY _merge_keyword_gap_questions' question-suppression check
+    below (and the baseline-projection helper's own consistency check) -
+    never ats_score.py's real scoring functions. See title_cluster_
+    profiles.py's module docstring for the full boundary explanation."""
+    from search.title_cluster import resolve_title_cluster
+    from tailoring.title_cluster_profiles import get_cluster_known_skills
+
+    title = (job or {}).get("title") or ""
+    cluster_name = resolve_title_cluster(title)
+    return get_cluster_known_skills(cluster_name)
+
+
+def _cluster_known_units_for_job(job: dict | None) -> list[str]:
+    """Same title-cluster resolution as _cluster_known_skills_for_job()
+    above, but returns the cluster's confirmed facts as independent text
+    UNITS (title_cluster_profiles.get_cluster_known_units) for folding
+    into build_already_known_units()'s own unit list - so
+    skill_evidenced_in_text()'s conjunctive, per-unit check (built for the
+    candidate's own profile/gap-answer text) also covers a fact confirmed
+    for this job's title cluster on an earlier job, via the exact same
+    matching function, not a second parallel evidence-checking codepath."""
+    from search.title_cluster import resolve_title_cluster
+    from tailoring.title_cluster_profiles import get_cluster_known_units
+
+    title = (job or {}).get("title") or ""
+    cluster_name = resolve_title_cluster(title)
+    return get_cluster_known_units(cluster_name)
+
+
 def _profile_supports_skill(term: str, profile: dict | None) -> bool:
     """True if the candidate's structured profile - not just the resume
     text this specific draft produced, and not just previously-answered
@@ -1170,6 +1216,8 @@ def _merge_keyword_gap_questions(
     previously_answered_skills: list[str] | None = None,
     profile: dict | None = None,
     missing_preferred_keywords: list[dict] | None = None,
+    cluster_known_skills: list[str] | None = None,
+    cluster_known_units: list[str] | None = None,
 ) -> list[dict]:
     """Folds missing-required-keyword gaps into the same clarifying_questions
     structure Profile Gaps already uses, instead of leaving them as inert
@@ -1236,7 +1284,19 @@ def _merge_keyword_gap_questions(
     the exact visual treatment, not decided here. Backfilling point_value
     onto a matching AI free-form question (described below) still
     happens too, for whichever preferred gaps the AI's own wording beats
-    this function's generated phrasing to first."""
+    this function's generated phrasing to first.
+
+    cluster_known_skills (Feature 2, 2026-08-17 - see title_cluster_
+    profiles.py's module docstring) is an OPTIONAL extra list of skill
+    labels already confirmed for this job's title cluster (a family of
+    related target-role titles configured in Settings, e.g. CIO/Head of
+    IT/VP Enterprise Architecture) - checked via the same _same_skill()
+    matcher as already_asked/_profile_supports_skill below, so a fact
+    confirmed on an earlier job in the same cluster suppresses a
+    near-duplicate question here too. Pure question-generation shortcut:
+    it only ever drops an entry from the returned question list, never
+    touches point_value, ats_score, or Feature 1's literal per-job
+    keyword verification."""
     # Canonical-taxonomy-aware same-skill check (2026-08-11, Zahir's "know
     # your enemy" foundation) - skills_match() alone only catches a
     # normalized-equality or word-boundary substring relationship, which
@@ -1274,7 +1334,14 @@ def _merge_keyword_gap_questions(
     # a matching previously_answered_skills LABEL - gets the same
     # treatment, regardless of which of this function's callers it came
     # from.
-    already_known_units = build_already_known_units(profile)
+    # Cluster units folded in here (2026-08-17, Feature 2) - the same
+    # combined-set approach cluster_known_units's own docstring describes:
+    # this one already_known_units list now backs the free-form
+    # clarifying_questions loop below via skill_evidenced_in_text(), so a
+    # fact confirmed for this job's title cluster suppresses a
+    # near-duplicate AI-proposed question too, not just the deterministic
+    # missing_required/preferred_keywords loops further down.
+    already_known_units = build_already_known_units(profile) + list(cluster_known_units or [])
     merged = []
     for q in clarifying_questions:
         # Real bug found live (2026-08-09, surfaced by app.py adding an
@@ -1362,7 +1429,11 @@ def _merge_keyword_gap_questions(
         # this does and doesn't catch (literal/near-literal only, not
         # genuine synonyms like "customer engagement" vs "client
         # engagement" - that needs real judgment, not string matching).
-        if any(_same_skill(term, skill) for skill in already_asked) or _profile_supports_skill(term, profile):
+        if (
+            any(_same_skill(term, skill) for skill in already_asked)
+            or _profile_supports_skill(term, profile)
+            or any(_same_skill(term, skill) for skill in (cluster_known_skills or []))
+        ):
             continue
         # Pre-flight score verification (2026-08-17, feature/basket-badge-
         # verification): _suggested_answer_for_keyword_gap() already weaves
@@ -1389,8 +1460,13 @@ def _merge_keyword_gap_questions(
         })
     for item in missing_preferred_keywords or []:
         term = item["label"]
-        # Same profile-support check as the required-keyword loop above.
-        if any(_same_skill(term, skill) for skill in already_asked_for_preferred) or _profile_supports_skill(term, profile):
+        # Same profile-support and cluster-known checks as the
+        # required-keyword loop above.
+        if (
+            any(_same_skill(term, skill) for skill in already_asked_for_preferred)
+            or _profile_supports_skill(term, profile)
+            or any(_same_skill(term, skill) for skill in (cluster_known_skills or []))
+        ):
             continue
         suggested_answer, _ = ensure_keyword_literally_present(
             term, _suggested_answer_for_keyword_gap(term, profile)
@@ -1731,6 +1807,8 @@ def _finalize_resume_draft(data: dict, job: dict | None, profile: dict | None) -
         data.get("clarifying_questions", []), ats.get("missing_required_keywords", []),
         previously_answered_skills, profile,
         missing_preferred_keywords=ats.get("missing_preferred_keywords", []),
+        cluster_known_skills=_cluster_known_skills_for_job(job),
+        cluster_known_units=_cluster_known_units_for_job(job),
     )
     return {
         "text": resume_text,
@@ -2455,6 +2533,8 @@ def analyze_fit_before_drafting(job: dict, profile: dict, app_record: dict) -> d
     score_result = score_resume_against_keywords(required_keywords, preferred_keywords, baseline_text, candidate_years_experience=_total_years_of_experience(profile))
 
     previously_answered_skills = [a["skill"] for a in profile.get("gap_interview_answers", []) if a.get("skill")]
+    cluster_known_skills = _cluster_known_skills_for_job(job)
+    cluster_known_units = _cluster_known_units_for_job(job)
 
     def _already_confirmed(item: dict) -> bool:
         # 2026-08-10: extended to also credit a keyword the candidate's
@@ -2469,7 +2549,19 @@ def analyze_fit_before_drafting(job: dict, profile: dict, app_record: dict) -> d
         # number) is deliberately untouched - this only affects the
         # projection shown before a fresh Generate actually writes the
         # term into the resume.
-        return any(skills_match(item["label"], skill) for skill in previously_answered_skills) or _profile_supports_skill(item["label"], profile)
+        #
+        # 2026-08-17 (Feature 2): same extension for a fact already
+        # confirmed on an earlier job in this job's title cluster - keeps
+        # this PROJECTED score consistent with _merge_keyword_gap_
+        # questions' own cluster-aware suppression below, same "score and
+        # question list agree with each other" reasoning as the profile
+        # case above. Still never touches the real, literal ats_score.
+        return (
+            any(skills_match(item["label"], skill) for skill in previously_answered_skills)
+            or _profile_supports_skill(item["label"], profile)
+            or any(skills_match(item["label"], skill) for skill in cluster_known_skills)
+            or skill_evidenced_in_text(item["label"], cluster_known_units)
+        )
 
     missing_required = score_result["missing_required_keywords"]
     missing_preferred = score_result["missing_preferred_keywords"]
@@ -2496,6 +2588,8 @@ def analyze_fit_before_drafting(job: dict, profile: dict, app_record: dict) -> d
         previously_answered_skills=previously_answered_skills,
         profile=profile,
         missing_preferred_keywords=missing_preferred,
+        cluster_known_skills=cluster_known_skills,
+        cluster_known_units=cluster_known_units,
     )
     open_questions = _questions_worth_asking(merged_questions, projected_score)
 
@@ -2834,11 +2928,30 @@ def save_gap_answers(job: dict, answered_questions: list[dict]) -> None:
     SCORE_SYSTEM_PROMPT applies it to every future job, not just this one;
     anything else (including missing/old-shape entries) saves as an ordinary
     skill-gap fact. Never called with an invented answer - the Results tab
-    UI only calls this with what the candidate actually typed."""
+    UI only calls this with what the candidate actually typed.
+
+    Feature 2 (2026-08-17): also seeds/updates this job's title-cluster
+    base profile (title_cluster_profiles.record_cluster_fact) for every
+    real answer saved here, same "confirming a fact for one job in a
+    cluster suppresses the near-duplicate question on the next job in that
+    cluster" behavior _merge_keyword_gap_questions reads back via
+    _cluster_known_skills_for_job(). A no-op if this job's title doesn't
+    resolve to any configured cluster. Every real call site of THIS
+    function is single-threaded (the Results tab's per-job save button,
+    and the basket's "Submit answers & redraft" handler's plain sequential
+    for-loop) - the basket DOES have a real ThreadPoolExecutor elsewhere
+    (app.py's "Draft & score all"), but that pool never calls this
+    function - see title_cluster_profiles.py's module docstring for the
+    full, directly-verified call-graph audit. record_cluster_fact() only
+    ever affects future QUESTION generation - it never touches
+    ats_score.py's scoring."""
     from datetime import datetime, timezone
 
     from profile.interview import save_answer
+    from search.title_cluster import resolve_title_cluster
+    from tailoring.title_cluster_profiles import record_cluster_fact
 
+    cluster_name = resolve_title_cluster(job.get("title") or "")
     role_context = f"{job.get('title', 'Unknown role')} at {job.get('organization', 'Unknown organization')}"
     # UTC, not local time (real bug found live 2026-08-08, General): this
     # gets compared against applications.py's documents_drafted_at, which
@@ -2857,3 +2970,4 @@ def save_gap_answers(job: dict, answered_questions: list[dict]) -> None:
             skill=q["skill"], role_context=role_context, answer=answer, date_captured=today,
             question=q.get("question", ""), is_disqualifier=(q.get("type") == "disqualifier_check"),
         )
+        record_cluster_fact(cluster_name, skill=q["skill"], evidence=answer, role_context=role_context)

@@ -81,6 +81,8 @@ def isolated_data(tmp_path, monkeypatch):
     import skills.canonical_taxonomy as canonical_taxonomy
     import skills.lookup as skills_lookup
     import search.exclusion_filter as exclusion_filter
+    import search.title_cluster as title_cluster
+    import tailoring.title_cluster_profiles as title_cluster_profiles
 
     monkeypatch.setattr(job_store, "JOBS_PATH", tmp_path / "jobs.json")
     monkeypatch.setattr(job_store, "ARCHIVE_PATH", tmp_path / "jobs-archive.json")
@@ -202,4 +204,12 @@ def isolated_data(tmp_path, monkeypatch):
     # and a test run against a settings.yaml with no custom terms
     # configured can't accidentally pick up real ones.
     monkeypatch.setattr(exclusion_filter, "SETTINGS_PATH", tmp_path / "settings.yaml")
+    # Title clusters (Feature 2, 2026-08-17) - same class of gap as
+    # exclusion_filter's SETTINGS_PATH above (also config/settings.yaml,
+    # different key) and every JSON store above: isolated so a test
+    # exercising resolve_title_cluster()/record_cluster_fact() can't read
+    # or write the real repo settings.yaml or data/title_cluster_
+    # profiles.json.
+    monkeypatch.setattr(title_cluster, "SETTINGS_PATH", tmp_path / "settings.yaml")
+    monkeypatch.setattr(title_cluster_profiles, "CLUSTER_PROFILES_PATH", tmp_path / "title_cluster_profiles.json")
     return tmp_path

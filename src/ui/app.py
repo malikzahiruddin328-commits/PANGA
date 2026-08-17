@@ -3565,6 +3565,61 @@ if active_tab == "settings":
             st.toast("Saved custom title exclusions.", icon=":material/check_circle:")
             st.rerun()
 
+    st.subheader("Title clusters")
+    st.markdown(
+        "Group related target-role titles that share most of the same "
+        "keyword asks (e.g. CIO, Head of IT, VP Enterprise Architecture) so "
+        "a fact confirmed for one job's questions is credited to every "
+        "other job whose title matches the same cluster, instead of being "
+        "asked again. One cluster per line: `Cluster name: title phrase 1, "
+        "title phrase 2, ...` - a job's title is matched against these "
+        "phrases the same way custom title exclusions are (plain, "
+        "case-insensitive \"contains this text\")."
+    )
+    title_cluster_settings = load_settings()
+    existing_clusters = title_cluster_settings.get("title_clusters", []) or []
+    title_clusters_text = st.text_area(
+        "Title clusters",
+        value="\n".join(
+            f"{c.get('name', '')}: {', '.join(c.get('titles', []))}"
+            for c in existing_clusters
+        ),
+        key="title_clusters_text",
+        label_visibility="collapsed",
+        placeholder="Executive IT Leadership: CIO, Head of IT, VP Enterprise Architecture",
+    )
+    if st.button("Save title clusters"):
+        parsed_clusters = []
+        skipped_lines = []
+        for line in title_clusters_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if ":" not in line:
+                skipped_lines.append(line)
+                continue
+            name, _, titles_part = line.partition(":")
+            name = name.strip()
+            titles = [t.strip() for t in titles_part.split(",") if t.strip()]
+            if not name or not titles:
+                skipped_lines.append(line)
+                continue
+            parsed_clusters.append({"name": name, "titles": titles})
+        title_cluster_settings["title_clusters"] = parsed_clusters
+        try:
+            save_settings(title_cluster_settings)
+        except Exception as exc:
+            st.error(f"Failed to save title clusters: {exc}")
+        else:
+            if skipped_lines:
+                st.warning(
+                    "Saved, but skipped line(s) missing a \"Cluster name: title, "
+                    "title\" format: " + "; ".join(skipped_lines)
+                )
+            else:
+                st.toast("Saved title clusters.", icon=":material/check_circle:")
+            st.rerun()
+
     if bhangi_create_issue is not None:
         # Same "no Bhangi checkout -> feature quietly absent, not an error"
         # rule as the Support tab above - this is a convenience on top of
