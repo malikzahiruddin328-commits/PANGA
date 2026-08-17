@@ -23,6 +23,8 @@ visible no matter which tab is open.
 import os
 import re
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -79,13 +81,15 @@ from search.job_alert_senders import load_job_alert_senders, save_job_alert_send
 from search.aggregators import ADZUNA_COUNTRIES, is_configured as adzuna_is_configured
 from search.source_activity import all_tracked_sources, is_source_stale
 from ranking.prioritize import weight_for, dedupe_across_sources, find_freshness_downgrade_targets
-from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion, set_strategy_tag, needs_edit_review, record_document_edit_review, get_applications_with_open_clarifying_questions, try_acquire_generation_lock, release_generation_lock
+from tailoring.applications import load_applications, upsert_application, get_application, get_pending_status_suggestions, confirm_status_suggestion, set_strategy_tag, needs_edit_review, record_document_edit_review, get_applications_with_open_clarifying_questions, try_acquire_generation_lock, release_generation_lock, is_qa_status_stale
 from tailoring.cta_emails import get_active_cta_emails, request_archive, request_draft, get_awaiting_draft_send
 from tailoring.interview_prep import load_interview_prep, get_interview_prep, record_round_outcome, build_prep_context, generate_prep, start_round, save_round
 from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
 from tailoring.bulk_generate import generate_for_job, generate_for_basket
-from tailoring.subscription_resume_qa import run_subscription_round, generate_questions_via_subscription, submit_answers_and_redraft
+from tailoring.subscription_resume_qa import run_subscription_round, generate_questions_via_subscription, submit_answers_and_redraft, recover_stale_qa_and_retry, TARGET_ATS_SCORE, MAX_QA_ROUNDS
+from concurrency.adaptive_throttle import effective_worker_count
 from tailoring.reasoner_cli import ReasonerUnavailable
+from tailoring.task_monitor import get_active_tasks, reset_stalled_task
 from tailoring.ats_score import detect_matched_keyword_regressions
 from tailoring.unconfirmed_claims import find_unconfirmed_markers, resolve_unconfirmed_claim
 from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed, analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_impact as _check_regenerate_impact, request_additional_gap_questions as _request_additional_gap_questions, reextract_ats_keywords_and_rescore as _reextract_ats_keywords_and_rescore, rescore_against_cached_keywords as _rescore_against_cached_keywords, gap_scan_is_current as _gap_scan_is_current, gap_scan_baseline_fingerprint as _gap_scan_baseline_fingerprint, _report_drafting_failure
@@ -138,6 +142,21 @@ from ui.license_gate import render_indicator_and_get_block, render_block_screen
 from licensing.client import release_device, create_portal_session, LicenseNetworkError, LicenseServiceError
 
 BHANGI_PROJECT = "panga"
+
+# Basket-wide "Draft & score all" concurrency (2026-08-17, Zahir's explicit
+# ask: "is it possible to make this draft and score to running in multiple
+# threads... 5 threads, for the sake of speed"; bumped 5->6 same day after
+# Zahir reported no local performance degradation at 5). 6 is the target
+# ceiling, same pattern/style as tailoring.drafting.MAX_CONCURRENT_DRAFTS
+# (the concurrent per-document drafting pool that's this feature's real
+# precedent in this codebase - bulk_generate.generate_for_basket() itself
+# turned out to still be a plain sequential loop, not concurrent, when
+# checked against the real current code). The actual worker count used for
+# a given run is capped further, downward only, by concurrency.
+# adaptive_throttle.effective_worker_count() right before the pool starts,
+# so this constant is a ceiling ("never more than 6 at once"), not a
+# guarantee every run gets exactly 6.
+BASKET_DRAFTALL_MAX_WORKERS = 6
 
 CATEGORY_LABELS = {
     "rejection": "Rejection",
@@ -464,15 +483,87 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
         k: v for k, v in st.session_state["panga_basket_finalbuild_results"].items() if k in basket_keys
     }
 
+    # One-time (per rerun) scoped CSS for _status_line below - see that
+    # function's docstring for why this exists instead of an inline
+    # `<p style=...>` wrapper. Targets any container whose Streamlit-
+    # generated key starts with "panga_status_line_" (there are several,
+    # one per distinct placeholder _status_line is used with) via a
+    # substring attribute selector, so a single shared rule covers all of
+    # them without needing a separate `<style>` block per call site. This
+    # `unsafe_allow_html=True` call is safe - the content is a static,
+    # hardcoded CSS rule with no interpolated user/job text in it, unlike
+    # the old per-call `<p style=...>{text}</p>` pattern this replaced.
+    st.markdown(
+        '<style>[class*="st-key-panga_status_line_"] p '
+        '{ margin: 0.2rem 0 !important; font-size: 0.85rem !important; }</style>',
+        unsafe_allow_html=True,
+    )
+    # Cache of placeholder id -> its inner st.empty(), so a placeholder
+    # used by multiple _status_line() calls within the same script run
+    # (e.g. every iteration of the draft-all progress loop) reuses the
+    # same underlying container/empty instead of re-creating one each
+    # time - see _status_line's docstring for why re-creating one per
+    # call breaks (StreamlitDuplicateElementKey).
+    _status_line_containers: dict = {}
+
+    def _status_line(placeholder, text: str) -> None:
+        """Renders a transient status/progress line at a smaller,
+        proportionate size (2026-08-17, Zahir live-usage report: the basket
+        progress line "looks too large" next to everything else in the
+        popover). Deliberately NOT Streamlit's caption widget - this
+        project's standing readability rule (docs/backlog-log.md, "UI
+        visual polish pass", 2026-07-30; enforced by tests/
+        test_ui_readability_standard.py) converted every caption-widget
+        call in Panga to `st.markdown()` specifically because captions
+        render as unreadably-light gray for text a user actually needs to
+        read, and a "job N/M is drafting" line is exactly that (not
+        decorative).
+
+        2026-08-17 (later same day): the first version of this shrank the
+        font by wrapping the whole line - icon shortcode included - in a
+        raw `<p style="font-size:...">{text}</p>` passed through
+        `st.markdown(..., unsafe_allow_html=True)`. That broke the
+        `:material/...:` icon shortcode every status line here uses -
+        confirmed live: Streamlit's markdown parser only expands
+        `:material/icon_name:` into a real icon when it appears in genuine
+        markdown text, not when it's embedded inside a literal HTML tag
+        under `unsafe_allow_html`, so it rendered as the literal
+        `:material/hourglass_top:` string instead of an hourglass glyph.
+        Fixed by keeping the text itself as plain, unwrapped
+        `st.markdown(text)` (so the icon shortcode expands normally) and
+        doing the font-size shrink via the scoped CSS class above instead
+        of inline HTML - verified live both ways: the inline-`<p>` version
+        prints the shortcode as text, this version renders the icon glyph
+        at the same 0.85rem size.
+        """
+        inner = _status_line_containers.get(id(placeholder))
+        if inner is None:
+            outer = placeholder.container(key=f"panga_status_line_{id(placeholder)}")
+            with outer:
+                inner = st.empty()
+            _status_line_containers[id(placeholder)] = inner
+        inner.markdown(text)
+
     def _qa_progress_placeholder():
         placeholder = st.empty()
 
         def _on_progress(stage: str) -> None:
-            placeholder.markdown(f":material/hourglass_top: {stage.capitalize()}... (this can take 40-90+ seconds)")
+            _status_line(
+                placeholder,
+                f":material/hourglass_top: {stage.capitalize()}... typically takes 40-90 seconds per job, please wait.",
+            )
         return _on_progress
 
     with st.container(key="panga_basket_bar"):
-        bar_cols = st.columns([3, 2, 2])
+        # bar_cols[0] holds the basket trigger button + its popover (widened
+        # 2026-08-17, Zahir's explicit ask: the popover was only stretching
+        # to match this column's width, cutting question text/badges off
+        # well before the page's own nav buttons on the right - see
+        # st.popover(..., width="stretch") below, which sizes to this
+        # column, not the page). bar_cols[2] is otherwise unused (see the
+        # `pass` below) so its share was reclaimed here rather than shrinking
+        # bar_cols[1]'s subtitle text.
+        bar_cols = st.columns([7, 2, 1])
         with bar_cols[0]:
             with st.popover(f":material/shopping_basket: Basket ({len(basket_jobs)})", width="stretch"):
                 if not basket_jobs:
@@ -480,14 +571,327 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                 else:
                     st.markdown(f"**{len(basket_jobs)} job(s) in your basket**")
 
-                    # --- Section 1: per-job rows (label, live status/score,
-                    # per-job "Generate final resume", remove). No per-item
-                    # "Draft & score" here any more - that's now the single
-                    # basket-wide action in section 2 below, per Zahir's
-                    # design point 1 ("ONE Draft & score action... not
-                    # per-item"). A per-job Retry survives for the "failed"
-                    # case only, so one stuck job doesn't force re-running
-                    # the whole basket to unstick it.
+                    # --- Section 1: single basket-wide "Draft & score all"
+                    # button (Zahir's design point 1, then narrowed further
+                    # 2026-08-17: Zahir confirmed he wants ONLY ONE draft/
+                    # score control for the whole basket - this button, at
+                    # the TOP of the panel - not a separate per-item trigger;
+                    # per-job rows below (section 2) are a READ-ONLY status
+                    # display, with Retry surviving only for the "stuck"/
+                    # "failed" case. Loops the SAME per-job
+                    # run_subscription_round() every per-item flow used to
+                    # call, now via a bounded thread pool (2026-08-17,
+                    # Zahir's explicit ask: "is it possible to make this
+                    # draft and score to running in multiple threads... 5
+                    # threads, for the sake of speed") instead of one job at
+                    # a time. Real wall-clock win because each call is a
+                    # real 40-90+ second `claude` CLI SUBPROCESS call
+                    # (subscription_resume_qa.run_subscription_round ->
+                    # reasoner_cli.run_claude_cli) that spends almost all of
+                    # that time blocked on I/O waiting for the CLI, not
+                    # holding the GIL doing local CPU work - several
+                    # genuinely overlap instead of fighting over one core.
+                    # Continues past one job's failure so it doesn't block
+                    # the rest of the batch (same pattern generate_for_
+                    # basket() already uses for the paid path).
+                    #
+                    # Moved to the TOP of the panel (2026-08-17, Zahir
+                    # live-usage report: the button sat near the top of the
+                    # popover while its progress line rendered far below,
+                    # past the whole per-job list and the Open Questions
+                    # section - the "does an action need scrolling to see
+                    # its result" anti-pattern this repo's own CLAUDE.md HCI
+                    # checklist documents). The button, its status text, and
+                    # its progress bar are now the very first things in the
+                    # panel and are created adjacent to each other in source
+                    # order, so clicking it and seeing feedback never needs
+                    # scrolling.
+                    #
+                    # Concurrency-safety notes (CLAUDE.md's race-condition
+                    # checklist, applied to genuinely new concurrent
+                    # access):
+                    # - Per-job isolation: run_subscription_round() and
+                    #   recover_stale_qa_and_retry() both acquire/release
+                    #   applications.try_acquire_generation_lock()/
+                    #   release_generation_lock() themselves, per (source,
+                    #   job_id) - two workers can never draft the SAME job
+                    #   at once, while DIFFERENT jobs proceed fully
+                    #   independently. That lock, and every applications.py
+                    #   read-modify-write these calls make (upsert_
+                    #   application, set_qa_status, record_subscription_
+                    #   qa_round, ...), is itself guarded by security.
+                    #   file_lock.locked("applications") - a real msvcrt
+                    #   byte-range lock Windows enforces per open file
+                    #   HANDLE, so it already serializes concurrent THREADS
+                    #   in this one process exactly the way it already
+                    #   serialized concurrent PROCESSES; no new locking was
+                    #   needed here.
+                    # - Stale-detection race: clear_stale_qa_status()
+                    #   re-checks staleness atomically UNDER that same lock
+                    #   immediately before clearing it (not just trusting an
+                    #   earlier is_qa_status_stale() read) - a job another
+                    #   worker is genuinely still drafting can't be
+                    #   misdetected as stale and double-retried; that
+                    #   guarantee was already independent of how many
+                    #   concurrent callers exist.
+                    # - UI updates: Streamlit's st.empty()/session_state
+                    #   writes are NOT thread-safe from worker threads (see
+                    #   tailoring.drafting.generate_documents()'s own
+                    #   concurrent per-document pool, which DOES call
+                    #   on_progress from inside worker threads for
+                    #   substatus text - an existing, unrelated gap, not
+                    #   repeated here). _draftall_worker below still never
+                    #   touches st.* directly - it returns a plain result
+                    #   tuple, and every UI/session_state write happens on
+                    #   THIS (main) thread, either right after a future
+                    #   completes, or during a timed poll of the thread-safe
+                    #   stage dict (see next note) - never from inside a
+                    #   worker thread.
+                    # - Live mid-run progress (2026-08-17, second Zahir
+                    #   live-usage report: the counter would jump to "9/10"
+                    #   almost instantly - already-done jobs are correctly
+                    #   skipped, not re-run - then sit frozen for the full
+                    #   40-90+ second duration of the LAST real job, with no
+                    #   visible sign anything was happening). Fixed by
+                    #   having _draftall_worker's on_progress callback
+                    #   (_record_stage) write its current stage ("drafting",
+                    #   "scoring", ...) into `job_stage`, a plain dict
+                    #   guarded by `stage_lock` (a threading.Lock). Writing
+                    #   to a lock-guarded dict from a worker thread IS safe
+                    #   (unlike st.*); only READING it and turning that into
+                    #   a st.* call happens on the main thread, inside the
+                    #   polling loop's `except FuturesTimeoutError` branch
+                    #   below - so the thread-safety rule above is respected
+                    #   exactly the same way it already was.
+                    st.markdown("**Draft & score the whole basket at once (subscription, $0)**")
+                    draftall_clicked = st.button(
+                        f"Draft & score all {len(basket_jobs)} job(s)", key="basket_draftall",
+                        help=(
+                            f"Runs the $0 subscription draft+score round for every job in your basket, "
+                            f"up to {BASKET_DRAFTALL_MAX_WORKERS} at a time (fewer if this machine is "
+                            f"already under heavy CPU load). Not a paid call. Each job can still take "
+                            f"40-90+ seconds, but several run at once."
+                        ),
+                    )
+                    draftall_placeholder = st.empty()
+                    draftall_progress_bar = st.empty()
+                    if draftall_clicked:
+                        profile = load_profile()
+                        stage_lock = threading.Lock()
+                        job_stage: dict[tuple, str] = {}
+
+                        def _draftall_worker(job: dict) -> tuple[tuple, dict, bool]:
+                            """Runs off the main thread inside the pool below - MUST
+                            NOT touch st.* or st.session_state (see the UI-updates
+                            note above). Returns (key, outcome, stale_recovered) so
+                            the caller does every bit of UI/session_state writing
+                            itself, only after this future completes or during a
+                            timed poll of job_stage. Its on_progress callback
+                            (_record_stage) only ever writes to the lock-guarded
+                            job_stage dict - never touches st.* - which is what
+                            makes it safe to call from this worker thread."""
+                            source, job_id = job.get("source"), job.get("job_id")
+                            job_key = (source, job_id)
+                            stale_recovered = False
+
+                            def _record_stage(stage: str) -> None:
+                                with stage_lock:
+                                    job_stage[job_key] = stage
+
+                            try:
+                                # Re-read this job's OWN current record here (a fresh
+                                # per-job read taken right before use, not a shared
+                                # snapshot several workers could see stale copies of)
+                                # - same "judge staleness on real current state" fix
+                                # the prior sequential loop already had, still correct
+                                # run concurrently since each worker only ever reads
+                                # its own job's record.
+                                current_record = get_application(source, job_id) or {}
+                                # 2026-08-17 target-driven QA loop hard-cap guard:
+                                # a job already "ready" (>= target ATS) or
+                                # "plateaued" (already hit MAX_QA_ROUNDS) has
+                                # nothing left this loop is supposed to do -
+                                # no new answers were submitted, so a further
+                                # round would neither raise the score nor ask
+                                # a genuinely new question, and would silently
+                                # push the round count PAST the 3-round hard
+                                # cap on every repeat click of this same bulk
+                                # button. "Draft & score all" only ever
+                                # advances a job that's still genuinely
+                                # in_progress (or never drafted at all) -
+                                # re-running a terminal job is the caller's
+                                # explicit job (per-job Retry after a real
+                                # answer, or the per-job "Generate final
+                                # resume" button), never this bulk action.
+                                loop_state = current_record.get("subscription_qa_loop_state")
+                                if loop_state in ("ready", "plateaued"):
+                                    outcome = {
+                                        "ok": True, "locked": False, "round": current_record.get("subscription_qa_round"),
+                                        "resume_draft": None, "error": None, "skipped_terminal": True,
+                                    }
+                                elif is_qa_status_stale(current_record):
+                                    # Doesn't just skip a stuck job silently, and
+                                    # doesn't hang forever waiting on it either
+                                    # (Zahir's explicit ask) - reset + bounded
+                                    # auto-retry (max 2, see subscription_resume_qa.
+                                    # recover_stale_qa_and_retry()) right here.
+                                    outcome = recover_stale_qa_and_retry(job, profile, on_progress=_record_stage)
+                                    stale_recovered = bool(outcome.get("stale_recovered"))
+                                else:
+                                    outcome = run_subscription_round(job, profile, on_progress=_record_stage)
+                            except Exception as exc:
+                                # Defense in depth, matching generate_for_basket()'s
+                                # own "one item's failure shouldn't stop the rest"
+                                # pattern (CLAUDE.md) - run_subscription_round() is
+                                # documented to only ever raise via its own
+                                # (ReasonerUnavailable, RuntimeError) handling, but a
+                                # whole-basket run with several real concurrent
+                                # subprocess calls is exactly the place an unexpected
+                                # exception type would otherwise take a worker down
+                                # silently (real bug hit live 2026-08-17 verifying the
+                                # prior sequential branch: a raw json.JSONDecodeError
+                                # escaped uncaught - fixed at its source in reasoner_
+                                # cli.parse_json_reply(), this catch is the
+                                # belt-and-suspenders backstop for anything else like
+                                # it).
+                                outcome = {"ok": False, "locked": False, "round": None, "resume_draft": None, "error": str(exc)}
+                            finally:
+                                # Done (success or failure) - clear this job's stage so a
+                                # stale "drafting" doesn't linger in job_stage after the
+                                # future has actually completed (the main thread also
+                                # drops it from `pending` right when it notices the
+                                # future finish, but this closes the window between
+                                # "worker finished" and "main thread noticed").
+                                with stage_lock:
+                                    job_stage.pop(job_key, None)
+                            return (source, job_id), outcome, stale_recovered
+
+                        # Ceiling of BASKET_DRAFTALL_MAX_WORKERS (6), backed off
+                        # downward by concurrency.adaptive_throttle if this machine
+                        # is already under real CPU load right now (Zahir's explicit
+                        # ask, 2026-08-17: throttle down under load rather than
+                        # always saturating the machine) - checked once, right
+                        # before this batch starts.
+                        worker_count = effective_worker_count(min(len(basket_jobs), BASKET_DRAFTALL_MAX_WORKERS))
+                        total = len(basket_jobs)
+                        jobs_by_key = {(j.get("source"), j.get("job_id")): j for j in basket_jobs}
+                        _status_line(
+                            draftall_placeholder,
+                            f":material/hourglass_top: Drafting & scoring {total} job(s) - "
+                            f"up to {worker_count} running concurrently...",
+                        )
+                        draftall_progress_bar.progress(0.0)
+                        results = {}
+                        stale_recovered_count = 0
+                        completed = 0
+                        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+                            future_to_job = {pool.submit(_draftall_worker, job): job for job in basket_jobs}
+                            pending = set(future_to_job.keys())
+                            while pending:
+                                try:
+                                    # timeout=2: if nothing finishes within 2s this raises
+                                    # FuturesTimeoutError, caught below, so we re-poll
+                                    # job_stage and refresh the display even while every
+                                    # remaining job is still mid-flight - this is what
+                                    # fixes the "frozen at 9/10 for 40-90s" gap (see the
+                                    # class-level comment above).
+                                    for future in as_completed(pending, timeout=2):
+                                        pending.discard(future)
+                                        job = future_to_job[future]
+                                        try:
+                                            key, outcome, stale_recovered = future.result()
+                                        except Exception as exc:
+                                            # Safety net only - _draftall_worker already
+                                            # catches every exception internally, this guards
+                                            # against a genuine bug in the pool/future
+                                            # machinery itself so one job's futures-level
+                                            # failure still can't take the whole batch down.
+                                            source, job_id = job.get("source"), job.get("job_id")
+                                            key = (source, job_id)
+                                            outcome = {"ok": False, "locked": False, "round": None, "resume_draft": None, "error": str(exc)}
+                                            stale_recovered = False
+                                        results[key] = outcome
+                                        if stale_recovered:
+                                            stale_recovered_count += 1
+                                        completed += 1
+                                        draftall_progress_bar.progress(completed / total)
+                                        _status_line(
+                                            draftall_placeholder,
+                                            f":material/hourglass_top: [{completed}/{total}] completed - "
+                                            f"just finished: {job_label(job)}...",
+                                        )
+                                except FuturesTimeoutError:
+                                    # No future finished in the last 2s - poll the
+                                    # thread-safe stage dict (main thread READS here;
+                                    # only workers WRITE, under stage_lock - see
+                                    # _draftall_worker/_record_stage above) and refresh
+                                    # the text so there's periodic, visible proof
+                                    # something is still happening even between
+                                    # completions - not just a static counter frozen
+                                    # for the full 40-90+ second duration of the last
+                                    # real job.
+                                    with stage_lock:
+                                        active_stages = dict(job_stage)
+                                    if active_stages:
+                                        detail = ", ".join(
+                                            f"{job_label(jobs_by_key[jk])}: {stage}"
+                                            for jk, stage in active_stages.items() if jk in jobs_by_key
+                                        )
+                                        _status_line(
+                                            draftall_placeholder,
+                                            f":material/hourglass_top: [{completed}/{total}] completed - "
+                                            f"still working - {detail}...",
+                                        )
+                                    # else: no per-stage detail reported yet this poll -
+                                    # leave the last-shown text as-is rather than
+                                    # blanking it, and loop back to wait again.
+                        draftall_progress_bar.progress(1.0)
+                        draftall_placeholder.markdown(":material/check_circle: Done.")
+                        st.session_state["panga_basket_draftall_results"] = results
+                        skipped_terminal = sum(1 for r in results.values() if r.get("skipped_terminal"))
+                        succeeded = sum(1 for r in results.values() if r["ok"] and not r.get("skipped_terminal"))
+                        locked = sum(1 for r in results.values() if r.get("locked"))
+                        failed = len(results) - succeeded - locked - skipped_terminal
+                        summary = f"{succeeded} of {len(results)} job(s) drafted & scored."
+                        if skipped_terminal:
+                            summary += f" {skipped_terminal} already at target or plateaued - not re-drafted."
+                        if locked:
+                            summary += f" {locked} skipped (already generating elsewhere)."
+                        if failed:
+                            summary += f" {failed} failed - see below."
+                        # Visible evidence a stall-and-retry actually happened (Zahir's
+                        # explicit ask: "not just have it silently work or silently
+                        # fail") - a toast alone would vanish on the rerun below before
+                        # he could read it if it were the ONLY signal, so this is
+                        # folded into the same summary toast that already survives via
+                        # the existing draftall_results session_state, not a separate
+                        # one-off notification.
+                        if stale_recovered_count:
+                            summary += f" {stale_recovered_count} job(s) looked stuck (stalled) and were reset + retried automatically."
+                        st.toast(summary, icon=":material/check_circle:" if not failed else ":material/warning:")
+                        st.rerun()
+                    draftall_results = st.session_state["panga_basket_draftall_results"]
+                    if draftall_results:
+                        failed_jobs = [
+                            job_label(j) for j in basket_jobs
+                            if (r := draftall_results.get((j.get("source"), j.get("job_id")))) and not r["ok"] and not r["locked"]
+                        ]
+                        if failed_jobs:
+                            st.markdown(f":material/error: Failed to draft: {', '.join(failed_jobs)} - use that job's Retry below.")
+
+                    st.divider()
+
+                    # --- Section 2: per-job rows (label, live status/score,
+                    # per-job "Generate final resume", remove). Purely a
+                    # READ-ONLY status display for the draft/score step -
+                    # there is no separate per-item "Draft & score" trigger
+                    # here (confirmed 2026-08-17, Zahir: only ONE draft/
+                    # score control for the whole basket, the button above).
+                    # A per-job Retry survives for the "stuck"/"failed" case
+                    # only, so one stuck job doesn't force re-running the
+                    # whole basket to unstick it. "Generate final resume" is
+                    # a separate, unrelated per-item action (the one real
+                    # paid call) and stays exactly as it was.
                     all_open_questions = []  # [(job, app_record, question), ...] across the whole basket, built while looping so section 3 doesn't need a second pass
                     for job in basket_jobs:
                         source, job_id = job.get("source"), job.get("job_id")
@@ -503,7 +907,34 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                         with item_cols[0]:
                             st.markdown(f"{job_label(job)}")
                         with item_cols[1]:
-                            if qa_status == "drafting":
+                            # Real resilience fix (2026-08-17): a job can be
+                            # stuck showing "drafting"/etc. because the app
+                            # process that set it died mid-call (a real
+                            # incident that day required a manual DB-level
+                            # fix - see applications.is_qa_status_stale()'s
+                            # own docstring). Checked BEFORE the ordinary
+                            # in-progress branches below so a genuinely stale
+                            # status gets its own Retry rather than showing
+                            # an "hourglass" line forever with no way out.
+                            is_stale = is_qa_status_stale(app_record)
+                            stale_retries = app_record.get("subscription_qa_stale_retry_count", 0)
+                            if is_stale:
+                                st.markdown(
+                                    f":material/warning: Looks stuck ({qa_status}, no update for "
+                                    f"5+ min - the app likely died mid-call)."
+                                    + (f" Auto-retried {stale_retries}x already." if stale_retries else "")
+                                )
+                                if st.button("Retry (subscription, $0)", key=f"basket_item_stalertry_{source}_{job_id}"):
+                                    on_progress = _qa_progress_placeholder()
+                                    outcome = recover_stale_qa_and_retry(job, load_profile(), on_progress=on_progress)
+                                    if outcome.get("locked"):
+                                        st.toast(f"{job_label(job)} actually just finished (or is genuinely still running) - no retry needed.", icon=":material/info:")
+                                    elif outcome["ok"]:
+                                        st.toast(f"Stuck job reset and retried - round {outcome['round']} drafted, ATS {outcome['resume_draft']['ats_score']}/100.", icon=":material/refresh:")
+                                    else:
+                                        st.toast(f"Auto-retry failed: {outcome['error']}", icon=":material/error:")
+                                    st.rerun()
+                            elif qa_status == "drafting":
                                 st.markdown(":material/hourglass_top: Drafting initial resume (subscription)...")
                             elif qa_status == "generating_questions":
                                 st.markdown(":material/hourglass_top: Generating questions...")
@@ -522,12 +953,38 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                                         st.toast(f"Subscription draft failed: {outcome['error']}", icon=":material/error:")
                                     st.rerun()
                             elif qa_round == 0:
-                                st.markdown(":material/pending: Not drafted yet - use \"Draft & score all\" below.")
+                                st.markdown(":material/pending: Not drafted yet - use \"Draft & score all\" above.")
                             else:
+                                # 2026-08-17 target-driven QA loop - real,
+                                # actionable per-job state (Zahir's design
+                                # point 3: "Round 2/3, ATS 84, 3 more
+                                # high-value gaps identified" vs "Plateaued
+                                # at ATS 78 after 3 rounds - your call to
+                                # proceed" vs "ATS 94 - ready to build, no
+                                # more questions"). subscription_qa_loop_state
+                                # is stamped by run_subscription_round() the
+                                # SAME round this score was recorded, so the
+                                # two can never disagree/go stale relative
+                                # to each other.
                                 score_text = f"{qa_score}/100" if qa_score is not None else "not yet scored"
                                 history = app_record.get("subscription_ats_score_history") or []
                                 trend = (" (" + " → ".join(f"r{h['round']}: {h['ats_score']}" for h in history) + ")") if len(history) > 1 else ""
-                                st.markdown(f":material/check_circle: Round {qa_round} - ATS {score_text}{trend}")
+                                loop_state = app_record.get("subscription_qa_loop_state")
+                                gap_count = len(open_questions)
+                                if loop_state == "ready":
+                                    st.markdown(f":material/check_circle: ATS {score_text} - ready to build, no more questions{trend}.")
+                                elif loop_state == "plateaued":
+                                    st.markdown(
+                                        f":material/flag: Plateaued at ATS {score_text} after {qa_round} rounds "
+                                        f"(target {TARGET_ATS_SCORE}) - your call whether to still build{trend}."
+                                    )
+                                elif gap_count:
+                                    st.markdown(
+                                        f":material/check_circle: Round {qa_round}/{MAX_QA_ROUNDS} - ATS {score_text} - "
+                                        f"{gap_count} more high-value gap{'s' if gap_count != 1 else ''} identified{trend}."
+                                    )
+                                else:
+                                    st.markdown(f":material/check_circle: Round {qa_round}/{MAX_QA_ROUNDS} - ATS {score_text}{trend}.")
                         with item_cols[2]:
                             if st.button(
                                 "Generate final resume", key=f"basket_item_finalbuild_{source}_{job_id}",
@@ -581,64 +1038,6 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                             else:
                                 st.markdown(f":material/error: Failed just now: {', '.join(bulk_final['errors'].keys()) or 'see Results tab'}.")
 
-                    st.divider()
-
-                    # --- Section 2: single basket-wide "Draft & score all"
-                    # (Zahir's design point 1) - loops the SAME per-job
-                    # run_subscription_round() every per-item button used to
-                    # call, real [i/total] progress like scripts/
-                    # run_search.py's own scoring loop, continuing past one
-                    # job's failure so it doesn't block the rest of the
-                    # batch (same pattern generate_for_basket() already
-                    # uses for the paid path).
-                    st.markdown("**Draft & score the whole basket at once (subscription, $0)**")
-                    if st.button(
-                        f"Draft & score all {len(basket_jobs)} job(s)", key="basket_draftall",
-                        help="Runs the $0 subscription draft+score round for every job in your basket, one at a time. Not a paid call. Can take 40-90+ seconds per job.",
-                    ):
-                        draftall_placeholder = st.empty()
-                        results = {}
-                        for i, job in enumerate(basket_jobs, start=1):
-                            source, job_id = job.get("source"), job.get("job_id")
-                            draftall_placeholder.markdown(f":material/hourglass_top: [{i}/{len(basket_jobs)}] {job_label(job)}: drafting & scoring (subscription)...")
-                            try:
-                                outcome = run_subscription_round(job, load_profile())
-                            except Exception as exc:
-                                # Defense in depth, matching generate_for_basket()'s own
-                                # "one item's failure shouldn't stop the rest" pattern
-                                # (CLAUDE.md) - run_subscription_round() is documented to
-                                # only ever raise via its own (ReasonerUnavailable,
-                                # RuntimeError) handling, but a whole-basket loop with 10
-                                # real subprocess calls is exactly the place an unexpected
-                                # exception type would otherwise take the entire batch
-                                # down mid-run (real bug hit live 2026-08-17 verifying this
-                                # branch: a raw json.JSONDecodeError from a malformed
-                                # reasoner reply escaped uncaught and crashed the whole
-                                # Streamlit script - fixed at its source in
-                                # reasoner_cli.parse_json_reply(), this catch is the
-                                # belt-and-suspenders backstop for anything else like it).
-                                outcome = {"ok": False, "locked": False, "round": None, "resume_draft": None, "error": str(exc)}
-                            results[(source, job_id)] = outcome
-                        draftall_placeholder.markdown(":material/check_circle: Done.")
-                        st.session_state["panga_basket_draftall_results"] = results
-                        succeeded = sum(1 for r in results.values() if r["ok"])
-                        locked = sum(1 for r in results.values() if r.get("locked"))
-                        failed = len(results) - succeeded - locked
-                        summary = f"{succeeded} of {len(results)} job(s) drafted & scored."
-                        if locked:
-                            summary += f" {locked} skipped (already generating elsewhere)."
-                        if failed:
-                            summary += f" {failed} failed - see below."
-                        st.toast(summary, icon=":material/check_circle:" if not failed else ":material/warning:")
-                        st.rerun()
-                    draftall_results = st.session_state["panga_basket_draftall_results"]
-                    if draftall_results:
-                        failed_jobs = [
-                            job_label(j) for j in basket_jobs
-                            if (r := draftall_results.get((j.get("source"), j.get("job_id")))) and not r["ok"] and not r["locked"]
-                        ]
-                        if failed_jobs:
-                            st.markdown(f":material/error: Failed to draft: {', '.join(failed_jobs)} - use that job's Retry above.")
 
                     st.divider()
 
@@ -657,11 +1056,13 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                             key="basket_shared_qa_expander", expanded=True, on_change="rerun",
                         ):
                             st.markdown(
-                                "Answer these to raise the score further on each job's next subscription "
-                                "round - only used if you confirm they're true, nothing is ever invented. "
-                                "Some boxes are pre-filled with a proposed guess - edit it to whatever's "
-                                "actually true, or leave it blank to skip. Only the jobs you actually answer "
-                                "get redrafted."
+                                f"Only the highest-value gaps for each job (required-keyword gaps first, "
+                                f"ranked by real score impact) - not every possible question, and capped at "
+                                f"{MAX_QA_ROUNDS} rounds per job. Answer these to raise the score further on "
+                                "each job's next subscription round - only used if you confirm they're true, "
+                                "nothing is ever invented. Some boxes are pre-filled with a proposed guess - "
+                                "edit it to whatever's actually true, or leave it blank to skip. Only the jobs "
+                                "you actually answer get redrafted."
                             )
                             # question -> answered entry, grouped by job so only jobs with a real
                             # edited answer get redrafted (per Zahir's "answered together" design,
@@ -674,7 +1075,36 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                                 suggested_answer = q.get("suggested_answer") or ""
                                 with st.container(border=True):
                                     st.markdown(job_label(job))
-                                    st_markdown_raw_text(q["question"])
+                                    # Real "why does this one matter" indicator (2026-08-17,
+                                    # feature/basket-qa-impact-badge) - Zahir's live complaint:
+                                    # "there should be a score up indicator else why would
+                                    # anyone respond to questions." rank_and_cap_questions()
+                                    # in subscription_resume_qa.py already ranks required-
+                                    # keyword gaps ahead of preferred ones by real point_value
+                                    # (drafting._merge_keyword_gap_questions' own computed
+                                    # score impact, not a guess), but that ranking was never
+                                    # actually surfaced here - same badge/color convention
+                                    # already used for the single-job Discuss & draft panel
+                                    # above (~line 2494), reused rather than inventing new
+                                    # CSS: green "Required" for a required-keyword gap (top of
+                                    # the ranking), blue "Preferred" for a preferred-keyword
+                                    # gap (still real, smaller-tier), gray "standing pref" for
+                                    # a disqualifier_check, gray "value not yet known" for a
+                                    # free-form AI question with no matching extracted keyword
+                                    # (honest about what genuinely isn't computable, never a
+                                    # fabricated number).
+                                    badge_col, text_col = st.columns([1, 5])
+                                    with badge_col:
+                                        if q.get("type") == "disqualifier_check":
+                                            st.badge("standing pref", color="gray")
+                                        elif q.get("point_value") is not None:
+                                            tier_label = "Preferred" if q.get("is_preferred") else "Required"
+                                            tier_color = "blue" if q.get("is_preferred") else "green"
+                                            st.badge(f"{tier_label} +{q['point_value']:g} pts", color=tier_color)
+                                        else:
+                                            st.badge("value not yet known", color="gray")
+                                    with text_col:
+                                        st_markdown_raw_text(q["question"])
                                     answer_value = st.text_area(
                                         q["question"], value=suggested_answer, key=q_key,
                                         height=68, label_visibility="collapsed",
@@ -696,7 +1126,7 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                                 redraft_results = {}
                                 for i, (job_key, answer_entries) in enumerate(per_job_answers.items(), start=1):
                                     job = jobs_by_key[job_key]
-                                    submit_placeholder.markdown(f":material/hourglass_top: [{i}/{answered_job_count}] {job_label(job)}: applying your answers & redrafting...")
+                                    _status_line(submit_placeholder, f":material/hourglass_top: [{i}/{answered_job_count}] {job_label(job)}: applying your answers & redrafting...")
                                     try:
                                         redraft_results[job_key] = submit_answers_and_redraft(job, load_profile(), answer_entries)
                                     except Exception as exc:
@@ -923,6 +1353,70 @@ def _cta_auto_refresh_watcher() -> None:
     st.session_state[watch_key] = sig
     if previous is not None and previous != sig:
         st.rerun()
+
+
+@st.fragment(run_every="10s")
+def _render_task_monitor() -> None:
+    """Task Monitor tab's live body (2026-08-17) - defined at module level,
+    same as _cta_auto_refresh_watcher above, rather than nested inside the
+    tab's elif block, so it's decorated with @st.fragment exactly once per
+    process rather than being redefined on every rerun. Auto-refreshes on
+    its own 10s timer so elapsed time and liveness stay current without
+    Zahir needing to manually reload, and because it's a fragment, a tick
+    here never disturbs any other tab's own in-progress interaction.
+    Reads task_monitor.get_active_tasks() fresh every tick - never cached -
+    "not a black box" is the entire point of this view."""
+    tasks = get_active_tasks()
+    if not tasks:
+        st.success("Nothing currently in flight - no subscription rounds or paid builds running right now.")
+        return
+
+    stalled_tasks = [t for t in tasks if t["stalled"]]
+    if stalled_tasks:
+        st.error(f"{len(stalled_tasks)} job(s) below look genuinely stalled - PID confirmed dead or well past a normal call's duration, not just slow.")
+
+    for task in tasks:
+        with st.container(border=True):
+            title_col, status_col, pid_col, action_col = st.columns([3, 2, 2, 2])
+            with title_col:
+                # st.markdown throughout, never st.caption - this app's
+                # standing readability rule (CLAUDE.md's HCI section,
+                # enforced by tests/test_ui_readability_standard.py):
+                # st.caption renders under WCAG 1.4.3's 4.5:1 contrast
+                # minimum against this app's theme colors.
+                st.markdown(f"**{task['title']}**")
+                st.markdown(task["organization"])
+            with status_col:
+                kind_label = "Subscription draft" if task["kind"] == "subscription" else "Paid final build"
+                st.markdown(f"{kind_label} · `{task['status']}`")
+                st.markdown(f"Running {task['elapsed_label']}")
+            with pid_col:
+                if task["pid"] is None:
+                    st.markdown("PID not recorded yet")
+                elif task["kind"] == "paid_build":
+                    st.markdown(f"App process PID {task['pid']} (in-process API call, not an independent subprocess)")
+                elif task["pid_alive"]:
+                    st.markdown(f":material/check_circle: PID {task['pid']} alive")
+                else:
+                    st.markdown(f":material/cancel: PID {task['pid']} not running")
+            with action_col:
+                if task["stalled"]:
+                    st.markdown(task["stall_reason"] or "stalled")
+                    if st.button(
+                        "Stalled - reset & retry", key=f"reset_stalled_{task['kind']}_{task['source']}_{task['job_id']}",
+                        type="primary", width="stretch",
+                    ):
+                        reset_stalled_task(task["source"], task["job_id"], task["kind"])
+                        # scope="app" (not the fragment default) - the Task
+                        # Monitor tab's own "(N)" count badge is computed
+                        # OUTSIDE this fragment (in TABS, before the tab-
+                        # button row), so a fragment-only rerun would clear
+                        # this job's stalled row but leave the badge
+                        # showing the stale count until some unrelated
+                        # interaction happened to trigger a full rerun.
+                        st.rerun(scope="app")
+                else:
+                    st.markdown("Looks genuinely active")
 
 
 _PROGRESS_CHAR_RE = re.compile(r"([\d,]+) characters")
@@ -2599,7 +3093,9 @@ TAB_ICONS = {
     "support": ":material/support_agent:",
     "settings": ":material/settings:",
     "ops": ":material/monitoring:",
+    "monitor": ":material/pending_actions:",
 }
+_active_task_count = len(get_active_tasks())
 TABS = [
     ("cta", f"Call to action ({cta_count})" if cta_count else "Call to action"),
     ("results", f"Results ({results_count})"),
@@ -2614,6 +3110,12 @@ TABS = [
     # this codebase's standing "no custom CSS for theming" rule (native
     # Streamlit only) applies here the same as everywhere else.
     ("ops", "Ops :material/fiber_new:"),
+    # Task Monitor (2026-08-17) - real PID/liveness view over every
+    # in-flight subscription draft/Q&A round and paid final-build lock, so
+    # a stuck-looking background job can be checked against real evidence
+    # instead of guessing from the stored status string alone. Count badge
+    # mirrors the same "(N)" pattern every other tab above already uses.
+    ("monitor", f"Task Monitor ({_active_task_count})" if _active_task_count else "Task Monitor"),
 ]
 tab_cols = st.columns(len(TABS))
 for col, (key, label) in zip(tab_cols, TABS):
@@ -5858,3 +6360,23 @@ elif active_tab == "ops":
                 hide_index=True,
                 column_config={"_duration_ms": None},
             )
+
+elif active_tab == "monitor":
+    # Task Monitor (2026-08-17) - real answer to a problem hit live twice
+    # today: a stuck/slow-looking background subscription draft call or a
+    # `claude` CLI subprocess had no way to be checked - subscription_qa_
+    # status just says a string like "drafting", with no PID, no start
+    # time, no real liveness check. This view reads task_monitor.
+    # get_active_tasks() fresh on every render/tick (never cached - "not a
+    # black box" is the entire point) and shows real elapsed time plus a
+    # genuine OS-level liveness check for every non-idle job, so a job
+    # that's actually hung shows up as stalled here even while its stored
+    # status string still claims it's working.
+    render_feedback_widget("monitor")
+    st.header("Task Monitor")
+    st.markdown(
+        "Every subscription draft/Q&A round and paid final build currently "
+        "in flight, with the real OS process behind it - not just the "
+        "stored status string."
+    )
+    _render_task_monitor()

@@ -31,7 +31,13 @@ from llm_client import (
     get_client as _client,
     is_configured,
 )
-from skill_label_match import normalize_skill_label, skills_match
+from skill_label_match import (
+    build_already_known_units,
+    filter_questions_evidenced_in_profile,
+    normalize_skill_label,
+    skill_evidenced_in_text,
+    skills_match,
+)
 from tailoring.ats_score import STANDARD_HEADERS, detect_keyword_wording_regressions, detect_matched_keyword_regressions, plateau_note_for_gaps, score_resume_against_keywords, score_resume_ats
 from tailoring.baseline_resume import select_baseline_resume_text
 from tailoring.claim_verification import flag_unverified_resume_claims
@@ -1112,8 +1118,25 @@ def _profile_supports_skill(term: str, profile: dict | None) -> bool:
     active-cross-referencing instruction for where that layer lives
     instead). This only catches a real, if under-surfaced, literal-or-
     near-literal match - e.g. a certification or skill-list entry that
-    states the term but never made it into this specific tailored draft."""
-    return any(skills_match(term, unit) for unit in _profile_narrative_units(profile))
+    states the term but never made it into this specific tailored draft.
+
+    2026-08-17 real production incident added a second, complementary
+    check: skills_match() per-unit above requires the WHOLE term to
+    appear as one contiguous phrase within (or containing) a single
+    profile unit - it still misses a genuinely-covered fact whose words
+    are scattered differently, e.g. term "onshore/offshore teams" against
+    the real bullet "Led a team of 8 (onshore/offshore)" (singular
+    "team", word order "team...onshore/offshore" not "onshore/offshore
+    team[s]") - not a contiguous phrase match either direction, so the
+    per-unit loop above genuinely can't catch it. skill_evidenced_in_text()
+    is looser but conjunctive (every significant word must appear
+    somewhere, not as one contiguous phrase) and searches the FULL known
+    corpus (profile units AND gap-answer free text) at once rather than
+    per-unit - see skill_label_match.py's own docstring for the exact
+    real case this closes."""
+    if any(skills_match(term, unit) for unit in _profile_narrative_units(profile)):
+        return True
+    return skill_evidenced_in_text(term, build_already_known_units(profile))
 
 
 def _suggested_answer_for_keyword_gap(term: str, profile: dict | None) -> str:
@@ -1240,6 +1263,18 @@ def _merge_keyword_gap_questions(
     already_asked += [s for s in (previously_answered_skills or []) if s]
     already_asked_for_preferred = already_asked + [item["label"] for item in missing_required_keywords]
     keyword_gap_lookup = list(missing_required_keywords) + list(missing_preferred_keywords or [])
+    # 2026-08-17 real production incident (see skill_label_match.py's own
+    # docstring item 3) - computed once, not per question/keyword, since
+    # it scans the whole profile: the same conjunctive, code-level
+    # backstop _profile_supports_skill() already uses below for the
+    # missing_required/preferred_keywords loops, applied here too so a
+    # pre-existing/AI-proposed free-form clarifying_question whose fact is
+    # already stated in the candidate's own profile text (a gap-answer's
+    # free text, or a work_history/client_engagements bullet) - not just
+    # a matching previously_answered_skills LABEL - gets the same
+    # treatment, regardless of which of this function's callers it came
+    # from.
+    already_known_units = build_already_known_units(profile)
     merged = []
     for q in clarifying_questions:
         # Real bug found live (2026-08-09, surfaced by app.py adding an
@@ -1258,7 +1293,10 @@ def _merge_keyword_gap_questions(
         # fresh rerun right after saving re-renders the identical
         # already-answered text_area, which still differs from its
         # suggested_answer, saving and rerunning again forever.
-        if q.get("skill") and any(_same_skill(q["skill"], s) for s in (previously_answered_skills or [])):
+        if q.get("skill") and (
+            any(_same_skill(q["skill"], s) for s in (previously_answered_skills or []))
+            or skill_evidenced_in_text(q["skill"], already_known_units)
+        ):
             continue
         match = None
         if q.get("point_value") is None and q.get("skill"):
@@ -1627,6 +1665,12 @@ def _finalize_resume_draft(data: dict, job: dict | None, profile: dict | None) -
         ]))
         ats = score_resume_ats(posting_text, resume_text)
     previously_answered_skills = [a.get("skill") for a in (profile or {}).get("gap_interview_answers", [])]
+    # _merge_keyword_gap_questions() itself now runs the deterministic
+    # already-known-profile-text check (2026-08-17 real production
+    # incident - see skill_label_match.py's own docstring item 3) over
+    # the raw AI-proposed clarifying_questions below, not just previously_
+    # answered_skills' label-only match - no separate pre-filter needed
+    # here.
     merged_questions = _merge_keyword_gap_questions(
         data.get("clarifying_questions", []), ats.get("missing_required_keywords", []),
         previously_answered_skills, profile,
@@ -2606,6 +2650,14 @@ def request_additional_gap_questions(
         q for q in data.get("clarifying_questions", [])
         if q.get("skill") and not any(skills_match(q["skill"], covered) for covered in already_covered)
     ]
+    # Same deterministic backstop as _finalize_resume_draft (2026-08-17,
+    # real production incident - see skill_label_match.py's own docstring
+    # item 3): the already_covered check above only matches a proposed
+    # question's "skill" LABEL against prior skill LABELS. It cannot catch
+    # a fact already confirmed inside the free-text ANSWER of a
+    # differently-labeled gap entry, or stated directly in a work_history/
+    # client_engagements bullet that was never a "gap" question at all.
+    new_questions = filter_questions_evidenced_in_profile(new_questions, build_already_known_units(profile))
     return {
         "added_count": len(new_questions),
         "new_questions": new_questions,

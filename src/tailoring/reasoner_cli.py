@@ -54,7 +54,7 @@ class ReasonerUnavailable(Exception):
     this clearly rather than treating it as an ordinary per-job error."""
 
 
-def run_claude_cli(prompt: str, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS) -> str:
+def run_claude_cli(prompt: str, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS, on_start=None) -> str:
     """Invokes the `claude` CLI in non-interactive print mode as a fresh,
     synchronous subprocess and returns its final text reply. Blocks until
     the subprocess returns a result or times out - never depends on any
@@ -67,6 +67,23 @@ def run_claude_cli(prompt: str, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS) 
     tool-permission prompt on) - safe here because every prompt built by
     this module's callers only ever asks for a JSON text reply; no
     file/bash tool use is requested, expected, or needed.
+
+    on_start(pid: int), if given, fires with the REAL OS process ID of the
+    `claude` subprocess this exact call just launched, as soon as it's
+    known (right after the process starts, before this function blocks
+    waiting for it to finish) - added 2026-08-17 so a caller can persist
+    that PID (and a start timestamp) onto the application record it's
+    working on, closing the real gap Zahir hit live twice today:
+    subscription_qa_status only ever said a string like "drafting", with
+    no way to tell WHICH of several concurrently-running `claude` OS
+    processes (confirmed live: `Get-Process claude` returned 16
+    unlabeled ones) belongs to which job, or whether that specific process
+    is still alive vs. genuinely hung. Uses subprocess.Popen (not
+    subprocess.run) specifically so the real PID is available before the
+    call blocks - subprocess.run only returns after the process has
+    already exited, too late to ever record its PID for a still-running
+    call. Never called if the process fails to start at all (the
+    FileNotFoundError case below) - there is no real PID in that case.
 
     The prompt is piped via stdin, NOT passed as a `-p <prompt>` argv
     element - a real bug found live-verifying this module (2026-08-13):
@@ -84,8 +101,13 @@ def run_claude_cli(prompt: str, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS) 
     passes the prompt as an argv element) - flagged for Release Manager
     to reconcile at merge time (see this module's own top docstring)."""
     try:
-        proc = subprocess.run(
+        # subprocess.Popen, not subprocess.run - see on_start's own
+        # docstring note above for why: run() blocks until the process has
+        # already exited before handing back anything, so there's no point
+        # in its lifetime a caller could ever observe a still-running PID.
+        proc = subprocess.Popen(
             ["claude", "-p", "--output-format", "json", "--permission-mode", "bypassPermissions"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             # Real bug found live 2026-08-17 (feature/jd-keyword-taxonomy-gaps,
             # Phase 1 verification against real job posting text): plain
             # text=True lets subprocess pick stdin's encoding from
@@ -107,18 +129,33 @@ def run_claude_cli(prompt: str, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS) 
             # posting with non-Latin1 text; fixed here rather than worked
             # around locally since it's the shared mechanism, not a bug in
             # any one caller.
-            input=prompt, capture_output=True, text=True, encoding="utf-8", timeout=timeout_seconds, check=False,
+            text=True, encoding="utf-8",
         )
     except FileNotFoundError as exc:
         raise ReasonerUnavailable("The 'claude' CLI isn't installed or isn't on PATH on this machine.") from exc
+
+    if on_start:
+        on_start(proc.pid)
+
+    try:
+        stdout, stderr = proc.communicate(input=prompt, timeout=timeout_seconds)
     except subprocess.TimeoutExpired as exc:
+        # communicate()'s own docs are explicit that a caught TimeoutExpired
+        # leaves the child process still running (unlike subprocess.run,
+        # which kills it for you) - without this, a timed-out call would
+        # leave an orphaned `claude` process behind with nothing left
+        # tracking it (this function's own caller already marked the job
+        # "failed" and moved on), exactly the kind of untracked zombie
+        # process this whole feature exists to prevent, not just to detect.
+        proc.kill()
+        proc.communicate()
         raise RuntimeError(f"Reasoner call timed out after {timeout_seconds}s without returning.") from exc
     if proc.returncode != 0:
-        raise RuntimeError(f"claude CLI exited with code {proc.returncode}: {(proc.stderr or '').strip()[:500]}")
+        raise RuntimeError(f"claude CLI exited with code {proc.returncode}: {(stderr or '').strip()[:500]}")
     try:
-        envelope = json.loads(proc.stdout)
+        envelope = json.loads(stdout)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"claude CLI returned non-JSON output: {proc.stdout[:500]}") from exc
+        raise RuntimeError(f"claude CLI returned non-JSON output: {stdout[:500]}") from exc
     if envelope.get("is_error"):
         raise RuntimeError(f"claude CLI reported an error: {str(envelope.get('result', ''))[:500]}")
     return envelope.get("result", "")

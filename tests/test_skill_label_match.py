@@ -1,4 +1,12 @@
-from skill_label_match import normalize_skill_label, skills_match
+from skill_label_match import (
+    build_already_known_units,
+    filter_questions_evidenced_in_profile,
+    filter_questions_not_asked_before,
+    normalize_skill_label,
+    question_text_similarity,
+    skill_evidenced_in_text,
+    skills_match,
+)
 
 
 def test_normalize_skill_label_is_public_and_used_by_drafting_py():
@@ -45,3 +53,163 @@ def test_genuinely_different_wording_does_not_match():
 def test_empty_labels_never_match():
     assert skills_match("", "") is False
     assert skills_match("", "Databricks") is False
+
+
+# --- 2026-08-17 real production incident (skill_label_match.py's own
+# docstring item 3): Zahir was asked "The posting requires 'onshore/
+# offshore teams' - do you have real, genuine experience with it?" even
+# though (a) that exact fact is buried inside the free-text ANSWER to a
+# DIFFERENTLY-labeled gap question ("si partner relationships", answered
+# 2026-08-07 - the "skill" LABEL never mentions onshore/offshore at all)
+# and (b) it's stated directly across several real work_history/
+# client_engagements bullets. Both facts confirmed against the real
+# production master_profile.json before writing this test - not a
+# synthetic guess at the shape of the data. skills_match()/label-only
+# dedup can never catch either case; build_already_known_units() +
+# skill_evidenced_in_text() are the real fix.
+
+_REAL_SI_PARTNER_GAP_ANSWER = (
+    "Yes. I have substantial experience building and managing "
+    "systems-integrator (SI), managed-service-provider, and strategic "
+    "technology-partner relationships across enterprise transformation "
+    "programmes.\n\nAt SK Life Science, I directed specialist partners "
+    "supporting SAP S/4HANA, Ariba, Veeva, data/MDM, cybersecurity, "
+    "validation, helpdesk, NOC, and SOC operations. I owned vendor "
+    "selection, statements of work, delivery governance, performance "
+    "management, budget oversight, service quality, and compliance "
+    "accountability.\n\nEarlier, in consulting leadership roles, I "
+    "managed multi-client delivery programmes and partner relationships "
+    "with IBM, Microsoft, TIBCO, Tableau, QlikView, Tamr, and Kalido for "
+    "organisations including Eisai, AbbVie, TD Bank, Great American "
+    "Insurance, and Univision. I coordinated onshore and offshore "
+    "delivery teams, aligned partners to business outcomes, and ensured "
+    "delivery across data, analytics, MDM, cloud, and integration "
+    "initiatives."
+)
+
+
+def _real_shaped_profile() -> dict:
+    return {
+        "gap_interview_answers": [
+            {
+                "skill": "si partner relationships",
+                "answer": _REAL_SI_PARTNER_GAP_ANSWER,
+                "canonical_skill_id": "systems_integrator_delivery_partner_names",
+                "is_disqualifier": False,
+            },
+        ],
+        "work_history": [
+            {
+                "employer": "Streebo, Inc.",
+                "title": "US Professional Services Director",
+                "bullets": ["Managed 25 US-based and 50 offshore consultants."],
+            },
+        ],
+        "client_engagements": [
+            {
+                "client": "The Brick (Canada)",
+                "bullets": ["Led team of 15 consultants (onshore/offshore)."],
+            },
+        ],
+    }
+
+
+def test_skill_label_alone_would_miss_the_real_onshore_offshore_case():
+    # Documents WHY this bug reached a real user: the pre-existing,
+    # label-only dedup (skills_match against gap_interview_answers'
+    # "skill" field) genuinely cannot catch this - the label stored is
+    # "si partner relationships", not "onshore/offshore teams".
+    assert skills_match("onshore/offshore teams", "si partner relationships") is False
+
+
+def test_skill_evidenced_in_text_catches_fact_buried_in_a_differently_labeled_answer():
+    corpus = build_already_known_units(_real_shaped_profile())
+    assert skill_evidenced_in_text("onshore/offshore teams", corpus) is True
+
+
+def test_skill_evidenced_in_text_catches_fact_stated_only_in_a_resume_bullet():
+    profile = {"gap_interview_answers": [], "work_history": [
+        {"employer": "Eisai Pharmaceuticals", "bullets": ["Led a team of 8 (onshore/offshore)."]},
+    ], "client_engagements": []}
+    corpus = build_already_known_units(profile)
+    assert skill_evidenced_in_text("onshore/offshore teams", corpus) is True
+
+
+def test_skill_evidenced_in_text_requires_at_least_two_significant_words():
+    # Single-word labels are deliberately left to skills_match()/
+    # previously_answered_skills - a conjunctive one-word "match" would be
+    # a bare, unqualified presence check and far too prone to false
+    # positives (see this function's own docstring).
+    corpus = build_already_known_units(_real_shaped_profile())
+    assert skill_evidenced_in_text("delivery", corpus) is False
+
+
+def test_skill_evidenced_in_text_does_not_false_positive_on_unrelated_label():
+    corpus = build_already_known_units(_real_shaped_profile())
+    assert skill_evidenced_in_text("kubernetes cluster administration", corpus) is False
+
+
+def test_filter_questions_evidenced_in_profile_drops_the_real_reported_question():
+    corpus = build_already_known_units(_real_shaped_profile())
+    questions = [
+        {
+            "type": "skill_gap",
+            "skill": "onshore/offshore teams",
+            "question": "The posting requires \"onshore/offshore teams\" - do you have real, genuine experience with it?",
+            "suggested_answer": "",
+        },
+        {
+            "type": "skill_gap",
+            "skill": "kubernetes cluster administration",
+            "question": "The posting requires \"kubernetes cluster administration\" - do you have real, genuine experience with it?",
+            "suggested_answer": "",
+        },
+    ]
+    filtered = filter_questions_evidenced_in_profile(questions, corpus)
+    assert [q["skill"] for q in filtered] == ["kubernetes cluster administration"]
+
+
+def test_filter_questions_evidenced_in_profile_empty_corpus_keeps_everything():
+    questions = [{"skill": "onshore/offshore teams", "question": "x"}]
+    assert filter_questions_evidenced_in_profile(questions, "") == questions
+
+
+def test_build_already_known_units_handles_missing_profile():
+    assert build_already_known_units(None) == []
+    assert build_already_known_units({}) == []
+
+
+# --- question_text_similarity() / filter_questions_not_asked_before()
+# (2026-08-17, target-driven QA loop cross-round dedup) ---
+
+
+def test_question_text_similarity_high_for_reworded_same_question():
+    a = "Do you have real, hands-on Databricks experience you can describe for this role?"
+    b = "Can you describe your real, hands-on Databricks experience for this role?"
+    assert question_text_similarity(a, b) >= 0.6
+
+
+def test_question_text_similarity_low_for_genuinely_different_questions():
+    a = "Do you have real, genuine experience with Databricks?"
+    b = "Have you ever owned a P&L before?"
+    assert question_text_similarity(a, b) < 0.6
+
+
+def test_question_text_similarity_identical_is_one():
+    text = "Do you have real, genuine experience with Kubernetes?"
+    assert question_text_similarity(text, text) == 1.0
+
+
+def test_filter_questions_not_asked_before_drops_reworded_repeat():
+    prior = ["Do you have real, hands-on Databricks experience you can describe for this role?"]
+    questions = [
+        {"skill": "Databricks", "question": "Can you describe your real, hands-on Databricks experience for this role?"},
+        {"skill": "P&L ownership", "question": "Have you ever owned a P&L before?"},
+    ]
+    filtered = filter_questions_not_asked_before(questions, prior)
+    assert [q["skill"] for q in filtered] == ["P&L ownership"]
+
+
+def test_filter_questions_not_asked_before_empty_history_keeps_everything():
+    questions = [{"skill": "x", "question": "q"}]
+    assert filter_questions_not_asked_before(questions, []) == questions

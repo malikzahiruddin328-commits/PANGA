@@ -473,8 +473,40 @@ def set_discussion_status(
 # the round/score history survives across sessions.
 QA_STATUSES = {"drafting", "generating_questions", "awaiting_answers", "redrafting", "failed"}
 
+# The subset of QA_STATUSES that represent an actual subscription call in
+# flight (as opposed to "awaiting_answers" - idle, waiting on the user to
+# fill in a form - or "failed" - a terminal state already surfaced to the
+# user with its own Retry). Real observed single-call duration is 40-90s
+# (Zahir, live production, 2026-08-17); 5 minutes is roughly 3-4x that, well
+# past any realistic legitimate call, so a job still showing one of these
+# after that long almost certainly means the process that set it (app
+# restart, killed subprocess, crash) never got to update it - not a call
+# that's merely running long. Kept deliberately much shorter than
+# _GENERATION_LOCK_STALE_AFTER_MINUTES (20) above: that constant is tuned
+# for the PAID generate_for_job() path, which can legitimately run several
+# minutes across its own self-correction retries: this subscription path is
+# a single `claude` CLI call with no such retry loop, so a much tighter
+# staleness bound is both safe and necessary here (a 20-minute wait to
+# recover a dead subscription draft is exactly the "no visible way to
+# recover" gap Zahir reported, 2026-08-17).
+#
+# Also reused (2026-08-17, real PID/timing tracking) by set_qa_status()
+# below to decide whether a passed-in pid/started_at should actually be
+# kept or forced back to None (there's only a real `claude` CLI subprocess
+# to point at while one of these is active), and by task_monitor.py to
+# decide which records are worth a real OS-level liveness check at all -
+# deliberately the SAME constant as the stale-drafting fix's own "which
+# statuses represent a real call in flight" set, not a second, parallel
+# one that could silently drift out of sync with it.
+_QA_ACTIVE_STATUSES = {"drafting", "generating_questions", "redrafting"}
+_QA_STATUS_STALE_AFTER_MINUTES = 5
+MAX_STALE_QA_AUTO_RETRIES = 2
 
-def set_qa_status(source: str, job_id: str, status: str | None, error: str | None = None) -> None:
+
+def set_qa_status(
+    source: str, job_id: str, status: str | None, error: str | None = None,
+    pid: int | None = None, started_at: str | None = None,
+) -> None:
     """Tracks where a job's in-app subscription draft/Q&A loop is right
     now - "drafting" (initial or re-draft subscription call in flight),
     "generating_questions" (subscription call generating this round's
@@ -487,9 +519,46 @@ def set_qa_status(source: str, job_id: str, status: str | None, error: str | Non
     get-or-create/lock-free stamping pattern as set_discussion_status()
     above, deliberately mirrored rather than reusing that function
     directly - this is a genuinely different state machine (an iterative
-    free loop with no message board involved), not the same one."""
+    free loop with no message board involved), not the same one.
+
+    Also stamps subscription_qa_status_at (2026-08-17) whenever status is
+    set to a real (non-None) value - the timestamp is_qa_status_stale()
+    below reads to tell a genuinely-still-running call apart from one whose
+    owning process died before it could ever clear its own status. Popped
+    (not left stale) when status clears to None, matching release_
+    generation_lock()'s own pop-on-clear convention just above.
+
+    pid/started_at (2026-08-17, real PID/timing tracking - a separate,
+    complementary fix landed alongside the staleness/auto-retry work
+    above): the REAL OS process ID of the `claude` CLI subprocess this
+    round's call is actually running as, and when it started - not just a
+    status string or a "how long has it been" timestamp. This is the
+    concrete fix for a real problem hit live twice: with only a status
+    string to go on, there was no way to tell which of several
+    concurrently-running `claude` OS processes (`Get-Process claude`
+    returned 16 unlabeled ones) belonged to this job, or whether it was
+    still genuinely alive vs. hung. Callers pass these via reasoner_cli.
+    run_claude_cli()'s on_start callback, right as the subprocess actually
+    starts - see subscription_resume_qa.py and discuss_and_draft.py for
+    the wiring. tailoring.task_monitor's Task Monitor view is what
+    actually reads this real PID for a live liveness check, alongside
+    (not instead of) is_qa_status_stale()'s own time-based signal above -
+    together they catch both a dead-but-recent process (PID check, faster)
+    and a process this app simply has no PID record for yet or can't
+    verify (time-based fallback).
+
+    Only ever stored when `status` is one of _QA_ACTIVE_STATUSES (there's
+    a real subprocess to point at); for every other status (None,
+    "awaiting_answers", "failed") pid/started_at are forced back to None
+    regardless of what's passed, so a stale PID from a previous round can
+    never linger and be mistaken for the current one - this is the same
+    "clear stale state, don't just stop updating it" principle CLAUDE.md's
+    HCI section calls out for Streamlit widgets, applied here to persisted
+    process state instead."""
     if status is not None and status not in QA_STATUSES:
         raise ValueError(f"status must be one of {QA_STATUSES} or None, got {status!r}")
+    if status not in _QA_ACTIVE_STATUSES:
+        pid, started_at = None, None
     if get_application(source, job_id) is None:
         upsert_application(source, job_id, status="under review")
     with locked("applications"):
@@ -498,13 +567,114 @@ def set_qa_status(source: str, job_id: str, status: str | None, error: str | Non
             if app["source"] == source and app["job_id"] == job_id:
                 app["subscription_qa_status"] = status
                 app["subscription_qa_error"] = error
+                app["subscription_qa_pid"] = pid
+                app["subscription_qa_started_at"] = started_at
+                if status is not None:
+                    app["subscription_qa_status_at"] = datetime.now(timezone.utc).isoformat()
+                else:
+                    app.pop("subscription_qa_status_at", None)
                 _save_all(applications)
                 _write_dossier(source, job_id)
                 return
         raise KeyError(f"no application record for ({source!r}, {job_id!r}) even after creation")
 
 
-def record_subscription_qa_round(source: str, job_id: str, ats_score: int | None, draft_source: str = "subscription") -> int:
+def is_qa_status_stale(app_record: dict) -> bool:
+    """True if this application's subscription_qa_status is an active
+    ("drafting"/"generating_questions"/"redrafting") state that's been set
+    for longer than _QA_STATUS_STALE_AFTER_MINUTES - a real signal the
+    owning process died mid-call rather than merely running long. Pure/no
+    store I/O (mirrors needs_edit_review() above) so callers can check an
+    already-loaded record cheaply, e.g. once per row on every basket
+    render, without a file read per job."""
+    status = app_record.get("subscription_qa_status")
+    if status not in _QA_ACTIVE_STATUSES:
+        return False
+    status_at = app_record.get("subscription_qa_status_at")
+    if not status_at:
+        # An active status with no timestamp can only be a pre-2026-08-17
+        # record (this field didn't exist before) - treat as stale rather
+        # than trusting it forever, since there's no way to tell its real
+        # age and a stuck-forever record is exactly the bug being fixed.
+        return True
+    age_minutes = (datetime.now(timezone.utc) - datetime.fromisoformat(status_at)).total_seconds() / 60
+    return age_minutes >= _QA_STATUS_STALE_AFTER_MINUTES
+
+
+def clear_stale_qa_status(source: str, job_id: str) -> bool:
+    """Atomically re-checks staleness under the SAME lock right before
+    clearing (not just trusting an earlier is_qa_status_stale() call made
+    while rendering the row) and, only if it's genuinely still stale at
+    that exact moment, resets subscription_qa_status to None AND force-
+    releases the paired generation lock (generation_lock_acquired_at) -
+    both fields get set together by the same dead call, so recovering one
+    without the other would leave try_acquire_generation_lock() still
+    reporting "locked" for up to another 20 minutes (_GENERATION_LOCK_
+    STALE_AFTER_MINUTES), defeating the whole point of a tighter,
+    subscription-specific staleness bound.
+
+    Returns True if it actually cleared something (caller should proceed
+    with a retry); False if the status was no longer stale by the time this
+    ran under lock (the real call finished, or another caller already
+    recovered it, in the gap between the caller's own check and this call)
+    - in that case nothing is touched and the caller must NOT retry, to
+    avoid two live drafts racing for the same job (the same "read-modify-
+    write safe if run twice" discipline CLAUDE.md requires for shared
+    state, applied here as a genuine check-then-act done entirely inside
+    one locked() section rather than two separate steps)."""
+    with locked("applications"):
+        applications = load_applications()
+        for app in applications:
+            if app["source"] == source and app["job_id"] == job_id:
+                if not is_qa_status_stale(app):
+                    return False
+                app["subscription_qa_status"] = None
+                app["subscription_qa_error"] = None
+                app.pop("subscription_qa_status_at", None)
+                app.pop("generation_lock_acquired_at", None)
+                _save_all(applications)
+                _write_dossier(source, job_id)
+                return True
+        return False
+
+
+def increment_qa_stale_retry_count(source: str, job_id: str) -> int:
+    """Bumps subscription_qa_stale_retry_count (bounded auto-retry counter
+    for a detected-stale draft, capped by callers at MAX_STALE_QA_AUTO_
+    RETRIES) and returns the new count. Same locked read-modify-write
+    pattern as record_subscription_qa_round() below - never a read-then-
+    separate-write from the caller."""
+    with locked("applications"):
+        applications = load_applications()
+        for app in applications:
+            if app["source"] == source and app["job_id"] == job_id:
+                count = app.get("subscription_qa_stale_retry_count", 0) + 1
+                app["subscription_qa_stale_retry_count"] = count
+                _save_all(applications)
+                return count
+        return 0
+
+
+def reset_qa_stale_retry_count(source: str, job_id: str) -> None:
+    """Clears the counter above once a round actually completes
+    successfully - a job that stalls once, gets auto-retried, and then
+    succeeds shouldn't have that history count against a LATER, unrelated
+    stall (the cap is "2 in a row without a real success between them", not
+    a lifetime limit)."""
+    with locked("applications"):
+        applications = load_applications()
+        for app in applications:
+            if app["source"] == source and app["job_id"] == job_id:
+                if app.get("subscription_qa_stale_retry_count"):
+                    app["subscription_qa_stale_retry_count"] = 0
+                    _save_all(applications)
+                return
+
+
+def record_subscription_qa_round(
+    source: str, job_id: str, ats_score: int | None, draft_source: str = "subscription",
+    loop_state: str | None = None, newly_asked_question_texts: list[str] | None = None,
+) -> int:
     """Appends one entry to subscription_ats_score_history and bumps
     subscription_qa_round - called once per completed subscription draft
     round (the very first draft, and every re-draft after answers are
@@ -519,7 +689,24 @@ def record_subscription_qa_round(source: str, job_id: str, ats_score: int | None
     paid generate_for_job() draft (which never calls this - it's recorded
     via the ordinary resume_text/resume_ats_score fields, same as it
     always has been) - kept here mainly so a future reader of the raw JSON
-    can tell every history entry really was a $0 round."""
+    can tell every history entry really was a $0 round.
+
+    loop_state (2026-08-17, target-driven QA loop) - one of "ready"
+    (ats_score already >= the 90 target, no more questions), "plateaued"
+    (hit the 3-round hard cap still under 90 - the user's explicit call
+    whether to still build) or "in_progress" (below target, rounds
+    remain) - stamped onto the record in the SAME locked write as the
+    round bump so a reader never sees a round number that's ahead of the
+    state describing it. None leaves the existing value untouched.
+
+    newly_asked_question_texts (same feature) - the real, full question
+    text surfaced (or considered and ranked out) THIS round, appended to
+    subscription_qa_asked_question_texts so a LATER round's generation
+    prompt and skill_label_match.filter_questions_not_asked_before() can
+    both see the complete real history of what this exact job has already
+    been asked, not just this round's own output. Appended, never
+    replaced - each round's questions add to the running history, they
+    don't reset it."""
     with locked("applications"):
         applications = load_applications()
         for app in applications:
@@ -534,6 +721,12 @@ def record_subscription_qa_round(source: str, job_id: str, ats_score: int | None
                 })
                 app["subscription_ats_score_history"] = history
                 app["subscription_qa_round"] = round_number
+                if loop_state is not None:
+                    app["subscription_qa_loop_state"] = loop_state
+                if newly_asked_question_texts:
+                    asked = app.get("subscription_qa_asked_question_texts") or []
+                    asked = asked + [t for t in newly_asked_question_texts if t]
+                    app["subscription_qa_asked_question_texts"] = asked
                 _save_all(applications)
                 _write_dossier(source, job_id)
                 return round_number

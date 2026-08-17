@@ -12,18 +12,29 @@ call, on jobs already sitting in the store), this runs on EVERY job coming
 out of EVERY search channel (USAJOBS, ZipRecruiter, Dice, Indeed, company
 sites, industry boards) before search.job_store.save_jobs() ever writes a
 record - so it must stay purely deterministic (no AI call, no network
-call) to be cheap enough to run at that volume. Four layers:
+call) to be cheap enough to run at that volume. Nine layers (plus a
+pharma/clinical/regulatory extension merged in on top, see below):
 
 1. Seniority-tier exclusion: the candidate (Zahir) is a 25-year VP/CIO/
    Head-of-IT executive. An individual-contributor-tier noun in the title
    (Engineer, Analyst, Specialist, Consultant, Scientist, Representative,
    Coordinator, Associate) almost always means a near-zero fit_score
    regardless of domain match - UNLESS the title is also Director-level or
-   above (Director, VP, Vice President, Head, Chief, President, SVP,
-   EVP), which qualifies it back in. "Senior Systems Engineer" excludes
-   (Engineer, no qualifier); "Senior Director" and "Associate Director"
-   both keep (Director qualifies "Associate" the same way it qualifies
-   "Senior").
+   above (Director, VP, Vice President, Head, Chief, President, SVP, EVP,
+   CIO, CISO, CTO), which qualifies it back in. "Senior Systems Engineer"
+   excludes (Engineer, no qualifier); "Senior Director" and "Associate
+   Director" both keep (Director qualifies "Associate" the same way it
+   qualifies "Senior"). Fixed 2026-08-17: the bare abbreviations "CIO"/
+   "CISO"/"CTO" were missing from the qualifier list - only spelled-out
+   words and other abbreviations (VP, SVP, EVP) were recognized, so a
+   real production title, "Associate CIO, Administrative Applications"
+   (Princeton University, via Dice), was wrongly excluded here:
+   "Associate" alone doesn't qualify, and "CIO" wasn't recognized as an
+   exec-qualifying word, so the IC-tier "Associate" noun went unchallenged
+   (confirmed in the live exclusion log, 2026-08-13 and 2026-08-17
+   occurrences of the exact same title). Added with \b word boundaries so
+   they only match as standalone abbreviations (e.g. never as a substring
+   of an unrelated word).
 2. Clinical/medical domain exclusion: Medical Director, Physician, Nurse
    Practitioner, Registered Nurse, Clinical Research/Development/
    Scientist/Pharmacology, Medical Science Liaison, Medical Advisor,
@@ -112,6 +123,82 @@ call) to be cheap enough to run at that volume. Four layers:
    Platform Engineering"/"CIO"/"CTO"/"Engineering Manager"-shaped title in
    the store - none of those 100+ leadership titles contain the bare
    "engineer"/"architect" noun this layer keys on.
+6. Project/Program/Product management track exclusion (built 2026-08-13 on
+   the feature/pm-intern-exclusion branch; merged into this file
+   2026-08-17 alongside layers 3-5 which were built independently on
+   master the same week - see check_exclusion()'s docstring on layer
+   ordering). PM/PgM/ProdM is a DIFFERENT career track from Zahir's
+   IT-leadership target (CIO/CISO/Director-VP-Head of IT) even at
+   Director/VP level - "Project Director," "Program Director," "VP of
+   Product Management" are all genuinely senior titles that would
+   otherwise SURVIVE layer 1 (which only filters IC-level titles, not
+   Director+/VP+), so this needs its own independent layer, same as
+   clinical. Scoped narrowly to the literal noun phrase (project/program/
+   product immediately followed by manager/management/director, or the
+   PMO acronym) specifically so it does NOT catch a real validated KEEP
+   like "Director, IT Service Continuity" or "IT Director, Vendor
+   Management" (neither contains "project/program/product" immediately
+   before "manager/management/director") - validated 2026-08-13 against
+   the full live job store (140 real occurrences / 113 unique titles
+   matched, incl. "Project Director," "DHS PROGRAM DIRECTOR 4 - 79704,"
+   "VP of Product Management, Monetization," "Head of Product Management
+   - Intelligence Ventures" - the exact real examples Zahir flagged from
+   the review queue). Re-validated 2026-08-17 against today's larger,
+   changed live store as part of the merge - see the retroactive-sweep
+   report for current counts.
+7. Intern/internship exclusion (built 2026-08-13, same branch as layer 6):
+   any title indicating the posting itself IS an internship/entry-level
+   intern role. Reuses layer 1's _EXEC_QUALIFIER_PATTERN as an exemption,
+   same shape as the seniority layer's own IC-noun/exec-qualifier logic -
+   a title containing "internship" that ALSO carries an executive-
+   qualifying word ("Dietitian (Dietetic Internship Director)," a real
+   title in the live store) is a role that DIRECTS an internship program,
+   not an intern position, and must not be caught; plain intern postings
+   ("Intern - Biotechnologist (Protein)," "Fall 2026 IT Intern (...)")
+   carry no such qualifier and are excluded.
+8. Information-security-domain exclusion (built 2026-08-13, same branch as
+   layers 6-7, Zahir's explicit request after manually rejecting "VP,
+   Information Security and Compliance" (Veritone Corp) and "Director of
+   Information Security (Hybrid)" (SAGE Dining Services) from the live
+   review queue and saying "add that to the filter as well"). Originally
+   scoped narrowly to the literal "information security"/"infosec"
+   phrase; broadened the same day (Zahir's explicit option-B choice on a
+   direct two-option question) to match ANY title containing the word
+   "security" at all - including combined IT+Security leadership titles
+   like "Director, IT & Security" and "Head of Infrastructure &
+   Security," not just pure security-specialist titles. Verified against
+   the real live job store: 35 real titles containing "security" but not
+   "information security" were being missed under the old narrow pattern
+   (examples: "API Security Engineer," "Director of IT Platforms &
+   Security," "Director, IT & Security," "Head of Cyber Security," "Head
+   of Infrastructure & Security," "IT Security Director," "SVP, Network
+   Security Engineering Lead," "Transportation Security Officer," "VP HR,
+   Safety & Security," "Vice President, Software Supply Chain Security")
+   - all now excluded under the broadened pattern.
+
+   This layer originally exempted the literal "Chief Information Security
+   Officer" phrase and the bare "CISO" abbreviation from exclusion, on the
+   reasoning that fit_score (not search-time filtering) should be the
+   layer that scores CISO roles low. Zahir explicitly overrode that
+   2026-08-13: "ciso and security... must be excluded from the initial
+   fetch" - he wants CISO excluded at search/fetch time too, not just
+   scored low later. This matches his own real profile data
+   (`data/profile/structured/master_profile.json`): "Zahir does NOT
+   consider himself qualified for CISO-titled roles specifically...
+   Score/recommend CISO-titled roles low regardless of subject-matter
+   proximity - this is a real disqualifier, not just a preference." The
+   CISO exemption is therefore removed - "ciso" titles are now caught
+   directly by the broadened "security" pattern anyway (every real CISO
+   title contains the literal word "security" - "Chief Information
+   Security Officer"), so there's no longer a separate ciso-specific term
+   in the pattern at all.
+
+   CIO must still survive - this is the one boundary that does NOT
+   change. "Chief Information Officer" and its variants (Zahir's real
+   target role - confirmed via his profile's discussion of "Chief
+   Information Officer (CIO) at National Endowment for the Humanities" as
+   a genuine role of interest) contain no "security" substring, so a
+   CIO-only title is never touched by this layer either way.
 
 Branch experiment/filter-quality-improvements (started 2026-08-17, off
 master's tip after the seven layers above, per Zahir's explicit "10% noise
@@ -184,7 +271,11 @@ SETTINGS_PATH = PROJECT_ROOT / "config" / "settings.yaml"
 # Layer 1: seniority-tier exclusion. \b word boundaries throughout so e.g.
 # "head" never matches inside "headquarters"/"overhead" and "chief" never
 # matches inside an unrelated word - both real risks with naive substring
-# matching.
+# matching. "cio"/"ciso"/"cto" carry the same \b protection - each only
+# matches as a standalone abbreviation (e.g. "Associate CIO," or "VP/CTO"),
+# never as a substring inside an unrelated word (verified against the full
+# live job store 2026-08-17 - no real title contains "cio"/"ciso"/"cto" as
+# a false abbreviation match inside a longer word).
 #
 # Extended 2026-08-17 (experiment/filter-quality-improvements, measuring the
 # post-seven-layer pending-review baseline against Zahir's 10%-noise
@@ -211,9 +302,10 @@ SETTINGS_PATH = PROJECT_ROOT / "config" / "settings.yaml"
 # genuinely non-leadership IC roles - zero real leadership-relevant
 # titles are affected. (2) "FVP/SVP, Credit Administrator" (real Cathay
 # Bank job) still carries the "SVP" exec qualifier so layer 1 itself
-# still exempts it exactly as before - it's layer 6 below (new this
-# branch) that now separately excludes it, on domain grounds ("Credit"),
-# not a layer 1 change.
+# still exempts it exactly as before - it's layer 9 below (renumbered
+# from the branch's original "layer 6" after merging with master's own
+# layers 6-8) that now separately excludes it, on domain grounds
+# ("Credit"), not a layer 1 change.
 _IC_TIER_PATTERN = re.compile(
     r"\b(engineer|analyst|specialist|consultant|scientist|representative|coordinator|associate"
     r"|administrator|technician|spec)\b"
@@ -221,7 +313,7 @@ _IC_TIER_PATTERN = re.compile(
     re.I,
 )
 _EXEC_QUALIFIER_PATTERN = re.compile(
-    r"\b(director|vice president|vp|head|chief|president|svp|evp)\b",
+    r"\b(director|vice president|vp|head|chief|president|svp|evp|cio|ciso|cto)\b",
     re.I,
 )
 
@@ -375,18 +467,64 @@ _IC_ENGINEER_ROLE_PATTERN = re.compile(
 # found in the live store on its own.
 _PEOPLE_MANAGEMENT_PATTERN = re.compile(r"\bmanager\b", re.I)
 
-# Layer 6 (added 2026-08-17, experiment/filter-quality-improvements): non-IT
-# commercial/finance leadership exclusion. The second-largest real remaining
-# noise cluster found while measuring the pending-queue baseline - 35 real
-# pending jobs, mostly JPMorganChase/Citi/Morningstar/Jefferies banking
-# postings, titled around a pure sales, finance, credit-risk, wealth-
-# management, or card/payments-product role with no IT/technology content
-# anywhere in the title. None of the prior six layers catch these: they
-# carry genuine exec-qualifying words (VP/SVP/Director/Chief), aren't
-# clinical/medical, aren't a generic admin/clerical phrase, and aren't a
-# hands-on IC engineering title - they're simply the wrong domain, the same
-# class of gap layer 2 (clinical) already exists to close for medical
-# roles, just for commercial/banking domains instead.
+# Layer 6: project/program/product management track exclusion. Deliberately
+# order-sensitive (project/program/product must come BEFORE
+# manager/management/director) so it does NOT catch a title where "Director"
+# precedes an unrelated "Product"/"Program" word (e.g. "Director, Product
+# Engineering" never matches - "product" isn't followed by
+# manager/management/director there), and does not touch a validated KEEP
+# like "Director, IT Service Continuity" or "IT Director, Vendor Management"
+# at all (neither contains "project"/"program"/"product" anywhere).
+_PM_TRACK_PATTERN = re.compile(
+    r"\b(?:project|program|product)\s+(?:manager|management|director)\b"
+    r"|\bpmo\b",
+    re.I,
+)
+
+# Layer 7: intern/internship exclusion. Reuses layer 1's
+# _EXEC_QUALIFIER_PATTERN as an exemption so a title that DIRECTS an
+# internship program ("Dietitian (Dietetic Internship Director)") is not
+# mistaken for an intern position itself.
+_INTERN_PATTERN = re.compile(r"\bintern\b|\binternship\b", re.I)
+
+# Layer 8: information-security-domain exclusion. Broadened 2026-08-13
+# (Zahir's explicit option-B choice on a direct two-option question) from
+# the original narrow "information security"/"infosec" phrase match to
+# ANY title containing the standalone word "security" - this deliberately
+# now catches combined IT+Security leadership titles ("Director, IT &
+# Security," "Head of Infrastructure & Security") as well as pure
+# security-specialist titles, not just an "information security" domain
+# phrase. Still word-boundary matched so it never fires on "security"
+# appearing as part of a different word. Keeps the "infosec" alternative
+# alongside the broad "security" match - "infosec" (a real live-store
+# abbreviation, e.g. "IT Spec (Infosec), GS-2210-14") doesn't contain the
+# literal substring "security", so it would otherwise be silently dropped
+# by the broadening. "Chief Information Security Officer"/"CISO" titles
+# are caught by the "security" alternative now (every real CISO title
+# contains the literal word "security"), so there is no separate
+# ciso-specific term needed. CIO must still survive - "Chief Information
+# Officer" and its variants contain no "security"/"infosec" substring, so
+# this layer never touches a CIO-only title either way.
+_INFO_SECURITY_PATTERN = re.compile(
+    r"\bsecurity\b|\binfosec\b",
+    re.I,
+)
+
+# Layer 9 (added 2026-08-17, experiment/filter-quality-improvements;
+# renumbered from the branch's original "layer 6" when merging into master,
+# which had independently claimed layers 6-8 above for PM-track/intern/
+# infosec in the meantime): non-IT commercial/finance leadership exclusion.
+# The second-largest real remaining noise cluster found while measuring the
+# pending-queue baseline - 35 real pending jobs, mostly JPMorganChase/Citi/
+# Morningstar/Jefferies banking postings, titled around a pure sales,
+# finance, credit-risk, wealth-management, or card/payments-product role
+# with no IT/technology content anywhere in the title. None of the prior
+# layers catch these: they carry genuine exec-qualifying words (VP/SVP/
+# Director/Chief), aren't clinical/medical, aren't a generic admin/clerical
+# phrase, aren't a hands-on IC engineering title, aren't PM-track, intern,
+# or security-domain - they're simply the wrong domain, the same class of
+# gap layer 2 (clinical) already exists to close for medical roles, just
+# for commercial/banking domains instead.
 #
 # Phrase/noun list: "sales" and "finance" as bare role nouns (deliberately
 # NOT "financial" - "Chief Financial Officer"/"VP Financial Planning" stay
@@ -497,6 +635,33 @@ def _ic_engineer_exclude(title: str) -> str | None:
     )
 
 
+def _pm_track_exclude(title: str) -> str | None:
+    match = _PM_TRACK_PATTERN.search(title)
+    if match:
+        return f"project/program/product management track (matched \"{match.group(0)}\")"
+    return None
+
+
+def _intern_exclude(title: str) -> str | None:
+    if _INTERN_PATTERN.search(title) and not _EXEC_QUALIFIER_PATTERN.search(title):
+        return "intern/internship-tier title with no executive-qualifying word present"
+    return None
+
+
+def _information_security_exclude(title: str) -> str | None:
+    match = _INFO_SECURITY_PATTERN.search(title)
+    if match:
+        return (
+            "security-domain role (matched "
+            f'"{match.group(0)}" - broadened 2026-08-13 to any title'
+            " containing \"security\", including combined IT+Security"
+            " leadership titles and CISO titles, a real disqualifier"
+            " per Zahir's own profile data, not just a lower-fit-score"
+            " preference)"
+        )
+    return None
+
+
 def _non_it_commercial_exclude(title: str) -> str | None:
     match = _NON_IT_COMMERCIAL_PATTERN.search(title)
     if not match:
@@ -509,14 +674,20 @@ def _non_it_commercial_exclude(title: str) -> str | None:
 def check_exclusion(job: dict, custom_exclusions: list[str] | None = None) -> dict | None:
     """Returns {"rule": ..., "reason": ...} if this job should never be
     persisted, or None if it should go through job_store.save_jobs()'s
-    normal path. All six layers are checked independently (not
+    normal path. All nine layers are checked independently (not
     short-circuit on an earlier layer's verdict) - see this module's own
     docstring on why "Medical Director" needs layer 2 to fire regardless
     of layer 1; layers 3 (the user's own custom terms), 4 (generic
     administrative/support titles), 5 (hands-on IC engineering/
-    architecture titles), and 6 (non-IT commercial/finance leadership
-    titles) are likewise checked even when earlier layers already passed,
-    so any of them can catch a title the others wouldn't.
+    architecture titles), 6 (PM/PgM/ProdM track), 7 (intern/internship),
+    8 (information-security domain), and 9 (non-IT commercial/finance
+    leadership titles) are likewise checked even when earlier layers
+    already passed, so any of them can catch a title the others wouldn't.
+    check_exclusion() returns the first rule that matches, in layer order,
+    purely for a single deterministic label per job - a title can trip more
+    than one layer (e.g. "IT PMO Consultant..." matches both layer 1's
+    IC-tier "Consultant" and layer 6's PM-track pattern) and is excluded
+    either way.
 
     custom_exclusions=None (the default) makes this call
     load_custom_title_exclusions() itself, for any caller that doesn't
@@ -547,6 +718,18 @@ def check_exclusion(job: dict, custom_exclusions: list[str] | None = None) -> di
     reason = _ic_engineer_exclude(title)
     if reason:
         return {"rule": "ic_engineer_title", "reason": reason}
+
+    reason = _pm_track_exclude(title)
+    if reason:
+        return {"rule": "pm_track_mismatch", "reason": reason}
+
+    reason = _intern_exclude(title)
+    if reason:
+        return {"rule": "intern_role", "reason": reason}
+
+    reason = _information_security_exclude(title)
+    if reason:
+        return {"rule": "information_security_domain", "reason": reason}
 
     reason = _non_it_commercial_exclude(title)
     if reason:

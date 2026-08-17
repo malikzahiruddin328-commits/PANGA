@@ -48,7 +48,7 @@ def test_resume_prompt_omits_keyword_request_when_job_already_has_them():
 def test_draft_resume_via_subscription_calls_cli_and_finalizes(monkeypatch):
     calls = []
 
-    def _fake_run_claude_cli(prompt, timeout_seconds=None):
+    def _fake_run_claude_cli(prompt, timeout_seconds=None, on_start=None):
         calls.append(prompt)
         return json.dumps({
             "text": "resume text", "target_seniority_at_least_vp": True,
@@ -77,7 +77,7 @@ def test_draft_resume_via_subscription_calls_cli_and_finalizes(monkeypatch):
 
 
 def test_draft_resume_via_subscription_does_not_overwrite_existing_keywords(monkeypatch):
-    monkeypatch.setattr(sqa, "run_claude_cli", lambda prompt, timeout_seconds=None: json.dumps({
+    monkeypatch.setattr(sqa, "run_claude_cli", lambda prompt, timeout_seconds=None, on_start=None: json.dumps({
         "text": "resume text", "target_seniority_at_least_vp": True,
         "suggested_strategy_tag": "tag", "clarifying_questions": [], "unconfirmed_claims": [],
     }))
@@ -92,7 +92,7 @@ def test_draft_resume_via_subscription_does_not_overwrite_existing_keywords(monk
 
 
 def test_draft_resume_via_subscription_propagates_reasoner_unavailable(monkeypatch):
-    def _boom(prompt, timeout_seconds=None):
+    def _boom(prompt, timeout_seconds=None, on_start=None):
         raise ReasonerUnavailable("claude CLI not on PATH")
     monkeypatch.setattr(sqa, "run_claude_cli", _boom)
 
@@ -106,15 +106,19 @@ def test_draft_resume_via_subscription_propagates_reasoner_unavailable(monkeypat
 # --- run_subscription_round() ---
 
 
-def _patch_round_persist(monkeypatch, round_number=1):
-    monkeypatch.setattr(sqa, "get_application", lambda source, job_id: {})
+def _patch_round_persist(monkeypatch, round_number=1, prior_app_record=None):
+    monkeypatch.setattr(sqa, "get_application", lambda source, job_id: dict(prior_app_record or {}))
     upserts = []
     monkeypatch.setattr(sqa, "upsert_application", lambda *a, **k: upserts.append((a, k)))
     monkeypatch.setattr(sqa, "sync_workspace_documents", lambda *a, **k: None)
-    monkeypatch.setattr(sqa, "record_subscription_qa_round", lambda source, job_id, ats_score: round_number)
+    round_calls = []
+    monkeypatch.setattr(
+        sqa, "record_subscription_qa_round",
+        lambda source, job_id, ats_score, **k: round_calls.append(k) or round_number,
+    )
     statuses = []
     monkeypatch.setattr(sqa, "set_qa_status", lambda *a, **k: statuses.append((a, k)))
-    return upserts, statuses
+    return upserts, statuses, round_calls
 
 
 def test_run_subscription_round_returns_locked_when_lock_unavailable(monkeypatch):
@@ -137,29 +141,130 @@ def test_run_subscription_round_success_persists_records_round_and_releases_lock
         "clarifying_questions": [{"skill": "Budget", "question": "q", "suggested_answer": ""}],
         "suggested_strategy_tag": "tag", "unconfirmed_claims": [],
     }
-    monkeypatch.setattr(sqa, "draft_resume_via_subscription", lambda job, profile, on_progress=None: resume_draft)
-    upserts, statuses = _patch_round_persist(monkeypatch, round_number=1)
+    monkeypatch.setattr(sqa, "draft_resume_via_subscription", lambda job, profile, on_progress=None, on_pid=None, already_asked_questions=None: resume_draft)
+    upserts, statuses, round_calls = _patch_round_persist(monkeypatch, round_number=1)
 
     result = sqa.run_subscription_round(dict(JOB), PROFILE)
 
-    assert result == {"ok": True, "locked": False, "round": 1, "resume_draft": resume_draft, "error": None}
+    assert result["ok"] is True and result["locked"] is False and result["round"] == 1 and result["error"] is None
+    assert result["resume_draft"]["qa_loop_state"] == "in_progress"  # 82 < 90 target, round 1 < 3 cap
     assert released == [("linkedin", "1")]
     assert len(upserts) == 1
     upsert_kwargs = upserts[0][1]
     assert upsert_kwargs["resume_text"] == "resume text"
     assert upsert_kwargs["resume_draft_source"] == "subscription"
     assert upsert_kwargs["resume_ats_score"] == 82
+    assert upsert_kwargs["resume_clarifying_questions"] == resume_draft["clarifying_questions"]
+    # Round-record call carries the real loop state + the newly-surfaced
+    # question text, atomically with the round bump.
+    assert round_calls[0]["loop_state"] == "in_progress"
+    assert round_calls[0]["newly_asked_question_texts"] == ["q"]
     # Stamped "drafting" before the call, then cleared (None) on success.
     stamped = [args[2] for args, kwargs in statuses]
     assert stamped == ["drafting", None]
+
+
+def test_run_subscription_round_ready_state_clears_questions_at_target(monkeypatch):
+    # Zahir: "the aim is to always give the user 90+ ats score... if it is
+    # less then 90 them its upto the user" - once a round hits 90+, no
+    # more questions should be surfaced even if the model proposed some.
+    monkeypatch.setattr(sqa, "try_acquire_generation_lock", lambda source, job_id: True)
+    monkeypatch.setattr(sqa, "release_generation_lock", lambda source, job_id: None)
+    resume_draft = {
+        "text": "resume text", "ats_score": 94, "ats_rationale": "r", "ats_next_actions": [],
+        "clarifying_questions": [{"skill": "Nice to have", "question": "q", "suggested_answer": ""}],
+        "suggested_strategy_tag": "tag", "unconfirmed_claims": [],
+    }
+    monkeypatch.setattr(sqa, "draft_resume_via_subscription", lambda job, profile, on_progress=None, on_pid=None, already_asked_questions=None: resume_draft)
+    upserts, statuses, round_calls = _patch_round_persist(monkeypatch, round_number=1)
+
+    result = sqa.run_subscription_round(dict(JOB), PROFILE)
+
+    assert result["resume_draft"]["qa_loop_state"] == "ready"
+    assert result["resume_draft"]["clarifying_questions"] == []
+    assert upserts[0][1]["resume_clarifying_questions"] == []
+    assert round_calls[0]["loop_state"] == "ready"
+    assert round_calls[0]["newly_asked_question_texts"] == []
+
+
+def test_run_subscription_round_plateaus_at_round_cap_below_target(monkeypatch):
+    # "cap at 2 or 3 rounds. if something cannot go up on 2-3 rounds it
+    # will never go up" - the 3rd round, still under 90, must stop asking
+    # rather than surfacing a 4th round's worth of questions.
+    monkeypatch.setattr(sqa, "try_acquire_generation_lock", lambda source, job_id: True)
+    monkeypatch.setattr(sqa, "release_generation_lock", lambda source, job_id: None)
+    resume_draft = {
+        "text": "resume text", "ats_score": 78, "ats_rationale": "r", "ats_next_actions": [],
+        "clarifying_questions": [{"skill": "Whatever", "question": "q", "suggested_answer": ""}],
+        "suggested_strategy_tag": "tag", "unconfirmed_claims": [],
+    }
+    monkeypatch.setattr(sqa, "draft_resume_via_subscription", lambda job, profile, on_progress=None, on_pid=None, already_asked_questions=None: resume_draft)
+    # Prior record already has 2 completed rounds - this call becomes round 3.
+    upserts, statuses, round_calls = _patch_round_persist(
+        monkeypatch, round_number=3, prior_app_record={"subscription_qa_round": 2},
+    )
+
+    result = sqa.run_subscription_round(dict(JOB), PROFILE)
+
+    assert result["resume_draft"]["qa_loop_state"] == "plateaued"
+    assert result["resume_draft"]["clarifying_questions"] == []
+    assert upserts[0][1]["resume_clarifying_questions"] == []
+    assert round_calls[0]["loop_state"] == "plateaued"
+
+
+def test_run_subscription_round_refuses_a_fourth_round_with_no_ai_call(monkeypatch):
+    # CLAUDE.md "check for infinite loops" applied literally: once a job
+    # already has MAX_QA_ROUNDS (3) completed rounds on record, a further
+    # call (bulk re-click, per-job Retry, or the manual "Check for more
+    # questions" -> answer -> redraft side door) must not spend a real
+    # `claude` CLI call at all - not even to re-confirm "still plateaued".
+    monkeypatch.setattr(sqa, "try_acquire_generation_lock", lambda source, job_id: True)
+    released = []
+    monkeypatch.setattr(sqa, "release_generation_lock", lambda source, job_id: released.append((source, job_id)))
+    monkeypatch.setattr(sqa, "get_application", lambda source, job_id: {"subscription_qa_round": 3, "resume_ats_score": 78})
+    draft_calls = []
+    monkeypatch.setattr(sqa, "draft_resume_via_subscription", lambda *a, **k: draft_calls.append(1) or {})
+    statuses = []
+    monkeypatch.setattr(sqa, "set_qa_status", lambda *a, **k: statuses.append((a, k)))
+
+    result = sqa.run_subscription_round(dict(JOB), PROFILE)
+
+    assert draft_calls == []  # no AI call at all
+    assert result == {"ok": True, "locked": False, "round": 3, "resume_draft": None, "error": None, "capped": True}
+    assert released == [("linkedin", "1")]  # lock still released
+    assert statuses == []  # status never touched - this was never "drafting"
+
+
+def test_run_subscription_round_passes_prior_asked_questions_to_draft_call(monkeypatch):
+    # Cross-round dedup (2026-08-17): the full text of every question
+    # asked in an earlier round must reach the draft call, not just skill
+    # labels, so round N's prompt can't restate round N-1's question.
+    monkeypatch.setattr(sqa, "try_acquire_generation_lock", lambda source, job_id: True)
+    monkeypatch.setattr(sqa, "release_generation_lock", lambda source, job_id: None)
+    draft_calls = []
+
+    def _fake_draft(job, profile, on_progress=None, on_pid=None, already_asked_questions=None):
+        draft_calls.append(already_asked_questions)
+        return {
+            "text": "t", "ats_score": 70, "ats_rationale": "r", "ats_next_actions": [],
+            "clarifying_questions": [], "suggested_strategy_tag": "tag", "unconfirmed_claims": [],
+        }
+    monkeypatch.setattr(sqa, "draft_resume_via_subscription", _fake_draft)
+    prior = {"subscription_qa_round": 1, "subscription_qa_asked_question_texts": ["Do you have AWS experience?"]}
+    _patch_round_persist(monkeypatch, round_number=2, prior_app_record=prior)
+
+    sqa.run_subscription_round(dict(JOB), PROFILE)
+
+    assert draft_calls == [["Do you have AWS experience?"]]
 
 
 def test_run_subscription_round_failure_stamps_failed_and_releases_lock(monkeypatch):
     monkeypatch.setattr(sqa, "try_acquire_generation_lock", lambda source, job_id: True)
     released = []
     monkeypatch.setattr(sqa, "release_generation_lock", lambda source, job_id: released.append((source, job_id)))
+    monkeypatch.setattr(sqa, "get_application", lambda source, job_id: {})
 
-    def _boom(job, profile, on_progress=None):
+    def _boom(job, profile, on_progress=None, on_pid=None, already_asked_questions=None):
         raise ReasonerUnavailable("claude CLI not on PATH")
     monkeypatch.setattr(sqa, "draft_resume_via_subscription", _boom)
     statuses = []
@@ -175,13 +280,58 @@ def test_run_subscription_round_failure_stamps_failed_and_releases_lock(monkeypa
     assert stamped == ["drafting", "failed"]
 
 
+# --- rank_and_cap_questions() / compute_qa_loop_state() ---
+
+
+def test_compute_qa_loop_state_ready_at_or_above_target():
+    assert sqa.compute_qa_loop_state(90, 1) == "ready"
+    assert sqa.compute_qa_loop_state(95, 2) == "ready"
+
+
+def test_compute_qa_loop_state_plateaued_at_round_cap_below_target():
+    assert sqa.compute_qa_loop_state(85, 3) == "plateaued"
+    assert sqa.compute_qa_loop_state(85, 4) == "plateaued"
+
+
+def test_compute_qa_loop_state_in_progress_below_target_and_cap():
+    assert sqa.compute_qa_loop_state(70, 1) == "in_progress"
+    assert sqa.compute_qa_loop_state(70, 2) == "in_progress"
+
+
+def test_rank_and_cap_questions_required_before_preferred_and_by_point_value():
+    questions = [
+        {"skill": "Nice thing", "question": "q1", "is_preferred": True, "point_value": 20},
+        {"skill": "Small required", "question": "q2", "point_value": 2},
+        {"skill": "Big required", "question": "q3", "point_value": 10},
+    ]
+    ranked = sqa.rank_and_cap_questions(questions, [], max_questions=3)
+    assert [q["skill"] for q in ranked] == ["Big required", "Small required", "Nice thing"]
+
+
+def test_rank_and_cap_questions_caps_to_max():
+    questions = [{"skill": f"s{i}", "question": f"q{i}", "point_value": i} for i in range(10)]
+    ranked = sqa.rank_and_cap_questions(questions, [], max_questions=3)
+    assert len(ranked) == 3
+    assert [q["skill"] for q in ranked] == ["s9", "s8", "s7"]  # highest point_value first
+
+
+def test_rank_and_cap_questions_drops_cross_round_near_duplicates():
+    prior = ["Do you have real, hands-on Databricks experience you can describe for this role?"]
+    questions = [
+        {"skill": "Databricks", "question": "Can you describe your real, hands-on Databricks experience for this role?", "point_value": 5},
+        {"skill": "Genuinely new", "question": "Have you owned a P&L before?", "point_value": 3},
+    ]
+    ranked = sqa.rank_and_cap_questions(questions, prior, max_questions=3)
+    assert [q["skill"] for q in ranked] == ["Genuinely new"]
+
+
 # --- generate_questions_via_subscription() ---
 
 
 def test_generate_questions_via_subscription_persists_and_stamps_awaiting_answers(monkeypatch):
     monkeypatch.setattr(sqa, "get_application", lambda source, job_id: {"resume_clarifying_questions": []})
     new_q = [{"skill": "Team size", "question": "How many direct reports?", "suggested_answer": ""}]
-    monkeypatch.setattr(sqa, "_generate_questions_via_subscription", lambda job, profile, app_record, on_progress=None: {
+    monkeypatch.setattr(sqa, "_generate_questions_via_subscription", lambda job, profile, app_record, on_progress=None, on_pid=None: {
         "added_count": 1, "new_questions": new_q, "merged_clarifying_questions": new_q,
     })
     upserts = []
@@ -199,7 +349,7 @@ def test_generate_questions_via_subscription_persists_and_stamps_awaiting_answer
 
 def test_generate_questions_via_subscription_honest_empty_clears_status(monkeypatch):
     monkeypatch.setattr(sqa, "get_application", lambda source, job_id: {})
-    monkeypatch.setattr(sqa, "_generate_questions_via_subscription", lambda job, profile, app_record, on_progress=None: {
+    monkeypatch.setattr(sqa, "_generate_questions_via_subscription", lambda job, profile, app_record, on_progress=None, on_pid=None: {
         "added_count": 0, "new_questions": [], "merged_clarifying_questions": [],
     })
     monkeypatch.setattr(sqa, "upsert_application", lambda *a, **k: None)
@@ -216,7 +366,7 @@ def test_generate_questions_via_subscription_honest_empty_clears_status(monkeypa
 def test_generate_questions_via_subscription_propagates_and_stamps_failed(monkeypatch):
     monkeypatch.setattr(sqa, "get_application", lambda source, job_id: {})
 
-    def _boom(job, profile, app_record, on_progress=None):
+    def _boom(job, profile, app_record, on_progress=None, on_pid=None):
         raise ReasonerUnavailable("claude CLI not on PATH")
     monkeypatch.setattr(sqa, "_generate_questions_via_subscription", _boom)
     statuses = []

@@ -284,7 +284,7 @@ REAL_PROFILE = {
 def test_generate_questions_via_subscription_calls_cli_and_returns_new_questions(monkeypatch):
     calls = []
 
-    def _fake_run_claude_cli(prompt, timeout_seconds=None):
+    def _fake_run_claude_cli(prompt, timeout_seconds=None, on_start=None):
         calls.append(prompt)
         return json.dumps({
             "clarifying_questions": [
@@ -314,7 +314,7 @@ def test_generate_questions_via_subscription_dedupes_against_already_covered(mon
     # reasoner proposes for it anyway must be filtered out, same
     # skills_match-based dedup request_additional_gap_questions() itself
     # uses, not a bare substring check.
-    def _fake_run_claude_cli(prompt, timeout_seconds=None):
+    def _fake_run_claude_cli(prompt, timeout_seconds=None, on_start=None):
         return json.dumps({
             "clarifying_questions": [
                 {"type": "skill_gap", "skill": "Team size", "question": "How many direct reports?", "suggested_answer": ""},
@@ -334,7 +334,7 @@ def test_generate_questions_via_subscription_dedupes_against_already_covered(mon
 
 
 def test_generate_questions_via_subscription_honest_empty_result(monkeypatch):
-    monkeypatch.setattr(discuss_and_draft, "run_claude_cli", lambda prompt, timeout_seconds=None: json.dumps({"clarifying_questions": []}))
+    monkeypatch.setattr(discuss_and_draft, "run_claude_cli", lambda prompt, timeout_seconds=None, on_start=None: json.dumps({"clarifying_questions": []}))
     monkeypatch.setattr(discuss_and_draft, "score_resume_against_keywords", lambda *a, **k: {
         "missing_required_keywords": [], "missing_preferred_keywords": [],
     })
@@ -346,7 +346,7 @@ def test_generate_questions_via_subscription_honest_empty_result(monkeypatch):
 
 
 def test_generate_questions_via_subscription_propagates_reasoner_unavailable(monkeypatch):
-    def _boom(prompt, timeout_seconds=None):
+    def _boom(prompt, timeout_seconds=None, on_start=None):
         raise ReasonerUnavailable("claude CLI not on PATH")
     monkeypatch.setattr(discuss_and_draft, "run_claude_cli", _boom)
     monkeypatch.setattr(discuss_and_draft, "score_resume_against_keywords", lambda *a, **k: {
