@@ -143,4 +143,21 @@ def parse_json_reply(text: str) -> dict:
         match = _JSON_OBJECT_RE.search(candidate)
         if not match:
             raise RuntimeError(f"Could not find a JSON object in the reasoner's reply: {text[:500]}")
-        return json.loads(match.group(0))
+        # Real bug found 2026-08-17 (feature/basket-consolidated-flow, live-
+        # verifying the new basket-wide "Draft & score all" loop): a reply
+        # can contain something that LOOKS like a JSON object (matches the
+        # regex) but still isn't valid JSON - e.g. a raw/unescaped control
+        # character inside a string value the model wrote. That crashed as
+        # an uncaught json.JSONDecodeError straight out of this function,
+        # even though every caller's own docstring (run_subscription_round,
+        # etc.) promises "RuntimeError on a genuine per-call failure...
+        # never swallowed" as the ONLY non-ReasonerUnavailable failure
+        # shape - an uncaught JSONDecodeError breaks that contract and, for
+        # any caller looping over multiple jobs without its own per-item
+        # try/except, takes the whole loop down with it (the exact
+        # "one item's failure shouldn't stop the rest" pattern CLAUDE.md
+        # calls out). Wrap it the same way the first attempt already is.
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Reasoner's reply looked like JSON but failed to parse: {exc}. Raw: {text[:500]}") from exc
