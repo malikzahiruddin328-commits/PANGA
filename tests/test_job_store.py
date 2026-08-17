@@ -1,6 +1,7 @@
 import search.exclusion_filter as exclusion_filter
 import search.job_store as job_store
-from security.crypto_store import read_json
+import tailoring.applications as applications
+from security.crypto_store import read_json, write_json
 
 
 def test_save_jobs_dedupes_by_source_and_job_id(isolated_data):
@@ -355,6 +356,36 @@ def test_save_jobs_apply_exclusion_false_bypasses_the_filter(isolated_data):
     assert read_json(exclusion_filter.EXCLUSION_LOG_PATH, default=[]) == []
 
 
+def test_save_jobs_excludes_a_job_matching_a_custom_user_exclusion(isolated_data):
+    exclusion_filter.SETTINGS_PATH.write_text(
+        "custom_title_exclusions:\n- Program Director\n", encoding="utf-8",
+    )
+    added = job_store.save_jobs([{
+        "source": "Dice", "job_id": "1", "title": "Senior Program Director, Clinical Ops",
+    }])
+    assert added == 0
+    assert job_store.load_jobs() == []
+    entries = read_json(exclusion_filter.EXCLUSION_LOG_PATH, default=[])
+    assert len(entries) == 1
+    assert "custom_user_exclusion" in entries[0]["exclusion_reason"]
+
+
+def test_save_jobs_custom_exclusions_do_not_affect_jobs_that_do_not_match(isolated_data):
+    exclusion_filter.SETTINGS_PATH.write_text(
+        "custom_title_exclusions:\n- Program Director\n", encoding="utf-8",
+    )
+    added = job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Director, IT Service Continuity"}])
+    assert added == 1
+    assert len(job_store.load_jobs()) == 1
+
+
+def test_save_jobs_with_no_custom_exclusions_configured_is_unaffected(isolated_data):
+    # No settings.yaml at all (fresh install) must behave exactly like
+    # today - built-in layers only, no error from a missing custom list.
+    added = job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Director, IT Service Continuity"}])
+    assert added == 1
+
+
 def test_add_manual_job_is_never_excluded(isolated_data):
     # Real regression guard: add_manual_job() feeds both Zahir's own
     # manual-paste UI and job_alert_scan.py's email-digest intake, which has
@@ -369,3 +400,220 @@ def test_add_manual_job_is_never_excluded(isolated_data):
     assert len(jobs) == 1
     assert jobs[0]["job_id"] == job["job_id"]
     assert read_json(exclusion_filter.EXCLUSION_LOG_PATH, default=[]) == []
+
+
+def _seed_application(source, job_id, status, resume_text=""):
+    applications.upsert_application(source, job_id, status=status, resume_text=resume_text)
+
+
+def test_archive_stale_jobs_dry_run_does_not_write(isolated_data):
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Director"}])
+    job_store.set_review_status("Dice", "1", "rejected")
+    result = job_store.archive_stale_jobs(dry_run=True)
+    assert result["candidate_count"] == 1
+    assert len(job_store.load_jobs()) == 1
+    assert job_store.load_archived_jobs() == []
+
+
+def test_archive_stale_jobs_moves_rejected_jobs(isolated_data):
+    job_store.save_jobs([
+        {"source": "Dice", "job_id": "1", "title": "Rejected One"},
+        {"source": "Dice", "job_id": "2", "title": "Still Live"},
+    ])
+    job_store.set_review_status("Dice", "1", "rejected")
+    result = job_store.archive_stale_jobs(dry_run=False)
+    assert result["candidate_count"] == 1
+    remaining = job_store.load_jobs()
+    assert len(remaining) == 1
+    assert remaining[0]["job_id"] == "2"
+    archived = job_store.load_archived_jobs()
+    assert len(archived) == 1
+    assert archived[0]["job_id"] == "1"
+
+
+def test_archive_stale_jobs_moves_not_interested_applications(isolated_data):
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Passed"}])
+    job_store.set_review_status("Dice", "1", "accepted")
+    _seed_application("Dice", "1", status="not interested")
+    result = job_store.archive_stale_jobs(dry_run=False)
+    assert result["candidate_count"] == 1
+    assert job_store.load_jobs() == []
+
+
+def test_archive_stale_jobs_moves_low_fit_score_regardless_of_age(isolated_data):
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Poor Fit"}])
+    job_store.set_review_status("Dice", "1", "accepted")
+    job_store.update_job_score("Dice", "1", 32, "Not a fit")
+    result = job_store.archive_stale_jobs(dry_run=False)
+    assert result["candidate_count"] == 1
+    assert job_store.load_jobs() == []
+
+
+def test_archive_stale_jobs_never_touches_unscored_jobs(isolated_data):
+    # Missing fit_score ("never scored") must never be conflated with
+    # "scored below 60" - only a real numeric score under 60 qualifies.
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Unscored"}])
+    result = job_store.archive_stale_jobs(dry_run=False)
+    assert result["candidate_count"] == 0
+    assert len(job_store.load_jobs()) == 1
+
+
+def test_archive_stale_jobs_protects_in_basket(isolated_data):
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "In Basket"}])
+    job_store.update_job_score("Dice", "1", 10, "Low score")
+    job_store.add_to_basket("Dice", "1")
+    result = job_store.archive_stale_jobs(dry_run=False)
+    assert result["candidate_count"] == 0
+    assert len(job_store.load_jobs()) == 1
+
+
+def test_archive_stale_jobs_protects_pending_review(isolated_data):
+    # save_jobs() stamps review_status="pending" by default.
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Awaiting review"}])
+    job_store.update_job_score("Dice", "1", 10, "Low score")
+    result = job_store.archive_stale_jobs(dry_run=False)
+    assert result["candidate_count"] == 0
+    assert len(job_store.load_jobs()) == 1
+
+
+def test_archive_stale_jobs_protects_real_engagement_over_low_score(isolated_data):
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Applied Anyway"}])
+    job_store.set_review_status("Dice", "1", "accepted")
+    job_store.update_job_score("Dice", "1", 20, "Low score")
+    _seed_application("Dice", "1", status="applied")
+    result = job_store.archive_stale_jobs(dry_run=False)
+    assert result["candidate_count"] == 0
+    assert len(job_store.load_jobs()) == 1
+
+
+def test_archive_stale_jobs_protects_a_real_generated_resume(isolated_data):
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Has Resume"}])
+    job_store.set_review_status("Dice", "1", "accepted")
+    job_store.update_job_score("Dice", "1", 20, "Low score")
+    _seed_application("Dice", "1", status="not interested", resume_text="Real drafted resume text.")
+    result = job_store.archive_stale_jobs(dry_run=False)
+    assert result["candidate_count"] == 0
+    assert len(job_store.load_jobs()) == 1
+
+
+def test_archive_stale_jobs_never_deletes_appends_to_archive_across_runs(isolated_data):
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "First"}])
+    job_store.set_review_status("Dice", "1", "rejected")
+    job_store.archive_stale_jobs(dry_run=False)
+
+    job_store.save_jobs([{"source": "Dice", "job_id": "2", "title": "Second"}])
+    job_store.set_review_status("Dice", "2", "rejected")
+    job_store.archive_stale_jobs(dry_run=False)
+
+    archived = job_store.load_archived_jobs()
+    assert {j["job_id"] for j in archived} == {"1", "2"}
+
+
+# --- Archive dedup (2026-08-13, save_jobs() checking jobs-archive.json too) -
+
+def test_save_jobs_skips_job_matching_archived_source_and_job_id(isolated_data):
+    write_json(job_store.ARCHIVE_PATH, [
+        {"source": "Dice", "job_id": "1", "title": "Rejected Long Ago", "review_status": "rejected"},
+    ])
+    added = job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Rejected Long Ago (repost)"}])
+    assert added == 0
+    # Never resurrected into the live store at all - not added-then-hidden.
+    assert job_store.load_jobs() == []
+
+
+def test_save_jobs_still_adds_a_genuinely_new_job_alongside_an_archived_one(isolated_data):
+    write_json(job_store.ARCHIVE_PATH, [
+        {"source": "Dice", "job_id": "1", "title": "Archived One"},
+    ])
+    added = job_store.save_jobs([
+        {"source": "Dice", "job_id": "1", "title": "Archived One (repost)"},
+        {"source": "Dice", "job_id": "2", "title": "Director, Genuinely New"},
+    ])
+    assert added == 1
+    jobs = job_store.load_jobs()
+    assert len(jobs) == 1
+    assert jobs[0]["job_id"] == "2"
+
+
+def test_save_jobs_logs_archive_dedup_skip(isolated_data):
+    write_json(job_store.ARCHIVE_PATH, [
+        {"source": "Indeed", "job_id": "99", "title": "Director of IT", "organization": "AbbVie", "location": "Remote"},
+    ])
+    job_store.save_jobs([{
+        "source": "Indeed", "job_id": "99", "title": "Director of IT",
+        "organization": "AbbVie", "location": "Remote",
+    }])
+    entries = read_json(job_store.ARCHIVE_DEDUP_LOG_PATH, default=[])
+    assert len(entries) == 1
+    assert entries[0]["source"] == "Indeed"
+    assert entries[0]["job_id"] == "99"
+    assert entries[0]["title"] == "Director of IT"
+    assert "skip_reason" in entries[0] and entries[0]["skip_reason"]
+
+
+def test_save_jobs_archive_dedup_skip_log_does_not_grow_unboundedly_across_runs(isolated_data):
+    # Same reasoning as exclusion_filter.log_exclusions()'s own test: a
+    # still-open archived posting keeps surfacing in every search run, so
+    # the log must de-dupe against what's already logged, not grow by one
+    # entry per run forever.
+    write_json(job_store.ARCHIVE_PATH, [{"source": "Dice", "job_id": "1", "title": "Archived"}])
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Archived"}])
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Archived"}])
+    entries = read_json(job_store.ARCHIVE_DEDUP_LOG_PATH, default=[])
+    assert len(entries) == 1
+
+
+def test_save_jobs_no_archive_skip_log_written_when_nothing_matches(isolated_data):
+    write_json(job_store.ARCHIVE_PATH, [{"source": "Dice", "job_id": "999", "title": "Unrelated"}])
+    job_store.save_jobs([{"source": "Dice", "job_id": "1", "title": "Director, Genuinely New"}])
+    assert read_json(job_store.ARCHIVE_DEDUP_LOG_PATH, default=[]) == []
+
+
+def test_save_jobs_apply_exclusion_false_bypasses_archive_dedup_too(isolated_data):
+    # add_manual_job() below relies on this: Zahir's own manual paste UI
+    # (and job_alert_scan.py's email-digest extraction) must be able to
+    # re-add a specific posting even if it matches something archived -
+    # same reasoning as the exclusion-filter bypass, a considered explicit
+    # add should never be silently refused.
+    write_json(job_store.ARCHIVE_PATH, [{"source": "linkedin", "job_id": "1", "title": "Archived"}])
+    added = job_store.save_jobs(
+        [{"source": "linkedin", "job_id": "1", "title": "Archived (Zahir re-adding on purpose)"}],
+        apply_exclusion=False,
+    )
+    assert added == 1
+    assert len(job_store.load_jobs()) == 1
+    assert read_json(job_store.ARCHIVE_DEDUP_LOG_PATH, default=[]) == []
+
+
+def test_add_manual_job_can_re_add_a_job_that_matches_the_archive(isolated_data):
+    write_json(job_store.ARCHIVE_PATH, [{"source": "linkedin", "job_id": "4123456789", "title": "Old"}])
+    job = job_store.add_manual_job(
+        title="Head of IT", organization="Aerospike", location="Remote",
+        description="Reconsidering this one.", posting_url="https://www.linkedin.com/jobs/view/4123456789/",
+    )
+    assert job["job_id"] == "4123456789"
+    assert len(job_store.load_jobs()) == 1
+
+
+def test_save_jobs_loads_archive_once_per_batch_not_once_per_job(isolated_data, monkeypatch):
+    # Performance sanity check (CLAUDE.md's perf-review rule, and this
+    # fix's own brief): jobs-archive.json is 2,652+ real records and
+    # growing - loading/scanning it once per incoming job in a batch would
+    # be an O(n) file load per job instead of one load for the whole call.
+    write_json(job_store.ARCHIVE_PATH, [{"source": "Dice", "job_id": "999", "title": "Archived"}])
+    call_count = {"n": 0}
+    real_load_archived_jobs = job_store.load_archived_jobs
+
+    def counting_load_archived_jobs():
+        call_count["n"] += 1
+        return real_load_archived_jobs()
+
+    monkeypatch.setattr(job_store, "load_archived_jobs", counting_load_archived_jobs)
+
+    job_store.save_jobs([
+        {"source": "Dice", "job_id": "1", "title": "Director One"},
+        {"source": "Dice", "job_id": "2", "title": "Director Two"},
+        {"source": "Dice", "job_id": "3", "title": "Director Three"},
+        {"source": "Dice", "job_id": "999", "title": "Archived (repost)"},
+    ])
+    assert call_count["n"] == 1

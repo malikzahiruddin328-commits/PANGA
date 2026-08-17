@@ -15,16 +15,119 @@ actually cost."
 Encrypted at rest via security.crypto_store, same as every other store
 under data/ - not a cost-dashboard UI (explicitly out of scope), just a
 real number for other code to read.
+
+Shared-across-worktrees path resolution (2026-08-13, real incident): every
+other store under data/ (jobs.json, applications.json, ...) is deliberately
+PER-CHECKOUT - PROJECT_ROOT used to be computed from `Path(__file__).
+resolve().parents[1]`, i.e. wherever THIS copy of cost_log.py physically
+lives, which is exactly right for those stores (each git worktree gets its
+own isolated test data on purpose). cost_log.json is different: it is
+llm_client._check_spend_cap()'s real dollar ledger for a real Anthropic
+bill, and money spent from a worktree process is exactly as real as money
+spent from the main checkout - there is only ever ONE actual $/day being
+spent, no matter how many separate `data/` directories exist on disk (one
+per worktree, since data/ is gitignored and each worktree checks out its
+own copy of the tree). Using the file's-own-location PROJECT_ROOT here gave
+every worktree its own independent, empty cost_log.json and therefore its
+own independent $10/day budget - confirmed live 2026-08-13: the main
+checkout showed $14.76 spent while a worktree simultaneously showed $1.75
+in its own separate file, neither process aware of the other's spend, both
+still willing to spend more.
+
+_resolve_shared_data_dir() fixes this by always resolving to the MAIN
+checkout's data/ directory, regardless of which worktree's copy of this
+file is actually executing - a linked worktree's `.git` is a FILE (not a
+directory) containing `gitdir: <main_repo>/.git/worktrees/<name>`, which is
+enough to walk back to the one real main checkout on disk (see function
+docstring). This is design option 1 from the fix's own ask (an absolute,
+git-anchored path) rather than option 2 (a brand-new shared file under
+.claude/, following message_board.py's convention) - kept in data/ with the
+SAME crypto_store encryption/shape/tooling every existing reader (Ops tab,
+last_cost_for_job, the whole cost_log test suite) already expects, instead
+of introducing a second, unencrypted, differently-shaped copy of real
+financial data living outside data/'s existing security convention for no
+benefit other than avoiding a git-anchor computation.
 """
 
+import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
 from security.crypto_store import read_json, write_json
 from security.file_lock import locked
 
+logger = logging.getLogger(__name__)
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-COST_LOG_PATH = PROJECT_ROOT / "data" / "cost_log.json"
+
+
+def _resolve_shared_data_dir(start: Path | None = None) -> Path:
+    """The one real, shared data/ directory cost_log.json (and its lock)
+    must live under - always the MAIN checkout's, never a linked worktree's
+    own copy. `start` is the checkout root to resolve FROM (defaults to
+    PROJECT_ROOT, i.e. wherever this file itself actually lives) - exposed
+    as a parameter so tests can point it at a fabricated worktree/main-repo
+    pair on disk without needing a second real git checkout.
+
+    PANGA_MAIN_DATA_DIR overrides everything below when set - an explicit
+    escape hatch for an unusual layout (or a test) that doesn't want git-
+    anchor detection at all, same "operator override always wins" pattern
+    PANGA_DAILY_SPEND_CAP_USD/PANGA_KEYRING_SERVICE already use elsewhere
+    in this codebase.
+
+    Detection: a normal (non-worktree) checkout has `.git` as a real
+    directory - nothing to resolve, `start` IS the main checkout, return its
+    own data/. A linked worktree (created via `git worktree add`, the
+    pattern every Panga feature branch uses under .claude/worktrees/) has
+    `.git` as a plain text FILE whose single line is
+    `gitdir: <main_repo>/.git/worktrees/<name>` - parsing that path and
+    walking up 3 levels (<name> -> worktrees -> .git -> repo root) recovers
+    the one real main checkout, confirmed against this exact repo's real
+    worktree layout (git_marker.read_text() -> gitdir path -> parents[2]).
+    Falls back to `start`'s own data/ (the old, worktree-local behavior)
+    only if the `.git` file doesn't parse as expected or the recovered path
+    doesn't actually check out as a real git repo - logged loudly (ERROR)
+    since that means a worktree process silently reverted to its own
+    isolated budget, exactly the bug this function exists to close."""
+    override = os.environ.get("PANGA_MAIN_DATA_DIR")
+    if override:
+        return Path(override)
+
+    root = start if start is not None else PROJECT_ROOT
+    git_marker = root / ".git"
+
+    if git_marker.is_dir():
+        return root / "data"
+
+    if git_marker.is_file():
+        try:
+            text = git_marker.read_text(encoding="utf-8").strip()
+            prefix = "gitdir:"
+            if text.startswith(prefix):
+                gitdir = Path(text[len(prefix):].strip())
+                if not gitdir.is_absolute():
+                    gitdir = (root / gitdir).resolve()
+                main_root = gitdir.parents[2]
+                if (main_root / ".git").is_dir():
+                    return main_root / "data"
+        except (OSError, IndexError):
+            pass
+
+    logger.error(
+        "Could not resolve the main checkout from %s's .git - falling back "
+        "to this checkout's own data/ directory. If this is a linked git "
+        "worktree, its cost_log.json/spend cap will be isolated from the "
+        "real shared ledger until this is fixed (set PANGA_MAIN_DATA_DIR "
+        "to override explicitly).",
+        root,
+    )
+    return root / "data"
+
+
+_SHARED_DATA_DIR = _resolve_shared_data_dir()
+COST_LOG_PATH = _SHARED_DATA_DIR / "cost_log.json"
+LOCK_DIR = _SHARED_DATA_DIR / ".locks"
 
 
 def log_api_cost(
@@ -87,7 +190,7 @@ def log_api_cost(
         entry["models_tried"] = models_tried
     if job_key:
         entry["source"], entry["job_id"] = job_key
-    with locked("cost_log"):
+    with locked("cost_log", lock_dir=LOCK_DIR):
         entries = read_json(COST_LOG_PATH, default=[])
         entries.append(entry)
         write_json(COST_LOG_PATH, entries)

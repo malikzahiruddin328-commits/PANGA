@@ -68,6 +68,7 @@ def upsert_application(
     apply_answers: list[dict] | None = None,
     resume_unconfirmed_claims_ai_reported: list[dict] | None = None,
     resume_gap_scan_fingerprint: str | None = None,
+    resume_draft_source: str | None = None,
 ) -> None:
     """Creates or updates the application record for (source, job_id).
     Fields left as None don't overwrite previously saved values -
@@ -114,7 +115,12 @@ def upsert_application(
     before firing again, so opening Analyze Fit repeatedly for the same
     resume version doesn't re-trigger the AI call every render/scroll,
     only when the resume text actually changed (a fresh Generate) or
-    this is the first time it's ever run for this job."""
+    this is the first time it's ever run for this job. resume_draft_source
+    (2026-08-13) is "subscription" or "paid" - which mechanism produced
+    the CURRENT resume_text, stamped every time resume_text is set, so a
+    reader of the record (or the UI) can always tell a $0 subscription
+    draft from the one final paid build rather than assuming every stored
+    resume came from the same path."""
     with locked("applications"):
         applications = load_applications()
         for app in applications:
@@ -126,6 +132,8 @@ def upsert_application(
                     app["documents_drafted_at"] = datetime.now(timezone.utc).isoformat()
                 if resume_text is not None:
                     app["resume_text"] = resume_text
+                if resume_draft_source is not None:
+                    app["resume_draft_source"] = resume_draft_source
                 if cover_letter_text is not None:
                     app["cover_letter_text"] = cover_letter_text
                 if exec_bio_text is not None:
@@ -170,6 +178,7 @@ def upsert_application(
             ),
             "document_edit_review": None,
             "resume_text": resume_text,
+            "resume_draft_source": resume_draft_source,
             "cover_letter_text": cover_letter_text,
             "exec_bio_text": exec_bio_text,
             "leadership_summary_text": leadership_summary_text,
@@ -384,6 +393,151 @@ def get_applications_with_open_clarifying_questions() -> list[dict]:
     empty (see tailoring/drafting.py's _questions_worth_asking()), or a new,
     smaller set of genuine gaps replaces the old one."""
     return [a for a in load_applications() if a.get("resume_clarifying_questions")]
+
+
+
+# "Discuss & draft" basket operation (2026-08-13, docs/resume-hybrid-
+# execution-design.md §1b, confirmed hybrid design - tailoring.
+# discuss_and_draft owns the actual flow, this module just tracks state on
+# the application record, same "stamp state on the record itself" pattern
+# already used for the generation lock / skip_reason_reviewed above).
+#
+# "generating_questions" added 2026-08-13 (fix/discuss-draft-subscription-
+# questions) when start_discussion()'s opening-question generation moved
+# off the paid API onto a subscription-covered `claude` CLI subprocess
+# call - that call can genuinely take upward of a minute on a large real
+# profile (same order of magnitude as the resume-reasoner path's own
+# 39-63s full-draft calls), so a second tab/session polling this record
+# mid-call needs to see real state, not nothing - same "not a black box"
+# requirement "drafting_final" already satisfies for finish_discussion().
+DISCUSSION_STATUSES = {"generating_questions", "awaiting_discussion", "drafting_final", "done", "failed"}
+
+
+def set_discussion_status(
+    source: str, job_id: str, status: str | None,
+    board_message_id: str | None = None, error: str | None = None,
+) -> None:
+    """Tracks where a job's live gap-question discussion is in its
+    lifecycle - "awaiting_discussion" (questions posted to the shared
+    message board, waiting on Zahir to resolve them in a live, free
+    Claude Code conversation - never another paid API round), "drafting_
+    final" (answers confirmed, the one final generate_documents() call is
+    in flight - visible to a second browser tab/session polling this
+    record while a multi-minute self-correction draft is running),
+    "done" (that final draft persisted successfully), "failed" (it
+    didn't - `error` carries the real message, same as generate_for_job()'s
+    own errors dict, so a stuck job is distinguishable from "not yet
+    picked up" rather than looking indistinguishable forever), or None
+    (no discussion ever started for this job). Real progress visibility
+    per the hybrid-design ask - "not a black box" - not a single opaque
+    flag.
+
+    Get-or-creates the application record (same shape upsert_application()
+    would create) rather than requiring one to already exist first - a job
+    can be sent to "Discuss & draft" straight from the basket before it's
+    ever had a resume drafted, so there may be no application record yet.
+
+    board_message_id, once set, is left alone unless a new value or an
+    explicit status=None (discussion reset/cleared) is passed - so
+    "drafting_final"/"done"/"failed" transitions for the SAME discussion
+    keep pointing at the same message-board entry without the caller
+    having to re-pass it every time."""
+    if status is not None and status not in DISCUSSION_STATUSES:
+        raise ValueError(f"status must be one of {DISCUSSION_STATUSES} or None, got {status!r}")
+    if get_application(source, job_id) is None:
+        upsert_application(source, job_id, status="under review")
+    with locked("applications"):
+        applications = load_applications()
+        for app in applications:
+            if app["source"] == source and app["job_id"] == job_id:
+                app["discussion_status"] = status
+                app["discussion_error"] = error
+                if board_message_id is not None:
+                    app["discussion_board_message_id"] = board_message_id
+                elif status is None:
+                    app["discussion_board_message_id"] = None
+                _save_all(applications)
+                _write_dossier(source, job_id)
+                return
+        raise KeyError(f"no application record for ({source!r}, {job_id!r}) even after creation")
+
+
+# In-app subscription-covered basket document build (2026-08-13,
+# tailoring.subscription_resume_qa - replaces "Discuss & draft"'s
+# message-board hand-off per Zahir's explicit rejection of that shape:
+# "the user will remain in the app they will not come to claude screens").
+# Real state stamped on the application record itself (not Streamlit
+# session_state, which vanishes on reload - same "persist across reruns"
+# principle already applied to discussion_status/basket membership) so a
+# reload mid-multi-minute subscription call still shows real progress, and
+# the round/score history survives across sessions.
+QA_STATUSES = {"drafting", "generating_questions", "awaiting_answers", "redrafting", "failed"}
+
+
+def set_qa_status(source: str, job_id: str, status: str | None, error: str | None = None) -> None:
+    """Tracks where a job's in-app subscription draft/Q&A loop is right
+    now - "drafting" (initial or re-draft subscription call in flight),
+    "generating_questions" (subscription call generating this round's
+    clarifying questions), "awaiting_answers" (questions are shown in the
+    UI, waiting on the user to fill in/confirm the form), "redrafting"
+    (answers submitted, re-draft subscription call in flight), "failed"
+    (the last subscription call itself failed - `error` carries the real
+    message), or None (idle - no call in flight, safe to show action
+    buttons). Same "not a black box" real-progress requirement and
+    get-or-create/lock-free stamping pattern as set_discussion_status()
+    above, deliberately mirrored rather than reusing that function
+    directly - this is a genuinely different state machine (an iterative
+    free loop with no message board involved), not the same one."""
+    if status is not None and status not in QA_STATUSES:
+        raise ValueError(f"status must be one of {QA_STATUSES} or None, got {status!r}")
+    if get_application(source, job_id) is None:
+        upsert_application(source, job_id, status="under review")
+    with locked("applications"):
+        applications = load_applications()
+        for app in applications:
+            if app["source"] == source and app["job_id"] == job_id:
+                app["subscription_qa_status"] = status
+                app["subscription_qa_error"] = error
+                _save_all(applications)
+                _write_dossier(source, job_id)
+                return
+        raise KeyError(f"no application record for ({source!r}, {job_id!r}) even after creation")
+
+
+def record_subscription_qa_round(source: str, job_id: str, ats_score: int | None, draft_source: str = "subscription") -> int:
+    """Appends one entry to subscription_ats_score_history and bumps
+    subscription_qa_round - called once per completed subscription draft
+    round (the very first draft, and every re-draft after answers are
+    submitted). Real read-modify-write under the same applications lock
+    every other write in this module uses (CLAUDE.md race-condition rule -
+    two browser tabs building the same job concurrently must not silently
+    drop one round's history entry), not a read-then-separate-write from
+    the caller. Returns the new round number (1-based) so the caller can
+    stamp it on the UI/other records without a second read.
+
+    draft_source distinguishes a subscription round from the one, final
+    paid generate_for_job() draft (which never calls this - it's recorded
+    via the ordinary resume_text/resume_ats_score fields, same as it
+    always has been) - kept here mainly so a future reader of the raw JSON
+    can tell every history entry really was a $0 round."""
+    with locked("applications"):
+        applications = load_applications()
+        for app in applications:
+            if app["source"] == source and app["job_id"] == job_id:
+                history = app.get("subscription_ats_score_history") or []
+                round_number = app.get("subscription_qa_round", 0) + 1
+                history.append({
+                    "round": round_number,
+                    "ats_score": ats_score,
+                    "at": datetime.now(timezone.utc).isoformat(),
+                    "source": draft_source,
+                })
+                app["subscription_ats_score_history"] = history
+                app["subscription_qa_round"] = round_number
+                _save_all(applications)
+                _write_dossier(source, job_id)
+                return round_number
+        raise KeyError(f"no application record for ({source!r}, {job_id!r}) - draft a round via run_subscription_round() first")
 
 
 def confirm_status_suggestion(source: str, job_id: str, accept: bool) -> None:

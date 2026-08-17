@@ -6,6 +6,7 @@ from .env (USAJOBS_API_KEY, USAJOBS_USER_AGENT_EMAIL).
 """
 
 import os
+from datetime import date
 from pathlib import Path
 
 import requests
@@ -16,9 +17,68 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 API_URL = "https://data.usajobs.gov/api/search"
 
+# Historic JOA (Job Opportunity Announcement) API - separate endpoint from
+# the search API above. Used by check_position_open() below; see that
+# function's docstring for why the search API itself can't do this anymore.
+HISTORIC_JOA_URL = "https://data.usajobs.gov/api/historicjoa"
+
 
 class USAJobsNotConfigured(Exception):
     pass
+
+
+class USAJobsPositionNotFound(Exception):
+    """Raised by check_position_open() when the Historic JOA API has no
+    record at all for the given PositionID (announcement number) - e.g. a
+    typo'd/garbage id, or (theoretically) one old enough to have fallen out
+    of USAJOBS' own retention. Deliberately a real exception rather than a
+    bool, so freshness_check.py's existing `except Exception: return None`
+    wrapper around this call (see _check_usajobs()) already treats "no
+    record found" as the correct fail-safe "couldn't tell" (None) instead
+    of a false positive for "closed" - a genuinely closed posting Panga
+    itself found still has a real historic record (confirmed live
+    2026-08-17, see check_position_open()'s docstring)."""
+    pass
+
+
+def _log(message: str) -> None:
+    # Same print(..., flush=True) convention as job_sources.py's/
+    # run_search.py's own _log() - keeps this module's stdout visible in
+    # whatever captures it (scheduled script, Streamlit console, etc.)
+    # without adding a logging dependency this file didn't already have.
+    print(f"[usajobs] {message}", flush=True)
+
+
+def _requested_category_codes(job_category_code: str) -> set[str]:
+    """job_category_code may be a single code ("2210") or several
+    semicolon-joined (confirmed live 2026-08-12 in
+    search_jobs_by_series_and_grade()'s docstring - that's the real
+    USAJOBS separator, not a repeated param). Split defensively either
+    way so a single code still works."""
+    return {code.strip() for code in job_category_code.split(";") if code.strip()}
+
+
+def _actual_category_codes(descriptor: dict) -> set[str]:
+    """USAJOBS' real response (live-verified 2026-08-17 against
+    JobCategoryCode=2210) puts a job's true category/series in
+    MatchedObjectDescriptor.JobCategory - a list of {"Name": ..., "Code":
+    ...} objects, e.g. [{"Name": "Information Technology Management",
+    "Code": "2210"}]. USAJOBS' own server-side JobCategoryCode filter is
+    looser than the name implies: real production evidence (2026-08-17)
+    showed "Cook" (Bureau of Indian Education), "Staff Accountant" (Army
+    National Guard), and "Social Worker" (Air National Guard) coming back
+    from a JobCategoryCode=2210 request despite JobCategory not containing
+    2210 at all. This reads the field the API actually returns so callers
+    can reject those instead of trusting the request filter alone."""
+    return {
+        entry.get("Code")
+        for entry in descriptor.get("JobCategory") or []
+        if entry.get("Code")
+    }
+
+
+def _category_matches(descriptor: dict, requested_codes: set[str]) -> bool:
+    return bool(_actual_category_codes(descriptor) & requested_codes)
 
 
 def _headers() -> dict:
@@ -66,9 +126,23 @@ def search_jobs(
     response.raise_for_status()
     data = response.json()
 
+    # job_category_code was sent as a *request* filter above, but USAJOBS'
+    # own server-side filtering is looser than that implies (real
+    # production evidence 2026-08-17: off-domain jobs like "Cook" and
+    # "Staff Accountant" came back from a JobCategoryCode=2210 request).
+    # Validate each returned job's actual JobCategory against what was
+    # requested and drop anything that doesn't really match - deterministic,
+    # no AI involved. Keyword-only searches (no job_category_code) have
+    # nothing to validate against and pass through unchanged, same as today.
+    requested_codes = _requested_category_codes(job_category_code) if job_category_code else None
+
     jobs = []
+    skipped = 0
     for item in data.get("SearchResult", {}).get("SearchResultItems", []):
         d = item.get("MatchedObjectDescriptor", {})
+        if requested_codes is not None and not _category_matches(d, requested_codes):
+            skipped += 1
+            continue
         remuneration = d.get("PositionRemuneration") or [{}]
         pay = remuneration[0]
         apply_uris = d.get("ApplyURI") or [None]
@@ -85,6 +159,12 @@ def search_jobs(
             "apply_url": apply_uris[0],
             "qualification_summary": d.get("QualificationSummary"),
         })
+    if skipped:
+        _log(
+            f"search_jobs(job_category_code={job_category_code!r}): skipped "
+            f"{skipped} of {skipped + len(jobs)} returned job(s) whose actual "
+            f"JobCategory didn't match the requested code(s)"
+        )
     return jobs
 
 
@@ -195,6 +275,8 @@ def search_jobs_by_series_and_grade(
     level) are genuinely new - and those 5 are exactly the real gap this
     was built to close, including both confirmed examples above (CISO
     EM-2210-00, CIO CP-graded)."""
+    requested_codes = set(job_category_codes)
+
     def _fetch(extra_params: dict) -> list[dict]:
         params: dict = {
             "ResultsPerPage": results_per_page,
@@ -210,8 +292,15 @@ def search_jobs_by_series_and_grade(
         data = response.json()
 
         results = []
+        skipped = 0
         for item in data.get("SearchResult", {}).get("SearchResultItems", []):
             d = item.get("MatchedObjectDescriptor", {})
+            # Same real-world mismatch as search_jobs() - validate the
+            # returned job's actual JobCategory against the requested
+            # series instead of trusting USAJOBS' server-side filter.
+            if not _category_matches(d, requested_codes):
+                skipped += 1
+                continue
             remuneration = d.get("PositionRemuneration") or [{}]
             pay = remuneration[0]
             apply_uris = d.get("ApplyURI") or [None]
@@ -228,6 +317,12 @@ def search_jobs_by_series_and_grade(
                 "apply_url": apply_uris[0],
                 "qualification_summary": d.get("QualificationSummary"),
             })
+        if skipped:
+            _log(
+                f"search_jobs_by_series_and_grade(job_category_codes={job_category_codes!r}): "
+                f"skipped {skipped} of {skipped + len(results)} returned job(s) whose actual "
+                f"JobCategory didn't match the requested series"
+            )
         return results
 
     jobs = _fetch({"PayGradeLow": pay_grade_low, "PayGradeHigh": pay_grade_high})
@@ -243,19 +338,91 @@ def search_jobs_by_series_and_grade(
     return jobs
 
 
+_OPEN_POSITION_STATUSES = {"accepting applications"}
+
+
 def check_position_open(position_id: str) -> bool:
     """Freshness check (added 2026-08-05, PRD-adjacent "closed by employer"
-    automation): USAJOBS' own search API accepts PositionID as a filter, same
-    as Keyword/LocationName above - a closed/expired announcement simply
-    stops appearing in results, no separate status endpoint needed. Omits
-    WhoMayApply so a position that closed to the public but is still
-    internally open isn't misreported (Zahir isn't eligible for those anyway,
-    but "still exists" is the only question this function answers)."""
-    params = {"PositionID": position_id, "ResultsPerPage": 1}
-    response = requests.get(API_URL, headers=_headers(), params=params, timeout=30)
+    automation; REWRITTEN 2026-08-17 - the original implementation was
+    silently broken).
+
+    THE BUG: the original version passed PositionID as a filter to the
+    search API (API_URL, same endpoint search_jobs() uses above), on the
+    documented assumption that a closed/expired announcement simply stops
+    appearing in results. Live-verified 2026-08-17 that this is false:
+    PositionID is not a real filter on that endpoint at all - a real,
+    currently-open PositionID, a garbage string, an empty string, and a
+    string of zeros all returned the exact same 5 generic top-of-search
+    results (i.e. the parameter is silently ignored, not validated), so
+    this function could never return False for a real closed posting. It
+    was never caught because no test (mocked or live) ever exercised the
+    real API - see tests/test_usajobs.py, which had zero coverage of this
+    function before this fix.
+
+    THE FIX: USAJOBS exposes a separate Historic JOA endpoint
+    (HISTORIC_JOA_URL, data.usajobs.gov/api/historicjoa) that covers every
+    past AND current announcement and - unlike the search endpoint - really
+    does filter on AnnouncementNumbers (the same value stored as job_id/
+    PositionID everywhere else in this codebase). Confirmed live 2026-08-17
+    several ways:
+      - A real open posting (PositionID "DH-13024454-26-VJ", "Assistant
+        CIO, Technology") returned positionOpeningStatus "Accepting
+        applications" with positionCloseDate 2026-08-18 (in the future).
+      - A real CLOSED posting already sitting in Panga's own job store
+        (PositionID "req806", "Director, Office of Information Services and
+        Chief Information Officer (CIO)") returned positionOpeningStatus
+        "Job closed" with positionCloseDate 2026-01-23 (in the past) -
+        proof this endpoint actually reports real closures, not just
+        "still exists somewhere in history".
+      - A garbage id, an all-zeros id, and an empty string each returned
+        HTTP 204 with an empty body (no record) - correctly distinguishable
+        from both "open" and "closed", unlike the old endpoint's silent
+        same-5-results-regardless behavior.
+
+    Returns True only for positionOpeningStatus == "Accepting applications"
+    (case-insensitive) - every other observed status ("Job closed",
+    "Reviewing applications", "Hiring complete", "Job canceled", per
+    USAJOBS' own documented announcement-status vocabulary) means the
+    posting is no longer accepting new applicants, which is the real
+    question this function exists to answer for freshness_check.py. Falls
+    back to comparing positionCloseDate against today if the status field
+    is ever blank (defensive - not observed in practice, but cheap
+    insurance against a future API response with a genuinely open posting's
+    status field empty rather than absent).
+
+    Raises USAJobsPositionNotFound if the Historic JOA API has no record at
+    all - freshness_check.py's caller already wraps this call in
+    `except Exception: return None`, so a not-found here correctly becomes
+    "couldn't tell" (None, fail-safe toward still-open) rather than a false
+    "closed"."""
+    params = {"AnnouncementNumbers": position_id}
+    response = requests.get(HISTORIC_JOA_URL, headers=_headers(), params=params, timeout=30)
     response.raise_for_status()
-    data = response.json()
-    return int(data.get("SearchResult", {}).get("SearchResultCount", 0)) > 0
+    if response.status_code == 204 or not response.text.strip():
+        raise USAJobsPositionNotFound(
+            f"No Historic JOA record found for PositionID {position_id!r}"
+        )
+    records = response.json().get("data") or []
+    if not records:
+        raise USAJobsPositionNotFound(
+            f"No Historic JOA record found for PositionID {position_id!r}"
+        )
+    record = records[0]
+    status = (record.get("positionOpeningStatus") or "").strip().lower()
+    if status:
+        return status in _OPEN_POSITION_STATUSES
+
+    # Defensive fallback only - not hit by any live-observed response above.
+    close_date = record.get("positionCloseDate")
+    if close_date:
+        try:
+            return date.fromisoformat(close_date) >= date.today()
+        except ValueError:
+            pass
+    raise USAJobsPositionNotFound(
+        f"Historic JOA record for PositionID {position_id!r} has no usable "
+        "status or close date"
+    )
 
 
 if __name__ == "__main__":
