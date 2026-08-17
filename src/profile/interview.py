@@ -165,6 +165,51 @@ def save_answer(
         save_profile(profile)
 
 
+# Fixed role_context for save_profile_gap_review_answers() below - real,
+# human-readable provenance distinguishing an answer confirmed through the
+# cross-job Profile Gaps "Review recurring gaps" panel from one confirmed
+# against one specific job's own resume draft (every other save_answer()
+# caller passes a "{title} at {organization}" role_context instead) - so
+# the answered-questions view can show where a fact actually came from.
+PROFILE_GAP_REVIEW_ROLE_CONTEXT = "Profile gap review (recurring across multiple job postings)"
+
+
+def save_profile_gap_review_answers(answered_questions: list[dict]) -> None:
+    """Job-agnostic variant of tailoring.drafting.save_gap_answers() for
+    Phase 3 of Zahir's confirmed "final set of questions" taxonomy-gap
+    build (2026-08-17, feature/jd-keyword-taxonomy-gaps) - the standalone
+    "Review recurring profile gaps" panel isn't tied to any single job, so
+    it has no `job` dict to derive role_context from the way every other
+    caller of save_answer() does. Reuses save_answer() itself (not a
+    reimplementation of its update-in-place/canonical-id/locking logic)
+    with a fixed, honest role_context instead.
+
+    answered_questions: the subset the user actually typed a real answer
+    for (blank ones already filtered out by the caller, same documented
+    contract as save_gap_answers()) - each a
+    {"skill":, "answer":, "question":} dict. No "type"/is_disqualifier
+    here (unlike save_gap_answers()): these come from Phase 2's recurring-
+    keyword analysis, which only ever surfaces ordinary skill-gap facts,
+    never a disqualifier-check question - a disqualifier is a candidate-
+    stated exclusion asked about deliberately per-job, not something a
+    keyword-frequency tally could ever detect or phrase correctly, so
+    this function never sets is_disqualifier=True. Never called with an
+    invented answer - the UI only calls this with what the candidate
+    actually typed, same standing rule as every other gap-answer path in
+    this app."""
+    from datetime import datetime, timezone
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    for q in answered_questions:
+        answer = (q.get("answer") or "").strip()
+        if not answer:
+            continue
+        save_answer(
+            skill=q["skill"], role_context=PROFILE_GAP_REVIEW_ROLE_CONTEXT, answer=answer,
+            date_captured=today, question=q.get("question", ""), is_disqualifier=False,
+        )
+
+
 def redirect_canonical_skill_id(old_id: str, new_id: str) -> int:
     """Updates every gap_interview_answers entry whose canonical_skill_id
     == old_id to new_id instead. Real, necessary step whenever two
