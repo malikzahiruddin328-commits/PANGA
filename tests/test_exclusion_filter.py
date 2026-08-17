@@ -92,6 +92,36 @@ def test_title_matching_both_layers_is_still_excluded():
     assert result["rule"] in ("seniority_mismatch", "clinical_domain")
 
 
+@pytest.mark.parametrize("title", [
+    "Laboratory Technician",
+    "Veterinary Laboratory Technician",  # real Beacon Hill Life Sciences job
+    "Quality Control Laboratory Technician",  # real Beacon Hill Life Sciences job
+    "Lab Technician – Powdered Metals",  # real Beacon Hill Life Sciences job
+    "Engineering Lab Technician",  # real Beacon Hill Life Sciences job
+    "Senior Lab Tech",
+])
+def test_clinical_layer_excludes_lab_technician_titles(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is not None
+    assert result["rule"] == "clinical_domain"
+
+
+@pytest.mark.parametrize("title", [
+    "Lab Compute Analyst (all genders)",  # real AbbVie job - IT role, not a technician
+    "Lab Compute Senior Analyst (all genders)",  # real AbbVie job
+    "Cloud/Infrastructure Technician - DHA",  # real USAJOBS job
+    "Operating Systems Technician",  # real USAJOBS job
+    "IT Support Technician I",  # real U.S. Courts job
+    "IT Technician II",  # real U.S. Courts job
+    "R&D Engineering Technician",  # real Beacon Hill job - technician, but not lab-titled
+    "Technician, Equipment Engineering",  # real AbbVie job
+    "Scientist I - Laboratory Staff - Analytical Development",  # real AbbVie job - "Laboratory Staff", not "Laboratory Technician"
+])
+def test_clinical_layer_does_not_catch_non_lab_technician_titles(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is None or result["rule"] != "clinical_domain"
+
+
 def test_clinical_layer_fires_even_when_seniority_would_have_kept_it():
     # "Medical Director" carries "Director", which would satisfy the
     # seniority layer's exec-qualifier check on its own - layer 2 must
@@ -116,6 +146,149 @@ def test_known_bad_examples_are_excluded():
 
 def test_no_exclusion_for_a_plausible_unrelated_title():
     assert exclusion_filter.check_exclusion(_job("Chief Information Officer")) is None
+
+
+# --- Layer 3: custom user exclusions (2026-08-13, Settings tab build) ------
+
+def test_custom_exclusion_matches_case_insensitive_substring():
+    result = exclusion_filter.check_exclusion(
+        _job("Senior Program Director, Clinical Ops"),
+        custom_exclusions=["program director"],
+    )
+    assert result == {
+        "rule": "custom_user_exclusion",
+        "reason": 'matched custom excluded term "program director"',
+    }
+
+
+def test_custom_exclusion_is_a_free_form_substring_match_not_word_boundary():
+    # Deliberately NOT \b-bounded like the built-in layers - a non-technical
+    # user typing a fragment expects plain "contains this text", e.g. "CISO"
+    # should catch "Deputy CISO" and "intern" should catch "Internship".
+    assert exclusion_filter.check_exclusion(
+        _job("Deputy CISO"), custom_exclusions=["CISO"],
+    )["rule"] == "custom_user_exclusion"
+    assert exclusion_filter.check_exclusion(
+        _job("Summer Internship Program"), custom_exclusions=["Intern"],
+    )["rule"] == "custom_user_exclusion"
+
+
+def test_custom_exclusion_empty_list_has_no_effect():
+    assert exclusion_filter.check_exclusion(
+        _job("Director, IT Service Continuity"), custom_exclusions=[],
+    ) is None
+
+
+def test_custom_exclusion_term_matching_nothing_has_no_effect_and_no_error():
+    assert exclusion_filter.check_exclusion(
+        _job("Director, IT Service Continuity"),
+        custom_exclusions=["Underwater Basket Weaving Lead"],
+    ) is None
+
+
+def test_custom_exclusion_handles_blank_and_whitespace_only_terms_gracefully():
+    # A term list with stray empty strings (shouldn't happen given
+    # ui/app.py's save-time cleaning, but this is a public function other
+    # callers could hit directly) must not raise or match everything.
+    assert exclusion_filter.check_exclusion(
+        _job("Director, IT Service Continuity"),
+        custom_exclusions=["", "   ", "Underwater Basket Weaving Lead"],
+    ) is None
+
+
+def test_custom_exclusion_still_fires_when_built_in_layers_pass():
+    # "Program Director" alone passes both built-in layers (Director
+    # qualifies past seniority, no clinical match) - layer 3 must still be
+    # able to exclude it on its own.
+    assert exclusion_filter.check_exclusion(_job("Program Director")) is None
+    result = exclusion_filter.check_exclusion(
+        _job("Program Director"), custom_exclusions=["Program Director"],
+    )
+    assert result["rule"] == "custom_user_exclusion"
+
+
+def test_check_exclusion_defaults_to_loading_custom_exclusions_from_settings(isolated_data):
+    exclusion_filter.SETTINGS_PATH.write_text(
+        "custom_title_exclusions:\n- Program Director\n- CISO\n", encoding="utf-8",
+    )
+    result = exclusion_filter.check_exclusion(_job("Deputy CISO"))
+    assert result["rule"] == "custom_user_exclusion"
+
+
+def test_load_custom_title_exclusions_missing_file_returns_empty_list(isolated_data):
+    assert exclusion_filter.load_custom_title_exclusions() == []
+
+
+def test_load_custom_title_exclusions_missing_key_returns_empty_list(isolated_data):
+    exclusion_filter.SETTINGS_PATH.write_text("industries:\n- Pharma\n", encoding="utf-8")
+    assert exclusion_filter.load_custom_title_exclusions() == []
+
+
+def test_load_custom_title_exclusions_reads_configured_terms(isolated_data):
+    exclusion_filter.SETTINGS_PATH.write_text(
+        "custom_title_exclusions:\n- Project Manager\n- Intern\n", encoding="utf-8",
+    )
+    assert exclusion_filter.load_custom_title_exclusions() == ["Project Manager", "Intern"]
+
+
+# --- Layer 4: generic administrative/clerical/demo-support exclusion -------
+
+@pytest.mark.parametrize("title", [
+    "Administrative Assistant",
+    "Senior Administrative Assistant",
+    "Senior Administrative Assistant, IMCO, Eyecare & Specialty",  # real AbbVie job
+    "Executive Assistant",
+    "Executive Assistant to the CEO",
+    "Office Manager",
+    "Receptionist",
+    "Value Proposition and Demonstration Manager - Onco Solids",  # real AbbVie job
+    "Demonstration Manager",
+    "Value Proposition Manager",
+])
+def test_admin_support_layer_excludes_generic_non_technical_titles(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is not None
+    assert result["rule"] == "administrative_support_role"
+
+
+def test_front_desk_coordinator_excluded_by_seniority_layer_first():
+    # "Front Desk Coordinator" also matches this layer's own pattern, but
+    # layer 1 (Coordinator = IC-tier noun, no exec qualifier) runs first in
+    # check_exclusion() and claims it - same "excluded either way, rule
+    # label isn't the point" situation as the existing
+    # test_title_matching_both_layers_is_still_excluded() case above.
+    result = exclusion_filter.check_exclusion(_job("Front Desk Coordinator"))
+    assert result is not None
+    assert result["rule"] in ("seniority_mismatch", "administrative_support_role")
+
+
+@pytest.mark.parametrize("title", [
+    "Systems Administrator",
+    "Database Administrator",
+    "Network Administrator",
+    "Operational Technology Systems Administrator",  # real AbbVie job
+    "FVP/SVP, Credit Administrator",  # real AbbVie job - "Administrator" != "Administrative Assistant"
+    "Associate CIO, Administrative Applications",  # real AbbVie job - "Administrative Applications" != "Administrative Assistant"
+    "IT Office Manager",  # hedge: tech-qualified variant of a caught phrase
+    "Digital Demonstration Manager",  # hedge: tech-qualified variant of a caught phrase
+    "Chief Information Officer",
+    "Director, IT Service Continuity",
+    "VP Information Technology",
+])
+def test_admin_support_layer_does_not_catch_technical_or_unrelated_titles(title):
+    result = exclusion_filter.check_exclusion(_job(title))
+    assert result is None or result["rule"] != "administrative_support_role"
+
+
+def test_admin_support_layer_real_slipped_through_examples():
+    # The exact two real jobs Zahir flagged as having slipped through
+    # unfiltered from AbbVie's company-site pull.
+    assert exclusion_filter.check_exclusion(
+        _job("Value Proposition and Demonstration Manager - Onco Solids", organization="AbbVie")
+    )["rule"] == "administrative_support_role"
+    assert exclusion_filter.check_exclusion(
+        _job("Senior Administrative Assistant", organization="AbbVie")
+    )["rule"] == "administrative_support_role"
 
 
 # --- Logging: the non-negotiable "never silently dropped" requirement ------

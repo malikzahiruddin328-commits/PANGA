@@ -88,7 +88,11 @@ flowchart TD
 - `app.py` - the whole Streamlit app, one file, tabs switched via `active_tab` session state. Long - use the section headers (`elif active_tab == "..."`) to jump, don't read top to bottom.
 - `feedback_widget.py` - the point-and-talk feedback widget embedded on every tab.
 
-**feedback/**, **skills/** - small support modules (voice transcription, UI feedback store, industry/role skill lookup table).
+**feedback/** - small support module (voice transcription, UI feedback store).
+
+**skills/** - `lookup.py` (industry/role skill lookup table). `canonical_taxonomy.py` - the deterministic canonical skill/experience taxonomy (`data/skills/canonical_skills.json`, real personal data, not git-tracked) - `find_canonical_id()` (matching, no AI), `resolve_or_create_canonical_id()`/`run_locked_bulk_mutation()` (cross-process-safe writes, `security.file_lock.locked("canonical_taxonomy")`). `gap_frequency_analysis.py` (2026-08-17, feature/jd-keyword-taxonomy-gaps) - pure-Python, zero-AI-cost `analyze_recurring_gaps()`: tallies every job's extracted `ats_required_keywords`/`ats_preferred_keywords` against the canonical taxonomy, surfacing (a) confirmed canonical skills recurring in 3+ distinct postings with no `gap_interview_answers` entry yet, and (b) recurring free-text terms that don't match any taxonomy entry (new-concept candidates) - the "3+" threshold is `DEFAULT_MIN_RECURRENCE`, an overridable parameter, not a scattered magic number. `build_review_questions()` turns that ranked output into the question objects `ui/app.py`'s "Review recurring profile gaps" panel (Profile Gaps tab) renders.
+
+**tailoring/jd_keyword_extraction.py** (2026-08-17, feature/jd-keyword-taxonomy-gaps) - standalone, subscription-covered ($0, via `tailoring.reasoner_cli`) ATS keyword extraction for one job posting on its own, no resume draft needed - reuses `drafting.ATS_KEYWORDS_SYSTEM_PROMPT`/`_ats_keywords_schema()` and its three deterministic post-processing backstops (years-of-experience/soft-skill/degree-prefix), not a leaner unfiltered duplicate. Used by `scripts/batch_extract_jd_keywords.py` (resumable/capped batch runner, real per-run circuit breakers - max jobs and max wall-clock minutes, state logged to `data/jobs/jd_keyword_extraction_progress.json`) to backfill `ats_required_keywords`/`ats_preferred_keywords` onto real-JD jobs that don't have them yet. Run manually/repeatedly (never automatically) until the backlog drains - see the script's own module docstring.
 
 ## Where to look for X
 

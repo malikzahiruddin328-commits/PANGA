@@ -84,6 +84,8 @@ from tailoring.cta_emails import get_active_cta_emails, request_archive, request
 from tailoring.interview_prep import load_interview_prep, get_interview_prep, record_round_outcome, build_prep_context, generate_prep, start_round, save_round
 from tailoring.dossier import dossier_dir, sync_workspace_documents, check_for_edits
 from tailoring.bulk_generate import generate_for_job, generate_for_basket
+from tailoring.subscription_resume_qa import run_subscription_round, generate_questions_via_subscription, submit_answers_and_redraft
+from tailoring.reasoner_cli import ReasonerUnavailable
 from tailoring.ats_score import detect_matched_keyword_regressions
 from tailoring.unconfirmed_claims import find_unconfirmed_markers, resolve_unconfirmed_claim
 from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed, analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_impact as _check_regenerate_impact, request_additional_gap_questions as _request_additional_gap_questions, reextract_ats_keywords_and_rescore as _reextract_ats_keywords_and_rescore, rescore_against_cached_keywords as _rescore_against_cached_keywords, gap_scan_is_current as _gap_scan_is_current, gap_scan_baseline_fingerprint as _gap_scan_baseline_fingerprint, _report_drafting_failure
@@ -116,6 +118,8 @@ from feedback.ui_feedback import get_open_feedback, mark_resolved
 from ui.feedback_widget import render_feedback_widget
 from profile.ingest import load_manifest_result, remove_document, ingest_uploaded_document, resume_text as ingested_resume_text
 from profile.storage import load_profile, update_profile_field
+from profile.interview import save_profile_gap_review_answers
+from skills.gap_frequency_analysis import analyze_recurring_gaps, build_review_questions, DEFAULT_MIN_RECURRENCE
 try:
     # Bhangi is a separate, standalone cross-project tool (see
     # _find_bhangi_src above) - not something this app ships or installs
@@ -387,14 +391,68 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
     Streamlit session_state, so it survives page reloads. "Expandable" is
     a real st.popover, not a fake collapse/expand - clicking it opens an
     actual floating panel listing every basket job with a per-item remove
-    action and a per-item "Generate" button, plus one bulk "Generate for
-    all N" action for the whole basket - covering both the per-job and
-    bulk document-generation actions the spec asked the basket itself to
-    support (the Results tab's own per-job "Generate documents" section,
-    inside each job's detail panel, already covers the per-job case there
-    too - this is a second, basket-scoped way to reach the same per-job
-    action without leaving the basket panel)."""
+    action and one bulk "Generate for all N" action for the whole basket
+    (the Results tab's own per-job "Generate documents" section, inside
+    each job's detail panel, already covers the per-job case there too -
+    this basket panel is a bulk-scoped way to reach the same underlying
+    pipeline without leaving the basket panel).
+
+    A standalone per-item "Generate" button used to live here too (left
+    of "Draft & score"), calling generate_for_job() directly - a paid API
+    call with no gate. Removed 2026-08-17 (real bug, flagged by Zahir off
+    a screenshot): it was a leftover from before the 2026-08-13 step-4
+    redesign below, sat in the first/leftmost column ahead of "Draft &
+    score" so it read as step 1 of the sequence when it was actually a
+    shortcut that bypassed the entire $0 subscription draft/score/Q&A
+    loop and spent real money immediately. "Fire final API build" below
+    is now the sole per-item path to generate_for_job(), gated behind at
+    least one completed subscription round. NOTE: the bulk "Generate for
+    all N job(s)" button further down this panel has the same
+    direct-paid-API-bypass shape (it calls generate_for_basket() with no
+    subscription-round gate) but was left as-is here - Zahir's report was
+    specifically about the per-item button from the screenshot, not this
+    one; flagged in the build report instead of changed.
+
+    Each item also gets the in-app subscription build/refine loop
+    (2026-08-13, tailoring.subscription_resume_qa - Zahir's confirmed real
+    design for basket document generation, REPLACING the earlier
+    message-board-based "Discuss & draft" - see subscription_resume_qa's
+    own module docstring for why: Zahir explicitly rejected routing the
+    user to a live Claude Code conversation outside the app - "the user
+    will remain in the app they will not come to claude screens"):
+
+    - "Draft & score (subscription, $0)" drafts an initial resume and a
+      real ATS score via the subscription-covered `claude` CLI (never the
+      paid API) - subscription_qa_status/subscription_qa_round on the
+      application record drive real progress ("Drafting initial
+      resume...", "Generating questions...") instead of a silent wait.
+    - Once a round exists, an expander shows the score history, any open
+      clarifying questions as an in-app editable form (pre-filled with a
+      hedged suggested answer, same pattern the Analyze Fit panel already
+      uses), and "Submit answers & redraft (subscription, $0)" - each
+      round is another $0 subscription call, incorporating whatever facts
+      were just confirmed.
+    - "Fire final API build" is the one paid call in this whole flow -
+      enabled only once at least one subscription round has completed
+      (subscription_qa_round > 0) - reusing bulk_generate.generate_for_job()
+      (the existing, already-tested, safety-gated pipeline) exactly as-is,
+      never a second implementation of it.
+
+    The old message-board "Discuss & draft"/"Finish draft" buttons are
+    REMOVED from this UI (judgment call, flagged in the build report this
+    shipped with): Zahir's design supersedes them and leaving both wired
+    up here would be two competing ways to do the same thing, one of which
+    he explicitly said isn't the shape he wants. tailoring.discuss_and_draft
+    itself is left in place, untouched, and unreferenced from this file -
+    not deleted - in case any other caller still needs it."""
     basket_jobs = [j for j in all_jobs if j.get("in_basket")]
+
+    def _qa_progress_placeholder():
+        placeholder = st.empty()
+
+        def _on_progress(stage: str) -> None:
+            placeholder.markdown(f":material/hourglass_top: {stage.capitalize()}... (this can take 40-90+ seconds)")
+        return _on_progress
 
     with st.container(key="panga_basket_bar"):
         bar_cols = st.columns([3, 2, 2])
@@ -406,34 +464,149 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                     st.markdown(f"**{len(basket_jobs)} job(s) in your basket**")
                     for job in basket_jobs:
                         source, job_id = job.get("source"), job.get("job_id")
-                        item_cols = st.columns([4, 1.4, 1])
+                        job_key = f"{source}_{job_id}"
+                        app_record = applications_by_key.get((source, job_id)) or {}
+                        qa_status = app_record.get("subscription_qa_status")
+                        qa_round = app_record.get("subscription_qa_round", 0)
+                        qa_score = app_record.get("resume_ats_score")
+                        open_questions = app_record.get("resume_clarifying_questions") or []
+                        item_cols = st.columns([3, 2.2, 1.8, 1])
                         with item_cols[0]:
                             st.markdown(f"{job_label(job)}")
                         with item_cols[1]:
+                            if qa_status == "drafting":
+                                st.markdown(":material/hourglass_top: Drafting initial resume (subscription)...")
+                            elif qa_status == "generating_questions":
+                                st.markdown(":material/hourglass_top: Generating questions...")
+                            elif qa_status == "redrafting":
+                                st.markdown(":material/hourglass_top: Applying your answers...")
+                            elif qa_status == "failed":
+                                st.markdown(f":material/error: {app_record.get('subscription_qa_error', 'Subscription call failed')}")
+                                if st.button("Retry (subscription, $0)", key=f"basket_item_subretry_{source}_{job_id}"):
+                                    on_progress = _qa_progress_placeholder()
+                                    outcome = run_subscription_round(job, load_profile(), on_progress=on_progress)
+                                    if outcome["locked"]:
+                                        st.toast(f"A generation is already in progress for {job_label(job)} - try again shortly.", icon=":material/warning:")
+                                    elif outcome["ok"]:
+                                        st.toast(f"Round {outcome['round']} drafted - ATS {outcome['resume_draft']['ats_score']}/100 - $0, subscription-covered.", icon=":material/check_circle:")
+                                    else:
+                                        st.toast(f"Subscription draft failed: {outcome['error']}", icon=":material/error:")
+                                    st.rerun()
+                            elif qa_round == 0:
+                                if st.button(
+                                    "Draft & score (subscription, $0)", key=f"basket_item_subdraft_{source}_{job_id}",
+                                    help="Drafts an initial resume and a real ATS score via your Claude subscription - not a paid API call, $0 cost. Can take 40-90+ seconds.",
+                                ):
+                                    on_progress = _qa_progress_placeholder()
+                                    outcome = run_subscription_round(job, load_profile(), on_progress=on_progress)
+                                    if outcome["locked"]:
+                                        st.toast(f"A generation is already in progress for {job_label(job)} - try again shortly.", icon=":material/warning:")
+                                    elif outcome["ok"]:
+                                        st.toast(f"Round {outcome['round']} drafted - ATS {outcome['resume_draft']['ats_score']}/100 - $0, subscription-covered.", icon=":material/check_circle:")
+                                    else:
+                                        st.toast(f"Subscription draft failed: {outcome['error']}", icon=":material/error:")
+                                    st.rerun()
+                            else:
+                                score_text = f"{qa_score}/100" if qa_score is not None else "not yet scored"
+                                st.markdown(f":material/check_circle: Round {qa_round} - ATS {score_text}")
+                        with item_cols[2]:
                             if st.button(
-                                "Generate", key=f"basket_item_gen_{source}_{job_id}",
-                                disabled=not drafting_is_configured(),
-                                help="Generates the same document types picked below, for just this one job.",
+                                "Fire final API build", key=f"basket_item_finalbuild_{source}_{job_id}",
+                                disabled=not drafting_is_configured() or qa_round == 0,
+                                type="primary" if qa_round > 0 else "secondary",
+                                help=(
+                                    "Fires the one paid final resume+cover letter build, reusing the existing "
+                                    "tested pipeline (self-correction loop, claim verification, both safety "
+                                    "gates) exactly as-is. Enabled once at least one subscription round above "
+                                    "has completed - you decide when to stop refining for free."
+                                    if qa_round > 0 else
+                                    "Draft & score (subscription, $0) at least one round first - this button "
+                                    "fires the one real paid call once you're satisfied."
+                                ),
                             ):
                                 doc_keys = [k for k, _ in BASKET_DOC_TYPES if st.session_state.get(f"basket_doc_{k}", k in ("resume", "cover_letter"))]
                                 if not doc_keys:
                                     st.toast("Pick at least one document type below first.", icon=":material/warning:")
                                 else:
-                                    result = generate_for_job(job, load_profile(), doc_keys)
+                                    final_placeholder = st.empty()
+
+                                    def _final_progress(i, total, doc_key, substatus=None, _ph=final_placeholder):
+                                        label = doc_key.replace("_", " ")
+                                        detail = f" - {substatus}" if substatus else ""
+                                        _ph.markdown(f":material/hourglass_top: Drafting final version: {label} ({i}/{total}){detail}")
+                                    result = generate_for_job(job, load_profile(), doc_keys, on_progress=_final_progress)
                                     if result.get("locked"):
                                         st.toast(f"A generation is already in progress for {job_label(job)} - try again shortly.", icon=":material/warning:")
                                     elif result["ok"]:
-                                        st.toast(f"Documents drafted for {job_label(job)}.", icon=":material/check_circle:")
+                                        st.toast(f"Final documents drafted for {job_label(job)} - paid API call complete.", icon=":material/check_circle:")
                                     else:
                                         failed = ", ".join(result["errors"].keys())
                                         st.toast(f"{job_label(job)}: {failed} failed to draft - see the Results tab for detail.", icon=":material/warning:")
                                     st.rerun()
-                        with item_cols[2]:
+                        with item_cols[3]:
                             if st.button(":material/close:", key=f"basket_item_remove_{source}_{job_id}", help="Remove from basket"):
                                 remove_from_basket(source, job_id)
                                 st.rerun()
+
+                        if qa_round > 0 or open_questions:
+                            score_label = f"{qa_score}/100" if qa_score is not None else "not yet scored"
+                            with st.expander(f"Build & refine — round {qa_round}, ATS {score_label}", key=f"basket_subqa_expander_{job_key}", expanded=bool(open_questions), on_change="rerun"):
+                                history = app_record.get("subscription_ats_score_history") or []
+                                if history:
+                                    st.markdown("**Score history:** " + " → ".join(f"round {h['round']}: {h['ats_score']}" for h in history))
+                                if not open_questions:
+                                    st.markdown(":material/task_alt: No open questions right now - refine facts in your Profile, or fire the final build.")
+                                    if st.button("Check for more questions (subscription, $0)", key=f"basket_subqa_checkmore_{job_key}"):
+                                        on_progress = _qa_progress_placeholder()
+                                        try:
+                                            check_result = generate_questions_via_subscription(job, load_profile(), on_progress=on_progress)
+                                        except ReasonerUnavailable as exc:
+                                            st.toast(f"Can't check for more questions right now: {exc}", icon=":material/error:")
+                                        else:
+                                            if check_result["added_count"]:
+                                                st.toast(f"Found {check_result['added_count']} more thing(s) worth asking about.", icon=":material/info:")
+                                            else:
+                                                st.toast("No more real gaps found based on your current profile.", icon=":material/task_alt:")
+                                            st.rerun()
+                                else:
+                                    st.markdown(
+                                        "Answer these to raise the score further on your next subscription "
+                                        "round - only used if you confirm they're true, nothing is ever "
+                                        "invented. Some boxes are pre-filled with a proposed guess - edit it "
+                                        "to whatever's actually true, or leave it blank to skip."
+                                    )
+                                    answer_entries = []
+                                    for q in open_questions:
+                                        q_key = f"basketqa_{job_key}_{abs(hash(q['question'] + '|' + (q.get('suggested_answer') or ''))) % 10_000_000}"
+                                        suggested_answer = q.get("suggested_answer") or ""
+                                        with st.container(border=True):
+                                            st_markdown_raw_text(q["question"])
+                                            answer_value = st.text_area(
+                                                q["question"], value=suggested_answer, key=q_key,
+                                                height=68, label_visibility="collapsed",
+                                                placeholder="Type your answer..." if q.get("type") == "disqualifier_check" else None,
+                                            )
+                                        if answer_value and answer_value.strip() and answer_value != suggested_answer:
+                                            answer_entries.append({
+                                                "skill": q["skill"], "type": q["type"],
+                                                "answer": answer_value, "question": q["question"],
+                                            })
+                                    if st.button(
+                                        "Submit answers & redraft (subscription, $0)", key=f"basket_subqa_submit_{job_key}",
+                                        type="primary", disabled=not answer_entries,
+                                        help="Saves the answers you edited above and redrafts this resume via the subscription - not a paid call.",
+                                    ):
+                                        on_progress = _qa_progress_placeholder()
+                                        outcome = submit_answers_and_redraft(job, load_profile(), answer_entries, on_progress=on_progress)
+                                        if outcome["locked"]:
+                                            st.toast(f"A generation is already in progress for {job_label(job)} - try again shortly.", icon=":material/warning:")
+                                        elif outcome["ok"]:
+                                            st.toast(f"Round {outcome['round']} drafted - ATS {outcome['resume_draft']['ats_score']}/100 - $0, subscription-covered.", icon=":material/check_circle:")
+                                        else:
+                                            st.toast(f"Subscription re-draft failed: {outcome['error']}", icon=":material/error:")
+                                        st.rerun()
                     st.divider()
-                    st.markdown("**Document types** (used by both per-item Generate above and Generate all below)")
+                    st.markdown("**Document types** (used by both \"Fire final API build\" above and \"Generate for all\" below)")
                     doc_cols = st.columns(len(BASKET_DOC_TYPES))
                     for col, (doc_key, doc_label) in zip(doc_cols, BASKET_DOC_TYPES):
                         with col:
@@ -1779,6 +1952,88 @@ def render_analyze_fit_section(job: dict, app_record: dict, analysis: dict | Non
                     st.rerun()
 
 
+def render_recurring_gap_review_panel() -> None:
+    """Phase 3 of Zahir's confirmed "final set of questions" taxonomy-gap
+    build (2026-08-17, feature/jd-keyword-taxonomy-gaps). His own words on
+    the goal: the system has "seen its fair share of jobs that apply to
+    me and knows the language of the JDs" - this is that final,
+    consolidated round, built to MINIMIZE future per-job re-asking, not
+    add another round on top of the existing per-job clarifying-questions
+    flow below on this same tab.
+
+    Standalone - not tied to any single job in the basket, per Zahir's
+    explicit call on placement (his own words: "a standalone 'Review
+    profile gaps' entry point, reachable from Settings or a dedicated
+    section"). Placed at the top of the existing Profile Gaps tab rather
+    than a new tab or a Settings subsection: this tab is already the
+    real, established "cross-job profile facts" section (see
+    render_answered_gap_questions() immediately below, and the per-job
+    loop above this function's own call site) - a second, differently-
+    located place for the same category of decision would be exactly the
+    kind of duplicate-surface HCI gap this repo's CLAUDE.md calls out
+    (\"are related decisions forced into separate clicks/buttons when
+    they're really one decision made at one moment? Consolidate.\").
+
+    Reuses skills.gap_frequency_analysis (pure Python, zero AI cost - the
+    analysis itself runs on every page load, no spinner needed) and
+    profile.interview.save_profile_gap_review_answers() (the SAME
+    resolve_or_create_canonical_id()/save_answer() write path every other
+    confirmed profile fact in this app already goes through) - no new
+    write path, no new AI call, per the phase's own design.
+
+    Same auto-save-on-edit + st.toast + st.rerun() pattern as
+    render_analyze_fit_section's per-job questions immediately above -
+    one real interaction model for "answer a gap question" across this
+    whole tab, not two."""
+    analysis = analyze_recurring_gaps()
+    questions = build_review_questions(analysis)
+
+    with st.container(border=True):
+        st.markdown("**Review recurring profile gaps**")
+        st.markdown(
+            "Real terms that keep showing up as required/preferred across "
+            f"{analysis['jobs_with_keywords']} of your saved job postings "
+            f"(out of {analysis['total_jobs']} total) that recur "
+            f"{analysis['min_recurrence']}+ times and aren't confirmed in "
+            "your profile yet - answer these once here instead of "
+            "re-answering the same underlying fact job by job. Nothing is "
+            "ever guessed on your behalf: every box below starts empty, "
+            "and leaving one blank changes nothing."
+        )
+        if not questions:
+            if analysis["jobs_with_keywords"] == 0:
+                st.markdown(
+                    "No jobs have extracted ATS keywords yet - run "
+                    "`scripts/batch_extract_jd_keywords.py` to build up "
+                    "real data for this analysis."
+                )
+            else:
+                st.markdown("Nothing recurring enough to ask about right now - nice place to be.")
+        else:
+            st.markdown(f"{len(questions)} real, recurring gap(s) found.")
+            for q in questions:
+                q_key = f"recurring_gap_{abs(hash(q['skill'] + '|' + q['type'])) % 10_000_000}"
+                with st.container(border=True):
+                    badge_col, text_col = st.columns([1, 5])
+                    with badge_col:
+                        if q["type"] == "new_concept":
+                            st.badge("new concept", color="orange")
+                        else:
+                            st.badge(f"{q['job_count']} postings", color="blue")
+                    with text_col:
+                        st_markdown_raw_text(q["question"])
+                    answer_value = st.text_area(
+                        q["question"], value="", key=q_key, height=68,
+                        label_visibility="collapsed", placeholder="Type your answer, or leave blank to skip...",
+                    )
+                    if answer_value and answer_value.strip():
+                        save_profile_gap_review_answers([{
+                            "skill": q["skill"], "answer": answer_value, "question": q["question"],
+                        }])
+                        st.toast("Saved.", icon=":material/check_circle:")
+                        st.rerun()
+
+
 def render_answered_gap_questions() -> None:
     """Retrievable/editable history of every confirmed gap answer - Zahir's
     ask 2026-08-06: once a question is genuinely answered, it correctly
@@ -2605,6 +2860,38 @@ if active_tab == "settings":
             else:
                 st.toast("Saved job-alert senders.", icon=":material/check_circle:")
                 st.rerun()
+
+    st.subheader("Custom title exclusions")
+    st.markdown(
+        "Comma-separated titles to skip during search, checked against "
+        "every job title before it's saved. Applies alongside the "
+        "built-in filters."
+    )
+    custom_exclusions_settings = load_settings()
+    custom_title_exclusions_text = st.text_area(
+        "Custom title exclusions",
+        value=", ".join(custom_exclusions_settings.get("custom_title_exclusions", [])),
+        key="custom_title_exclusions_text",
+        label_visibility="collapsed",
+    )
+    if st.button("Save custom title exclusions"):
+        # Split on commas, trim whitespace, drop empty entries - handles
+        # extra commas/whitespace in free-form input gracefully (e.g.
+        # "Intern,, CISO ,  " -> ["Intern", "CISO"]) rather than erroring
+        # or saving blank terms that would never match anything.
+        cleaned_terms = [
+            term.strip()
+            for term in custom_title_exclusions_text.split(",")
+            if term.strip()
+        ]
+        custom_exclusions_settings["custom_title_exclusions"] = cleaned_terms
+        try:
+            save_settings(custom_exclusions_settings)
+        except Exception as exc:
+            st.error(f"Failed to save custom title exclusions: {exc}")
+        else:
+            st.toast("Saved custom title exclusions.", icon=":material/check_circle:")
+            st.rerun()
 
     if bhangi_create_issue is not None:
         # Same "no Bhangi checkout -> feature quietly absent, not an error"
@@ -5102,6 +5389,8 @@ elif active_tab == "gaps":
         "A job drops off this list once its questions are answered and its "
         "resume regenerated."
     )
+
+    render_recurring_gap_review_panel()
 
     gap_apps = get_applications_with_open_clarifying_questions()
     if not gap_apps:

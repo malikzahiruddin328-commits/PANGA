@@ -4,6 +4,7 @@ from tailoring.drafting import (
     RESUME_SPEC_USAJOBS,
     _draft_group,
     _draft_one,
+    _finalize_resume_draft,
     _drop_generic_soft_skill_keywords,
     _drop_years_experience_keywords,
     _merge_keyword_gap_questions,
@@ -323,6 +324,35 @@ def test_draft_one_resume_threads_unconfirmed_claims_through(monkeypatch):
 
     result = _draft_one(object(), [], "resume", None, job=job, profile={})
     assert result["unconfirmed_claims"] == [{"skill": "Team size", "text": "Led a team of 8-10 engineers?"}]
+
+
+# --- _finalize_resume_draft() (2026-08-13, extracted from _draft_one()'s
+# resume branch so a subscription-covered caller - tailoring.
+# subscription_resume_qa, feature/in-app-subscription-qa - can run its own
+# raw draft through the SAME deterministic safety gates, not a
+# reimplementation of them.) ---
+
+
+def test_finalize_resume_draft_matches_draft_one_for_the_same_raw_data(monkeypatch):
+    import tailoring.drafting as drafting
+
+    raw_data = {
+        "text": "SKILLS\nLed a team of 8-10 engineers?",
+        "target_seniority_at_least_vp": False,
+        "suggested_strategy_tag": "concise-2-page",
+        "clarifying_questions": [],
+        "unconfirmed_claims": [{"skill": "Team size", "text": "Led a team of 8-10 engineers?"}],
+    }
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": [], "ats_preferred_keywords": []}
+
+    def _fake_call_structured(client, **kwargs):
+        return raw_data
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured)
+
+    via_draft_one = _draft_one(object(), [], "resume", None, job=job, profile={})
+    via_finalize_directly = _finalize_resume_draft(raw_data, job, {})
+
+    assert via_draft_one == via_finalize_directly
 
 
 def test_draft_one_resume_renders_education_verbatim_from_the_profile(monkeypatch):

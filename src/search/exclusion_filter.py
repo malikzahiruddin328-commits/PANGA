@@ -12,7 +12,7 @@ call, on jobs already sitting in the store), this runs on EVERY job coming
 out of EVERY search channel (USAJOBS, ZipRecruiter, Dice, Indeed, company
 sites, industry boards) before search.job_store.save_jobs() ever writes a
 record - so it must stay purely deterministic (no AI call, no network
-call) to be cheap enough to run at that volume. Two layers:
+call) to be cheap enough to run at that volume. Four layers:
 
 1. Seniority-tier exclusion: the candidate (Zahir) is a 25-year VP/CIO/
    Head-of-IT executive. An individual-contributor-tier noun in the title
@@ -26,14 +26,57 @@ call) to be cheap enough to run at that volume. Two layers:
    "Senior").
 2. Clinical/medical domain exclusion: Medical Director, Physician, Nurse
    Practitioner, Registered Nurse, Clinical Research/Development/
-   Scientist/Pharmacology, Medical Science Liaison, Medical Advisor -
-   verified: "Senior Medical Director, Hematology Clinical Development" at
-   AbbVie scored 0 four separate times with an identical "clinical role,
-   no domain overlap" rationale. This layer is deliberately independent of
-   layer 1 - "Medical Director" carries an executive-qualifying word
-   ("Director") that would otherwise keep it, so the clinical check must
-   run regardless of the seniority verdict, not only when seniority
-   already excluded it.
+   Scientist/Pharmacology, Medical Science Liaison, Medical Advisor,
+   Laboratory/Lab Technician - verified: "Senior Medical Director,
+   Hematology Clinical Development" at AbbVie scored 0 four separate times
+   with an identical "clinical role, no domain overlap" rationale. This
+   layer is deliberately independent of layer 1 - "Medical Director"
+   carries an executive-qualifying word ("Director") that would otherwise
+   keep it, so the clinical check must run regardless of the seniority
+   verdict, not only when seniority already excluded it. Extended
+   2026-08-17 with lab/technician phrase matching ("laboratory
+   technician", "lab technician", "lab tech") after two real Beacon Hill
+   Life Sciences (industry board) jobs - "Veterinary Laboratory
+   Technician" and "Quality Control Laboratory Technician" - slipped
+   through: neither carried an IC-tier noun from layer 1 ("Technician"
+   isn't in that list) nor matched any prior clinical phrase. See the
+   pattern definition below for the false-positive check against real
+   "Lab Compute Analyst" (AbbVie) and "IT/Cloud Technician" (USAJOBS/U.S.
+   Courts) titles already in the live store.
+3. Custom title exclusions (added 2026-08-13): the user's own free-text
+   terms from the Settings tab, stored in config/settings.yaml's
+   "custom_title_exclusions" key (see load_custom_title_exclusions() and
+   _custom_exclude() below) - plain case-insensitive substring matching,
+   not the \b-boundary regex the built-in layers use, since a
+   non-technical user typing a free-form fragment expects "contains this
+   text" behavior.
+4. Generic administrative/clerical/demo-support role exclusion (added
+   2026-08-17, Zahir's explicit request after "Value Proposition and
+   Demonstration Manager" and "Senior Administrative Assistant" - two real
+   AbbVie company-site jobs, neither remotely IT/cybersecurity/digital-
+   transformation - slipped through to him unfiltered). Matches titled
+   roles like "Administrative Assistant," "Executive Assistant," "Office
+   Manager," "Receptionist," and "Demonstration Manager"/"Value
+   Proposition Manager" - none of these carry an IC-tier noun from layer
+   1's pattern (so layer 1 never catches them: "Assistant"/"Manager"
+   aren't in that list), and they're not a clinical/medical role either,
+   so layer 2 doesn't catch them. Deliberately titled-phrase matching, not
+   a generic "admin" substring - "Administrator" (a real, distinct
+   technical title: "Systems Administrator," "Database Administrator,"
+   "Network Administrator," "Operational Technology Systems
+   Administrator," all real titles in the live store) shares no common
+   substring with "Administrative Assistant" once matched as whole words,
+   so there is no risk of conflating the two. Also exempts any title that
+   independently carries an IT/technical qualifier word (IT, systems,
+   technology, technical, digital, network, infrastructure, security,
+   software, data, cloud, cyber, informatics) anywhere in the title - a
+   hedge against a real but
+   not-yet-seen title like "IT Office Manager" or "Digital Demonstration
+   Manager" that would otherwise be a false positive; validated 2026-08-17
+   against the full live job store (2 real matches: "Senior Administrative
+   Assistant" and "Senior Administrative Assistant, IMCO, Eyecare &
+   Specialty," both genuinely non-technical - zero false positives against
+   every real "Administrator"/"CIO"/"Director"/"VP" title in the store).
 
 Non-negotiable per Zahir's standing "never silently dropped" rule (the
 same one tailoring.fit_score_prefilter follows): an excluded job is never
@@ -49,6 +92,8 @@ import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import yaml
+
 from security.crypto_store import read_json, write_json
 from security.file_lock import locked
 
@@ -56,6 +101,15 @@ logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 EXCLUSION_LOG_PATH = PROJECT_ROOT / "data" / "jobs" / "search_exclusion_log.json"
+
+# Layer 3 (2026-08-13, Settings tab "Custom title exclusions" build): the
+# user's own free-text list, stored in config/settings.yaml alongside
+# target_roles/industries/etc. (same plain-YAML store ui/app.py's
+# load_settings()/save_settings() already read/write - no new storage
+# layer for this). Read here directly rather than importing
+# ui.app.load_settings() to avoid a search -> ui import (ui already
+# imports from search; the reverse would be circular).
+SETTINGS_PATH = PROJECT_ROOT / "config" / "settings.yaml"
 
 # Layer 1: seniority-tier exclusion. \b word boundaries throughout so e.g.
 # "head" never matches inside "headquarters"/"overhead" and "chief" never
@@ -83,7 +137,52 @@ _CLINICAL_PATTERN = re.compile(
     r"|\bclinical scientist\b"
     r"|\bclinical pharmacology\b"
     r"|\bmedical science liaison\b"
-    r"|\bmedical advisor\b",
+    r"|\bmedical advisor\b"
+    # Added 2026-08-17: two real Beacon Hill Life Sciences (industry
+    # staffing board) jobs - "Veterinary Laboratory Technician" and
+    # "Quality Control Laboratory Technician" - slipped through unfiltered.
+    # Neither carries an IC-tier noun from layer 1's pattern ("Technician"
+    # isn't in that list) and neither matched any existing clinical phrase
+    # above, so both reached Zahir unfiltered. Deliberately phrase-matching
+    # "lab/laboratory technician", not a bare "\blab\b" or "\btechnician\b"
+    # substring: validated against the full live job store (2026-08-17) -
+    # "Lab Compute Analyst"/"Lab Compute Senior Analyst" (AbbVie, real IT
+    # roles managing lab computing systems), "Cloud/Infrastructure
+    # Technician", "IT Support Technician I", "IT Technician II" (all real
+    # USAJOBS/U.S. Courts IT roles) all contain "lab" or "technician" in
+    # isolation but never the contiguous "lab/laboratory technician"
+    # phrase, so a narrower substring would have false-positived on real
+    # IT-relevant titles where this phrase-match does not.
+    r"|\blaboratory technician\b"
+    r"|\blab technician\b"
+    r"|\blab tech\b",
+    re.I,
+)
+
+# Layer 4: generic administrative/clerical/demo-support role exclusion.
+# Titled-phrase matching only (never a bare "admin" substring) so a real
+# technical "Administrator" title (Systems/Database/Network Administrator)
+# can never be conflated with "Administrative Assistant" - the two share no
+# common substring once matched as whole titled phrases.
+_ADMIN_SUPPORT_PATTERN = re.compile(
+    r"\badministrative assistant\b"
+    r"|\bexecutive assistant\b"
+    r"|\boffice manager\b"
+    r"|\breceptionist\b"
+    r"|\bfront desk\b"
+    r"|\bvalue proposition\b"
+    r"|\bdemonstration manager\b",
+    re.I,
+)
+
+# Exemption: any of these words appearing anywhere else in the title signals
+# a real IT/technical role, even one titled with an otherwise-generic
+# administrative/support phrase (e.g. a not-yet-seen "IT Office Manager" or
+# "Digital Demonstration Manager") - a real technical title must never be
+# caught by this layer.
+_TECH_QUALIFIER_PATTERN = re.compile(
+    r"\b(it|information technology|systems|technology|technical|digital|network|"
+    r"infrastructure|security|software|data|cloud|cyber|informatics)\b",
     re.I,
 )
 
@@ -101,12 +200,66 @@ def _clinical_exclude(title: str) -> str | None:
     return None
 
 
-def check_exclusion(job: dict) -> dict | None:
+def load_custom_title_exclusions() -> list[str]:
+    """Returns the user's own free-text exclusion terms from
+    config/settings.yaml's "custom_title_exclusions" key - already
+    split/trimmed at save time (see ui/app.py's Settings tab handler), so
+    this returns them as-is. Missing file or missing key both resolve to
+    an empty list, not an error - a fresh install/an unused field is the
+    common case and must be a true no-op, not a crash or a spurious
+    exclusion.
+
+    Called once per save_jobs() batch (not once per job) by
+    job_store.save_jobs(), which passes the result into check_exclusion()
+    for every job in that batch - avoids re-reading this file once per
+    job on what can be a large multi-source search result."""
+    if not SETTINGS_PATH.exists():
+        return []
+    with open(SETTINGS_PATH, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    return data.get("custom_title_exclusions") or []
+
+
+def _custom_exclude(title: str, custom_exclusions: list[str]) -> str | None:
+    """Case-insensitive substring match, deliberately not the \\b
+    word-boundary regex the built-in layers use above: a non-technical
+    user typing a free-form fragment (e.g. "Program Director" meant to
+    catch "Senior Program Director, Clinical Ops") expects plain "contains
+    this text" behavior, not regex semantics they never opted into."""
+    title_lower = title.lower()
+    for term in custom_exclusions:
+        term_clean = (term or "").strip()
+        if term_clean and term_clean.lower() in title_lower:
+            return f"matched custom excluded term \"{term_clean}\""
+    return None
+
+
+def _admin_support_exclude(title: str) -> str | None:
+    match = _ADMIN_SUPPORT_PATTERN.search(title)
+    if not match:
+        return None
+    if _TECH_QUALIFIER_PATTERN.search(title):
+        return None
+    return f"generic non-technical administrative/clerical/demo-support role (matched \"{match.group(0)}\")"
+
+
+def check_exclusion(job: dict, custom_exclusions: list[str] | None = None) -> dict | None:
     """Returns {"rule": ..., "reason": ...} if this job should never be
     persisted, or None if it should go through job_store.save_jobs()'s
-    normal path. Both layers are checked independently (not short-circuit
-    on layer 1's verdict) - see this module's own docstring on why
-    "Medical Director" needs layer 2 to fire regardless of layer 1."""
+    normal path. All four layers are checked independently (not
+    short-circuit on an earlier layer's verdict) - see this module's own
+    docstring on why "Medical Director" needs layer 2 to fire regardless
+    of layer 1; layers 3 (the user's own custom terms) and 4 (generic
+    administrative/support titles) are likewise checked even when earlier
+    layers already passed, so either can catch a title the others
+    wouldn't.
+
+    custom_exclusions=None (the default) makes this call
+    load_custom_title_exclusions() itself, for any caller that doesn't
+    already have the list on hand (e.g. a one-off/test call). Real
+    per-job callers in a loop (job_store.save_jobs()) should load once and
+    pass the same list to every check_exclusion() call instead, to avoid
+    re-reading settings.yaml once per job."""
     title = job.get("title") or ""
 
     reason = _seniority_exclude(title)
@@ -116,6 +269,16 @@ def check_exclusion(job: dict) -> dict | None:
     reason = _clinical_exclude(title)
     if reason:
         return {"rule": "clinical_domain", "reason": reason}
+
+    if custom_exclusions is None:
+        custom_exclusions = load_custom_title_exclusions()
+    reason = _custom_exclude(title, custom_exclusions)
+    if reason:
+        return {"rule": "custom_user_exclusion", "reason": reason}
+
+    reason = _admin_support_exclude(title)
+    if reason:
+        return {"rule": "administrative_support_role", "reason": reason}
 
     return None
 

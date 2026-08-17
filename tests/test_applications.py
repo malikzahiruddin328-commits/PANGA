@@ -204,3 +204,139 @@ def test_try_acquire_generation_lock_still_blocks_a_recent_lock(isolated_data):
     applications._save_all(apps)
 
     assert applications.try_acquire_generation_lock("Dice", "1") is False
+
+
+# --- set_discussion_status() (2026-08-13, "Discuss & draft" basket op) ---
+
+
+def test_set_discussion_status_creates_record_when_none_exists(isolated_data):
+    applications.set_discussion_status("Dice", "1", "awaiting_discussion", board_message_id="abc-123")
+    app = applications.get_application("Dice", "1")
+    assert app is not None
+    assert app["status"] == "under review"  # get-or-created default
+    assert app["discussion_status"] == "awaiting_discussion"
+    assert app["discussion_board_message_id"] == "abc-123"
+
+
+def test_set_discussion_status_rejects_unknown_status(isolated_data):
+    import pytest
+    with pytest.raises(ValueError):
+        applications.set_discussion_status("Dice", "1", "not_a_real_status")
+
+
+def test_set_discussion_status_none_clears_status_and_board_message_id(isolated_data):
+    applications.set_discussion_status("Dice", "1", "awaiting_discussion", board_message_id="abc-123")
+    applications.set_discussion_status("Dice", "1", None)
+    app = applications.get_application("Dice", "1")
+    assert app["discussion_status"] is None
+    assert app["discussion_board_message_id"] is None
+
+
+def test_set_discussion_status_keeps_board_message_id_across_transitions(isolated_data):
+    applications.set_discussion_status("Dice", "1", "awaiting_discussion", board_message_id="abc-123")
+    applications.set_discussion_status("Dice", "1", "drafting_final")
+    app = applications.get_application("Dice", "1")
+    # board_message_id wasn't re-passed on this call - must not be wiped.
+    assert app["discussion_board_message_id"] == "abc-123"
+    assert app["discussion_status"] == "drafting_final"
+
+
+def test_set_discussion_status_failed_stores_error(isolated_data):
+    applications.set_discussion_status("Dice", "1", "failed", error="cover_letter: web search failed")
+    app = applications.get_application("Dice", "1")
+    assert app["discussion_status"] == "failed"
+    assert app["discussion_error"] == "cover_letter: web search failed"
+
+
+def test_set_discussion_status_does_not_disturb_existing_application_fields(isolated_data):
+    applications.upsert_application("Dice", "1", status="applied", resume_text="draft v1")
+    applications.set_discussion_status("Dice", "1", "awaiting_discussion")
+    app = applications.get_application("Dice", "1")
+    assert app["status"] == "applied"
+    assert app["resume_text"] == "draft v1"
+
+
+# --- resume_draft_source (2026-08-13, in-app subscription Q&A build) ---
+
+
+def test_upsert_application_stamps_resume_draft_source(isolated_data):
+    applications.upsert_application("Dice", "1", status="under review", resume_text="v1", resume_draft_source="subscription")
+    assert applications.get_application("Dice", "1")["resume_draft_source"] == "subscription"
+
+
+def test_upsert_application_resume_draft_source_none_does_not_overwrite(isolated_data):
+    applications.upsert_application("Dice", "1", status="under review", resume_text="v1", resume_draft_source="subscription")
+    applications.upsert_application("Dice", "1", status="under review", resume_text="v2", resume_draft_source=None)
+    assert applications.get_application("Dice", "1")["resume_draft_source"] == "subscription"
+
+
+# --- set_qa_status() (2026-08-13, in-app subscription Q&A build) ---
+
+
+def test_set_qa_status_creates_record_when_none_exists(isolated_data):
+    applications.set_qa_status("Dice", "1", "drafting")
+    app = applications.get_application("Dice", "1")
+    assert app is not None
+    assert app["status"] == "under review"  # get-or-created default
+    assert app["subscription_qa_status"] == "drafting"
+
+
+def test_set_qa_status_rejects_unknown_status(isolated_data):
+    import pytest
+    with pytest.raises(ValueError):
+        applications.set_qa_status("Dice", "1", "not_a_real_status")
+
+
+def test_set_qa_status_none_clears_status(isolated_data):
+    applications.set_qa_status("Dice", "1", "drafting")
+    applications.set_qa_status("Dice", "1", None)
+    assert applications.get_application("Dice", "1")["subscription_qa_status"] is None
+
+
+def test_set_qa_status_failed_stores_error(isolated_data):
+    applications.set_qa_status("Dice", "1", "failed", error="claude CLI not on PATH")
+    app = applications.get_application("Dice", "1")
+    assert app["subscription_qa_status"] == "failed"
+    assert app["subscription_qa_error"] == "claude CLI not on PATH"
+
+
+def test_set_qa_status_does_not_disturb_existing_application_fields(isolated_data):
+    applications.upsert_application("Dice", "1", status="applied", resume_text="draft v1")
+    applications.set_qa_status("Dice", "1", "drafting")
+    app = applications.get_application("Dice", "1")
+    assert app["status"] == "applied"
+    assert app["resume_text"] == "draft v1"
+
+
+# --- record_subscription_qa_round() (2026-08-13, in-app subscription Q&A build) ---
+
+
+def test_record_subscription_qa_round_first_round_is_1(isolated_data):
+    applications.upsert_application("Dice", "1", status="under review")
+    round_number = applications.record_subscription_qa_round("Dice", "1", ats_score=72)
+    assert round_number == 1
+    app = applications.get_application("Dice", "1")
+    assert app["subscription_qa_round"] == 1
+    assert len(app["subscription_ats_score_history"]) == 1
+    entry = app["subscription_ats_score_history"][0]
+    assert entry["round"] == 1
+    assert entry["ats_score"] == 72
+    assert entry["source"] == "subscription"
+    assert entry["at"]
+
+
+def test_record_subscription_qa_round_appends_and_bumps_across_calls(isolated_data):
+    applications.upsert_application("Dice", "1", status="under review")
+    applications.record_subscription_qa_round("Dice", "1", ats_score=60)
+    second = applications.record_subscription_qa_round("Dice", "1", ats_score=78)
+    assert second == 2
+    app = applications.get_application("Dice", "1")
+    assert app["subscription_qa_round"] == 2
+    assert [e["round"] for e in app["subscription_ats_score_history"]] == [1, 2]
+    assert [e["ats_score"] for e in app["subscription_ats_score_history"]] == [60, 78]
+
+
+def test_record_subscription_qa_round_raises_without_existing_record(isolated_data):
+    import pytest
+    with pytest.raises(KeyError):
+        applications.record_subscription_qa_round("Dice", "1", ats_score=72)

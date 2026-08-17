@@ -10,6 +10,19 @@ a store's whole read+merge+write critical section so that can't happen.
 
 Windows-only (msvcrt), matching every other Windows-only assumption already
 in this app (keyring's DPAPI backend, run_app.bat).
+
+`lock_dir` param (2026-08-13, global-spend-cap fix): PROJECT_ROOT/_LOCK_DIR
+below are computed from THIS file's own on-disk location - fine for every
+store that's deliberately per-checkout (jobs.json, applications.json, ...:
+each git worktree is supposed to have its own isolated copy for test
+isolation), but wrong for a store that must be one genuinely shared,
+cross-worktree ledger, like cost_log.json's daily spend cap (see
+cost_log.py's own resolution of the real shared data/ directory - a
+worktree process running this same file_lock.py still needs to lock the
+SAME physical lock file a main-checkout process would use, or the lock
+provides no real cross-process protection for that store at all). Passing
+`lock_dir` overrides the default per-checkout directory for exactly that
+case; omitting it keeps every existing caller's behavior unchanged.
 """
 
 import msvcrt
@@ -24,15 +37,21 @@ _POLL_INTERVAL_SECONDS = 0.05
 
 
 @contextmanager
-def locked(name: str):
+def locked(name: str, lock_dir: Path | None = None):
     """Held for the duration of the `with` block. `name` identifies which
     store is being locked (e.g. "jobs", "applications") - each name gets its
     own lock file, so locking one store never blocks an unrelated one.
     Raises TimeoutError if the lock isn't acquired within _MAX_WAIT_SECONDS,
     rather than blocking forever if a prior holder crashed mid-write without
-    releasing it."""
-    _LOCK_DIR.mkdir(parents=True, exist_ok=True)
-    lock_path = _LOCK_DIR / f"{name}.lock"
+    releasing it.
+
+    lock_dir defaults to this checkout's own data/.locks (unchanged
+    behavior for every existing caller) - pass an explicit lock_dir for a
+    store that must share one lock file across every git worktree, not
+    just within a single checkout (see module docstring)."""
+    target_dir = lock_dir if lock_dir is not None else _LOCK_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = target_dir / f"{name}.lock"
     with open(lock_path, "a+b") as f:
         deadline = time.monotonic() + _MAX_WAIT_SECONDS
         while True:
