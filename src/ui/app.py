@@ -1066,7 +1066,36 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                                 suggested_answer = q.get("suggested_answer") or ""
                                 with st.container(border=True):
                                     st.markdown(job_label(job))
-                                    st_markdown_raw_text(q["question"])
+                                    # Real "why does this one matter" indicator (2026-08-17,
+                                    # feature/basket-qa-impact-badge) - Zahir's live complaint:
+                                    # "there should be a score up indicator else why would
+                                    # anyone respond to questions." rank_and_cap_questions()
+                                    # in subscription_resume_qa.py already ranks required-
+                                    # keyword gaps ahead of preferred ones by real point_value
+                                    # (drafting._merge_keyword_gap_questions' own computed
+                                    # score impact, not a guess), but that ranking was never
+                                    # actually surfaced here - same badge/color convention
+                                    # already used for the single-job Discuss & draft panel
+                                    # above (~line 2494), reused rather than inventing new
+                                    # CSS: green "Required" for a required-keyword gap (top of
+                                    # the ranking), blue "Preferred" for a preferred-keyword
+                                    # gap (still real, smaller-tier), gray "standing pref" for
+                                    # a disqualifier_check, gray "value not yet known" for a
+                                    # free-form AI question with no matching extracted keyword
+                                    # (honest about what genuinely isn't computable, never a
+                                    # fabricated number).
+                                    badge_col, text_col = st.columns([1, 5])
+                                    with badge_col:
+                                        if q.get("type") == "disqualifier_check":
+                                            st.badge("standing pref", color="gray")
+                                        elif q.get("point_value") is not None:
+                                            tier_label = "Preferred" if q.get("is_preferred") else "Required"
+                                            tier_color = "blue" if q.get("is_preferred") else "green"
+                                            st.badge(f"{tier_label} +{q['point_value']:g} pts", color=tier_color)
+                                        else:
+                                            st.badge("value not yet known", color="gray")
+                                    with text_col:
+                                        st_markdown_raw_text(q["question"])
                                     answer_value = st.text_area(
                                         q["question"], value=suggested_answer, key=q_key,
                                         height=68, label_visibility="collapsed",
