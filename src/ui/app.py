@@ -390,62 +390,79 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
     add_to_basket()/remove_from_basket() - an `in_basket` flag), not in
     Streamlit session_state, so it survives page reloads. "Expandable" is
     a real st.popover, not a fake collapse/expand - clicking it opens an
-    actual floating panel listing every basket job with a per-item remove
-    action and one bulk "Generate for all N" action for the whole basket
-    (the Results tab's own per-job "Generate documents" section, inside
-    each job's detail panel, already covers the per-job case there too -
-    this basket panel is a bulk-scoped way to reach the same underlying
-    pipeline without leaving the basket panel).
+    actual floating panel.
 
-    A standalone per-item "Generate" button used to live here too (left
-    of "Draft & score"), calling generate_for_job() directly - a paid API
-    call with no gate. Removed 2026-08-17 (real bug, flagged by Zahir off
-    a screenshot): it was a leftover from before the 2026-08-13 step-4
-    redesign below, sat in the first/leftmost column ahead of "Draft &
-    score" so it read as step 1 of the sequence when it was actually a
-    shortcut that bypassed the entire $0 subscription draft/score/Q&A
-    loop and spent real money immediately. "Fire final API build" below
-    is now the sole per-item path to generate_for_job(), gated behind at
-    least one completed subscription round. NOTE: the bulk "Generate for
-    all N job(s)" button further down this panel has the same
-    direct-paid-API-bypass shape (it calls generate_for_basket() with no
-    subscription-round gate) but was left as-is here - Zahir's report was
-    specifically about the per-item button from the screenshot, not this
-    one; flagged in the build report instead of changed.
+    2026-08-17 (feature/basket-consolidated-flow) - CONSOLIDATED BASKET
+    FLOW, Zahir's own confirmed design, replacing the previous mostly-
+    per-item basket UI (2026-08-13). His own words, verified back to him
+    and explicitly confirmed "exactally": ONE "Draft & score" action runs
+    for the WHOLE basket at once, not per job; a SINGLE shared Q&A surface
+    handles open clarifying questions across every basket job together,
+    not one form per job; the updated ATS score after a redraft is "the
+    indicator for the user to decide if they really want to generate the
+    final resume or not"; only then does "Generate final resume" (renamed
+    from "Fire final API build"/"Generate for all N") fire the one real
+    paid build, gated to jobs that have actually been through at least one
+    subscription round. Five real sections now, top to bottom:
 
-    Each item also gets the in-app subscription build/refine loop
-    (2026-08-13, tailoring.subscription_resume_qa - Zahir's confirmed real
-    design for basket document generation, REPLACING the earlier
-    message-board-based "Discuss & draft" - see subscription_resume_qa's
-    own module docstring for why: Zahir explicitly rejected routing the
-    user to a live Claude Code conversation outside the app - "the user
-    will remain in the app they will not come to claude screens"):
+    1. Per-job row: label, live status (subscription round + ATS score,
+       or a real "drafting..."/"generating questions..." progress line,
+       or a failure + per-job Retry - a single stuck job over the `claude`
+       CLI shouldn't force re-running the whole basket to unstick it),
+       per-job "Generate final resume" (still reuses generate_for_job(),
+       still gated on subscription_qa_round > 0 - unchanged from the prior
+       per-item button, just relabeled), and remove.
+    2. "Draft & score all (subscription, $0)" - one basket-wide action,
+       loops run_subscription_round() (the SAME per-job function the old
+       per-item button called - not reimplemented) across every basket
+       job with real "[i/total] <title>" progress, same pattern
+       scripts/run_search.py's own scoring loop already uses.
+    3. A single consolidated "Open questions across your basket" section -
+       every open clarifying_questions entry from every basket job in one
+       flow, each tagged with which job it belongs to, answered together.
+       Submitting redrafts only the jobs that actually got a real answer
+       (submit_answers_and_redraft(), unchanged, called once per affected
+       job) - still $0, subscription-covered.
+    4. Document-type checkboxes (shared by both the per-job and bulk final
+       build, as before).
+    5. "Generate final resume" (bulk) - the renamed, NOW-GATED version of
+       the old "Generate for all N job(s)" button. REAL BUG FIX: the prior
+       bulk button called generate_for_basket() over every basket job with
+       NO subscription-round gate - same unsafe-bypass shape as the
+       per-item "Generate" button removed in the immediately-prior commit
+       (9a468e7), just at the bulk level, flagged in that commit's own
+       docstring rather than fixed there. Fixed here: only jobs with
+       subscription_qa_round > 0 are actually sent to generate_for_basket();
+       jobs that aren't ready are listed by name in a clear "skipped"
+       message, never silently dropped or silently built anyway. After the
+       run, each job's real final state (ATS score, success/failure) is
+       kept visible via st.session_state (Streamlit reruns on every click,
+       so a toast alone would vanish before Zahir could read it) for a
+       real before-leaving-basket review - satisfies Zahir's step 5.
 
-    - "Draft & score (subscription, $0)" drafts an initial resume and a
-      real ATS score via the subscription-covered `claude` CLI (never the
-      paid API) - subscription_qa_status/subscription_qa_round on the
-      application record drive real progress ("Drafting initial
-      resume...", "Generating questions...") instead of a silent wait.
-    - Once a round exists, an expander shows the score history, any open
-      clarifying questions as an in-app editable form (pre-filled with a
-      hedged suggested answer, same pattern the Analyze Fit panel already
-      uses), and "Submit answers & redraft (subscription, $0)" - each
-      round is another $0 subscription call, incorporating whatever facts
-      were just confirmed.
-    - "Fire final API build" is the one paid call in this whole flow -
-      enabled only once at least one subscription round has completed
-      (subscription_qa_round > 0) - reusing bulk_generate.generate_for_job()
-      (the existing, already-tested, safety-gated pipeline) exactly as-is,
-      never a second implementation of it.
-
-    The old message-board "Discuss & draft"/"Finish draft" buttons are
-    REMOVED from this UI (judgment call, flagged in the build report this
-    shipped with): Zahir's design supersedes them and leaving both wired
-    up here would be two competing ways to do the same thing, one of which
-    he explicitly said isn't the shape he wants. tailoring.discuss_and_draft
-    itself is left in place, untouched, and unreferenced from this file -
-    not deleted - in case any other caller still needs it."""
+    tailoring.discuss_and_draft (the earlier message-board "Discuss &
+    draft"/"Finish draft" mechanism, already superseded 2026-08-13) is
+    still left in place, untouched, and unreferenced from this file - not
+    deleted - in case any other caller still needs it."""
     basket_jobs = [j for j in all_jobs if j.get("in_basket")]
+    basket_keys = {(j.get("source"), j.get("job_id")) for j in basket_jobs}
+
+    # Bulk-run results are stashed in session_state (not a plain local var)
+    # because every button click triggers a full Streamlit rerun - a local
+    # variable's result would be computed, shown for zero frames, and lost
+    # before Zahir ever saw it. Cleared automatically once a job leaves the
+    # basket (see the filter below) so a stale result for a removed/rebuilt
+    # job can't linger and be mistaken for current state.
+    if "panga_basket_draftall_results" not in st.session_state:
+        st.session_state["panga_basket_draftall_results"] = {}
+    if "panga_basket_finalbuild_results" not in st.session_state:
+        st.session_state["panga_basket_finalbuild_results"] = {}
+    st.session_state["panga_basket_draftall_results"] = {
+        k: v for k, v in st.session_state["panga_basket_draftall_results"].items() if k in basket_keys
+    }
+    st.session_state["panga_basket_finalbuild_results"] = {
+        k: v for k, v in st.session_state["panga_basket_finalbuild_results"].items() if k in basket_keys
+    }
 
     def _qa_progress_placeholder():
         placeholder = st.empty()
@@ -462,15 +479,27 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                     st.markdown("Nothing in your basket yet. Add a job from the Results tab.")
                 else:
                     st.markdown(f"**{len(basket_jobs)} job(s) in your basket**")
+
+                    # --- Section 1: per-job rows (label, live status/score,
+                    # per-job "Generate final resume", remove). No per-item
+                    # "Draft & score" here any more - that's now the single
+                    # basket-wide action in section 2 below, per Zahir's
+                    # design point 1 ("ONE Draft & score action... not
+                    # per-item"). A per-job Retry survives for the "failed"
+                    # case only, so one stuck job doesn't force re-running
+                    # the whole basket to unstick it.
+                    all_open_questions = []  # [(job, app_record, question), ...] across the whole basket, built while looping so section 3 doesn't need a second pass
                     for job in basket_jobs:
                         source, job_id = job.get("source"), job.get("job_id")
-                        job_key = f"{source}_{job_id}"
-                        app_record = applications_by_key.get((source, job_id)) or {}
+                        job_key = (source, job_id)
+                        app_record = applications_by_key.get(job_key) or {}
                         qa_status = app_record.get("subscription_qa_status")
                         qa_round = app_record.get("subscription_qa_round", 0)
                         qa_score = app_record.get("resume_ats_score")
                         open_questions = app_record.get("resume_clarifying_questions") or []
-                        item_cols = st.columns([3, 2.2, 1.8, 1])
+                        for q in open_questions:
+                            all_open_questions.append((job, app_record, q))
+                        item_cols = st.columns([3, 2.5, 2, 1])
                         with item_cols[0]:
                             st.markdown(f"{job_label(job)}")
                         with item_cols[1]:
@@ -493,25 +522,15 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                                         st.toast(f"Subscription draft failed: {outcome['error']}", icon=":material/error:")
                                     st.rerun()
                             elif qa_round == 0:
-                                if st.button(
-                                    "Draft & score (subscription, $0)", key=f"basket_item_subdraft_{source}_{job_id}",
-                                    help="Drafts an initial resume and a real ATS score via your Claude subscription - not a paid API call, $0 cost. Can take 40-90+ seconds.",
-                                ):
-                                    on_progress = _qa_progress_placeholder()
-                                    outcome = run_subscription_round(job, load_profile(), on_progress=on_progress)
-                                    if outcome["locked"]:
-                                        st.toast(f"A generation is already in progress for {job_label(job)} - try again shortly.", icon=":material/warning:")
-                                    elif outcome["ok"]:
-                                        st.toast(f"Round {outcome['round']} drafted - ATS {outcome['resume_draft']['ats_score']}/100 - $0, subscription-covered.", icon=":material/check_circle:")
-                                    else:
-                                        st.toast(f"Subscription draft failed: {outcome['error']}", icon=":material/error:")
-                                    st.rerun()
+                                st.markdown(":material/pending: Not drafted yet - use \"Draft & score all\" below.")
                             else:
                                 score_text = f"{qa_score}/100" if qa_score is not None else "not yet scored"
-                                st.markdown(f":material/check_circle: Round {qa_round} - ATS {score_text}")
+                                history = app_record.get("subscription_ats_score_history") or []
+                                trend = (" (" + " → ".join(f"r{h['round']}: {h['ats_score']}" for h in history) + ")") if len(history) > 1 else ""
+                                st.markdown(f":material/check_circle: Round {qa_round} - ATS {score_text}{trend}")
                         with item_cols[2]:
                             if st.button(
-                                "Fire final API build", key=f"basket_item_finalbuild_{source}_{job_id}",
+                                "Generate final resume", key=f"basket_item_finalbuild_{source}_{job_id}",
                                 disabled=not drafting_is_configured() or qa_round == 0,
                                 type="primary" if qa_round > 0 else "secondary",
                                 help=(
@@ -520,8 +539,8 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                                     "gates) exactly as-is. Enabled once at least one subscription round above "
                                     "has completed - you decide when to stop refining for free."
                                     if qa_round > 0 else
-                                    "Draft & score (subscription, $0) at least one round first - this button "
-                                    "fires the one real paid call once you're satisfied."
+                                    "Draft & score at least one round first (below) - this button fires the "
+                                    "one real paid call once you're satisfied with the score."
                                 ),
                             ):
                                 doc_keys = [k for k, _ in BASKET_DOC_TYPES if st.session_state.get(f"basket_doc_{k}", k in ("resume", "cover_letter"))]
@@ -542,101 +561,234 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                                     else:
                                         failed = ", ".join(result["errors"].keys())
                                         st.toast(f"{job_label(job)}: {failed} failed to draft - see the Results tab for detail.", icon=":material/warning:")
+                                    st.session_state["panga_basket_finalbuild_results"][job_key] = {
+                                        "ok": bool(result.get("ok")), "locked": bool(result.get("locked")),
+                                        "errors": result.get("errors") or {},
+                                    }
                                     st.rerun()
                         with item_cols[3]:
                             if st.button(":material/close:", key=f"basket_item_remove_{source}_{job_id}", help="Remove from basket"):
                                 remove_from_basket(source, job_id)
                                 st.rerun()
+                        bulk_final = st.session_state["panga_basket_finalbuild_results"].get(job_key)
+                        if bulk_final is not None:
+                            if bulk_final["locked"]:
+                                st.markdown(":material/warning: Skipped just now - another generation was already in progress for this job.")
+                            elif bulk_final["ok"]:
+                                score_now = applications_by_key.get(job_key, {}).get("resume_ats_score")
+                                score_now_text = f" - final ATS {score_now}/100" if score_now is not None else ""
+                                st.markdown(f":material/check_circle: Final resume built{score_now_text}.")
+                            else:
+                                st.markdown(f":material/error: Failed just now: {', '.join(bulk_final['errors'].keys()) or 'see Results tab'}.")
 
-                        if qa_round > 0 or open_questions:
-                            score_label = f"{qa_score}/100" if qa_score is not None else "not yet scored"
-                            with st.expander(f"Build & refine — round {qa_round}, ATS {score_label}", key=f"basket_subqa_expander_{job_key}", expanded=bool(open_questions), on_change="rerun"):
-                                history = app_record.get("subscription_ats_score_history") or []
-                                if history:
-                                    st.markdown("**Score history:** " + " → ".join(f"round {h['round']}: {h['ats_score']}" for h in history))
-                                if not open_questions:
-                                    st.markdown(":material/task_alt: No open questions right now - refine facts in your Profile, or fire the final build.")
-                                    if st.button("Check for more questions (subscription, $0)", key=f"basket_subqa_checkmore_{job_key}"):
-                                        on_progress = _qa_progress_placeholder()
-                                        try:
-                                            check_result = generate_questions_via_subscription(job, load_profile(), on_progress=on_progress)
-                                        except ReasonerUnavailable as exc:
-                                            st.toast(f"Can't check for more questions right now: {exc}", icon=":material/error:")
-                                        else:
-                                            if check_result["added_count"]:
-                                                st.toast(f"Found {check_result['added_count']} more thing(s) worth asking about.", icon=":material/info:")
-                                            else:
-                                                st.toast("No more real gaps found based on your current profile.", icon=":material/task_alt:")
-                                            st.rerun()
-                                else:
-                                    st.markdown(
-                                        "Answer these to raise the score further on your next subscription "
-                                        "round - only used if you confirm they're true, nothing is ever "
-                                        "invented. Some boxes are pre-filled with a proposed guess - edit it "
-                                        "to whatever's actually true, or leave it blank to skip."
-                                    )
-                                    answer_entries = []
-                                    for q in open_questions:
-                                        q_key = f"basketqa_{job_key}_{abs(hash(q['question'] + '|' + (q.get('suggested_answer') or ''))) % 10_000_000}"
-                                        suggested_answer = q.get("suggested_answer") or ""
-                                        with st.container(border=True):
-                                            st_markdown_raw_text(q["question"])
-                                            answer_value = st.text_area(
-                                                q["question"], value=suggested_answer, key=q_key,
-                                                height=68, label_visibility="collapsed",
-                                                placeholder="Type your answer..." if q.get("type") == "disqualifier_check" else None,
-                                            )
-                                        if answer_value and answer_value.strip() and answer_value != suggested_answer:
-                                            answer_entries.append({
-                                                "skill": q["skill"], "type": q["type"],
-                                                "answer": answer_value, "question": q["question"],
-                                            })
-                                    if st.button(
-                                        "Submit answers & redraft (subscription, $0)", key=f"basket_subqa_submit_{job_key}",
-                                        type="primary", disabled=not answer_entries,
-                                        help="Saves the answers you edited above and redrafts this resume via the subscription - not a paid call.",
-                                    ):
-                                        on_progress = _qa_progress_placeholder()
-                                        outcome = submit_answers_and_redraft(job, load_profile(), answer_entries, on_progress=on_progress)
-                                        if outcome["locked"]:
-                                            st.toast(f"A generation is already in progress for {job_label(job)} - try again shortly.", icon=":material/warning:")
-                                        elif outcome["ok"]:
-                                            st.toast(f"Round {outcome['round']} drafted - ATS {outcome['resume_draft']['ats_score']}/100 - $0, subscription-covered.", icon=":material/check_circle:")
-                                        else:
-                                            st.toast(f"Subscription re-draft failed: {outcome['error']}", icon=":material/error:")
-                                        st.rerun()
                     st.divider()
-                    st.markdown("**Document types** (used by both \"Fire final API build\" above and \"Generate for all\" below)")
+
+                    # --- Section 2: single basket-wide "Draft & score all"
+                    # (Zahir's design point 1) - loops the SAME per-job
+                    # run_subscription_round() every per-item button used to
+                    # call, real [i/total] progress like scripts/
+                    # run_search.py's own scoring loop, continuing past one
+                    # job's failure so it doesn't block the rest of the
+                    # batch (same pattern generate_for_basket() already
+                    # uses for the paid path).
+                    st.markdown("**Draft & score the whole basket at once (subscription, $0)**")
+                    if st.button(
+                        f"Draft & score all {len(basket_jobs)} job(s)", key="basket_draftall",
+                        help="Runs the $0 subscription draft+score round for every job in your basket, one at a time. Not a paid call. Can take 40-90+ seconds per job.",
+                    ):
+                        draftall_placeholder = st.empty()
+                        results = {}
+                        for i, job in enumerate(basket_jobs, start=1):
+                            source, job_id = job.get("source"), job.get("job_id")
+                            draftall_placeholder.markdown(f":material/hourglass_top: [{i}/{len(basket_jobs)}] {job_label(job)}: drafting & scoring (subscription)...")
+                            try:
+                                outcome = run_subscription_round(job, load_profile())
+                            except Exception as exc:
+                                # Defense in depth, matching generate_for_basket()'s own
+                                # "one item's failure shouldn't stop the rest" pattern
+                                # (CLAUDE.md) - run_subscription_round() is documented to
+                                # only ever raise via its own (ReasonerUnavailable,
+                                # RuntimeError) handling, but a whole-basket loop with 10
+                                # real subprocess calls is exactly the place an unexpected
+                                # exception type would otherwise take the entire batch
+                                # down mid-run (real bug hit live 2026-08-17 verifying this
+                                # branch: a raw json.JSONDecodeError from a malformed
+                                # reasoner reply escaped uncaught and crashed the whole
+                                # Streamlit script - fixed at its source in
+                                # reasoner_cli.parse_json_reply(), this catch is the
+                                # belt-and-suspenders backstop for anything else like it).
+                                outcome = {"ok": False, "locked": False, "round": None, "resume_draft": None, "error": str(exc)}
+                            results[(source, job_id)] = outcome
+                        draftall_placeholder.markdown(":material/check_circle: Done.")
+                        st.session_state["panga_basket_draftall_results"] = results
+                        succeeded = sum(1 for r in results.values() if r["ok"])
+                        locked = sum(1 for r in results.values() if r.get("locked"))
+                        failed = len(results) - succeeded - locked
+                        summary = f"{succeeded} of {len(results)} job(s) drafted & scored."
+                        if locked:
+                            summary += f" {locked} skipped (already generating elsewhere)."
+                        if failed:
+                            summary += f" {failed} failed - see below."
+                        st.toast(summary, icon=":material/check_circle:" if not failed else ":material/warning:")
+                        st.rerun()
+                    draftall_results = st.session_state["panga_basket_draftall_results"]
+                    if draftall_results:
+                        failed_jobs = [
+                            job_label(j) for j in basket_jobs
+                            if (r := draftall_results.get((j.get("source"), j.get("job_id")))) and not r["ok"] and not r["locked"]
+                        ]
+                        if failed_jobs:
+                            st.markdown(f":material/error: Failed to draft: {', '.join(failed_jobs)} - use that job's Retry above.")
+
+                    st.divider()
+
+                    # --- Section 3: consolidated open-questions flow
+                    # (Zahir's design point 2 - "a SINGLE shared Q&A chat
+                    # interface... across ALL jobs in the basket together").
+                    # Every open clarifying_questions entry from every
+                    # basket job in one flow, each tagged with its job.
+                    # Submitting redrafts only the jobs that actually got a
+                    # real edited answer, via the same per-job
+                    # submit_answers_and_redraft() the old per-item form
+                    # called - not a new implementation.
+                    if all_open_questions:
+                        with st.expander(
+                            f"Open questions across your basket ({len(all_open_questions)})",
+                            key="basket_shared_qa_expander", expanded=True, on_change="rerun",
+                        ):
+                            st.markdown(
+                                "Answer these to raise the score further on each job's next subscription "
+                                "round - only used if you confirm they're true, nothing is ever invented. "
+                                "Some boxes are pre-filled with a proposed guess - edit it to whatever's "
+                                "actually true, or leave it blank to skip. Only the jobs you actually answer "
+                                "get redrafted."
+                            )
+                            # question -> answered entry, grouped by job so only jobs with a real
+                            # edited answer get redrafted (per Zahir's "answered together" design,
+                            # not every basket job on every submit).
+                            per_job_answers: dict[tuple, list[dict]] = {}
+                            for job, app_record, q in all_open_questions:
+                                source, job_id = job.get("source"), job.get("job_id")
+                                job_key = (source, job_id)
+                                q_key = f"basketqa_{source}_{job_id}_{abs(hash(q['question'] + '|' + (q.get('suggested_answer') or ''))) % 10_000_000}"
+                                suggested_answer = q.get("suggested_answer") or ""
+                                with st.container(border=True):
+                                    st.markdown(job_label(job))
+                                    st_markdown_raw_text(q["question"])
+                                    answer_value = st.text_area(
+                                        q["question"], value=suggested_answer, key=q_key,
+                                        height=68, label_visibility="collapsed",
+                                        placeholder="Type your answer..." if q.get("type") == "disqualifier_check" else None,
+                                    )
+                                if answer_value and answer_value.strip() and answer_value != suggested_answer:
+                                    per_job_answers.setdefault(job_key, []).append({
+                                        "skill": q["skill"], "type": q["type"],
+                                        "answer": answer_value, "question": q["question"],
+                                    })
+                            answered_job_count = len(per_job_answers)
+                            if st.button(
+                                f"Submit answers & redraft ({answered_job_count} job(s), subscription, $0)",
+                                key="basket_shared_qa_submit", type="primary", disabled=not per_job_answers,
+                                help="Saves the answers you edited above and redrafts only the jobs you answered, via the subscription - not a paid call.",
+                            ):
+                                jobs_by_key = {(j.get("source"), j.get("job_id")): j for j in basket_jobs}
+                                submit_placeholder = st.empty()
+                                redraft_results = {}
+                                for i, (job_key, answer_entries) in enumerate(per_job_answers.items(), start=1):
+                                    job = jobs_by_key[job_key]
+                                    submit_placeholder.markdown(f":material/hourglass_top: [{i}/{answered_job_count}] {job_label(job)}: applying your answers & redrafting...")
+                                    try:
+                                        redraft_results[job_key] = submit_answers_and_redraft(job, load_profile(), answer_entries)
+                                    except Exception as exc:
+                                        # Same "one item's failure shouldn't stop the rest"
+                                        # backstop as the Draft & score all loop above.
+                                        redraft_results[job_key] = {"ok": False, "locked": False, "round": None, "resume_draft": None, "error": str(exc)}
+                                submit_placeholder.markdown(":material/check_circle: Done.")
+                                succeeded = sum(1 for r in redraft_results.values() if r["ok"])
+                                st.toast(f"{succeeded} of {answered_job_count} job(s) redrafted with your answers.", icon=":material/check_circle:")
+                                st.rerun()
+                    else:
+                        drafted_jobs = [j for j in basket_jobs if (applications_by_key.get((j.get("source"), j.get("job_id"))) or {}).get("subscription_qa_round", 0) > 0]
+                        if drafted_jobs:
+                            st.markdown(":material/task_alt: No open questions right now across your basket.")
+                            with st.expander("Check individual jobs for more questions (subscription, $0)", key="basket_checkmore_expander", on_change="rerun"):
+                                for job in drafted_jobs:
+                                    source, job_id = job.get("source"), job.get("job_id")
+                                    check_cols = st.columns([3, 2])
+                                    with check_cols[0]:
+                                        st.markdown(job_label(job))
+                                    with check_cols[1]:
+                                        if st.button("Check for more questions", key=f"basket_subqa_checkmore_{source}_{job_id}"):
+                                            on_progress = _qa_progress_placeholder()
+                                            try:
+                                                check_result = generate_questions_via_subscription(job, load_profile(), on_progress=on_progress)
+                                            except ReasonerUnavailable as exc:
+                                                st.toast(f"Can't check for more questions right now: {exc}", icon=":material/error:")
+                                            else:
+                                                if check_result["added_count"]:
+                                                    st.toast(f"Found {check_result['added_count']} more thing(s) worth asking about for {job_label(job)}.", icon=":material/info:")
+                                                else:
+                                                    st.toast(f"No more real gaps found for {job_label(job)} based on your current profile.", icon=":material/task_alt:")
+                                                st.rerun()
+
+                    st.divider()
+
+                    # --- Section 4/5: document types + gated bulk final build.
+                    st.markdown("**Document types** (used by both \"Generate final resume\" above and below)")
                     doc_cols = st.columns(len(BASKET_DOC_TYPES))
                     for col, (doc_key, doc_label) in zip(doc_cols, BASKET_DOC_TYPES):
                         with col:
                             st.checkbox(doc_label, value=doc_key in ("resume", "cover_letter"), key=f"basket_doc_{doc_key}")
                     if not drafting_is_configured():
                         st.markdown("No Anthropic API key configured - add one to `.env` and restart to generate documents.")
-                    if st.button(f"Generate for all {len(basket_jobs)} job(s)", type="primary", disabled=not drafting_is_configured()):
+
+                    ready_jobs = [j for j in basket_jobs if (applications_by_key.get((j.get("source"), j.get("job_id"))) or {}).get("subscription_qa_round", 0) > 0]
+                    not_ready_jobs = [j for j in basket_jobs if j not in ready_jobs]
+                    if st.button(
+                        f"Generate final resume for all {len(ready_jobs)} ready job(s)", key="basket_finalbuild_bulk",
+                        type="primary", disabled=not drafting_is_configured() or not ready_jobs,
+                        help=(
+                            "Fires the one paid final build for every basket job that has completed at "
+                            "least one subscription Draft & score round. Jobs that haven't been drafted "
+                            "yet are skipped, not silently built."
+                            if ready_jobs else
+                            "No basket job has a completed subscription round yet - use \"Draft & score all\" above first."
+                        ),
+                    ):
                         doc_keys = [k for k, _ in BASKET_DOC_TYPES if st.session_state.get(f"basket_doc_{k}", k in ("resume", "cover_letter"))]
                         if not doc_keys:
                             st.toast("Pick at least one document type first.", icon=":material/warning:")
                         else:
                             with st.container(key="basket_bulk_progress_bar"):
-                                bulk_bar = st.progress(0, text=f"Drafting 1 of {len(basket_jobs)}: {job_label(basket_jobs[0])}...")
+                                bulk_bar = st.progress(0, text=f"Drafting 1 of {len(ready_jobs)}: {job_label(ready_jobs[0])}...")
                             st.html(progress_shimmer_css("basket_bulk_progress_bar"))
 
                             def _update_bulk_progress(i, total, job):
                                 bulk_bar.progress((i - 1) / total, text=f"Drafting {i} of {total}: {job_label(job)}...")
 
-                            results = generate_for_basket(basket_jobs, load_profile(), doc_keys, on_progress=_update_bulk_progress)
+                            results = generate_for_basket(ready_jobs, load_profile(), doc_keys, on_progress=_update_bulk_progress)
                             bulk_bar.progress(1.0, text=":material/check_circle: Done.")
+                            for job_key, r in results.items():
+                                st.session_state["panga_basket_finalbuild_results"][job_key] = {
+                                    "ok": bool(r.get("ok")), "locked": bool(r.get("locked")), "errors": r.get("errors") or {},
+                                }
                             succeeded = sum(1 for r in results.values() if r["ok"])
                             locked = sum(1 for r in results.values() if r.get("locked"))
                             failed = len(results) - succeeded - locked
-                            summary = f"{succeeded} of {len(results)} job(s) drafted."
+                            summary = f"{succeeded} of {len(results)} ready job(s) drafted."
                             if locked:
                                 summary += f" {locked} skipped (already generating elsewhere)."
                             if failed:
                                 summary += f" {failed} had at least one document fail - see the Results tab for detail."
+                            if not_ready_jobs:
+                                summary += f" {len(not_ready_jobs)} skipped (no subscription round yet): {', '.join(job_label(j) for j in not_ready_jobs)}."
                             st.toast(summary, icon=":material/check_circle:" if not failed else ":material/warning:")
                             st.rerun()
+                    if not_ready_jobs:
+                        st.markdown(
+                            f":material/info: {len(not_ready_jobs)} job(s) not ready (no subscription round yet, "
+                            f"so not included above): {', '.join(job_label(j) for j in not_ready_jobs)}."
+                        )
         with bar_cols[1]:
             st.html(
                 '<div class="panga-basket-subtitle">'
