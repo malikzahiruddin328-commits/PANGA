@@ -26,6 +26,7 @@ import hashlib
 import json
 import os
 import secrets
+import time
 from pathlib import Path
 
 import keyring
@@ -175,14 +176,80 @@ def decrypt_bytes(blob: bytes) -> bytes:
 
 
 def read_bytes(path: Path) -> bytes | None:
-    if not path.exists():
-        return None
-    return decrypt_bytes(path.read_bytes())
+    """Same transient-Windows-PermissionError retry as write_bytes()'s
+    os.replace() call, found by this fix's own regression test: a reader's
+    open() can momentarily race the OS-level file swap during a concurrent
+    write_bytes() and see a transient PermissionError, not because the file
+    is genuinely locked, but because the atomic replace is mid-flight on
+    Windows. Retries a few times with a short backoff before giving up -
+    still raises if the file is genuinely inaccessible (e.g. a real
+    permissions problem, not a swap in progress)."""
+    last_exc = None
+    for attempt in range(20):
+        if not path.exists():
+            return None
+        try:
+            return decrypt_bytes(path.read_bytes())
+        except (PermissionError, FileNotFoundError) as exc:
+            last_exc = exc
+            time.sleep(min(0.03 * (attempt + 1), 0.25))
+    raise last_exc
 
 
 def write_bytes(path: Path, data: bytes) -> None:
+    """Writes atomically: encrypts fully in memory, writes the ciphertext to
+    a sibling temp file, then os.replace()s it onto `path` in one OS-level
+    operation.
+
+    Real crash, 2026-08-17: the previous version did `path.write_bytes(...)`
+    directly, which opens the file in 'wb' mode - truncating it to zero
+    bytes BEFORE the new content is written. Every read of this store
+    (read_bytes/read_json, used by job_store.load_jobs(),
+    applications.load_applications(), etc.) takes no lock at all, on the
+    documented assumption that "reads don't need the lock, only
+    read-modify-write does" - true only if a write is atomic from a
+    reader's point of view. It wasn't: a concurrent read landing in the
+    truncate-then-write window could see an empty or partially-written
+    file, fail decryption, and raise an uncaught exception. This matters in
+    practice, not just in theory - a background job-search run (locked
+    writes via security.file_lock, several minutes long) and the live
+    Streamlit session read the same jobs.json/applications.json
+    concurrently, and 8510 crashed during exactly that overlap the same
+    day this was found. os.replace() is atomic on both Windows and POSIX -
+    a concurrent reader now always sees either the fully-old or the
+    fully-new file, never a partial one - so every existing unlocked read
+    call site becomes safe without needing to touch any of them.
+
+    Retry note (found writing this fix's own regression test, real and
+    reproducible, not theoretical): unlike POSIX rename(), Windows'
+    MoveFileEx (what os.replace() uses under the hood there) can raise
+    PermissionError [WinError 5] "Access is denied" if a reader happens to
+    hold `path` open at the exact instant of replace - a real, transient
+    condition, not a permanent failure; it clears as soon as that reader's
+    handle closes, which is typically milliseconds later given every read
+    in this codebase is a single open-read-close with no held handles. A
+    short bounded retry absorbs that window without masking a genuinely
+    stuck/locked file (e.g. antivirus scanning, another process holding an
+    exclusive lock) - it still raises after retries are exhausted."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(encrypt_bytes(data))
+    ciphertext = encrypt_bytes(data)
+    tmp_path = path.with_name(f"{path.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}")
+    try:
+        tmp_path.write_bytes(ciphertext)
+        last_exc = None
+        for attempt in range(20):
+            try:
+                os.replace(tmp_path, path)
+                last_exc = None
+                break
+            except PermissionError as exc:
+                last_exc = exc
+                time.sleep(min(0.03 * (attempt + 1), 0.25))
+        if last_exc is not None:
+            raise last_exc
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def read_json(path: Path, default=None):
