@@ -90,7 +90,7 @@ from tailoring.subscription_resume_qa import run_subscription_round, generate_qu
 from concurrency.adaptive_throttle import effective_worker_count
 from tailoring.reasoner_cli import ReasonerUnavailable
 from tailoring.task_monitor import get_active_tasks, reset_stalled_task
-from tailoring.ats_score import detect_matched_keyword_regressions
+from tailoring.ats_score import detect_matched_keyword_regressions, ensure_keyword_literally_present
 from tailoring.unconfirmed_claims import find_unconfirmed_markers, resolve_unconfirmed_claim
 from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed, analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_impact as _check_regenerate_impact, request_additional_gap_questions as _request_additional_gap_questions, reextract_ats_keywords_and_rescore as _reextract_ats_keywords_and_rescore, rescore_against_cached_keywords as _rescore_against_cached_keywords, gap_scan_is_current as _gap_scan_is_current, gap_scan_baseline_fingerprint as _gap_scan_baseline_fingerprint, _report_drafting_failure, no_reference_found_answer
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
@@ -2634,6 +2634,57 @@ def render_analyze_fit_section(job: dict, app_record: dict, analysis: dict | Non
                     # codebase's established pattern.
                     st.toast("Saved.", icon=":material/check_circle:")
                     st.rerun()
+                elif not is_disqualifier and q.get("point_value") is not None:
+                    # 2026-08-18, Zahir's exact ask: when the AI's suggested
+                    # answer is ALREADY correct and complete, he shouldn't
+                    # have to retype/nudge it just to get it to register -
+                    # that's pure friction and easy to skip entirely,
+                    # leaving a correct-looking answer that never actually
+                    # counted toward the score. The edit-differs-from-
+                    # suggested_answer check right above this is exactly
+                    # right for catching an UNTOUCHED box (no real signal of
+                    # review), but it can never be relaxed to treat
+                    # untouched-and-unclicked as consent - see the 31-fake-
+                    # answers incident in the comment above. An explicit
+                    # click here IS a real signal of intent (unlike an
+                    # untouched box), so it's safe to save the box's CURRENT
+                    # text as-is the moment it's clicked, whether or not the
+                    # user changed anything first. Placed directly under the
+                    # box rather than as a separate step elsewhere - per
+                    # this repo's own HCI rule ("are related decisions
+                    # forced into separate clicks when they're really one
+                    # decision made at one moment? Consolidate."), this is
+                    # the same "confirm or edit this answer" decision the
+                    # text box already represents, not a new one. Only
+                    # offered for questions with a real point_value badge
+                    # (a real suggested_answer/keyword to confirm) -
+                    # disqualifier_check questions are excluded above
+                    # (their box starts empty, per "not a guess" note) and
+                    # free-form questions with no computable point value
+                    # have nothing concrete to "confirm as shown" either.
+                    confirm_col, _spacer_col = st.columns([1, 4])
+                    with confirm_col:
+                        if st.button("Confirm as shown", key=f"{q_key}_confirm"):
+                            # Same literal-keyword-presence guarantee the
+                            # suggested_answer already went through at
+                            # generation time (tailoring.drafting.
+                            # _keyword_gap_answer) - re-applied here rather
+                            # than assumed, so an edited-but-not-yet-
+                            # detected-as-different box (or any future
+                            # change to how suggested_answer is built)
+                            # can't silently bypass the same pre-flight
+                            # guarantee the "+N pts" badge's number is
+                            # actually promising. Idempotent/no-op if the
+                            # keyword's already literally present.
+                            confirmed_answer, _ = ensure_keyword_literally_present(
+                                q["skill"], answer_value
+                            )
+                            save_gap_answers(job, [{
+                                "skill": q["skill"], "type": q["type"],
+                                "answer": confirmed_answer, "question": q["question"],
+                            }])
+                            st.toast("Saved.", icon=":material/check_circle:")
+                            st.rerun()
 
 
 def render_recurring_gap_review_panel() -> None:

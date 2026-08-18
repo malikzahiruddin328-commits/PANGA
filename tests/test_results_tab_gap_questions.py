@@ -390,6 +390,143 @@ def test_untouched_suggested_answer_does_not_get_saved_as_a_real_confirmed_answe
     assert not any(a["skill"] == "Databricks" for a in answers)
 
 
+# --- Explicit "Confirm as shown" control (2026-08-18) ---
+# Zahir's exact words: "if the confirmation response is correct the user
+# should not do anything, just move to the next question and the user's
+# assumption will be that whatever is in the required +N points will be
+# applied to the overall ATS score." Before this, an already-correct
+# suggested_answer required a pointless edit just to register - easy to
+# skip, silently leaving a correct-looking answer that never counted.
+
+def test_confirm_button_saves_untouched_suggested_answer_verbatim(results_app_with_gap_questions):
+    at = results_app_with_gap_questions
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+
+    box = next(t for t in at.text_area if "Databricks" in t.label)
+    displayed_text = box.value
+
+    confirm_button = next(b for b in at.button if b.key and b.key.endswith("_confirm") and b.key.startswith(box.key))
+    confirm_button.click().run(timeout=30)
+
+    assert not at.exception
+    from profile.storage import load_profile
+
+    answers = load_profile().get("gap_interview_answers", [])
+    match = next((a for a in answers if a["skill"] == "Databricks"), None)
+    assert match is not None
+    # Saved exactly what was shown - the literal keyword was already woven
+    # in at generation time (_keyword_gap_answer), so ensure_keyword_
+    # literally_present is a true no-op here, byte-for-byte unchanged.
+    assert match["answer"] == displayed_text
+    assert "databricks" in match["answer"].lower()
+
+
+def test_untouched_box_with_no_confirm_click_still_never_auto_saves(results_app_with_gap_questions):
+    # The original 31-fake-answers protection must still hold: merely
+    # rendering (even repeatedly) without ever clicking Confirm must not
+    # save anything.
+    at = results_app_with_gap_questions
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+    at.run(timeout=30)
+    at.run(timeout=30)
+
+    assert not at.exception
+    from profile.storage import load_profile
+
+    answers = load_profile().get("gap_interview_answers", [])
+    assert not any(a["skill"] == "Databricks" for a in answers)
+
+
+def test_editing_and_moving_on_without_confirm_click_still_auto_saves(results_app_with_gap_questions):
+    # The pre-existing edit-triggered auto-save path (answer_value !=
+    # suggested_answer) must keep working unchanged for users who DO edit
+    # and never touch the new Confirm control.
+    at = results_app_with_gap_questions
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+
+    box = next(t for t in at.text_area if "Databricks" in t.label)
+    box.set_value("Yes, led a 2-year Databricks migration.")
+    at.run(timeout=30)
+
+    assert not at.exception
+    from profile.storage import load_profile
+
+    answers = load_profile().get("gap_interview_answers", [])
+    assert any(a["skill"] == "Databricks" and "migration" in a["answer"] for a in answers)
+    assert any(t.value == "Saved." for t in at.toast)
+
+
+def test_confirm_button_not_offered_for_disqualifier_questions(results_app_with_gap_questions):
+    at = results_app_with_gap_questions
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    upsert_application(
+        "Dice", "job1", status="under review",
+        resume_clarifying_questions=[{
+            "type": "disqualifier_check", "skill": "role_level",
+            "question": "Should VP/CIO roles below a certain org size be excluded going forward?",
+            "suggested_answer": "",
+        }],
+    )
+    at.run(timeout=30)
+
+    assert not at.exception
+    box = next(t for t in at.text_area if "VP/CIO" in t.label)
+    assert not any(b.key and b.key.startswith(box.key) and b.key.endswith("_confirm") for b in at.button)
+
+
+def test_confirm_button_not_offered_for_free_form_no_point_value_questions(results_app_with_gap_questions):
+    # No badge/point_value means nothing concrete to "confirm as shown" -
+    # same reasoning as the disqualifier case, just a different exclusion.
+    at = results_app_with_gap_questions
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    upsert_application(
+        "Dice", "job1", status="under review",
+        resume_clarifying_questions=[{
+            "type": "skill_gap", "skill": "SK Life Science IT team size",
+            "question": "How many engineers are on the SK Life Science IT team?",
+            "suggested_answer": "",
+        }],
+    )
+    at.run(timeout=30)
+
+    assert not at.exception
+    box = next(t for t in at.text_area if "engineers" in t.label)
+    assert not any(b.key and b.key.startswith(box.key) and b.key.endswith("_confirm") for b in at.button)
+
+
+def test_confirm_button_saves_current_edited_text_not_original_suggestion(results_app_with_gap_questions):
+    # Confirm must take whatever text is CURRENTLY in the box (respecting
+    # any in-progress edit), not silently re-save the original
+    # suggested_answer underneath an edit the user hasn't "committed" via
+    # the auto-save path yet.
+    at = results_app_with_gap_questions
+    at.session_state["active_tab"] = "results"
+    at.session_state["selected_idx_Dice"] = 0
+    at.run(timeout=30)
+
+    box = next(t for t in at.text_area if "Databricks" in t.label)
+    box.set_value("Yes, 3 years leading a Databricks lakehouse migration.")
+
+    confirm_button = next(b for b in at.button if b.key and b.key.endswith("_confirm") and b.key.startswith(box.key))
+    confirm_button.click().run(timeout=30)
+
+    assert not at.exception
+    from profile.storage import load_profile
+
+    answers = load_profile().get("gap_interview_answers", [])
+    match = next((a for a in answers if a["skill"] == "Databricks"), None)
+    assert match is not None
+    assert "lakehouse migration" in match["answer"]
+
+
 def test_generate_button_regenerates_using_the_confirmed_answer(results_app_with_gap_questions, monkeypatch):
     import tailoring.drafting as drafting
 
