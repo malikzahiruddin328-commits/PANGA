@@ -900,7 +900,20 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                         qa_status = app_record.get("subscription_qa_status")
                         qa_round = app_record.get("subscription_qa_round", 0)
                         qa_score = app_record.get("resume_ats_score")
-                        open_questions = app_record.get("resume_clarifying_questions") or []
+                        # disqualifier_check questions are never shown per-job
+                        # any more (2026-08-18, Part 3 of the "standing
+                        # preferences move to Settings" build) - they're a
+                        # one-time-declare-in-Settings fact, not a per-job
+                        # gap to answer, so they're filtered out here at the
+                        # source rather than only at render time, keeping
+                        # gap_count (below) and the basket-wide "Open
+                        # questions" expander honest about what's actually
+                        # still shown. See Settings' "Standing preferences"
+                        # section for where these now live.
+                        open_questions = [
+                            q for q in (app_record.get("resume_clarifying_questions") or [])
+                            if q.get("type") != "disqualifier_check"
+                        ]
                         for q in open_questions:
                             all_open_questions.append((job, app_record, q))
                         item_cols = st.columns([3, 2.5, 2, 1])
@@ -2686,6 +2699,108 @@ def render_analyze_fit_section(job: dict, app_record: dict, analysis: dict | Non
                             st.toast("Saved.", icon=":material/check_circle:")
                             st.rerun()
 
+        # "Accept all" (2026-08-18, Zahir's real ask, live tonight): a
+        # single button below every individual question that bulk-confirms
+        # every ELIGIBLE suggested answer currently shown, instead of
+        # clicking "Confirm as shown" once per question on an 18-question
+        # panel. Same eligibility rule as the individual button above
+        # (not is_disqualifier and point_value is not None) - disqualifier_
+        # check questions are never eligible here either (per Part 3 of
+        # this build, they no longer even render in this per-job panel at
+        # all - see the type filter at the top of answer_entries below - so
+        # in practice this loop never sees one, but the explicit check is
+        # kept as defense in depth against a future regression re-adding
+        # them here). Reads each question's CURRENT box text from
+        # st.session_state (already populated by the text_area render
+        # above, in this same script run) rather than the original
+        # suggested_answer, so an edit the user made just before clicking
+        # "Accept all" is honored, not silently discarded.
+        if open_questions:
+            no_reference_placeholders = {
+                entry["key"]: no_reference_found_answer(entry["q"].get("skill") or entry["q"]["question"])
+                for entry in answer_entries
+            }
+            eligible_for_accept_all = []
+            for entry in answer_entries:
+                q, key = entry["q"], entry["key"]
+                if q["type"] == "disqualifier_check" or q.get("point_value") is None:
+                    continue
+                current_text = st.session_state.get(key, q.get("suggested_answer") or "")
+                if not current_text.strip():
+                    continue
+                # Skip the honest "no reference found" placeholder - there's
+                # nothing real to accept, don't force-save a non-answer as
+                # if it were a confirmed fact.
+                if current_text.strip() == no_reference_placeholders[key].strip():
+                    continue
+                eligible_for_accept_all.append({"q": q, "text": current_text})
+
+            if eligible_for_accept_all:
+                st.divider()
+                if st.button(
+                    f"Accept all ({len(eligible_for_accept_all)})",
+                    key=f"acceptall_{job_key}",
+                    help=(
+                        "Confirms every eligible suggested answer shown above "
+                        "as-is, then redrafts this resume with the newly "
+                        "confirmed facts folded in - same pipeline as clicking "
+                        "each 'Confirm as shown' button individually, in one "
+                        "step. Skips disqualifier-type questions and any box "
+                        "still showing the honest \"no reference found\" "
+                        "placeholder."
+                    ),
+                ):
+                    to_save = []
+                    for item in eligible_for_accept_all:
+                        q = item["q"]
+                        # Same pre-flight literal-keyword guarantee the
+                        # individual "Confirm as shown" button already runs -
+                        # see that button's own comment above for why.
+                        confirmed_answer, _ = ensure_keyword_literally_present(q["skill"], item["text"])
+                        to_save.append({
+                            "skill": q["skill"], "type": q["type"],
+                            "answer": confirmed_answer, "question": q["question"],
+                        })
+                    save_gap_answers(job, to_save)
+                    # This button only ever operates on ONE job's questions,
+                    # so there is nothing to parallelize within itself - but
+                    # if this pattern is ever extended to a multi-job bulk-
+                    # accept (e.g. "Accept all" across every job in the
+                    # basket), that MUST reuse the existing ThreadPoolExecutor
+                    # pattern this file already has for exactly this shape of
+                    # work (see the basket-wide "Draft & score all" button's
+                    # _draftall_worker/BASKET_DRAFTALL_MAX_WORKERS/
+                    # effective_worker_count, above in this same file), never
+                    # a bare sequential loop over jobs - see
+                    # feedback_parallelize_batch_operations.md for the real
+                    # incident (3x slower wall-clock time) that documents
+                    # exactly this mistake.
+                    with st.spinner(
+                        f"Redrafting this resume with {len(to_save)} newly "
+                        "confirmed fact(s) - this is a real redraft (not "
+                        "instant), it can take 40-90+ seconds..."
+                    ):
+                        outcome = run_subscription_round(job, profile)
+                    if outcome.get("ok") and not outcome.get("locked"):
+                        st.toast(
+                            f"Accepted {len(to_save)} answer(s) and redrafted.",
+                            icon=":material/check_circle:",
+                        )
+                    elif outcome.get("locked"):
+                        st.toast(
+                            "Saved your answers, but this job's generation "
+                            "lock is busy right now - redraft skipped, try "
+                            "again shortly.",
+                            icon=":material/info:",
+                        )
+                    else:
+                        st.toast(
+                            f"Saved your answers, but the redraft failed: "
+                            f"{outcome.get('error') or 'unknown error'}",
+                            icon=":material/error:",
+                        )
+                    st.rerun()
+
 
 def render_recurring_gap_review_panel() -> None:
     """Phase 3 of Zahir's confirmed "final set of questions" taxonomy-gap
@@ -3214,6 +3329,66 @@ for col, (key, label) in zip(tab_cols, TABS):
             st.rerun()
 st.divider()
 
+def _pending_disqualifier_questions(profile: dict) -> list[dict]:
+    """Every not-yet-declared disqualifier_check question sitting in ANY
+    job's stored resume_clarifying_questions - Part 3 of the 2026-08-18
+    "standing preferences move to Settings" build (Zahir's real, live ask:
+    a disqualifier-type fact like "Security clearance" or "Washington, DC
+    relocation and compensation" should be "setting driven and once
+    declared it is declared unless the user explicitly changes it," not a
+    per-job question that can reappear).
+
+    Investigation finding backing this design (see drafting.
+    analyze_fit_before_drafting's own comment for the full writeup): a
+    disqualifier question WAS already meant to stop reappearing once
+    answered (both the AI's own prompt instruction and this app's
+    _merge_keyword_gap_questions dedup check for it), but both of those
+    are label-text/canonical-taxonomy MATCHES against previously_answered_
+    skills - genuinely fragile the moment the AI phrases the same
+    underlying topic slightly differently on a later round (exactly the
+    same class of gap CLAUDE.md already documents for skill_gap
+    questions). Rather than trying to make that matching bulletproof, the
+    per-job surfacing is removed entirely (see analyze_fit_before_drafting
+    and the basket-wide open-questions loop in this file) and replaced
+    with this: a single, deduplicated, declare-once surface here in
+    Settings.
+
+    Dedup uses the SAME canonical-taxonomy-aware skill match _merge_
+    keyword_gap_questions() itself uses (skills_match() first, canonical
+    id equality as a fallback) - both against already-declared profile
+    gap_interview_answers (is_disqualifier=True) and against every OTHER
+    pending disqualifier already collected from an earlier job in this
+    same scan, so several jobs independently proposing the same
+    disqualifier topic surfaces once here, not once per job."""
+    from skill_label_match import skills_match
+    from skills.canonical_taxonomy import find_canonical_id, load_taxonomy
+
+    taxonomy = load_taxonomy()
+
+    def _same_skill(a: str, b: str) -> bool:
+        if skills_match(a, b):
+            return True
+        id_a, id_b = find_canonical_id(a, taxonomy), find_canonical_id(b, taxonomy)
+        return id_a is not None and id_a == id_b
+
+    declared_skills = [
+        a.get("skill") for a in profile.get("gap_interview_answers", [])
+        if a.get("is_disqualifier") and a.get("skill")
+    ]
+    pending: list[dict] = []
+    for app_record in load_applications():
+        for q in app_record.get("resume_clarifying_questions") or []:
+            if q.get("type") != "disqualifier_check" or not q.get("skill"):
+                continue
+            skill = q["skill"]
+            if any(_same_skill(skill, s) for s in declared_skills):
+                continue
+            if any(_same_skill(skill, item["skill"]) for item in pending):
+                continue
+            pending.append({"skill": skill, "question": q.get("question", "")})
+    return pending
+
+
 active_tab = st.session_state["active_tab"]
 
 if active_tab == "settings":
@@ -3690,6 +3865,71 @@ if active_tab == "settings":
             else:
                 st.toast("Saved title clusters.", icon=":material/check_circle:")
             st.rerun()
+
+    st.subheader("Standing preferences")
+    st.markdown(
+        "Real, borderline-fit judgment calls your resumes' own questions "
+        "have flagged (e.g. security clearance, relocation/compensation "
+        "for a specific location, a role type you might want to rule "
+        "out) - declared ONCE here, not per job. Once declared, it "
+        "applies to every future job's score (a matching posting scores "
+        "low regardless of subject-matter proximity) until you explicitly "
+        "change it - it never reappears as a per-job question again."
+    )
+    standing_prefs_profile = load_profile()
+    declared_disqualifiers = [
+        a for a in standing_prefs_profile.get("gap_interview_answers", [])
+        if a.get("is_disqualifier")
+    ]
+    if declared_disqualifiers:
+        st.markdown(f"**Already declared ({len(declared_disqualifiers)})**")
+        for entry in declared_disqualifiers:
+            with st.container(border=True):
+                st.markdown(f"**{entry.get('skill', 'Unlabeled')}**")
+                if entry.get("question"):
+                    st.markdown(entry["question"])
+                edit_key = f"standingpref_edit_{abs(hash(entry.get('skill', ''))) % 10_000_000}"
+                edited_text = st.text_area(
+                    "Declared answer", value=entry.get("answer", ""),
+                    key=edit_key, height=68, label_visibility="collapsed",
+                )
+                if st.button("Update", key=f"{edit_key}_save", disabled=not edited_text.strip() or edited_text == entry.get("answer", "")):
+                    from datetime import datetime, timezone
+                    from profile.interview import save_answer
+                    save_answer(
+                        skill=entry["skill"], role_context=entry.get("role_context", "Settings - Standing preferences"),
+                        answer=edited_text.strip(), date_captured=datetime.now(timezone.utc).date().isoformat(),
+                        question=entry.get("question", ""), is_disqualifier=True,
+                    )
+                    st.toast("Updated.", icon=":material/check_circle:")
+                    st.rerun()
+    else:
+        st.markdown("Nothing declared yet.")
+
+    pending_disqualifiers = _pending_disqualifier_questions(standing_prefs_profile)
+    if pending_disqualifiers:
+        st.markdown(f"**Not yet declared ({len(pending_disqualifiers)}) - found in your saved jobs' questions**")
+        for item in pending_disqualifiers:
+            with st.container(border=True):
+                st.markdown(f"**{item['skill']}**")
+                if item.get("question"):
+                    st.markdown(item["question"])
+                declare_key = f"standingpref_new_{abs(hash(item['skill'])) % 10_000_000}"
+                new_answer = st.text_area(
+                    "Your answer", value="", key=declare_key, height=68,
+                    label_visibility="collapsed",
+                    placeholder="Type your answer - a genuine judgment call only you can make...",
+                )
+                if st.button("Declare", key=f"{declare_key}_save", disabled=not new_answer.strip()):
+                    from datetime import datetime, timezone
+                    from profile.interview import save_answer
+                    save_answer(
+                        skill=item["skill"], role_context="Settings - Standing preferences",
+                        answer=new_answer.strip(), date_captured=datetime.now(timezone.utc).date().isoformat(),
+                        question=item.get("question", ""), is_disqualifier=True,
+                    )
+                    st.toast("Declared - this now applies to every future job's score.", icon=":material/check_circle:")
+                    st.rerun()
 
     st.subheader("Custom organization exclusions")
     st.markdown(

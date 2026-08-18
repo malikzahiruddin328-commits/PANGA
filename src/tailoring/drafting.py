@@ -41,6 +41,7 @@ from skill_label_match import (
 from tailoring.ats_score import STANDARD_HEADERS, detect_keyword_wording_regressions, detect_matched_keyword_regressions, ensure_keyword_literally_present, plateau_note_for_gaps, score_resume_against_keywords, score_resume_ats
 from tailoring.baseline_resume import select_baseline_resume_text
 from tailoring.claim_verification import flag_unverified_resume_claims
+from tailoring.us_spelling import apply_us_spelling_backstop
 
 logger = logging.getLogger(__name__)
 
@@ -298,7 +299,8 @@ Ground rules:
 - Return ONLY the documents requested via the structured output schema. No extra commentary.
 
 Writing voice - under no circumstances may this read as AI-written. It must read as a real senior executive's own writing, full stop:
-- British English prose conventions - phrasing, idiom, and a measured, understated register - but American spellings throughout (e.g. "color" not "colour", "organize" not "organise", "center" not "centre"), since this is for US employers.
+- Consistent US English spelling throughout, with no exceptions - e.g. "color" not "colour", "organize"/"organization" not "organise"/"organisation", "center" not "centre", "specialize" not "specialise", "program" not "programme", "-ize"/"-yze" endings not "-ise"/"-yse" (analyze not analyse, prioritize not prioritise), "defense" not "defence", "traveled"/"canceled" not "travelled"/"cancelled". This candidate's own background includes UK-based education, so British spelling is a real, live risk to actively guard against, not a hypothetical one - re-check every word ending in -our, -re, -ise/-yse, -ogue, or a doubled consonant before an -ed/-ing suffix for a US-spelling slip before finalizing.
+- Natural, human writing style throughout - never robotic, stiff, or AI-sounding phrasing. Write the way an experienced, thoughtful writer actually talks about their own work: varied rhythm, plain word choices over inflated ones, genuine specificity over generic polish.
 - Vary sentence length and structure line to line; never fall into a uniform rhythm.
 - Do not use these overused AI-writing tells: corporate buzzwords (leverage, spearhead, synergy, robust, cutting-edge, seamless, dynamic, passionate, game-changer); repetitive three-item lists; formulaic openers ("In today's fast-paced environment...", "I am thrilled to apply..."); "not just X, but Y" constructions; excessive em dashes; and stacking multiple adjectives before a noun.
 - Every claim should sound like something this specific person would actually say about his own work - concrete, specific, a little understated rather than oversold.
@@ -1891,6 +1893,19 @@ def _finalize_resume_draft(data: dict, job: dict | None, profile: dict | None) -
     rather than re-implementing or approximating them - the whole point
     being that no execution model gets to skip or weaken these checks."""
     resume_text = data.get("text", "")
+    # Deterministic US-spelling backstop (2026-08-18, Zahir's real ask) -
+    # SYSTEM_PROMPT already instructs US spelling explicitly, but per
+    # CLAUDE.md's own standing principle #3 ("AI output checked by a
+    # literal/deterministic downstream rule is fragile without a
+    # code-level backstop"), a prompt instruction alone isn't trusted here
+    # - Zahir's own source profile has a UK-education background (London
+    # university), a real, live source of British spellings leaking into
+    # generated text. Runs first, before every other deterministic pass
+    # below, so anything downstream (rank-prefix stripping, education
+    # verbatim render, unverified-claims flagging) always sees the final,
+    # US-spelled text rather than operating on text that gets rewritten
+    # again afterward.
+    resume_text = apply_us_spelling_backstop(resume_text)
     if not data.get("target_seniority_at_least_vp", True):
         # Deterministic safety net, not left to prompt compliance alone
         # (see _strip_rank_prefixes docstring) - only for a below-VP
@@ -2727,6 +2742,35 @@ def analyze_fit_before_drafting(job: dict, profile: dict, app_record: dict) -> d
         cluster_known_units=cluster_known_units,
     )
     open_questions = _questions_worth_asking(merged_questions, projected_score)
+    # Part 3, 2026-08-18 ("standing preferences move to Settings", Zahir's
+    # real live ask): disqualifier_check questions are DELIBERATELY dropped
+    # from open_questions here, the single choke point ui.app.py's
+    # render_analyze_fit_section and the Profile Gaps tab's per-job loop
+    # both consume (directly, or via _analyze_fit_with_auto_gap_scan, which
+    # just wraps this same function) - a disqualifier is a one-time,
+    # standing-preference declaration (Settings' new "Standing preferences"
+    # section), never a per-job gap to re-ask about. This does NOT affect
+    # what's PERSISTED to app_record["resume_clarifying_questions"] (this
+    # function never writes anything) - the raw, unfiltered
+    # clarifying_questions the AI proposes still gets saved by whichever
+    # function actually persists a draft (_finalize_resume_draft,
+    # rescore_against_cached_keywords, request_additional_gap_questions),
+    # which is exactly what lets Settings scan every job's stored
+    # questions for a not-yet-declared disqualifier fact to surface there.
+    # Root cause found during investigation: the AI's own dedup instinct
+    # (told in the schema description to check gap_interview_answers
+    # before proposing one again) and this module's _merge_keyword_gap_
+    # questions() dedup (_same_skill() label/canonical-taxonomy matching
+    # against previously_answered_skills) are BOTH real, but both are
+    # fragile against the AI simply phrasing the same disqualifier topic
+    # differently on a later round - exactly the kind of "AI output
+    # checked by a literal/deterministic downstream rule is fragile
+    # without a code-level backstop" gap this repo's own CLAUDE.md already
+    # calls out. Rather than trying to make the label-matching bulletproof,
+    # this removes the per-job re-surfacing risk entirely by never
+    # rendering a disqualifier_check question per-job again, regardless of
+    # whether it's already answered or not.
+    open_questions = [q for q in open_questions if q.get("type") != "disqualifier_check"]
 
     return {
         "projected_score": projected_score,
