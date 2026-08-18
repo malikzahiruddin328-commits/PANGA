@@ -236,11 +236,48 @@ def test_save_jobs_does_not_overwrite_review_status_on_existing_record(isolated_
 
 
 def test_add_manual_job_skips_the_review_gate(isolated_data):
+    # A genuine one-at-a-time manual add (Zahir's own "Add a job manually"
+    # UI form, or a one-off script call) - review_required defaults to
+    # False, so it must NOT regress from this behavior.
     job = job_store.add_manual_job(
         title="Head of IT", organization="Aerospike", location="Remote",
         description="d", posting_url="https://example.com/careers/1", source="company_site",
     )
     assert job["review_status"] == "accepted"
+
+
+def test_add_manual_job_review_required_true_stamps_pending(isolated_data):
+    # Real production bug, fixed 2026-08-18: scripts/job_alert_scan.py's
+    # Gmail digest extraction is an unattended automated bulk process, not
+    # a genuine one-at-a-time human choice, even though it calls
+    # add_manual_job() the same way the UI form does - it must opt into
+    # the review gate explicitly, per Zahir's "i want all to be for manual
+    # review i really want to control what goes to step 2." This must land
+    # review_status="pending" exactly like a fresh source-connector result
+    # from save_jobs(), not "accepted".
+    job = job_store.add_manual_job(
+        title="Solutions Architect", organization="Acme Corp", location="Remote",
+        description="d", posting_url="https://www.linkedin.com/jobs/view/999888777/",
+        source="linkedin", review_required=True,
+    )
+    assert job["review_status"] == "pending"
+
+
+def test_add_manual_job_review_required_true_still_bypasses_exclusion_filter(isolated_data):
+    # review_required=True must not accidentally re-enable the search-time
+    # exclusion filter - job_alert_scan.py's standing "add every listing
+    # found, never skip one for looking like the wrong industry/vertical"
+    # rule (Zahir's 2026-08-06 instruction) still applies regardless of
+    # review gate status. Use a title pattern exclusion_filter would flag
+    # for an automated search connector (a bare IC-tier title with no
+    # executive qualifier) to prove it's not silently dropped here.
+    job = job_store.add_manual_job(
+        title="Registered Nurse", organization="Acme Health", location="Remote",
+        description="d", posting_url="https://example.com/careers/rn-1",
+        source="linkedin", review_required=True,
+    )
+    assert job in job_store.load_jobs()
+    assert job["review_status"] == "pending"
 
 
 def test_set_review_status_updates_matching_job(isolated_data):

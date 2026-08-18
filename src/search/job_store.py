@@ -124,17 +124,24 @@ def save_jobs(new_jobs: list[dict], apply_exclusion: bool = True, review_require
     tab's review UI - see ui/app.py's "Review new search result(s)"
     section and scripts/run_search.py's score_unscored_jobs(), both of
     which only score review_status == "accepted" jobs).
-    add_manual_job() below passes both apply_exclusion=False and
-    review_required=False - a job Zahir pastes in himself (or
-    job_alert_scan.py extracts) is already a considered choice, not a
-    broad-net search hit, so gating it behind a second manual accept
-    click would be pure friction with no real review value, on top of
-    it already being exempt from the exclusion filter above. A job saved
-    before this field existed has no review_status at all - every reader
-    of this field must treat a missing key as "accepted" (the implicit
-    historical default), never as "pending", or every job ever saved
-    before 2026-08-13 would silently vanish behind an unintended review
-    gate.
+    add_manual_job() below always passes apply_exclusion=False (both its
+    real callers are exempt from the exclusion filter - see that
+    function's docstring), but review_required now varies by caller
+    (fixed 2026-08-18, closing a real gap Zahir called out explicitly on
+    2026-08-13: "i want all to be for manual review i really want to
+    control what goes to step 2"): a job Zahir pastes in himself via the
+    UI form (or a one-off manual script call) is already a considered,
+    one-at-a-time choice, so gating it behind a second manual accept
+    click would be pure friction with no real review value - that caller
+    passes (or defaults to) review_required=False. scripts/job_alert_scan.py's
+    Gmail digest extraction, despite calling the same function, is an
+    unattended automated bulk process - nobody looks at a listing before
+    it's saved - so it now passes review_required=True, same as every
+    other automated source connector. A job saved before this field
+    existed has no review_status at all - every reader of this field
+    must treat a missing key as "accepted" (the implicit historical
+    default), never as "pending", or every job ever saved before
+    2026-08-13 would silently vanish behind an unintended review gate.
 
     apply_exclusion also gates the archive-dedup check added 2026-08-13
     (see this docstring's "Archive dedup" section above): add_manual_job()'s
@@ -279,6 +286,7 @@ def add_manual_job(
     description: str,
     posting_url: str,
     source: str = "linkedin",
+    review_required: bool = False,
 ) -> dict:
     """Creates a job record for a posting the user found himself (PRD §13
     LinkedIn manual intake) rather than one an automated search channel
@@ -306,6 +314,41 @@ def add_manual_job(
     a future caller with no such guard would hit it silently, so it's
     fixed at the source rather than left as an implicit assumption only
     today's two callers happen to uphold.
+
+    review_required (fixed 2026-08-18, real production bug - a
+    review_required=True path was designed and tested on
+    feature/gmail-alert-review-gate back on 2026-08-13, per Zahir's
+    explicit call that day: "i want all to be for manual review i really
+    want to control what goes to step 2" - but that branch was never
+    merged to master, so master kept the pre-review-gate hardcoded
+    save_jobs(..., review_required=False) call this whole time. Confirmed
+    live 2026-08-18: 33 job-alert-digest records (22 linkedin, 11 lensa,
+    all added 2026-08-18) had already been silently stamped
+    review_status="accepted" - bypassing the review gate that's existed
+    for every other source connector since 2026-08-13 - despite never
+    being looked at by Zahir):
+
+    Defaults to False, because this function has two genuinely different
+    real callers that must NOT be treated the same:
+
+    - Zahir's own "Add a job manually" form in ui/app.py, and any
+      one-off direct script call he runs himself (e.g. a single job
+      added by hand) - he already looked at and chose this exact
+      posting one at a time. Routing that back through a review queue
+      for him to accept his own already-made choice would be circular
+      busywork, not a real control point. Stays review_required=False
+      (the default) - no caller of this kind needs to change.
+    - scripts/job_alert_scan.py's Gmail digest extraction - this LOOKS
+      like the same "one job at a time" shape (one add_manual_job() call
+      per listing) but is actually an unattended, automated bulk process:
+      a scheduled task reads however many digest emails arrived, an AI
+      extraction pulls out however many listings they contain, and every
+      one gets saved with no human having looked at any of them yet.
+      That's exactly the "step 2" gate Zahir wants every source to go
+      through - it was only exempted originally because the *code path*
+      (add_manual_job, not save_jobs) looked like the manual one, not
+      because a human actually reviewed each listing before it landed.
+      That caller now passes review_required=True explicitly.
     """
     match = LINKEDIN_JOB_ID_RE.search(posting_url)
     if match:
@@ -324,11 +367,16 @@ def add_manual_job(
         "description": description,
         "posting_url": posting_url,
     }
-    # apply_exclusion=False, review_required=False: see save_jobs()'s own
-    # docstring - this path (Zahir's manual paste UI AND job_alert_scan.py's
-    # email-digest extraction) is explicitly exempt from both search-time
-    # exclusion and the review gate.
-    save_jobs([job], apply_exclusion=False, review_required=False)
+    # apply_exclusion=False: see save_jobs()'s own docstring - both real
+    # callers of this function (Zahir's manual paste UI and
+    # job_alert_scan.py's email-digest extraction) are exempt from
+    # search-time exclusion regardless of review_required.
+    # review_required is passed straight through to save_jobs() (fixed
+    # 2026-08-18 - see this function's own docstring above): the default
+    # (False) is right for a genuine one-at-a-time manual add, but
+    # job_alert_scan.py overrides it to True since it's an unattended
+    # automated bulk process, not a considered human choice per listing.
+    save_jobs([job], apply_exclusion=False, review_required=review_required)
     return job
 
 

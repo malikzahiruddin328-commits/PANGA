@@ -62,6 +62,26 @@ def test_extracted_listing_is_saved_with_mapped_source(isolated_data, monkeypatc
     assert stored[0]["organization"] == "Acme Corp"
 
 
+def test_extracted_listing_lands_pending_review_status(isolated_data, monkeypatch):
+    # Real production bug, fixed 2026-08-18: job_alert_scan.py's
+    # add_manual_job() call must pass review_required=True, so every
+    # Gmail-digest listing waits for Zahir to accept it in the Results
+    # tab before it's eligible for fit_score scoring - it must NOT land
+    # review_status="accepted" (the manual-paste-UI default), same as any
+    # other automated source connector's fresh results.
+    monkeypatch.setattr(job_alert_scan, "extract_listings", lambda subject, body: [
+        {"title": "CIO", "organization": "Acme Corp", "location": "Remote", "posting_url": "https://linkedin.com/jobs/view/12345", "description": ""},
+    ])
+    account = FakeAccount([FakeMessage()])
+
+    new_jobs = job_alert_scan.scan_account(account, _SENDERS)
+
+    assert len(new_jobs) == 1
+    assert new_jobs[0]["review_status"] == "pending"
+    stored = job_store.load_jobs()
+    assert stored[0]["review_status"] == "pending"
+
+
 def test_message_marked_job_alert_reviewed_even_with_no_listings(isolated_data, monkeypatch):
     monkeypatch.setattr(job_alert_scan, "extract_listings", lambda subject, body: [])
     account = FakeAccount([FakeMessage(ref="m1")])

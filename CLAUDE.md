@@ -251,6 +251,27 @@ isn't backfilled or guessed at - it saves as-is and picks up the existing
 paste-JD-manually UX (`ui/app.py`'s `render_paste_jd_prompt_before_drafting`)
 the same way any other thin job record does.
 
+**Review gate:** every listing this scan saves goes into the same manual-
+review queue as every other automated source connector
+(`review_status="pending"`, via `add_manual_job(..., review_required=True)`)
+and does not proceed to `fit_score` scoring until Zahir accepts it in the
+Results tab's review UI - per his explicit 2026-08-13 call, "i want all to
+be for manual review i really want to control what goes to step 2." This is
+distinct from Zahir's own "Add a job manually" UI form and any one-off
+manual script call, which stay exempt (`review_required=False`, the
+default) - those are a considered, one-at-a-time human choice already;
+this scan is an unattended automated bulk process even though it reuses
+the same `add_manual_job()` code path. **This was designed and built on
+2026-08-13 (`feature/gmail-alert-review-gate`) but that branch was never
+merged to master** - master silently kept the old hardcoded
+`review_required=False` behavior for this path until a real production
+bug was caught and fixed 2026-08-18 (33 job-alert-digest records had
+already been stamped `review_status="accepted"` without ever being
+reviewed, though none had yet been scored). If this section and the code
+in `src/search/job_store.py`/`scripts/job_alert_scan.py` ever disagree
+again, trust the code and flag it - this is exactly the failure mode that
+let the gap sit live for five days undetected.
+
 ## Merging a finished worktree branch into master
 
 Panga usually has several sessions working in parallel worktrees. When a

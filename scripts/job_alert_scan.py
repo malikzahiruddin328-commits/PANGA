@@ -30,13 +30,33 @@ CLAUDE.md already states for the old manual process, unchanged here.
 Listings save via search.job_store.add_manual_job(), so job_id dedup
 (LinkedIn URL job-id regex, else a URL hash) and the source tag are
 exactly the manual "Add a job manually" flow's own logic - not
-reimplemented here. Newly-saved jobs get no fit_score at save time; the
-existing scripts/run_search.py's daily score_unscored_jobs() sweep
-(scoped to ALL jobs missing fit_score store-wide, not just its own
-freshly-searched ones) picks them up automatically on its next run - see
-install_scheduled_tasks.ps1's comment on this script's registered time
-for why it's scheduled just before that sweep rather than needing its own
-scoring step.
+reimplemented here.
+
+Review gate (fixed 2026-08-18, real production bug): every listing this
+script saves passes add_manual_job(..., review_required=True), so it
+lands review_status="pending" exactly like every other automated source
+connector's results - Zahir's explicit call: "i want all to be for
+manual review i really want to control what goes to step 2." This script
+was originally left exempt (review_required defaulted to False for every
+add_manual_job() caller, including this one) because it reuses the same
+manual-add code path Zahir's own paste-a-job UI form uses - but unlike
+that form, nothing here is a considered, one-at-a-time human choice: a
+scheduled task reads however many digest emails arrived and an AI
+extraction pulls out however many listings they contain, with no human
+looking at any of them before they're saved. That's a bulk automated
+process in substance, whatever code path it happens to share
+syntactically. (A review_required=True fix for this exact gap was
+designed, implemented, and tested on feature/gmail-alert-review-gate on
+2026-08-13, but that branch was never merged to master - master kept the
+old hardcoded-False behavior the whole time, so every listing saved here
+between 2026-08-13 and this fix silently bypassed the review gate.)
+Newly-saved jobs get no fit_score at save time regardless; once accepted
+in the Results tab's review UI, the existing scripts/run_search.py's
+daily score_unscored_jobs() sweep (scoped to ALL accepted jobs missing
+fit_score store-wide, not just its own freshly-searched ones) picks them
+up automatically on its next run - see install_scheduled_tasks.ps1's
+comment on this script's registered time for why it's scheduled just
+before that sweep rather than needing its own scoring step.
 
 A listing with no posting_url is skipped and logged, not saved: job_store
 add_manual_job()'s dedup falls back to hashing posting_url when no
@@ -118,6 +138,20 @@ def scan_account(account, senders: list[str]) -> list[dict]:
                     description=listing["description"],
                     posting_url=listing["posting_url"],
                     source=senders_source_for(msg.sender, senders),
+                    # Fixed 2026-08-18 (real production bug): this is an
+                    # unattended, automated bulk process (an AI extraction
+                    # over however many digest emails arrived, no human
+                    # looking at any listing before it's saved) - not a
+                    # genuine one-at-a-time manual add, even though it
+                    # calls add_manual_job() the same way Zahir's own
+                    # paste-a-job UI form does. Per Zahir's explicit
+                    # 2026-08-13 call ("i want all to be for manual review
+                    # i really want to control what goes to step 2"),
+                    # every listing lands review_status="pending" like any
+                    # other source connector's results, and only proceeds
+                    # to fit_score once he accepts it in the Results tab's
+                    # review UI.
+                    review_required=True,
                 )
             except Exception as exc:  # noqa: BLE001 - one bad listing shouldn't stop the rest
                 _log(f"    couldn't save listing {listing.get('title')!r}: {exc}")
