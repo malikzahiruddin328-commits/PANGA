@@ -250,29 +250,55 @@ def test_projected_score_moves_after_answering_before_generating(results_app_wit
     assert get_application("Dice", "job1")["resume_ats_score"] == INITIAL_SCORE
 
 
-def test_disqualifier_question_gets_no_point_badge_and_distinct_flag_note(results_app_with_gap_questions):
-    # A disqualifier_check question comes from the AI's own past drafted
-    # resume_clarifying_questions (missing_required_keywords never
-    # produces one - that mechanism only knows about literal keyword
-    # gaps, not standing preferences), so this seeds it there directly.
+def test_disqualifier_question_never_renders_in_the_per_job_panel(results_app_with_gap_questions):
+    # 2026-08-18, Part 3 of the "standing preferences move to Settings"
+    # build (Zahir's real live ask): disqualifier_check questions used to
+    # render here with a "standing pref" badge - they no longer render in
+    # this per-job panel AT ALL, regardless of answered state. They now
+    # only ever surface in Settings' new "Standing preferences" section
+    # (see test_standing_preferences_settings.py). A disqualifier_check
+    # question comes from the AI's own past drafted resume_clarifying_
+    # questions (missing_required_keywords never produces one - that
+    # mechanism only knows about literal keyword gaps, not standing
+    # preferences), so this seeds it there directly, alongside the real
+    # Databricks skill_gap question this fixture already carries, to prove
+    # ONLY the disqualifier is dropped, not everything.
     at = results_app_with_gap_questions
     at.session_state["active_tab"] = "results"
     at.session_state["selected_idx_Dice"] = 0
     upsert_application(
         "Dice", "job1", status="under review",
-        resume_clarifying_questions=[{
-            "type": "disqualifier_check", "skill": "role_level",
-            "question": "Should VP/CIO roles below a certain org size be excluded going forward?",
-            "suggested_answer": "",
-        }],
+        resume_clarifying_questions=[
+            {
+                "type": "skill_gap", "skill": "Databricks", "question": DATABRICKS_QUESTION_TEXT,
+                "suggested_answer": "Unknown - please describe your real experience (if any) with this.",
+                "point_value": DATABRICKS_POINT_VALUE,
+            },
+            {
+                "type": "disqualifier_check", "skill": "role_level",
+                "question": "Should VP/CIO roles below a certain org size be excluded going forward?",
+                "suggested_answer": "",
+            },
+        ],
     )
     at.run(timeout=30)
 
     assert not at.exception
+    # The real skill_gap question still renders normally.
+    assert any("Databricks" in t.label for t in at.text_area)
+    # The disqualifier question does not render anywhere in this panel -
+    # no matching text_area, no "standing pref" badge, no "applies to
+    # every" flag note.
+    assert not any("VP/CIO" in t.label for t in at.text_area)
     badge_lines = [m.value for m in at.markdown if "-badge[" in m.value]
-    assert any("standing pref" in b for b in badge_lines)
+    assert not any("standing pref" in b for b in badge_lines)
     markdown_text = " ".join(m.value for m in at.markdown)
-    assert "applies to every" in markdown_text.lower()
+    assert "applies to every" not in markdown_text.lower()
+    # Persisted storage is untouched - the raw disqualifier question is
+    # still saved on the application record (needed for Settings' scan) -
+    # this fix is a render-time filter, not a data-deletion.
+    stored = get_application("Dice", "job1")["resume_clarifying_questions"]
+    assert any(q.get("type") == "disqualifier_check" for q in stored)
 
 
 def test_answer_saves_immediately_without_clicking_any_button(results_app_with_gap_questions):
@@ -463,6 +489,18 @@ def test_editing_and_moving_on_without_confirm_click_still_auto_saves(results_ap
 
 
 def test_confirm_button_not_offered_for_disqualifier_questions(results_app_with_gap_questions):
+    # A disqualifier_check question never renders here at all any more
+    # (see test_disqualifier_question_never_renders_in_the_per_job_panel),
+    # so there is no box for it and therefore no "Confirm as shown" button
+    # tied to one. Note the job's own required-keyword gap (Databricks)
+    # legitimately re-synthesizes its OWN "Confirm as shown" button
+    # regardless of what's passed into resume_clarifying_questions here
+    # (analyze_fit_before_drafting always re-derives missing_required_
+    # keywords fresh from the job's real ats_required_keywords vs.
+    # resume_text) - this test isn't about "no confirm buttons at all", it
+    # confirms every confirm button that DOES render is tied to a real,
+    # currently-rendered question box, never an orphaned one for the
+    # disqualifier that was filtered out.
     at = results_app_with_gap_questions
     at.session_state["active_tab"] = "results"
     at.session_state["selected_idx_Dice"] = 0
@@ -477,8 +515,10 @@ def test_confirm_button_not_offered_for_disqualifier_questions(results_app_with_
     at.run(timeout=30)
 
     assert not at.exception
-    box = next(t for t in at.text_area if "VP/CIO" in t.label)
-    assert not any(b.key and b.key.startswith(box.key) and b.key.endswith("_confirm") for b in at.button)
+    assert not any("VP/CIO" in t.label for t in at.text_area)
+    box_keys = [t.key for t in at.text_area if t.key]
+    confirm_buttons = [b for b in at.button if b.key and b.key.endswith("_confirm")]
+    assert all(any(b.key.startswith(bk) for bk in box_keys) for b in confirm_buttons)
 
 
 def test_confirm_button_not_offered_for_free_form_no_point_value_questions(results_app_with_gap_questions):

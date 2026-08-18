@@ -361,6 +361,38 @@ def test_finalize_resume_draft_matches_draft_one_for_the_same_raw_data(monkeypat
     assert via_draft_one == via_finalize_directly
 
 
+def test_finalize_resume_draft_applies_the_us_spelling_backstop(monkeypatch):
+    # 2026-08-18, Zahir's real ask: generated resume_text must consistently
+    # use US spelling - Zahir's own source profile has a UK-education
+    # background (London university), a real, live risk of British
+    # spellings leaking through even with the SYSTEM_PROMPT instruction in
+    # place. Per this repo's own CLAUDE.md principle #3 ("AI output
+    # checked by a literal/deterministic downstream rule is fragile
+    # without a code-level backstop"), _finalize_resume_draft must run a
+    # real deterministic pass, not just rely on the prompt.
+    raw_data = {
+        "text": "SKILLS\nOrganised and prioritised cross-functional programmes; recognised for strong colour sense.",
+        "target_seniority_at_least_vp": True,
+        "suggested_strategy_tag": "",
+        "clarifying_questions": [],
+        "unconfirmed_claims": [],
+    }
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": [], "ats_preferred_keywords": []}
+
+    result = _finalize_resume_draft(raw_data, job, {})
+
+    assert "Organized" in result["text"]
+    assert "prioritized" in result["text"]
+    assert "programs" in result["text"]
+    assert "recognized" in result["text"]
+    assert "color" in result["text"]
+    assert "Organised" not in result["text"]
+    assert "prioritised" not in result["text"]
+    assert "programmes" not in result["text"]
+    assert "recognised" not in result["text"]
+    assert "colour" not in result["text"]
+
+
 def test_draft_one_resume_renders_education_verbatim_from_the_profile(monkeypatch):
     # 2026-08-10 fix: _draft_one must not trust the AI's own freeform
     # EDUCATION wording, even when the AI's motive (hitting a literal
@@ -1965,6 +1997,59 @@ def test_analyze_fit_before_drafting_plateau_note_still_names_a_genuinely_unansw
     result = analyze_fit_before_drafting(job, profile, app_record)
     assert result["plateau_note"] is not None
     assert "Databricks" in result["plateau_note"]
+
+
+def test_analyze_fit_before_drafting_never_returns_a_disqualifier_check_question():
+    # Part 3, 2026-08-18 ("standing preferences move to Settings", Zahir's
+    # real live ask): a disqualifier_check question must never come back
+    # in open_questions - not the per-job Results panel's job, any more -
+    # regardless of whether it's already been declared or not. This is
+    # the single choke point both render_analyze_fit_section and the
+    # Profile Gaps tab's expander-count loop consume, so filtering here
+    # covers both UI surfaces at once.
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": ["Python", "Databricks"], "ats_preferred_keywords": []}
+    resume_text = "PROFESSIONAL EXPERIENCE\nEngineer.\n\nEDUCATION\nBS\n\nSKILLS\nPython"
+    app_record = {
+        "resume_text": resume_text,
+        "resume_clarifying_questions": [{
+            "type": "disqualifier_check", "skill": "role_level",
+            "question": "Should VP/CIO roles below a certain org size be excluded going forward?",
+            "suggested_answer": "",
+        }],
+    }
+    profile = {"gap_interview_answers": []}
+
+    result = analyze_fit_before_drafting(job, profile, app_record)
+    assert not any(q.get("type") == "disqualifier_check" for q in result["open_questions"])
+    # The real skill_gap gap (Databricks, from the missing-keyword
+    # detection) still comes through unaffected.
+    assert any(q.get("skill") == "Databricks" for q in result["open_questions"])
+
+
+def test_analyze_fit_before_drafting_drops_disqualifier_even_when_already_declared():
+    # Confirms this is a blanket per-job removal, not conditional on
+    # answered state - a disqualifier already declared (is_disqualifier
+    # entry in gap_interview_answers) must ALSO never re-appear here,
+    # same as an undeclared one. (Before this fix, whether it reappeared
+    # depended on fragile AI-phrasing/label-matching - see this function's
+    # own comment for the investigation finding.)
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": ["Python"], "ats_preferred_keywords": []}
+    resume_text = "PROFESSIONAL EXPERIENCE\nEngineer.\n\nSKILLS\nPython"
+    app_record = {
+        "resume_text": resume_text,
+        "resume_clarifying_questions": [{
+            "type": "disqualifier_check", "skill": "CISO roles",
+            "question": "Exclude CISO-titled roles going forward?",
+            "suggested_answer": "",
+        }],
+    }
+    profile = {"gap_interview_answers": [{
+        "skill": "CISO roles", "answer": "Exclude these.", "is_disqualifier": True,
+        "question": "Exclude CISO-titled roles going forward?",
+    }]}
+
+    result = analyze_fit_before_drafting(job, profile, app_record)
+    assert not any(q.get("type") == "disqualifier_check" for q in result["open_questions"])
 
 
 def _fake_call_structured_returning(items):
