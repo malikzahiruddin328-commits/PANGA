@@ -92,7 +92,7 @@ from tailoring.reasoner_cli import ReasonerUnavailable
 from tailoring.task_monitor import get_active_tasks, reset_stalled_task
 from tailoring.ats_score import detect_matched_keyword_regressions
 from tailoring.unconfirmed_claims import find_unconfirmed_markers, resolve_unconfirmed_claim
-from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed, analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_impact as _check_regenerate_impact, request_additional_gap_questions as _request_additional_gap_questions, reextract_ats_keywords_and_rescore as _reextract_ats_keywords_and_rescore, rescore_against_cached_keywords as _rescore_against_cached_keywords, gap_scan_is_current as _gap_scan_is_current, gap_scan_baseline_fingerprint as _gap_scan_baseline_fingerprint, _report_drafting_failure
+from tailoring.drafting import generate_documents, score_job, save_gap_answers, generate_target_roles, is_configured as drafting_is_configured, DraftingNotConfigured, DraftingFailed, analyze_fit_before_drafting as _analyze_fit_before_drafting, check_regenerate_impact as _check_regenerate_impact, request_additional_gap_questions as _request_additional_gap_questions, reextract_ats_keywords_and_rescore as _reextract_ats_keywords_and_rescore, rescore_against_cached_keywords as _rescore_against_cached_keywords, gap_scan_is_current as _gap_scan_is_current, gap_scan_baseline_fingerprint as _gap_scan_baseline_fingerprint, _report_drafting_failure, no_reference_found_answer
 from prospector.kpis import coverage_summary, activity_summary, outcome_summary
 from prospector.rejection_diagnosis import gather_diagnosis_input, diagnose
 from prospector.target_accounts import load_target_accounts, set_status as set_target_account_status, set_website, load_website_lookup_cost, save_website_lookup_cost, find_paused_accounts_with_new_activity
@@ -1073,6 +1073,14 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                                 job_key = (source, job_id)
                                 q_key = f"basketqa_{source}_{job_id}_{abs(hash(q['question'] + '|' + (q.get('suggested_answer') or ''))) % 10_000_000}"
                                 suggested_answer = q.get("suggested_answer") or ""
+                                # Same render-time no-blank-box backstop as
+                                # the single-job Discuss & draft panel below
+                                # (~line 2575) - see that call site's
+                                # comment for why this needs to live at
+                                # render time, not just inside drafting.
+                                # _merge_keyword_gap_questions.
+                                if q.get("type") != "disqualifier_check" and not suggested_answer.strip():
+                                    suggested_answer = no_reference_found_answer(q.get("skill") or q["question"])
                                 with st.container(border=True):
                                     st.markdown(job_label(job))
                                     # Real "why does this one matter" indicator (2026-08-17,
@@ -2573,6 +2581,18 @@ def render_analyze_fit_section(job: dict, app_record: dict, analysis: dict | Non
                         "guess, so the box starts empty."
                     )
                 suggested_answer = q.get("suggested_answer") or ""
+                # Explicit no-match statement instead of a silent blank box
+                # (Zahir's 2026-08-18 refinement to the correct-behavior
+                # reference case) - a render-time backstop, not just a
+                # generation-time one, so a record persisted before this
+                # fix (or one from a path that bypasses drafting.
+                # _merge_keyword_gap_questions' own patching, e.g. "Answer
+                # more questions") still shows an honest statement rather
+                # than an unexplained empty box. Never applied to
+                # disqualifier_check, which is deliberately always blank
+                # (its own placeholder above already explains why).
+                if not is_disqualifier and not suggested_answer.strip():
+                    suggested_answer = no_reference_found_answer(q.get("skill") or q["question"])
                 answer_value = st.text_area(
                     q["question"], value=suggested_answer,
                     key=q_key, height=68, label_visibility="collapsed",

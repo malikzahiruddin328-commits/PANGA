@@ -919,14 +919,39 @@ _CLARIFYING_QUESTION_ITEM_SCHEMA = {
                 "answer, phrased as the candidate's own words - e.g. "
                 "a plausible number/scope guess given the role and "
                 "the rest of the profile ('Roughly 8-10 engineers, "
-                "~$2M budget?'). A suggestion to edit, never a "
+                "~$2M budget'). A suggestion to edit, never a "
                 "stated fact - make that uncertainty visible in the "
-                "phrasing itself (hedge words, a trailing '?') "
-                "rather than asserting it. Leave as an empty string "
-                "if you have no reasonable basis to propose "
-                "anything. For disqualifier_check: always an empty "
-                "string - this is a genuine judgment call only the "
-                "candidate can make, never a guess."
+                "phrasing itself (hedge words like 'roughly'/"
+                "'possibly'/'perhaps') rather than asserting it. "
+                "Never end the text with a question mark - write a "
+                "clean declarative sentence (hedged, not "
+                "interrogative), even when the question itself was "
+                "phrased as a question or offered explicit either/or "
+                "alternatives; do not echo the question's own "
+                "phrasing back as the answer's ending. "
+                "CRITICAL, real fabrication incident (2026-08-18): "
+                "never invent a SPECIFIC fact this guess needs - a "
+                "system/product/vendor name, a number, a date, a "
+                "scope detail - that isn't genuinely evidenced "
+                "somewhere in the profile (even loosely). A vague, "
+                "generally-hedged guess drawing on what the profile "
+                "actually shows is fine; a specific-sounding invented "
+                "detail bolted on to make the guess read as more "
+                "concrete is not, no matter how plausible it sounds "
+                "for someone in this role. If the question presents "
+                "explicit alternatives (either/or, multiple-choice-"
+                "shaped) and the candidate's real, documented history "
+                "genuinely fits NEITHER option, do not force-fit one "
+                "side by inventing supporting specifics - say so "
+                "plainly instead ('Neither of these matches my "
+                "documented history' plus whatever adjacent real fact "
+                "the profile does support, if any) rather than "
+                "picking a side and dressing it up. Leave as an empty "
+                "string if you have no reasonable basis to propose "
+                "anything - an honest empty string beats an invented "
+                "specific every time. For disqualifier_check: always "
+                "an empty string - this is a genuine judgment call "
+                "only the candidate can make, never a guess."
             ),
         },
     },
@@ -1185,6 +1210,94 @@ def _profile_supports_skill(term: str, profile: dict | None) -> bool:
     return skill_evidenced_in_text(term, build_already_known_units(profile))
 
 
+def no_reference_found_answer(term: str) -> str:
+    """The explicit, honest "genuinely no match" statement (Zahir's
+    2026-08-18 refinement) for a keyword-gap question this app has no real
+    basis to guess an answer for - replaces what used to be either a
+    generic "Unknown - please describe..." line or, worse, a silently
+    empty suggested_answer that rendered as a blank box with no
+    explanation at all. Public (not module-private) - ui/app.py's render
+    sites use this as a render-time backstop too, so a blank suggested_
+    answer from ANY source (a stored record from before this fix, or the
+    "Answer more questions" flow's own AI call, which never runs through
+    _merge_keyword_gap_questions' patching below) still shows an honest
+    statement instead of an unexplained empty box."""
+    return (
+        f"No reference found in your documented work history for \"{term}\". "
+        "If you have done this, please describe it so it can be added."
+    )
+
+
+def _declarative_answer(text: str) -> str:
+    """Strips a trailing '?' (and any trailing whitespace around it) from a
+    suggested_answer so it reads as a clean declarative starting draft,
+    never an echo of the question's own interrogative phrasing. Real
+    fabrication incident, 2026-08-18: a compound either/or question's own
+    "...or was it Y instead?" phrasing bled straight into the drafted
+    answer verbatim, ending in a literal "?". This is NOT the same
+    convention as flag_unverified_resume_claims' trailing-"?" hedge marker
+    (that's resume/cover-letter prose scanned by tailoring.
+    unconfirmed_claims.find_unconfirmed_markers() as a machine-readable
+    "still needs resolving" flag, wired into real downstream gates) -
+    suggested_answer text for a keyword-gap question is never scanned by
+    that mechanism, so a trailing "?" here was never doing anything
+    functional, just reading oddly as if the box were asking Zahir a
+    question back rather than proposing an answer for him to edit. Applied
+    BEFORE ensure_keyword_literally_present() below, so this strips the
+    raw AI/deterministic text regardless of whether the literal keyword
+    happens to already be present (the case that let the Gellert
+    fabrication's trailing "?" through untouched - keyword_literally_
+    present() was already True, so the text was returned completely
+    unchanged, "?" and all)."""
+    stripped = (text or "").rstrip()
+    while stripped.endswith("?"):
+        stripped = stripped[:-1].rstrip()
+    return stripped
+
+
+_DEGREE_OR_EDUCATION_KEYWORD_MARKERS = (
+    "degree", "bachelor's", "bachelor", "master's", "master", "diploma",
+    "certification", "certified",
+)
+
+
+def _is_degree_or_education_keyword(term: str) -> bool:
+    """True for a keyword that's a credential to HOLD, not a skill to have
+    "experience with" - real live mismatch, 2026-08-18 (Head of IT -
+    Verily): the generic template asked "The posting requires 'technical
+    undergraduate degree' - do you have real, genuine experience with it?"
+    which doesn't make sense for a degree - you hold one, you don't have
+    "experience with" it. Deliberately simple substring matching (not
+    NLP/semantic) - same restraint as every other deny-list/marker check
+    in this module (_drop_generic_soft_skill_keywords etc.): scoped to the
+    concrete evidence found (degree/diploma/certification wording), not
+    speculatively extended to categories (clearances, licenses, language
+    fluency) with no real repro found in a live scan of stored job
+    keywords."""
+    t = term.lower()
+    return any(marker in t for marker in _DEGREE_OR_EDUCATION_KEYWORD_MARKERS)
+
+
+def _keyword_gap_question_text(term: str, is_preferred: bool) -> str:
+    """Chooses the right question phrasing for a deterministic keyword-gap
+    question - the "hold/don't-hold" phrasing for a degree/education-type
+    keyword (see _is_degree_or_education_keyword), the original "do you
+    have real, genuine experience with it" phrasing for everything else."""
+    if _is_degree_or_education_keyword(term):
+        stake = f"would value holding \"{term}\" as a nice-to-have" if is_preferred else f"requires \"{term}\""
+        return (
+            f"The posting {stake} - do you hold this? If so, briefly "
+            "describe it (institution, field, year) so it can be added to "
+            "your resume."
+        )
+    stake = f"would value \"{term}\" as a nice-to-have" if is_preferred else f"requires \"{term}\""
+    return (
+        f"The posting {stake} - do you have real, genuine "
+        "experience with it? If so, briefly describe it so it can be "
+        "added to your resume."
+    )
+
+
 def _suggested_answer_for_keyword_gap(term: str, profile: dict | None) -> str:
     """A genuine, honest starting guess for a missing-required-keyword
     question - Zahir's explicit correction 2026-08-06: an empty box was the
@@ -1201,14 +1314,44 @@ def _suggested_answer_for_keyword_gap(term: str, profile: dict | None) -> str:
     tailored resume didn't happen to include). If it doesn't appear
     anywhere at all, there is truly no real basis to guess yes or no, so
     the honest starting text says exactly that rather than inventing
-    confidence - still real text to edit, not a blank box."""
+    confidence - still real text to edit, not a blank box.
+
+    2026-08-18: the "no real basis at all" branch now returns
+    no_reference_found_answer()'s explicit statement instead of a bare
+    "Unknown..." line (Zahir's refinement to the correct-behavior
+    reference case: even a genuine no-match deserves an explicit sentence,
+    not just a terse placeholder). Neither branch ends in "?" any more -
+    declarative starting text only, never phrased as a question back to
+    the reader."""
     profile_text_lower = json.dumps(profile or {}, default=str).lower()
     if term.lower() in profile_text_lower:
         return (
             f"Your profile may already mention \"{term}\" - can you confirm "
-            "and briefly describe your real experience with it?"
+            "and briefly describe your real experience with it."
         )
-    return "Unknown - please describe your real experience (if any) with this."
+    return no_reference_found_answer(term)
+
+
+def _keyword_gap_answer(term: str, raw_answer: str) -> tuple[str, bool]:
+    """The single choke point every keyword-gap suggested_answer passes
+    through before it's ever returned to a caller (2026-08-18, folds
+    together the three real fixes from the Gellert WMS fabrication
+    incident): strip a trailing "?" the raw text (AI-drafted or this
+    module's own deterministic guess) might carry (_declarative_answer);
+    if that leaves nothing real to work with, fall back to the explicit
+    no_reference_found_answer() statement rather than an empty string;
+    then run the existing pre-flight ensure_keyword_literally_present()
+    guarantee (2026-08-17, already shipped - this builds on it rather than
+    duplicating it) so the literal keyword the deterministic scorer checks
+    for is always really present in the text a confirmation would carry
+    forward. When raw_answer was already blank/no-basis, the fallback text
+    already names the term inside quotes, so ensure_keyword_literally_
+    present() finds it already present and returns it byte-for-byte
+    unchanged."""
+    base = _declarative_answer(raw_answer)
+    if not base.strip():
+        base = no_reference_found_answer(term)
+    return ensure_keyword_literally_present(term, base)
 
 
 def _merge_keyword_gap_questions(
@@ -1385,7 +1528,7 @@ def _merge_keyword_gap_questions(
             # actually checks for must really be present in the text a
             # confirmation would carry forward, not left to whether the AI
             # happened to phrase it that way.
-            patched_answer, was_present = ensure_keyword_literally_present(
+            patched_answer, was_present = _keyword_gap_answer(
                 match["label"], q.get("suggested_answer") or ""
             )
             merged.append({
@@ -1413,7 +1556,7 @@ def _merge_keyword_gap_questions(
             # (or the backfill branch above, on some earlier round) used
             # to justify this question's point_value in the first place,
             # so it's the right term to verify/patch against.
-            patched_answer, _ = ensure_keyword_literally_present(q["skill"], q.get("suggested_answer") or "")
+            patched_answer, _ = _keyword_gap_answer(q["skill"], q.get("suggested_answer") or "")
             merged.append({**q, "suggested_answer": patched_answer, "keyword_verified": True})
         else:
             merged.append(q)
@@ -1443,17 +1586,13 @@ def _merge_keyword_gap_questions(
         # guarantee for both branches (and any future change to that
         # function) rather than relying on two independently-written
         # f-strings to each happen to stay correct.
-        suggested_answer, _ = ensure_keyword_literally_present(
+        suggested_answer, _ = _keyword_gap_answer(
             term, _suggested_answer_for_keyword_gap(term, profile)
         )
         merged.append({
             "type": "skill_gap",
             "skill": term,
-            "question": (
-                f"The posting requires \"{term}\" - do you have real, genuine "
-                "experience with it? If so, briefly describe it so it can be "
-                "added to your resume."
-            ),
+            "question": _keyword_gap_question_text(term, is_preferred=False),
             "suggested_answer": suggested_answer,
             "point_value": item["point_value"],
             "keyword_verified": True,
@@ -1468,18 +1607,14 @@ def _merge_keyword_gap_questions(
             or any(_same_skill(term, skill) for skill in (cluster_known_skills or []))
         ):
             continue
-        suggested_answer, _ = ensure_keyword_literally_present(
+        suggested_answer, _ = _keyword_gap_answer(
             term, _suggested_answer_for_keyword_gap(term, profile)
         )
         merged.append({
             "type": "skill_gap",
             "skill": term,
             "is_preferred": True,
-            "question": (
-                f"The posting would value \"{term}\" as a nice-to-have - do you have "
-                "real, genuine experience with it? If so, briefly describe it so it "
-                "can be added to your resume."
-            ),
+            "question": _keyword_gap_question_text(term, is_preferred=True),
             "suggested_answer": suggested_answer,
             "point_value": item["point_value"],
             "keyword_verified": True,
@@ -2637,7 +2772,19 @@ _ANSWER_MORE_SYSTEM_PROMPT = (
     "don't do it. If you find genuine, substantively-equivalent coverage "
     "under different wording, treat that requirement as already handled "
     "and do not ask about it at all, the same as if it were on the "
-    "ALREADY COVERED list."
+    "ALREADY COVERED list.\n\n"
+    "Real fabrication incident, 2026-08-18: a compound either/or question "
+    "(\"did you own the WMS product itself, or was it handled entirely by "
+    "the 3PL?\") got a suggested_answer inventing a specific SAP module "
+    "name that appears nowhere in the profile, to force the candidate's "
+    "real background to fit one side of the either/or. Every "
+    "suggested_answer you propose must follow the same anti-fabrication "
+    "rule as the schema's own field description: never invent a specific "
+    "system/product/vendor name, number, date, or scope detail with no "
+    "real basis in the profile, even a plausible-sounding one; if an "
+    "either/or question's real answer fits neither offered option, say so "
+    "honestly rather than picking a side and dressing it up with invented "
+    "specifics; and never end suggested_answer with a question mark."
 )
 
 
@@ -2808,6 +2955,22 @@ def request_additional_gap_questions(
     # differently-labeled gap entry, or stated directly in a work_history/
     # client_engagements bullet that was never a "gap" question at all.
     new_questions = filter_questions_evidenced_in_profile(new_questions, build_already_known_units(profile))
+    # Deterministic trailing-"?" backstop (2026-08-18, same real
+    # fabrication incident as _merge_keyword_gap_questions' own
+    # _declarative_answer fix): this function's new_questions never pass
+    # through _merge_keyword_gap_questions at all (they're appended
+    # straight onto merged_clarifying_questions below, not merged/patched
+    # - a real, separate gap this incident's audit surfaced: several
+    # stored questions from this exact code path carried a raw AI
+    # suggested_answer, entirely unverified for keyword presence OR
+    # declarative phrasing). A later rescore/regenerate that DOES run
+    # _merge_keyword_gap_questions will still catch and fully patch these
+    # once they pick up a real point_value, but there's no reason to leave
+    # an interrogative-sounding "?" ending sitting in front of Zahir in
+    # the meantime just because that hasn't happened yet.
+    for q in new_questions:
+        if q.get("suggested_answer"):
+            q["suggested_answer"] = _declarative_answer(q["suggested_answer"])
     return {
         "added_count": len(new_questions),
         "new_questions": new_questions,

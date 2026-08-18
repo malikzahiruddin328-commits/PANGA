@@ -2,11 +2,15 @@ from tailoring.drafting import (
     ATS_KEYWORDS_SYSTEM_PROMPT,
     RESUME_SPEC,
     RESUME_SPEC_USAJOBS,
+    _CLARIFYING_QUESTION_ITEM_SCHEMA,
+    _declarative_answer,
     _draft_group,
     _draft_one,
     _finalize_resume_draft,
     _drop_generic_soft_skill_keywords,
     _drop_years_experience_keywords,
+    _is_degree_or_education_keyword,
+    _keyword_gap_question_text,
     _merge_keyword_gap_questions,
     _profile_narrative_units,
     _profile_supports_skill,
@@ -20,6 +24,7 @@ from tailoring.drafting import (
     analyze_fit_before_drafting,
     check_regenerate_impact,
     generate_documents,
+    no_reference_found_answer,
     request_additional_gap_questions,
     save_gap_answers,
 )
@@ -2619,3 +2624,171 @@ def test_gap_scan_is_current_true_only_when_the_stored_fingerprint_matches():
 
     app_record["resume_text"] = "SKILLS\nRust"  # a fresh Generate changed the text
     assert drafting.gap_scan_is_current(job, app_record) is False
+
+
+# --- Real fabrication incident, 2026-08-18 (Gellert Global Group WMS
+# either/or question) - regression tests for the fix. ---
+
+def test_declarative_answer_strips_a_trailing_question_mark():
+    assert _declarative_answer("Roughly 8-10 engineers?") == "Roughly 8-10 engineers"
+
+
+def test_declarative_answer_strips_multiple_trailing_question_marks_and_whitespace():
+    assert _declarative_answer("Is that right??  ") == "Is that right"
+
+
+def test_declarative_answer_leaves_a_clean_sentence_untouched():
+    assert _declarative_answer("Roughly 8-10 engineers.") == "Roughly 8-10 engineers."
+
+
+def test_declarative_answer_handles_blank_and_none():
+    assert _declarative_answer("") == ""
+    assert _declarative_answer(None) == ""
+
+
+def test_no_reference_found_answer_names_the_term_and_never_ends_in_question_mark():
+    result = no_reference_found_answer("Warehouse management system (WMS) ownership")
+    assert "Warehouse management system (WMS) ownership" in result
+    assert not result.endswith("?")
+    assert "No reference found" in result
+
+
+def test_suggested_answer_for_keyword_gap_no_signal_uses_explicit_no_reference_text():
+    # Zahir's 2026-08-18 refinement to the correct-behavior reference case
+    # (Head of IT - The Nuclear Company, NIST 800-171/CMMC): even a
+    # genuine no-match deserves an explicit statement, not a terse
+    # "Unknown..." placeholder or a silent blank box.
+    result = _suggested_answer_for_keyword_gap("NIST 800-171", {"name": "Jane Doe", "seniority": "Director"})
+    assert result == no_reference_found_answer("NIST 800-171")
+    assert not result.endswith("?")
+
+
+def test_suggested_answer_for_keyword_gap_profile_mention_does_not_end_in_question_mark():
+    profile = {"name": "Jane Doe", "notes": "Led a Databricks migration in 2023."}
+    result = _suggested_answer_for_keyword_gap("Databricks", profile)
+    assert not result.endswith("?")
+
+
+def test_merge_keyword_gap_questions_strips_trailing_question_mark_even_when_keyword_already_present():
+    # The exact real-world repro (Gellert Global Group, 2026-08-18): the
+    # AI's own free-form suggested_answer already contained the literal
+    # keyword label, so the old code's keyword-literal check short-
+    # circuited to "already present, return unchanged" and the fabricated
+    # trailing "?" sailed straight through untouched.
+    existing = [{
+        "type": "skill_gap", "skill": "Warehouse management system (WMS) ownership",
+        "question": (
+            "Did you ever own or implement a warehouse management system "
+            "itself, or was warehousing handled entirely by the 3PL with "
+            "your team owning the data feeds and reporting?"
+        ),
+        "suggested_answer": (
+            "Warehousing sat with the 3PL, with my team owning the 3PL "
+            "data feeds and the reporting layer rather than a WMS product?"
+        ),
+    }]
+    merged = _merge_keyword_gap_questions(existing, _missing("Warehouse management system (WMS) ownership"))
+    assert len(merged) == 1
+    assert not merged[0]["suggested_answer"].endswith("?")
+    assert keyword_literally_present("Warehouse management system (WMS) ownership", merged[0]["suggested_answer"])
+
+
+def test_merge_keyword_gap_questions_replaces_a_blank_ai_answer_with_the_explicit_no_reference_text():
+    # Real gap found in a live sample audit (2026-08-18): several stored
+    # keyword-gap-shaped questions carried a literal empty-string
+    # suggested_answer - a silent blank box in the UI, with no signal to
+    # Zahir about why. The AI-drafted-question backfill branch must never
+    # leave that empty once it's carrying a real point_value/badge.
+    existing = [{
+        "type": "skill_gap", "skill": "SS&C platform experience",
+        "question": "Have you worked with SS&C platforms in any capacity?",
+        "suggested_answer": "",
+    }]
+    merged = _merge_keyword_gap_questions(existing, _missing("SS&C platform experience"))
+    assert merged[0]["suggested_answer"] != ""
+    assert "No reference found" in merged[0]["suggested_answer"]
+    assert keyword_literally_present("SS&C platform experience", merged[0]["suggested_answer"])
+
+
+def test_merge_keyword_gap_questions_retroactive_backfill_replaces_blank_answer_too():
+    stale_stored_question = {
+        "type": "skill_gap", "skill": "SEI platform experience", "question": "?",
+        "suggested_answer": "",
+        "point_value": 5.0,
+    }
+    merged = _merge_keyword_gap_questions([stale_stored_question], [])
+    assert merged[0]["suggested_answer"] != ""
+    assert "No reference found" in merged[0]["suggested_answer"]
+
+
+def test_is_degree_or_education_keyword_detects_real_examples():
+    # Live examples pulled from real stored job keywords, 2026-08-18.
+    assert _is_degree_or_education_keyword("technical undergraduate degree") is True
+    assert _is_degree_or_education_keyword("Bachelor's degree") is True
+    assert _is_degree_or_education_keyword("PMP certification") is True
+    assert _is_degree_or_education_keyword("GCP") is False
+    assert _is_degree_or_education_keyword("stakeholder management") is False
+
+
+def test_keyword_gap_question_text_uses_hold_phrasing_for_a_degree_keyword():
+    # Live mismatch, 2026-08-18 (Head of IT - Verily): the old generic
+    # template asked "do you have real, genuine experience with it?" about
+    # a degree - nonsensical, you hold a degree, you don't have
+    # "experience with" it.
+    q = _keyword_gap_question_text("technical undergraduate degree", is_preferred=False)
+    assert "do you hold this" in q
+    assert "do you have real, genuine experience" not in q
+
+
+def test_keyword_gap_question_text_keeps_experience_phrasing_for_an_ordinary_skill():
+    q = _keyword_gap_question_text("GCP", is_preferred=False)
+    assert q == (
+        "The posting requires \"GCP\" - do you have real, genuine "
+        "experience with it? If so, briefly describe it so it can be "
+        "added to your resume."
+    )
+
+
+def test_merge_keyword_gap_questions_uses_hold_phrasing_for_a_missing_degree_keyword():
+    merged = _merge_keyword_gap_questions([], _missing("technical undergraduate degree"))
+    assert len(merged) == 1
+    assert "do you hold this" in merged[0]["question"]
+
+
+def test_merge_keyword_gap_questions_uses_hold_phrasing_for_a_missing_preferred_degree_keyword():
+    merged = _merge_keyword_gap_questions(
+        [], [], missing_preferred_keywords=_missing("Master's degree"),
+    )
+    assert len(merged) == 1
+    assert "do you hold this" in merged[0]["question"]
+
+
+def test_clarifying_question_schema_forbids_inventing_specifics_and_forced_either_or_fit():
+    desc = _CLARIFYING_QUESTION_ITEM_SCHEMA["properties"]["suggested_answer"]["description"]
+    assert "never end the text with a question mark" in desc.lower()
+    assert "either/or" in desc.lower()
+    assert "invent" in desc.lower()
+
+
+def test_request_additional_gap_questions_strips_trailing_question_mark_from_suggested_answer(monkeypatch):
+    # Real gap surfaced by this incident's audit: this code path's
+    # new_questions never pass through _merge_keyword_gap_questions'
+    # _declarative_answer fix at all - a separate, deterministic backstop
+    # is needed here too so a trailing "?" doesn't sit in front of Zahir
+    # until some later rescore happens to touch this question.
+    import tailoring.drafting as drafting
+
+    monkeypatch.setattr(drafting, "_client", lambda: object())
+    monkeypatch.setattr(drafting, "call_structured", _fake_call_structured_returning([
+        {
+            "type": "skill_gap", "skill": "Team size at Acme", "question": "How big was the team?",
+            "suggested_answer": "Roughly 8-10 engineers?",
+        },
+    ]))
+
+    job = {"source": "linkedin", "job_id": "1", "ats_required_keywords": [], "ats_preferred_keywords": []}
+    app_record = {"resume_text": "SKILLS\nPython", "resume_clarifying_questions": []}
+    profile = {"gap_interview_answers": []}
+
+    result = request_additional_gap_questions(job, profile, app_record)
+    assert result["new_questions"][0]["suggested_answer"] == "Roughly 8-10 engineers"
