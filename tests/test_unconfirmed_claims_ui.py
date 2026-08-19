@@ -4,6 +4,8 @@ lets Zahir turn a hedged "?" guess into a confirmed fact, one claim at a
 time, rather than just being told (by the pre-existing hard gates in
 test_results_tab_unconfirmed_claims_gate.py) that something is blocked."""
 
+import json
+
 import pytest
 from streamlit.testing.v1 import AppTest
 
@@ -11,6 +13,24 @@ from search.job_store import save_jobs, update_job_score
 from tailoring.applications import get_application, upsert_application
 
 APP_PATH = "src/ui/app.py"
+
+
+@pytest.fixture(autouse=True)
+def _no_real_source_crosscheck_reasoner_call(monkeypatch):
+    """Real gap this file would otherwise hit: 2026-08-19's source-
+    crosscheck pass (tailoring.claim_source_crosscheck) now runs the FIRST
+    time render_unconfirmed_claims_section renders for a job, and calls the
+    real `claude` CLI subprocess (reasoner_cli.run_claude_cli) unless
+    mocked - unlike the paid-API path, _no_real_anthropic_api_calls in
+    conftest.py does nothing to stop this one. Defaulting every test in
+    this file to "nothing resolved" (same shape a genuine reasoner failure
+    already fails soft to) keeps every existing test's behavior exactly
+    what it was before this pass existed - a real claim it can't verify is
+    still left for the manual panel below, unchanged. Tests that want to
+    exercise the new auto-resolve behavior itself override this with their
+    own monkeypatch."""
+    import tailoring.claim_source_crosscheck as csc
+    monkeypatch.setattr(csc, "run_claude_cli", lambda *a, **k: json.dumps({"resolved": []}))
 
 
 @pytest.fixture
@@ -219,3 +239,63 @@ def test_apply_answers_claim_resolves_via_confirm(isolated_data, monkeypatch):
     answers = app_record["apply_answers"]
     assert answers[0]["value"] == "Roughly $180K"
     assert "?" not in answers[0]["value"]
+
+
+def test_auto_crosscheck_resolves_a_claim_already_in_source_documents(results_app_with_unconfirmed_claim, monkeypatch):
+    # Real bug Zahir hit live (2026-08-19): asked to re-confirm facts already
+    # stated in his own ingested documents. The panel must now silently
+    # resolve anything the crosscheck can verify, with zero question asked.
+    import tailoring.claim_source_crosscheck as csc
+    monkeypatch.setattr("profile.ingest.all_documents_text", lambda: "Real resume: led a team of 8-10 engineers.")
+    monkeypatch.setattr(csc, "run_claude_cli", lambda *a, **k: json.dumps({
+        "resolved": [{"index": 0, "resolved_line": "Led a team of 8-10 engineers."}],
+    }))
+
+    at = results_app_with_unconfirmed_claim
+    _open_job(at)
+
+    assert not at.exception
+    app_record = get_application("Dice", "job1")
+    assert "Led a team of 8-10 engineers." in app_record["resume_text"]
+    assert "?" not in app_record["resume_text"]
+    # The panel itself is gone - nothing left to ask.
+    markdown_text = " ".join(m.value for m in at.markdown)
+    assert "unconfirmed claim" not in markdown_text
+
+
+def test_auto_crosscheck_leaves_genuinely_unverifiable_claims_for_the_manual_panel(results_app_with_unconfirmed_claim, monkeypatch):
+    import tailoring.claim_source_crosscheck as csc
+    monkeypatch.setattr("profile.ingest.all_documents_text", lambda: "Real resume has no team-size figure at all.")
+    monkeypatch.setattr(csc, "run_claude_cli", lambda *a, **k: json.dumps({"resolved": []}))
+
+    at = results_app_with_unconfirmed_claim
+    _open_job(at)
+
+    assert not at.exception
+    app_record = get_application("Dice", "job1")
+    assert "8-10" in app_record["resume_text"]
+    assert "?" in app_record["resume_text"]
+    markdown_text = " ".join(m.value for m in at.markdown)
+    assert "1 unconfirmed claim to resolve" in markdown_text
+
+
+def test_auto_crosscheck_only_calls_the_reasoner_once_per_job(results_app_with_unconfirmed_claim, monkeypatch):
+    # No per-render reasoner call (CLAUDE.md's own rule) - session-state
+    # gated to run exactly once per job, even across multiple reruns.
+    import tailoring.claim_source_crosscheck as csc
+    calls = []
+
+    def _fake_run(prompt, timeout_seconds=None, on_start=None):
+        calls.append(1)
+        return json.dumps({"resolved": []})
+
+    monkeypatch.setattr("profile.ingest.all_documents_text", lambda: "")
+    monkeypatch.setattr(csc, "run_claude_cli", _fake_run)
+
+    at = results_app_with_unconfirmed_claim
+    _open_job(at)
+    assert len(calls) == 1
+
+    # A later, unrelated rerun on the same job must not fire it again.
+    at.run(timeout=30)
+    assert len(calls) == 1

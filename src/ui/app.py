@@ -2494,12 +2494,50 @@ def render_unconfirmed_claims_section(job: dict, app_record: dict) -> None:
         return
 
     job_key = f"{job.get('source')}_{job.get('job_id')}"
+
+    # Real gap Zahir hit live (2026-08-19): a hedged "?" guess is often
+    # already stated, unhedged, in his real ingested documents - it only
+    # got hedged because this job's draft was built from an earlier DRAFT
+    # (tailoring.baseline_resume.select_baseline_resume_text() often reuses
+    # a past application's resume as the new one's starting point), several
+    # steps removed from the real source. Cross-checking against the real
+    # documents and auto-resolving anything genuinely verifiable there,
+    # BEFORE ever asking Zahir, is the actual fix - see tailoring.claim_
+    # source_crosscheck's own module docstring for the full root-cause
+    # writeup. Gated to run only ONCE per job (session-state flag), not on
+    # every rerun - an automatic reasoner call on every render of this
+    # panel would violate this repo's own "no per-render LLM call" rule
+    # (see gap_question_phrasing.py's docstring for the same reasoning).
+    crosschecked_key = f"claims_crosschecked_{job_key}"
+    if not st.session_state.get(crosschecked_key):
+        st.session_state[crosschecked_key] = True
+        from profile.ingest import all_documents_text
+        from tailoring.claim_source_crosscheck import crosscheck_claims_against_source
+
+        resolved_by_index = crosscheck_claims_against_source(unresolved, all_documents_text())
+        if resolved_by_index:
+            for index, resolved_line in resolved_by_index.items():
+                result = resolve_unconfirmed_claim(job, app_record, unresolved[index], action="edit", new_text=resolved_line)
+                _persist_resolved_claim(job, app_record, result)
+                app_record.update(result)
+            st.toast(
+                f"Auto-confirmed {len(resolved_by_index)} claim(s) already stated in your documents.",
+                icon=":material/check_circle:",
+            )
+            unresolved = find_unconfirmed_markers(app_record)
+            if not unresolved:
+                st.rerun()
+
+    if not unresolved:
+        return
+
     with st.container(border=True):
         plural = "s" if len(unresolved) != 1 else ""
         st.markdown(
             f"**:material/help: {len(unresolved)} unconfirmed claim{plural} to resolve** - "
-            "the AI wrote these into your documents as plausible guesses. Confirm "
-            "each one as true, or restate it as a fact. Until then, the Apply "
+            "the AI wrote these into your documents as plausible guesses. Panga already checked "
+            "these against your resume and other documents and couldn't verify them there, so "
+            "confirm each one as true, or restate it as a fact. Until then, the Apply "
             "Assist packet stays blocked and this job can't be marked \"applied\"."
         )
         for idx, claim in enumerate(unresolved):

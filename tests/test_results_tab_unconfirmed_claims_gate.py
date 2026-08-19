@@ -6,6 +6,8 @@ backstop, not just an instruction" bar as CLAUDE.md's known failure
 pattern #3. These exercise the actual in-app wiring (AppTest), not just
 the underlying tailoring.unconfirmed_claims functions in isolation."""
 
+import json
+
 import pytest
 from streamlit.testing.v1 import AppTest
 
@@ -13,6 +15,17 @@ from search.job_store import save_jobs, update_job_score
 from tailoring.applications import get_application, upsert_application
 
 APP_PATH = "src/ui/app.py"
+
+
+@pytest.fixture(autouse=True)
+def _no_real_source_crosscheck_reasoner_call(monkeypatch):
+    """Same real gap as test_unconfirmed_claims_ui.py's own fixture of this
+    name - see that file for the full writeup. This file's fixtures also
+    render_unconfirmed_claims_section via AppTest, so it needs the same
+    mock to stay hermetic/fast rather than shelling out to the real
+    `claude` CLI."""
+    import tailoring.claim_source_crosscheck as csc
+    monkeypatch.setattr(csc, "run_claude_cli", lambda *a, **k: json.dumps({"resolved": []}))
 
 
 @pytest.fixture
