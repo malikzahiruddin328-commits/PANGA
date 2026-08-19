@@ -182,3 +182,25 @@ def test_parse_json_reply_handles_stray_surrounding_text():
 def test_parse_json_reply_raises_when_no_json_object_found():
     with pytest.raises(RuntimeError, match="Could not find a JSON object"):
         reasoner_cli.parse_json_reply("no json here at all")
+
+
+def test_parse_json_reply_handles_bare_json_array():
+    """Real bug found 2026-08-19: parse_json_reply used to be hardcoded to
+    only match a top-level JSON object, so a bare array reply either
+    raised "Could not find a JSON object" or, worse, silently truncated to
+    whatever inner object the object regex happened to match."""
+    assert reasoner_cli.parse_json_reply('[{"a": 1}, {"a": 2}]') == [{"a": 1}, {"a": 2}]
+
+
+def test_parse_json_reply_handles_markdown_fence_array():
+    text = 'Sure, here it is:\n```json\n[{"a": 1}, {"a": 2}]\n```'
+    assert reasoner_cli.parse_json_reply(text) == [{"a": 1}, {"a": 2}]
+
+
+def test_parse_json_reply_handles_stray_surrounding_text_array():
+    text = 'Here is the array [{"a": 1}, {"a": 2}] - hope that helps!'
+    assert reasoner_cli.parse_json_reply(text) == [{"a": 1}, {"a": 2}]
+
+
+def test_parse_json_reply_handles_array_of_scalars():
+    assert reasoner_cli.parse_json_reply('["x", "y", "z"]') == ["x", "y", "z"]

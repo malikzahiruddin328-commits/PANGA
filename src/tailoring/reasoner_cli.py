@@ -162,24 +162,51 @@ def run_claude_cli(prompt: str, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS, 
 
 
 _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
-_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+_JSON_ARRAY_RE = re.compile(r"\[.*\]", re.DOTALL)
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", re.DOTALL)
 
 
-def parse_json_reply(text: str) -> dict:
+def _find_json_match(candidate: str):
+    """Real bug found 2026-08-19: the object/array regexes above can each
+    spuriously match INSIDE the other's structure - e.g. for a top-level
+    array of objects, `_JSON_OBJECT_RE`'s greedy `\\{.*\\}` still finds a
+    '{' and a '}' somewhere in the text and happily matches (wrongly)
+    across every element from the first '{' to the last '}', so which
+    regex to try first can't be a fixed order. Instead this looks at which
+    bracket - '{' or '[' - actually appears FIRST in the text (this holds
+    even with stray leading prose, e.g. "Here is the array [...] - hope
+    that helps!") and tries that structure's regex first, falling back to
+    the other one only if the first guess finds nothing."""
+    first_brace = candidate.find("{")
+    first_bracket = candidate.find("[")
+    if first_bracket != -1 and (first_brace == -1 or first_bracket < first_brace):
+        return _JSON_ARRAY_RE.search(candidate) or _JSON_OBJECT_RE.search(candidate)
+    if first_brace != -1:
+        return _JSON_OBJECT_RE.search(candidate) or _JSON_ARRAY_RE.search(candidate)
+    return None
+
+
+def parse_json_reply(text: str) -> dict | list:
     """Reasoner prompts ask for ONLY a bare JSON object, but a live
     reasoning reply isn't guaranteed to comply exactly (a ```json fence, a
     stray leading/trailing sentence) - the same "AI output feeding a
     literal downstream check needs a real parser, not a bare json.loads()"
-    principle CLAUDE.md already calls out elsewhere in this codebase."""
+    principle CLAUDE.md already calls out elsewhere in this codebase.
+
+    Also handles a top-level JSON array reply the same way (bare, or
+    inside a ```json fence) - real bug found 2026-08-19: some callers
+    legitimately want a list back, and this function used to be hardcoded
+    to objects only, silently failing (or truncating to an inner-object
+    fragment) on a bare array reply."""
     text = (text or "").strip()
     fence = _JSON_FENCE_RE.search(text)
     candidate = fence.group(1) if fence else text
     try:
         return json.loads(candidate)
     except json.JSONDecodeError:
-        match = _JSON_OBJECT_RE.search(candidate)
+        match = _find_json_match(candidate)
         if not match:
-            raise RuntimeError(f"Could not find a JSON object in the reasoner's reply: {text[:500]}")
+            raise RuntimeError(f"Could not find a JSON object or array in the reasoner's reply: {text[:500]}")
         # Real bug found 2026-08-17 (feature/basket-consolidated-flow, live-
         # verifying the new basket-wide "Draft & score all" loop): a reply
         # can contain something that LOOKS like a JSON object (matches the
