@@ -399,6 +399,43 @@ BASKET_DOC_TYPES = [
 ]
 
 
+def _job_already_built(app_record: dict, doc_keys: list[str]) -> bool:
+    """True only if `app_record` already has real final-build output for
+    EVERY doc_key in `doc_keys` (2026-08-19, basket "mass redo" fix). Field
+    names match tailoring/applications.py's real upsert_application()
+    fields, not a guess:
+    - resume: resume_draft_source == "paid" (stamped by
+      bulk_generate.generate_for_job() only when a real paid resume build
+      ran - the subscription QA loop stamps "subscription" instead, so a
+      subscription-only draft never counts as "built" here) AND a
+      non-empty resume_text.
+    - cover_letter / exec_bio / leadership_summary: a non-empty *_text
+      field - these are only ever written by the paid final-build path,
+      never the free subscription loop, so presence alone is enough.
+    - apply_answers: a non-empty list.
+    An unknown/future doc_key is treated as NOT built (conservative - keeps
+    it in the bulk target set, same as today's behavior, rather than
+    silently claiming something we can't actually verify is done).
+    Empty `doc_keys` (nothing checked) is never "already built" - the
+    caller already blocks that case with its own "pick a document type"
+    toast."""
+    if not doc_keys:
+        return False
+    for key in doc_keys:
+        if key == "resume":
+            if app_record.get("resume_draft_source") != "paid" or not (app_record.get("resume_text") or "").strip():
+                return False
+        elif key in ("cover_letter", "exec_bio", "leadership_summary"):
+            if not (app_record.get(f"{key}_text") or "").strip():
+                return False
+        elif key == "apply_answers":
+            if not app_record.get("apply_answers"):
+                return False
+        else:
+            return False
+    return True
+
+
 def render_basket_bar(all_jobs: list[dict]) -> None:
     """The basket bar, rendered once at the true top of the page (above the
     tab bar, so it's visible no matter which tab is open) per Zahir's spec.
@@ -883,6 +920,60 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
 
                     st.divider()
 
+                    # Currently-checked document types (Section 4/5's
+                    # checkboxes render further down the page, but their
+                    # session_state values already persist from the prior
+                    # rerun under these same keys - same pattern the
+                    # per-job "Generate final resume" button below already
+                    # relies on for its own doc_keys). Computed once here so
+                    # Section 2's per-job "already built" indicator and
+                    # Section 4/5's bulk-build target set both use the exact
+                    # same current selection, not two separately-recomputed
+                    # copies that could drift.
+                    current_doc_keys = [
+                        k for k, _ in BASKET_DOC_TYPES
+                        if st.session_state.get(f"basket_doc_{k}", k in ("resume", "cover_letter"))
+                    ]
+
+                    # Auto-clean already-built jobs out of the basket
+                    # (2026-08-19, Zahir's direct clarification: "as the
+                    # basket operation is done" - a fully-built job should
+                    # be REMOVED from the basket, not just shown grayed
+                    # out/skipped while it lingers). Checked once per
+                    # render, not only right after a fresh build, so a job
+                    # that was already fully built BEFORE this render even
+                    # started (the common case right after Zahir manually
+                    # retries a batch of failures - the ones that already
+                    # succeeded were built in an earlier click) also gets
+                    # cleaned up on the very next page load, not left
+                    # sitting there until something else happens to
+                    # re-trigger a build check. "Done" is judged strictly
+                    # against current_doc_keys (what's actually checked
+                    # right now) - if only "resume" is checked, a job built
+                    # for resume alone counts as done and is removed even
+                    # though a cover letter was never requested; that
+                    # matches "done relative to what was actually
+                    # requested," not an assumption every possible doc type
+                    # must exist. Uses the same remove_from_basket() the
+                    # manual per-job "X" button already calls, not a new
+                    # removal path. Runs before Section 2 even starts
+                    # rendering rows so a job about to be removed is never
+                    # drawn first and then yanked away.
+                    if current_doc_keys:
+                        stale_built_jobs = [
+                            j for j in basket_jobs
+                            if _job_already_built(applications_by_key.get((j.get("source"), j.get("job_id"))) or {}, current_doc_keys)
+                        ]
+                        if stale_built_jobs:
+                            for j in stale_built_jobs:
+                                remove_from_basket(j.get("source"), j.get("job_id"))
+                            st.toast(
+                                f"{len(stale_built_jobs)} already-built job(s) removed from the basket "
+                                f"automatically: {', '.join(job_label(j) for j in stale_built_jobs)}.",
+                                icon=":material/check_circle:",
+                            )
+                            st.rerun()
+
                     # --- Section 2: per-job rows (label, live status/score,
                     # per-job "Generate final resume", remove). Purely a
                     # READ-ONLY status display for the draft/score step -
@@ -902,6 +993,19 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                         qa_status = app_record.get("subscription_qa_status")
                         qa_round = app_record.get("subscription_qa_round", 0)
                         qa_score = app_record.get("resume_ats_score")
+                        # subscription_qa_loop_state is stamped by
+                        # run_subscription_round() the same round a score is
+                        # recorded (see the per-job status text below, ~line
+                        # 991, which reads this exact same field) - read it
+                        # here too, BEFORE building all_open_questions below,
+                        # so a plateaued job's leftover questions from its
+                        # last round never surface in the basket-wide
+                        # aggregate "Open questions" panel (Bug 2, fixed
+                        # 2026-08-19: that panel had no such filter even
+                        # though the per-job status right above it already
+                        # tells Zahir "nothing more can be done" for the
+                        # same job - contradicting itself).
+                        loop_state = app_record.get("subscription_qa_loop_state")
                         # disqualifier_check questions are never shown per-job
                         # any more (2026-08-18, Part 3 of the "standing
                         # preferences move to Settings" build) - they're a
@@ -916,8 +1020,9 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                             q for q in (app_record.get("resume_clarifying_questions") or [])
                             if q.get("type") != "disqualifier_check"
                         ]
-                        for q in open_questions:
-                            all_open_questions.append((job, app_record, q))
+                        if loop_state != "plateaued":
+                            for q in open_questions:
+                                all_open_questions.append((job, app_record, q))
                         item_cols = st.columns([3, 2.5, 2, 1])
                         with item_cols[0]:
                             st.markdown(f"{job_label(job)}")
@@ -984,7 +1089,9 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                                 score_text = f"{qa_score}/100" if qa_score is not None else "not yet scored"
                                 history = app_record.get("subscription_ats_score_history") or []
                                 trend = (" (" + " → ".join(f"r{h['round']}: {h['ats_score']}" for h in history) + ")") if len(history) > 1 else ""
-                                loop_state = app_record.get("subscription_qa_loop_state")
+                                # loop_state already computed above (before
+                                # all_open_questions was built) - reused here,
+                                # not recomputed, so the two can never disagree.
                                 gap_count = len(open_questions)
                                 if loop_state == "ready":
                                     st.markdown(f":material/check_circle: ATS {score_text} - ready to build, no more questions{trend}.")
@@ -1015,7 +1122,7 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                                     "one real paid call once you're satisfied with the score."
                                 ),
                             ):
-                                doc_keys = [k for k, _ in BASKET_DOC_TYPES if st.session_state.get(f"basket_doc_{k}", k in ("resume", "cover_letter"))]
+                                doc_keys = current_doc_keys
                                 if not doc_keys:
                                     st.toast("Pick at least one document type below first.", icon=":material/warning:")
                                 else:
@@ -1037,6 +1144,19 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                                         "ok": bool(result.get("ok")), "locked": bool(result.get("locked")),
                                         "errors": result.get("errors") or {},
                                     }
+                                    if result.get("ok"):
+                                        # 2026-08-19 amendment: don't wait for the
+                                        # general per-render auto-clean above to
+                                        # catch this on the NEXT render - remove
+                                        # it immediately once it's actually done
+                                        # for the doc_keys just requested. Re-read
+                                        # via get_application() rather than the
+                                        # stale applications_by_key snapshot -
+                                        # generate_for_job() just wrote fresh
+                                        # values this same call.
+                                        fresh_record = get_application(source, job_id) or {}
+                                        if _job_already_built(fresh_record, doc_keys):
+                                            remove_from_basket(source, job_id)
                                     st.rerun()
                         with item_cols[3]:
                             if st.button(":material/close:", key=f"basket_item_remove_{source}_{job_id}", help="Remove from basket"):
@@ -1052,6 +1172,23 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                                 st.markdown(f":material/check_circle: Final resume built{score_now_text}.")
                             else:
                                 st.markdown(f":material/error: Failed just now: {', '.join(bulk_final['errors'].keys()) or 'see Results tab'}.")
+                        elif _job_already_built(app_record, current_doc_keys):
+                            # Persistent "already built" indicator (Bug 1 fix,
+                            # 2026-08-19: Zahir's own words, "greyed out rather
+                            # than a mass redo") - distinct from the
+                            # `bulk_final` block above, which is ephemeral
+                            # (only set for a job just built THIS session).
+                            # This one reads the real stored build state, so
+                            # it still shows correctly after a page reload.
+                            # Same status-markdown pattern as every other
+                            # per-job status line in this section, not a new
+                            # visual convention.
+                            st.markdown(
+                                ":material/check_circle: Already built for the currently checked document "
+                                "types - the \"Generate final resume for N new/not-yet-built job(s)\" button "
+                                "below skips it. Use the \"Generate final resume\" button above to rebuild it "
+                                "anyway (e.g. after editing an answer)."
+                            )
 
 
                     st.divider()
@@ -1232,20 +1369,41 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                     if not drafting_is_configured():
                         st.markdown("No Anthropic API key configured - add one to `.env` and restart to generate documents.")
 
-                    ready_jobs = [j for j in basket_jobs if (applications_by_key.get((j.get("source"), j.get("job_id"))) or {}).get("subscription_qa_round", 0) > 0]
-                    not_ready_jobs = [j for j in basket_jobs if j not in ready_jobs]
+                    drafted_jobs_for_build = [j for j in basket_jobs if (applications_by_key.get((j.get("source"), j.get("job_id"))) or {}).get("subscription_qa_round", 0) > 0]
+                    not_ready_jobs = [j for j in basket_jobs if j not in drafted_jobs_for_build]
+                    # Bug 1 fix (2026-08-19): a drafted job that already has
+                    # real final-build output for every currently-checked
+                    # document type is excluded from the BULK target set -
+                    # re-running this button used to re-run (and re-charge)
+                    # every already-succeeded job alongside genuinely new
+                    # ones, with no way to retry just the failures without
+                    # re-billing the successes. The per-job "Generate final
+                    # resume" button above is unaffected and still works on
+                    # an already-built job regardless (e.g. after editing an
+                    # answer) - only this bulk button skips already-built
+                    # jobs by default.
+                    already_built_jobs = [
+                        j for j in drafted_jobs_for_build
+                        if _job_already_built(applications_by_key.get((j.get("source"), j.get("job_id"))) or {}, current_doc_keys)
+                    ]
+                    ready_jobs = [j for j in drafted_jobs_for_build if j not in already_built_jobs]
                     if st.button(
-                        f"Generate final resume for all {len(ready_jobs)} ready job(s)", key="basket_finalbuild_bulk",
+                        f"Generate final resume for {len(ready_jobs)} new/not-yet-built job(s)", key="basket_finalbuild_bulk",
                         type="primary", disabled=not drafting_is_configured() or not ready_jobs,
                         help=(
-                            "Fires the one paid final build for every basket job that has completed at "
-                            "least one subscription Draft & score round. Jobs that haven't been drafted "
-                            "yet are skipped, not silently built."
+                            "Fires the one paid final build for every basket job that's completed at least "
+                            "one subscription Draft & score round AND doesn't already have a final build for "
+                            "the currently checked document types below. Already-built jobs are skipped here "
+                            "so re-clicking this never re-charges them - use the per-job \"Generate final "
+                            "resume\" button on a specific job (above) to force a rebuild of an already-built "
+                            "job, e.g. after editing an answer."
                             if ready_jobs else
-                            "No basket job has a completed subscription round yet - use \"Draft & score all\" above first."
+                            "No basket job is both drafted and not-yet-built for the currently checked "
+                            "document types - use \"Draft & score all\" above, check different document "
+                            "types, or use a specific job's own \"Generate final resume\" button to rebuild."
                         ),
                     ):
-                        doc_keys = [k for k, _ in BASKET_DOC_TYPES if st.session_state.get(f"basket_doc_{k}", k in ("resume", "cover_letter"))]
+                        doc_keys = current_doc_keys
                         if not doc_keys:
                             st.toast("Pick at least one document type first.", icon=":material/warning:")
                         else:
@@ -1278,6 +1436,17 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                                 st.session_state["panga_basket_finalbuild_results"][job_key] = {
                                     "ok": bool(r.get("ok")), "locked": bool(r.get("locked")), "errors": r.get("errors") or {},
                                 }
+                                if r.get("ok"):
+                                    # Same immediate-removal amendment as the
+                                    # per-job single-build button above - each
+                                    # job that just succeeded in this batch is
+                                    # checked against the doc_keys actually
+                                    # requested and removed from the basket
+                                    # right away, not left for the next
+                                    # render's general auto-clean to catch.
+                                    fresh_record = get_application(job_key[0], job_key[1]) or {}
+                                    if _job_already_built(fresh_record, doc_keys):
+                                        remove_from_basket(job_key[0], job_key[1])
                             succeeded = sum(1 for r in results.values() if r["ok"])
                             locked = sum(1 for r in results.values() if r.get("locked"))
                             failed = len(results) - succeeded - locked
@@ -1288,6 +1457,8 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                                 summary += f" {failed} had at least one document fail - see the Results tab for detail."
                             if not_ready_jobs:
                                 summary += f" {len(not_ready_jobs)} skipped (no subscription round yet): {', '.join(job_label(j) for j in not_ready_jobs)}."
+                            if already_built_jobs:
+                                summary += f" {len(already_built_jobs)} skipped (already built for the checked document types): {', '.join(job_label(j) for j in already_built_jobs)}."
                             if stopped_early:
                                 skipped_labels = ", ".join(job_label(j) for j in stopped_early["skipped_jobs"])
                                 summary += (
@@ -1302,6 +1473,12 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                         st.markdown(
                             f":material/info: {len(not_ready_jobs)} job(s) not ready (no subscription round yet, "
                             f"so not included above): {', '.join(job_label(j) for j in not_ready_jobs)}."
+                        )
+                    if already_built_jobs:
+                        st.markdown(
+                            f":material/info: {len(already_built_jobs)} job(s) already built for the checked "
+                            f"document types, so not included above: {', '.join(job_label(j) for j in already_built_jobs)}. "
+                            "Use that job's own \"Generate final resume\" button to rebuild it."
                         )
         with bar_cols[1]:
             st.html(
