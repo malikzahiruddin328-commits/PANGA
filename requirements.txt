@@ -15,5 +15,7 @@ google-auth-httplib2
 google-auth-oauthlib
 msal
 psutil
+pystray
+Pillow
 pytest
 pytest-randomly
