@@ -33,10 +33,13 @@ from llm_client import (
 )
 from skill_label_match import (
     build_already_known_units,
+    build_units_pattern_index,
     filter_questions_evidenced_in_profile,
     normalize_skill_label,
+    normalize_units_once,
     skill_evidenced_in_text,
     skills_match,
+    skills_match_any_indexed,
 )
 from tailoring.ats_score import STANDARD_HEADERS, detect_keyword_wording_regressions, detect_matched_keyword_regressions, ensure_keyword_literally_present, plateau_note_for_gaps, score_resume_against_keywords, score_resume_ats
 from tailoring.baseline_resume import select_baseline_resume_text
@@ -1164,7 +1167,10 @@ def _cluster_known_units_for_job(job: dict | None) -> list[str]:
     return get_cluster_known_units(cluster_name)
 
 
-def _profile_supports_skill(term: str, profile: dict | None) -> bool:
+def _profile_supports_skill(
+    term: str, profile: dict | None,
+    narrative_index: list | None = None, known_normalized_units: list[str] | None = None,
+) -> bool:
     """True if the candidate's structured profile - not just the resume
     text this specific draft produced, and not just previously-answered
     gap questions - already states this term (or a real skills_match()
@@ -1206,10 +1212,36 @@ def _profile_supports_skill(term: str, profile: dict | None) -> bool:
     somewhere, not as one contiguous phrase) and searches the FULL known
     corpus (profile units AND gap-answer free text) at once rather than
     per-unit - see skill_label_match.py's own docstring for the exact
-    real case this closes."""
-    if any(skills_match(term, unit) for unit in _profile_narrative_units(profile)):
+    real case this closes.
+
+    narrative_index/known_normalized_units (2026-08-18, real perf fix -
+    see canonical_taxonomy.py's own module-level comment for the sibling
+    fix this pairs with): optional precomputed
+    skill_label_match.build_units_pattern_index(_profile_narrative_units(
+    profile)) / skill_label_match.normalize_units_once(build_already_
+    known_units(profile)) results a caller can pass in when it's about to
+    call this function once per missing keyword in a loop (analyze_fit_
+    before_drafting, _merge_keyword_gap_questions). Real profiling found
+    this function doing TWO real linear scans on every call - once
+    against ~130 narrative units (skills_match(), each re-normalizing and
+    re-compiling regex patterns for both sides), once against ~370 known
+    units (skill_evidenced_in_text(), re-normalizing all of them again) -
+    for a corpus that's byte-identical across every one of the (often
+    several dozen) missing-keyword calls in one job. Passing in the
+    precomputed index/normalized forms (built ONCE per job, see
+    skill_label_match.skills_match_any_indexed()'s own docstring) removes
+    that redundant re-normalize/re-compile work while returning exactly
+    the same boolean skills_match()/skill_evidenced_in_text() would have.
+    Defaults to None (compute fresh from the raw profile) so any other/
+    external caller, or a test, sees unchanged behavior without needing
+    to know about this optimization."""
+    if narrative_index is None:
+        narrative_index = build_units_pattern_index(_profile_narrative_units(profile))
+    if skills_match_any_indexed(term, narrative_index):
         return True
-    return skill_evidenced_in_text(term, build_already_known_units(profile))
+    if known_normalized_units is None:
+        known_normalized_units = normalize_units_once(build_already_known_units(profile))
+    return skill_evidenced_in_text(term, None, normalized_units=known_normalized_units)
 
 
 def no_reference_found_answer(term: str) -> str:
@@ -1486,7 +1518,22 @@ def _merge_keyword_gap_questions(
     # fact confirmed for this job's title cluster suppresses a
     # near-duplicate AI-proposed question too, not just the deterministic
     # missing_required/preferred_keywords loops further down.
-    already_known_units = build_already_known_units(profile) + list(cluster_known_units or [])
+    # Built once, not once per missing keyword (2026-08-18 perf fix, see
+    # _profile_supports_skill's own docstring) - the missing_required/
+    # missing_preferred loops further down each call _profile_supports_
+    # skill() once per item (up to several dozen real missing keywords on
+    # a real job), and every one of those calls used to independently
+    # rebuild this exact same profile-derived corpus from scratch.
+    # _profile_known_units_cache is deliberately the PLAIN profile corpus
+    # (no cluster units folded in) - matches _profile_supports_skill()'s
+    # own internal default exactly, kept separate from already_known_units
+    # below (which DOES fold cluster_known_units in, for the free-form
+    # clarifying_questions loop's own skill_evidenced_in_text() check) so
+    # behavior is byte-identical to before this fix, just faster.
+    _profile_known_units_cache = build_already_known_units(profile)
+    _profile_known_normalized_units_cache = normalize_units_once(_profile_known_units_cache)
+    _profile_narrative_index_cache = build_units_pattern_index(_profile_narrative_units(profile))
+    already_known_units = _profile_known_units_cache + list(cluster_known_units or [])
     merged = []
     for q in clarifying_questions:
         # Real bug found live (2026-08-09, surfaced by app.py adding an
@@ -1576,7 +1623,10 @@ def _merge_keyword_gap_questions(
         # engagement" - that needs real judgment, not string matching).
         if (
             any(_same_skill(term, skill) for skill in already_asked)
-            or _profile_supports_skill(term, profile)
+            or _profile_supports_skill(
+                term, profile,
+                narrative_index=_profile_narrative_index_cache, known_normalized_units=_profile_known_normalized_units_cache,
+            )
             or any(_same_skill(term, skill) for skill in (cluster_known_skills or []))
         ):
             continue
@@ -1605,7 +1655,10 @@ def _merge_keyword_gap_questions(
         # required-keyword loop above.
         if (
             any(_same_skill(term, skill) for skill in already_asked_for_preferred)
-            or _profile_supports_skill(term, profile)
+            or _profile_supports_skill(
+                term, profile,
+                narrative_index=_profile_narrative_index_cache, known_normalized_units=_profile_known_normalized_units_cache,
+            )
             or any(_same_skill(term, skill) for skill in (cluster_known_skills or []))
         ):
             continue
@@ -2685,6 +2738,13 @@ def analyze_fit_before_drafting(job: dict, profile: dict, app_record: dict) -> d
     previously_answered_skills = [a["skill"] for a in profile.get("gap_interview_answers", []) if a.get("skill")]
     cluster_known_skills = _cluster_known_skills_for_job(job)
     cluster_known_units = _cluster_known_units_for_job(job)
+    # Built once, not once per missing keyword (2026-08-18 perf fix, see
+    # _profile_supports_skill's own docstring) - _already_confirmed below
+    # runs once per missing_required/missing_preferred item, and this
+    # profile-derived corpus is identical every single time within one
+    # analyze_fit_before_drafting call.
+    _profile_narrative_index_cache = build_units_pattern_index(_profile_narrative_units(profile))
+    _profile_known_normalized_units_cache = normalize_units_once(build_already_known_units(profile))
 
     def _already_confirmed(item: dict) -> bool:
         # 2026-08-10: extended to also credit a keyword the candidate's
@@ -2708,7 +2768,10 @@ def analyze_fit_before_drafting(job: dict, profile: dict, app_record: dict) -> d
         # case above. Still never touches the real, literal ats_score.
         return (
             any(skills_match(item["label"], skill) for skill in previously_answered_skills)
-            or _profile_supports_skill(item["label"], profile)
+            or _profile_supports_skill(
+                item["label"], profile,
+                narrative_index=_profile_narrative_index_cache, known_normalized_units=_profile_known_normalized_units_cache,
+            )
             or any(skills_match(item["label"], skill) for skill in cluster_known_skills)
             or skill_evidenced_in_text(item["label"], cluster_known_units)
         )
