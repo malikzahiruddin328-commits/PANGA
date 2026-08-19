@@ -1152,18 +1152,45 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                                 key="basket_shared_qa_submit", type="primary", disabled=not per_job_answers,
                                 help="Saves the answers you edited above and redrafts only the jobs you answered, via the subscription - not a paid call.",
                             ):
+                                # Runs every job's redraft concurrently via the same
+                                # ThreadPoolExecutor pattern as "Draft & score all"
+                                # above (BASKET_DRAFTALL_MAX_WORKERS/effective_worker_count)
+                                # rather than a sequential for-loop (2026-08-18 perf fix -
+                                # a sequential version of this exact loop was caught live
+                                # taking ~18-20 minutes for 3 jobs; see CLAUDE.md's
+                                # standing performance-review requirement this was a real
+                                # miss against). Each job gets its own load_profile() call
+                                # inside the worker (not one shared dict passed to every
+                                # thread) since submit_answers_and_redraft's own docstring
+                                # warns a caller-held profile dict goes stale the moment any
+                                # one job's save_gap_answers() writes to the on-disk store -
+                                # true here even more than the single-job case, since
+                                # multiple jobs' saves can land while others are still
+                                # in flight.
                                 jobs_by_key = {(j.get("source"), j.get("job_id")): j for j in basket_jobs}
                                 submit_placeholder = st.empty()
                                 redraft_results = {}
-                                for i, (job_key, answer_entries) in enumerate(per_job_answers.items(), start=1):
+                                total = answered_job_count
+
+                                def _redraft_worker(job_key, answer_entries):
                                     job = jobs_by_key[job_key]
-                                    _status_line(submit_placeholder, f":material/hourglass_top: [{i}/{answered_job_count}] {job_label(job)}: applying your answers & redrafting...")
                                     try:
-                                        redraft_results[job_key] = submit_answers_and_redraft(job, load_profile(), answer_entries)
+                                        return job_key, submit_answers_and_redraft(job, load_profile(), answer_entries)
                                     except Exception as exc:
                                         # Same "one item's failure shouldn't stop the rest"
                                         # backstop as the Draft & score all loop above.
-                                        redraft_results[job_key] = {"ok": False, "locked": False, "round": None, "resume_draft": None, "error": str(exc)}
+                                        return job_key, {"ok": False, "locked": False, "round": None, "resume_draft": None, "error": str(exc)}
+
+                                worker_count = effective_worker_count(min(total, BASKET_DRAFTALL_MAX_WORKERS))
+                                _status_line(submit_placeholder, f":material/hourglass_top: Applying your answers & redrafting {total} job(s) - up to {worker_count} running concurrently...")
+                                completed = 0
+                                with ThreadPoolExecutor(max_workers=worker_count) as pool:
+                                    futures = [pool.submit(_redraft_worker, job_key, answer_entries) for job_key, answer_entries in per_job_answers.items()]
+                                    for future in as_completed(futures):
+                                        job_key, outcome = future.result()
+                                        redraft_results[job_key] = outcome
+                                        completed += 1
+                                        _status_line(submit_placeholder, f":material/hourglass_top: [{completed}/{total}] applying answers & redrafting...")
                                 submit_placeholder.markdown(":material/check_circle: Done.")
                                 succeeded = sum(1 for r in redraft_results.values() if r["ok"])
                                 st.toast(f"{succeeded} of {answered_job_count} job(s) redrafted with your answers.", icon=":material/check_circle:")
