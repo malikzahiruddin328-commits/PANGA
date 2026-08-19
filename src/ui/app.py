@@ -1518,11 +1518,24 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
 NOT_INTERESTED_STATUSES = ("not interested", "not-interested")  # handle both forms - see applications.py note
 CLOSED_STATUSES = ("closed by employer",)
 APPLIED_STATUSES = ("applied",)
+# Zahir's explicit ask (2026-08-19): this table is for jobs still worth a
+# decision - "only nulls or under review should be visible" by default.
+# APPLIED/NOT_INTERESTED/CLOSED already had their own hide-by-default
+# toggle; this covers the remaining non-actionable statuses the "Mark
+# status" dropdown can set (rejected, interview scheduled, offer) that had
+# no filter at all until now - a rejected job was sitting unfiltered
+# alongside real open opportunities. One combined toggle, not three
+# separate ones, since these three share the same "already past the point
+# of deciding whether to apply" reason for being hidden - unlike applied/
+# not-interested/closed, which Zahir specifically wanted distinguishable
+# from each other.
+ADVANCED_STATUSES = ("rejected", "interview scheduled", "offer")
 
 
 def compute_results_ranked(
     jobs: list[dict], target_roles: list[dict], min_score: int,
     show_not_interested: bool, show_closed: bool, show_applied: bool,
+    show_advanced: bool = False,
 ) -> list[dict]:
     """The same rank/filter/dedup pipeline the Results tab's own "N job(s)"
     heading computes (score threshold, the three hide-by-default statuses,
@@ -1554,6 +1567,8 @@ def compute_results_ranked(
         ranked = [j for j in ranked if application_status(j) not in CLOSED_STATUSES]
     if not show_applied:
         ranked = [j for j in ranked if application_status(j) not in APPLIED_STATUSES]
+    if not show_advanced:
+        ranked = [j for j in ranked if application_status(j) not in ADVANCED_STATUSES]
     return dedupe_across_sources(ranked)
 
 
@@ -3630,6 +3645,7 @@ results_count = len(compute_results_ranked(
     show_not_interested=st.session_state.get("results_show_not_interested", False),
     show_closed=st.session_state.get("results_show_closed", False),
     show_applied=st.session_state.get("results_show_applied", False),
+    show_advanced=st.session_state.get("results_show_advanced", False),
 ))
 results_total_scanned = len(jobs)
 prep_in_progress_count = sum(1 for r in prep_records for round_ in r["rounds"] if round_["status"] == "in_progress")
@@ -5396,6 +5412,15 @@ elif active_tab == "results":
     )
     if not show_applied:
         ranked = [j for j in ranked if application_status(j) not in APPLIED_STATUSES]
+
+    advanced_count = sum(1 for j in ranked if application_status(j) in ADVANCED_STATUSES)
+    show_advanced = st.checkbox(
+        f"Show {advanced_count} job(s) marked 'rejected', 'interview scheduled', or 'offer' "
+        "(hidden by default, nothing is deleted)",
+        key="results_show_advanced",
+    )
+    if not show_advanced:
+        ranked = [j for j in ranked if application_status(j) not in ADVANCED_STATUSES]
 
     # Cross-source dedup (2026-07-30): if a company has a direct-site channel
     # (Eisai/AbbVie/IQVIA via company_sites.py) and the same real opening also
