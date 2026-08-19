@@ -243,6 +243,9 @@ def test_manual_save_keeps_showing_analyze_fit_on_a_later_unrelated_rerun(result
 def test_jd_column_shown_in_results_table(results_app):
     # Zahir's ask 2026-08-06: a column he can scan across the whole table
     # at a glance, instead of opening each job to find out.
+    # 2026-08-19: the column became a clickable button ("Add JD"/"View JD",
+    # see test_jd_button_jumps_straight_to_the_box below) - labels updated
+    # from the original plain "✓"/"–" indicator to reflect that.
     at = results_app
     at.session_state["active_tab"] = "results"
     at.run(timeout=30)
@@ -254,9 +257,9 @@ def test_jd_column_shown_in_results_table(results_app):
         assert "JD" in df.columns
         rows.update(dict(zip(df["Role"], df["JD"])))
 
-    assert rows["Director, No JD"] == "–"
-    assert rows["Director, Never Drafted"] == "–"
-    assert rows["Director, With JD"] == "✓"
+    assert rows["Director, No JD"] == "Add JD"
+    assert rows["Director, Never Drafted"] == "Add JD"
+    assert rows["Director, With JD"] == "View JD"
 
 
 def test_view_update_box_shown_with_existing_text_prefilled_when_jd_present(results_app):

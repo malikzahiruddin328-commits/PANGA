@@ -5547,7 +5547,17 @@ elif active_tab == "results":
                     "Pay": pay,
                     "Score": job.get("fit_score"),
                     "Status": status_cell,
-                    "JD": "✓" if _job_has_captured_jd_text(job) else "–",
+                    # ButtonColumn (2026-08-19, Zahir's explicit ask): a
+                    # missing JD used to mean click the Role cell, scroll
+                    # past the whole detail panel, and find the paste box
+                    # buried below - too many steps for something worth one
+                    # click straight from the table. Label reflects current
+                    # state, same "cell value IS the button label" mechanism
+                    # Basket/Pass already use - "View JD" isn't just a
+                    # cosmetic choice: the same box already supports
+                    # viewing/editing captured text (render_jd_view_or_
+                    # update_box), so this is never a dead click either way.
+                    "JD": "View JD" if _job_has_captured_jd_text(job) else "Add JD",
                     "Posting": job.get("posting_url"),
                     # ButtonColumn's label comes from the cell value itself
                     # (2026-08-13 basket build, same mechanism "Pass" below
@@ -5580,6 +5590,23 @@ elif active_tab == "results":
                 if click:
                     st.session_state[selected_idx_key] = click["row"]
                     st.session_state[scroll_pending_key] = True
+
+            # "Add JD"/"View JD" (2026-08-19, Zahir's explicit ask): same
+            # activate-the-row mechanism as _activate_row above, but scrolls
+            # straight to the JD box specifically (jd_scroll_pending_key,
+            # its own anchor below) instead of just the top of the detail
+            # panel - the whole point is skipping the "scroll to find it"
+            # step, not just skipping the "click into the record" step.
+            jd_click_key = f"jdclick_{channel}"
+            jd_scroll_pending_key = f"jd_scroll_pending_{channel}"
+
+            def _activate_row_for_jd(
+                selected_idx_key=selected_idx_key, jd_click_key=jd_click_key, jd_scroll_pending_key=jd_scroll_pending_key,
+            ):
+                click = st.session_state.get(jd_click_key)
+                if click:
+                    st.session_state[selected_idx_key] = click["row"]
+                    st.session_state[jd_scroll_pending_key] = True
 
             # Inline "Pass" (Zahir's explicit ask, relayed via hub
             # 2026-08-06): marking a job "not interested" used to mean
@@ -5633,9 +5660,10 @@ elif active_tab == "results":
                         "Role", type="tertiary", alignment="left",
                         on_click=_activate_row, key=role_click_key,
                     ),
-                    "JD": st.column_config.TextColumn(
-                        "JD", alignment="left", width="small",
-                        help="Whether Panga has this posting's job description text to score and tailor against.",
+                    "JD": st.column_config.ButtonColumn(
+                        "JD", type="tertiary", alignment="left", width="small",
+                        help="Add or view this posting's job description text, right here - jumps straight to the box, no scrolling.",
+                        on_click=_activate_row_for_jd, key=jd_click_key,
                     ),
                     "Basket": st.column_config.ButtonColumn(
                         "Basket", type="tertiary", alignment="left", width="small",
@@ -5726,6 +5754,25 @@ elif active_tab == "results":
                 status = app_record.get("status")
 
                 render_unconfirmed_claims_section(job, app_record)
+
+                # Scroll target for the table's "Add JD"/"View JD" button
+                # (jd_scroll_pending_key, set by _activate_row_for_jd above) -
+                # placed right before the JD box itself, not just the top of
+                # the detail panel, so the click actually skips the "scroll
+                # to find it" step Zahir flagged, not just the "click into
+                # the record" step (the Role click / general scroll_pending_
+                # key already handled that part).
+                jd_anchor_id = f"jd-anchor-{channel}"
+                if st.session_state.pop(jd_scroll_pending_key, False):
+                    st.html(
+                        f'<div id="{jd_anchor_id}"></div>'
+                        '<script>'
+                        f'document.getElementById("{jd_anchor_id}")?.scrollIntoView({{behavior: "smooth", block: "start"}});'
+                        '</script>',
+                        unsafe_allow_javascript=True,
+                    )
+                else:
+                    st.html(f'<div id="{jd_anchor_id}"></div>')
 
                 # Only shown before a resume exists for this job (same
                 # "resume_ats_score is not None" condition the post-hoc
