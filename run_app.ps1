@@ -48,9 +48,46 @@ function Stop-AnyPortSquatter {
     }
 }
 
+function Start-TrayMonitorIfNotRunning {
+    # 2026-08-19 fix: the system-tray Task Monitor (src/task_tray.py,
+    # merged 2026-08-19) was built, tested, and merged - but nothing ever
+    # actually launched it, so it sat unused until manually started by
+    # hand. Wiring it in here so every real production start/restart also
+    # ensures the tray icon is running, without ever spawning a second one
+    # on top of an already-running instance (checked by real command line,
+    # not just "a python.exe exists" - matches this script's own
+    # "verify the real state, don't assume" standard). Runs detached
+    # (own process, not tracked by panga.pid) since the tray icon's own
+    # lifetime is independent of the production app's restart cycle - it
+    # should keep running (and briefly show "not running" via its own
+    # poll loop) across a Panga restart, not be killed and relaunched
+    # every time.
+    $pythonExe = Join-Path $root "venv\Scripts\python.exe"
+    $trayScript = Join-Path $root "src\task_tray.py"
+    if (-not (Test-Path $trayScript)) { return }
+
+    $existing = Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -and $_.CommandLine.Contains("task_tray.py") }
+    if ($existing) {
+        Write-Host "Tray monitor already running (PID $($existing[0].ProcessId))."
+        return
+    }
+
+    try {
+        Start-Process -FilePath $pythonExe -ArgumentList @($trayScript) -WorkingDirectory $root -WindowStyle Hidden | Out-Null
+        Write-Host "Started tray monitor."
+    } catch {
+        # Never let a tray-monitor launch failure block or fail the real
+        # app startup this script exists to make reliable - it's a
+        # convenience layer on top of production, not a dependency of it.
+        Write-Host "WARNING: could not start the tray monitor ($_) - Panga itself is unaffected."
+    }
+}
+
 Stop-TrackedProcess
 Stop-AnyPortSquatter
 Start-Sleep -Milliseconds 500
+Start-TrayMonitorIfNotRunning
 
 $streamlitExe = Join-Path $root "venv\Scripts\streamlit.exe"
 $appPath = Join-Path $root "src\ui\app.py"
