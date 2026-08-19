@@ -399,41 +399,53 @@ BASKET_DOC_TYPES = [
 ]
 
 
-def _job_already_built(app_record: dict, doc_keys: list[str]) -> bool:
-    """True only if `app_record` already has real final-build output for
-    EVERY doc_key in `doc_keys` (2026-08-19, basket "mass redo" fix). Field
-    names match tailoring/applications.py's real upsert_application()
-    fields, not a guess:
-    - resume: resume_draft_source == "paid" (stamped by
-      bulk_generate.generate_for_job() only when a real paid resume build
-      ran - the subscription QA loop stamps "subscription" instead, so a
-      subscription-only draft never counts as "built" here) AND a
-      non-empty resume_text.
+def _already_built_doc_keys(app_record: dict, doc_keys: list[str]) -> list[str]:
+    """Returns the subset of `doc_keys` that `app_record` already has real,
+    complete final-build output for (2026-08-19 - same "don't redraft a
+    perfectly good resume just to get a missing cover letter" fix as
+    tailoring/bulk_generate.py's _already_built_doc_keys(), which this is
+    deliberately kept identical to field-for-field so a job never reads as
+    "already built" in one place and not the other; a tailoring->ui import
+    isn't an option here since bulk_generate.py already avoids the reverse
+    import for the same reason). Field names match tailoring/
+    applications.py's real upsert_application() fields, not a guess:
+    - resume: resume_draft_source == "paid" (stamped only when a real paid
+      resume build ran - the subscription QA loop stamps "subscription"
+      instead, so a subscription-only draft never counts as "built" here)
+      AND a non-empty resume_text.
     - cover_letter / exec_bio / leadership_summary: a non-empty *_text
       field - these are only ever written by the paid final-build path,
       never the free subscription loop, so presence alone is enough.
     - apply_answers: a non-empty list.
-    An unknown/future doc_key is treated as NOT built (conservative - keeps
-    it in the bulk target set, same as today's behavior, rather than
-    silently claiming something we can't actually verify is done).
+    An unrecognized/future doc_key is never treated as already built
+    (conservative - it still gets drafted rather than silently skipped
+    based on a check this function doesn't actually know how to make)."""
+    built = []
+    for key in doc_keys:
+        if key == "resume":
+            if app_record.get("resume_draft_source") == "paid" and (app_record.get("resume_text") or "").strip():
+                built.append(key)
+        elif key in ("cover_letter", "exec_bio", "leadership_summary"):
+            if (app_record.get(f"{key}_text") or "").strip():
+                built.append(key)
+        elif key == "apply_answers":
+            if app_record.get("apply_answers"):
+                built.append(key)
+    return built
+
+
+def _job_already_built(app_record: dict, doc_keys: list[str]) -> bool:
+    """True only if `app_record` already has real final-build output for
+    EVERY doc_key in `doc_keys` (2026-08-19, basket "mass redo" fix). Built
+    on top of _already_built_doc_keys() above (added the same day for the
+    "Documents for this application" panel's own skip-already-built fix)
+    so the two checks can never drift apart.
     Empty `doc_keys` (nothing checked) is never "already built" - the
     caller already blocks that case with its own "pick a document type"
     toast."""
     if not doc_keys:
         return False
-    for key in doc_keys:
-        if key == "resume":
-            if app_record.get("resume_draft_source") != "paid" or not (app_record.get("resume_text") or "").strip():
-                return False
-        elif key in ("cover_letter", "exec_bio", "leadership_summary"):
-            if not (app_record.get(f"{key}_text") or "").strip():
-                return False
-        elif key == "apply_answers":
-            if not app_record.get("apply_answers"):
-                return False
-        else:
-            return False
-    return True
+    return set(_already_built_doc_keys(app_record, doc_keys)) == set(doc_keys)
 
 
 def render_basket_bar(all_jobs: list[dict]) -> None:
@@ -5748,111 +5760,198 @@ elif active_tab == "results":
                         st.error("A generation is already in progress for this job (another tab or a recent click) - wait for it to finish before trying again.")
                     else:
                         doc_labels = dict(doc_types)
-                        with st.container(key="draft_progress_bar"):
-                            progress_bar = st.progress(0, text=f"Drafting 1 of {len(selected)}: {doc_labels[selected[0]]}...")
-                        st.html(progress_shimmer_css("draft_progress_bar"))
+                        # Skip-already-built fix (2026-08-19, same "don't
+                        # redraft a perfectly good resume just to get a
+                        # missing cover letter" bug tailoring/bulk_generate.
+                        # py's generate_for_job() was fixed for the same day
+                        # - see _already_built_doc_keys() above). This panel
+                        # duplicates generate_documents()-calling/persist
+                        # logic outside generate_for_job() entirely (per
+                        # bulk_generate.py's own module docstring, which
+                        # calls it "risky to disturb"), so rather than
+                        # restructure it onto the shared path, the same
+                        # exclude-already-built-keys check is applied
+                        # directly here, inline, with the same field checks.
+                        already_built = _already_built_doc_keys(app_record, selected)
+                        keys_to_draft = [k for k in selected if k not in already_built]
 
-                        def _update_progress(i, total, doc_key, substatus=None):
-                            label = f"Drafting {i} of {total}: {doc_labels[doc_key]}"
-                            label += f" — {substatus}" if substatus else "..."
-                            within_doc = progress_fraction(doc_key, substatus)
-                            progress_bar.progress(((i - 1) + within_doc) / total, text=label)
-
-                        try:
-                            drafted = generate_documents(
-                                job, load_profile(), selected, on_progress=_update_progress,
-                                # "resume" already-in-selected is handled
-                                # internally (the just-drafted text is used
-                                # automatically) - this only matters for
-                                # the "redraft just the other docs, resume
-                                # unchanged" case, so cover_letter/exec_bio/
-                                # leadership_summary can still be checked
-                                # for factual consistency against it.
-                                existing_resume_text=app_record.get("resume_text") if "resume" not in selected else None,
-                            )
-                        except (DraftingNotConfigured, DraftingFailed) as exc:
-                            progress_bar.empty()
-                            st.error(str(exc))
-                        except Exception as exc:
-                            # Only reachable when exactly one document type was
-                            # selected (generate_documents() re-raises ANY
-                            # exception type for a single-doc_key request,
-                            # 2026-08-10) - for 2+ selected docs, a failure in
-                            # one never raises here at all anymore; it lands in
-                            # drafted["_errors"] instead (see the success branch
-                            # below), so every doc that DID succeed is still
-                            # saved rather than thrown away.
-                            progress_bar.empty()
-                            _report_drafting_failure(job, selected[0], exc)
-                            st.error("Something went wrong while drafting this document. It's been logged - try again in a moment.")
-                        else:
-                            progress_bar.progress(1.0, text=":material/check_circle: Done.")
-                            resume_draft = drafted.get("resume")
-                            resume_is_scored = isinstance(resume_draft, dict)
-                            # Real bug (state-handling audit, 2026-08-10):
-                            # this used to hardcode status="under review" -
-                            # clicking "Generate documents" again on a job
-                            # already marked applied/interview scheduled/
-                            # etc. (e.g. to refresh a cover letter) silently
-                            # reverted its status with zero warning.
-                            upsert_application(
-                                job["source"], job["job_id"], status=app_record.get("status", "under review"),
-                                documents_requested=selected,
-                                resume_text=resume_draft["text"] if resume_is_scored else resume_draft,
-                                resume_ats_score=resume_draft["ats_score"] if resume_is_scored else None,
-                                resume_ats_rationale=resume_draft["ats_rationale"] if resume_is_scored else None,
-                                resume_ats_next_actions=resume_draft["ats_next_actions"] if resume_is_scored else None,
-                                resume_clarifying_questions=resume_draft["clarifying_questions"] if resume_is_scored else None,
-                                suggested_strategy_tag=resume_draft["suggested_strategy_tag"] if resume_is_scored else None,
-                                resume_unconfirmed_claims_ai_reported=resume_draft.get("unconfirmed_claims", []) if resume_is_scored else None,
-                                cover_letter_text=drafted.get("cover_letter"),
-                                exec_bio_text=drafted.get("exec_bio"),
-                                leadership_summary_text=drafted.get("leadership_summary"),
-                                apply_answers=drafted.get("apply_answers"),
-                            )
-                            sync_workspace_documents(job["source"], job["job_id"], selected, drafted, load_profile(), job)
-                            if "resume" in selected and resume_is_scored:
-                                # Zahir's explicit ask 2026-08-06: the score,
-                                # "why this score" breakdown, and any outstanding
-                                # gap questions must be part of what he sees the
-                                # moment he generates - not something he has to
-                                # notice or go click open afterward. One-shot -
-                                # popped the next time this expander renders, so
-                                # it doesn't stay force-expanded forever.
-                                st.session_state[f"just_drafted_resume_{job['source']}_{job['job_id']}"] = True
-                            # generate_documents() with 2+ doc_keys never raises
-                            # on a per-doc failure (2026-08-10) - it reports to
-                            # Bhangi and returns the failure in drafted["_errors"]
-                            # instead, so whichever docs DID succeed are still
-                            # saved above. Surface what failed rather than
-                            # silently telling Zahir everything worked.
-                            failed = drafted.get("_errors") or {}
-                            drafting_errors_key = f"drafting_errors_{job['source']}_{job['job_id']}"
-                            if failed:
-                                failed_labels = ", ".join(doc_labels.get(k, k) for k in failed)
-                                st.toast(f"Some documents drafted, but {failed_labels} failed - see below.", icon=":material/warning:")
-                                # st.error() here never reaches Zahir - the
-                                # unconditional st.rerun() below tears this
-                                # render down before it paints (RM's finding,
-                                # 2026-08-11). Stashed for the NEXT render to
-                                # pick up instead - see the pop() near the top
-                                # of this job's "Documents for this
-                                # application" section.
-                                st.session_state[drafting_errors_key] = [
-                                    f"{doc_labels.get(doc_key, doc_key)}: {msg}" for doc_key, msg in failed.items()
-                                ]
-                            else:
-                                st.toast("Documents drafted. Review and download them below, then use them for the actual application.", icon=":material/check_circle:")
-                                # Clears any stale failure stashed by an
-                                # earlier attempt on this same job that was
-                                # never actually rendered (e.g. the user
-                                # navigated away before the section came back
-                                # around) - this generate succeeded in full,
-                                # so nothing failed-looking should linger.
-                                st.session_state.pop(drafting_errors_key, None)
-                            st.rerun()
-                        finally:
+                        if not keys_to_draft:
+                            # Every checked doc type already has real,
+                            # complete output for this job - no reason to
+                            # spend a single paid call. Still saves the
+                            # (unchanged) selection and releases the lock
+                            # acquired above, same as every other early-exit
+                            # branch in this section.
                             release_generation_lock(job["source"], job["job_id"])
+                            upsert_application(job["source"], job["job_id"], status=app_record.get("status", "under review"), documents_requested=selected)
+                            st.toast("Everything checked is already drafted - nothing to regenerate. Scroll down to review it.", icon=":material/info:")
+                            st.rerun()
+                        else:
+                            with st.container(key="draft_progress_bar"):
+                                progress_bar = st.progress(0, text=f"Drafting 1 of {len(keys_to_draft)}: {doc_labels[keys_to_draft[0]]}...")
+                            st.html(progress_shimmer_css("draft_progress_bar"))
+
+                            def _update_progress(i, total, doc_key, substatus=None):
+                                label = f"Drafting {i} of {total}: {doc_labels[doc_key]}"
+                                label += f" — {substatus}" if substatus else "..."
+                                within_doc = progress_fraction(doc_key, substatus)
+                                progress_bar.progress(((i - 1) + within_doc) / total, text=label)
+
+                            try:
+                                drafted = generate_documents(
+                                    job, load_profile(), keys_to_draft, on_progress=_update_progress,
+                                    # Based on keys_to_draft (what's actually
+                                    # being sent), not `selected` - if resume
+                                    # was reused (already built) but another
+                                    # doc type still needs drafting, this
+                                    # correctly passes the EXISTING resume
+                                    # text through so cover_letter/exec_bio/
+                                    # leadership_summary can still be checked
+                                    # for factual consistency against it.
+                                    existing_resume_text=app_record.get("resume_text") if "resume" not in keys_to_draft else None,
+                                )
+                            except (DraftingNotConfigured, DraftingFailed) as exc:
+                                progress_bar.empty()
+                                st.error(str(exc))
+                            except Exception as exc:
+                                # Only reachable when exactly one document type
+                                # was actually sent to drafting
+                                # (generate_documents() re-raises ANY
+                                # exception type for a single-doc_key request,
+                                # 2026-08-10) - for 2+ doc_keys, a failure in
+                                # one never raises here at all anymore; it
+                                # lands in drafted["_errors"] instead (see the
+                                # success branch below), so every doc that DID
+                                # succeed is still saved rather than thrown
+                                # away.
+                                progress_bar.empty()
+                                _report_drafting_failure(job, keys_to_draft[0], exc)
+                                st.error("Something went wrong while drafting this document. It's been logged - try again in a moment.")
+                            else:
+                                progress_bar.progress(1.0, text=":material/check_circle: Done.")
+                                # Merge each already-built doc_key's existing
+                                # content from app_record back into a copy of
+                                # `drafted` before persisting - `drafted`
+                                # itself only ever has entries for
+                                # keys_to_draft (what was actually just
+                                # generated), so without this the already-good
+                                # doc types would read back as "nothing"
+                                # below. `drafted` itself (unmerged) is still
+                                # what's passed to sync_workspace_documents()
+                                # further down - reused doc types already
+                                # have their real .docx on disk from whenever
+                                # they WERE built, so there's nothing to
+                                # rewrite there.
+                                merged = dict(drafted)
+                                if "resume" in already_built:
+                                    merged["resume"] = {
+                                        "text": app_record.get("resume_text"),
+                                        "ats_score": app_record.get("resume_ats_score"),
+                                        "ats_rationale": app_record.get("resume_ats_rationale"),
+                                        "ats_next_actions": app_record.get("resume_ats_next_actions") or [],
+                                        "clarifying_questions": app_record.get("resume_clarifying_questions") or [],
+                                        "suggested_strategy_tag": app_record.get("strategy_tag_suggestion"),
+                                        "unconfirmed_claims": app_record.get("resume_unconfirmed_claims_ai_reported") or [],
+                                    }
+                                for reused_key in ("cover_letter", "exec_bio", "leadership_summary"):
+                                    if reused_key in already_built:
+                                        merged[reused_key] = app_record.get(f"{reused_key}_text")
+                                if "apply_answers" in already_built:
+                                    merged["apply_answers"] = app_record.get("apply_answers")
+
+                                resume_draft = merged.get("resume")
+                                resume_is_scored = isinstance(resume_draft, dict)
+                                # Real bug (state-handling audit, 2026-08-10):
+                                # this used to hardcode status="under review" -
+                                # clicking "Generate documents" again on a job
+                                # already marked applied/interview scheduled/
+                                # etc. (e.g. to refresh a cover letter) silently
+                                # reverted its status with zero warning.
+                                upsert_application(
+                                    job["source"], job["job_id"], status=app_record.get("status", "under review"),
+                                    # The full originally-checked set, not just
+                                    # keys_to_draft - documents_requested
+                                    # reflects the complete desired selection;
+                                    # an already-built doc_key is still part
+                                    # of what was requested, just satisfied
+                                    # from existing content instead of a
+                                    # fresh draft.
+                                    documents_requested=selected,
+                                    resume_text=resume_draft["text"] if resume_is_scored else resume_draft,
+                                    # "paid" only when a resume was ACTUALLY
+                                    # freshly drafted this call (keys_to_draft,
+                                    # not selected) - this is the field
+                                    # _already_built_doc_keys() above checks
+                                    # to decide whether a future click can
+                                    # skip redrafting the resume, same as
+                                    # bulk_generate.py's generate_for_job()
+                                    # stamps it. Before this line existed, a
+                                    # resume drafted through THIS panel never
+                                    # got stamped at all, so this panel's own
+                                    # already-built check could never
+                                    # actually recognize its own past resume
+                                    # drafts - a real functional gap in this
+                                    # same fix, not a pre-existing one, caught
+                                    # while writing this fix's own tests.
+                                    # None here (resume reused) means "don't
+                                    # touch" (upsert_application()'s own
+                                    # None-means-unchanged contract), leaving
+                                    # whatever stamp was already there as-is.
+                                    resume_draft_source="paid" if "resume" in keys_to_draft else None,
+                                    resume_ats_score=resume_draft["ats_score"] if resume_is_scored else None,
+                                    resume_ats_rationale=resume_draft["ats_rationale"] if resume_is_scored else None,
+                                    resume_ats_next_actions=resume_draft["ats_next_actions"] if resume_is_scored else None,
+                                    resume_clarifying_questions=resume_draft["clarifying_questions"] if resume_is_scored else None,
+                                    suggested_strategy_tag=resume_draft["suggested_strategy_tag"] if resume_is_scored else None,
+                                    resume_unconfirmed_claims_ai_reported=resume_draft.get("unconfirmed_claims", []) if resume_is_scored else None,
+                                    cover_letter_text=merged.get("cover_letter"),
+                                    exec_bio_text=merged.get("exec_bio"),
+                                    leadership_summary_text=merged.get("leadership_summary"),
+                                    apply_answers=merged.get("apply_answers"),
+                                )
+                                sync_workspace_documents(job["source"], job["job_id"], keys_to_draft, drafted, load_profile(), job)
+                                if "resume" in keys_to_draft and resume_is_scored:
+                                    # Zahir's explicit ask 2026-08-06: the score,
+                                    # "why this score" breakdown, and any outstanding
+                                    # gap questions must be part of what he sees the
+                                    # moment he generates - not something he has to
+                                    # notice or go click open afterward. One-shot -
+                                    # popped the next time this expander renders, so
+                                    # it doesn't stay force-expanded forever.
+                                    st.session_state[f"just_drafted_resume_{job['source']}_{job['job_id']}"] = True
+                                # generate_documents() with 2+ doc_keys never raises
+                                # on a per-doc failure (2026-08-10) - it reports to
+                                # Bhangi and returns the failure in drafted["_errors"]
+                                # instead, so whichever docs DID succeed are still
+                                # saved above. Surface what failed rather than
+                                # silently telling Zahir everything worked.
+                                failed = drafted.get("_errors") or {}
+                                drafting_errors_key = f"drafting_errors_{job['source']}_{job['job_id']}"
+                                if failed:
+                                    failed_labels = ", ".join(doc_labels.get(k, k) for k in failed)
+                                    st.toast(f"Some documents drafted, but {failed_labels} failed - see below.", icon=":material/warning:")
+                                    # st.error() here never reaches Zahir - the
+                                    # unconditional st.rerun() below tears this
+                                    # render down before it paints (RM's finding,
+                                    # 2026-08-11). Stashed for the NEXT render to
+                                    # pick up instead - see the pop() near the top
+                                    # of this job's "Documents for this
+                                    # application" section.
+                                    st.session_state[drafting_errors_key] = [
+                                        f"{doc_labels.get(doc_key, doc_key)}: {msg}" for doc_key, msg in failed.items()
+                                    ]
+                                else:
+                                    st.toast("Documents drafted. Review and download them below, then use them for the actual application.", icon=":material/check_circle:")
+                                    # Clears any stale failure stashed by an
+                                    # earlier attempt on this same job that was
+                                    # never actually rendered (e.g. the user
+                                    # navigated away before the section came back
+                                    # around) - this generate succeeded in full,
+                                    # so nothing failed-looking should linger.
+                                    st.session_state.pop(drafting_errors_key, None)
+                                st.rerun()
+                            finally:
+                                release_generation_lock(job["source"], job["job_id"])
 
                 doc_field_map = {
                     "resume": "resume_text",
