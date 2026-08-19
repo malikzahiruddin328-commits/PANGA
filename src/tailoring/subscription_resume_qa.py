@@ -83,6 +83,7 @@ from tailoring.baseline_resume import select_baseline_resume_text
 from tailoring.discuss_and_draft import _generate_questions_via_subscription
 from tailoring.dossier import sync_workspace_documents
 from tailoring.drafting import ATS_KEYWORDS_EXTRACTOR_VERSION, SYSTEM_PROMPT, _finalize_resume_draft, _resume_spec_for_job, save_gap_answers
+from tailoring.gap_question_phrasing import rephrase_canned_gap_questions_via_llm
 from tailoring.reasoner_cli import ReasonerUnavailable, parse_json_reply, run_claude_cli
 
 # Target-driven, capped-round QA loop (2026-08-17, feature/target-driven-
@@ -371,6 +372,19 @@ def run_subscription_round(job: dict, profile: dict, on_progress=None) -> dict:
         if loop_state == "in_progress":
             questions_to_surface = rank_and_cap_questions(
                 resume_draft["clarifying_questions"], prior_asked_questions,
+            )
+            # Real fix for Zahir's standing "generic keyword prompt, not a
+            # real interviewer question" complaint (2026-08-19, see
+            # gap_question_phrasing.py's own module docstring for the full
+            # investigation/design): runs AFTER capping, so this is at most
+            # one additional bounded subscription call for this round's
+            # final (<= MAX_QUESTIONS_PER_ROUND) surfaced set, and none at
+            # all once the AI's own free-form questions already cover a
+            # gap in their own words. Never raises - see that function's
+            # own docstring for why a rephrase-only failure falls back to
+            # the original canned text rather than failing this round.
+            questions_to_surface = rephrase_canned_gap_questions_via_llm(
+                questions_to_surface, job, profile, on_progress=on_progress,
             )
         else:
             # "ready" (>= 90, no more questions needed) or "plateaued"

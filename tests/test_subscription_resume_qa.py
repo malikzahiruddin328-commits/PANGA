@@ -164,6 +164,65 @@ def test_run_subscription_round_success_persists_records_round_and_releases_lock
     assert stamped == ["drafting", None]
 
 
+def test_run_subscription_round_rephrases_canned_gap_questions_when_in_progress(monkeypatch):
+    # Real fix for Zahir's standing "generic keyword prompt" complaint
+    # (2026-08-19, see tailoring.gap_question_phrasing's own docstring):
+    # the ranked/capped in-progress question set must be run through the
+    # rephrase pass before it's persisted/surfaced. Mocked at the module
+    # seam run_subscription_round() actually calls - gap_question_
+    # phrasing's own internal reasoner-call behavior is covered by its own
+    # test suite, this only verifies the wiring/ordering.
+    monkeypatch.setattr(sqa, "try_acquire_generation_lock", lambda source, job_id: True)
+    monkeypatch.setattr(sqa, "release_generation_lock", lambda source, job_id: None)
+    original_questions = [{"skill": "Budget", "question": "canned q", "suggested_answer": ""}]
+    resume_draft = {
+        "text": "resume text", "ats_score": 60, "ats_rationale": "r", "ats_next_actions": [],
+        "clarifying_questions": list(original_questions),
+        "suggested_strategy_tag": "tag", "unconfirmed_claims": [],
+    }
+    monkeypatch.setattr(sqa, "draft_resume_via_subscription", lambda job, profile, on_progress=None, on_pid=None, already_asked_questions=None: resume_draft)
+    upserts, statuses, round_calls = _patch_round_persist(monkeypatch, round_number=1)
+
+    rephrase_calls = []
+
+    def _fake_rephrase(questions, job, profile, on_progress=None):
+        rephrase_calls.append((questions, job, profile))
+        return [{**questions[0], "question": "grounded q", "question_source": "llm_grounded"}]
+
+    monkeypatch.setattr(sqa, "rephrase_canned_gap_questions_via_llm", _fake_rephrase)
+
+    result = sqa.run_subscription_round(dict(JOB), PROFILE)
+
+    assert len(rephrase_calls) == 1
+    # Called with the already-ranked-and-capped list, not the raw one.
+    assert rephrase_calls[0][0] == original_questions
+    assert result["resume_draft"]["clarifying_questions"][0]["question"] == "grounded q"
+    assert upserts[0][1]["resume_clarifying_questions"][0]["question"] == "grounded q"
+    assert round_calls[0]["newly_asked_question_texts"] == ["grounded q"]
+
+
+def test_run_subscription_round_skips_rephrase_when_no_more_questions_needed(monkeypatch):
+    # "ready"/"plateaued" rounds already force questions_to_surface to []
+    # before this pass would run - must not call the rephraser on an empty
+    # list either (it would be a wasted, pointless CLI call).
+    monkeypatch.setattr(sqa, "try_acquire_generation_lock", lambda source, job_id: True)
+    monkeypatch.setattr(sqa, "release_generation_lock", lambda source, job_id: None)
+    resume_draft = {
+        "text": "resume text", "ats_score": 94, "ats_rationale": "r", "ats_next_actions": [],
+        "clarifying_questions": [{"skill": "Nice to have", "question": "canned q", "suggested_answer": ""}],
+        "suggested_strategy_tag": "tag", "unconfirmed_claims": [],
+    }
+    monkeypatch.setattr(sqa, "draft_resume_via_subscription", lambda job, profile, on_progress=None, on_pid=None, already_asked_questions=None: resume_draft)
+    _patch_round_persist(monkeypatch, round_number=1)
+
+    rephrase_calls = []
+    monkeypatch.setattr(sqa, "rephrase_canned_gap_questions_via_llm", lambda *a, **k: rephrase_calls.append(1) or [])
+
+    sqa.run_subscription_round(dict(JOB), PROFILE)
+
+    assert rephrase_calls == []
+
+
 def test_run_subscription_round_ready_state_clears_questions_at_target(monkeypatch):
     # Zahir: "the aim is to always give the user 90+ ats score... if it is
     # less then 90 them its upto the user" - once a round hits 90+, no
