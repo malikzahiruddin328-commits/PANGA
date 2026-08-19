@@ -125,6 +125,7 @@ from profile.ingest import load_manifest_result, remove_document, ingest_uploade
 from profile.storage import load_profile, update_profile_field
 from profile.interview import save_profile_gap_review_answers
 from skills.gap_frequency_analysis import analyze_recurring_gaps, build_review_questions, DEFAULT_MIN_RECURRENCE
+from tailoring.gap_answer_drafting import draft_gap_answer, draft_gap_answers_concurrently
 try:
     # Bhangi is a separate, standalone cross-project tool (see
     # _find_bhangi_src above) - not something this app ships or installs
@@ -2862,9 +2863,63 @@ def render_recurring_gap_review_panel() -> None:
     Same auto-save-on-edit + st.toast + st.rerun() pattern as
     render_analyze_fit_section's per-job questions immediately above -
     one real interaction model for "answer a gap question" across this
-    whole tab, not two."""
+    whole tab, not two.
+
+    2026-08-19 addition ("Draft with AI" / "Draft all with AI"): a real,
+    permanent feature built from a one-off throwaway script that proved
+    most of these recurring gaps (27 of 37 in a real run) can be answered
+    directly and correctly from Zahir's OWN already-documented profile
+    data (work_history, certifications, education, etc.) by an LLM call -
+    tailoring.gap_answer_drafting, the SAME $0 subscription `claude` CLI
+    mechanism (reasoner_cli.run_claude_cli) every other in-app AI call in
+    this file already uses. Zero fabrication: the draft is ALWAYS shown as
+    a pre-filled but EDITABLE box in a distinct review card BEFORE
+    anything saves - it never lands in the plain auto-save-on-type box
+    above, specifically because that box's own contract ("any non-blank
+    text is a real, deliberate answer Zahir just typed - save it") would
+    otherwise silently auto-save an unedited AI guess the instant it's
+    drafted, which is exactly the "prefilled value mistaken for the
+    user's own answer" HCI failure this repo's CLAUDE.md calls out. The
+    review card's "Confirm & save" button is the one and only path an
+    AI-drafted answer can reach save_profile_gap_review_answers() through -
+    matches this codebase's standing "AI suggests, human confirms facts"
+    discipline (see tailoring/claim_verification.py's own docstring for
+    the established pattern this mirrors).
+
+    Batch drafting ("Draft all with AI") reuses the ThreadPoolExecutor +
+    concurrency.adaptive_throttle.effective_worker_count pattern this
+    file's own basket-wide "Draft & score all" button established
+    (tailoring.gap_answer_drafting.draft_gap_answers_concurrently), never
+    a sequential loop over questions - this project's standing rule
+    against sequential loops for multi-item real-cost AI work (see
+    feedback_parallelize_batch_operations.md)."""
     analysis = analyze_recurring_gaps()
     questions = build_review_questions(analysis)
+
+    # session_state key -> {"can_answer":, "answer":, "error":} once a
+    # question has been drafted (single or batch) and not yet confirmed or
+    # discarded. Deliberately keyed by the SAME q_key the widget below
+    # already uses, so a batch draft and a per-question draft both land in
+    # the one review-card code path.
+    ai_drafts: dict = st.session_state.setdefault("recurring_gap_ai_drafts", {})
+    # Per-question monotonic counter, bumped every time a NEW draft lands
+    # for that question - folded into the review text_area's own widget
+    # key below (this repo's documented Streamlit gotcha, CLAUDE.md: "a
+    # widget ignores a new value= once its key already has session-state -
+    # fold whatever changed into the key"). Two real bugs this avoids,
+    # found live writing this feature's own tests: (1) without a fresh key
+    # per draft, discarding then re-drafting the same question would show
+    # the FIRST draft's stale text forever, since text_area's value= is
+    # ignored once its key exists; (2) manually st.session_state.pop()-ing
+    # a widget's OWN key (the first fix attempted here) crashes on the
+    # NEXT run with a real Streamlit KeyError - a widget's session-state
+    # entry is tracked through an internal id<->key mapping that survives
+    # across reruns, and force-deleting just the value out from under it
+    # leaves that mapping dangling. Never popping the widget key at all,
+    # and instead always giving the NEXT draft (if any) a new key, sidesteps
+    # both problems entirely - the old key's entry is simply never read
+    # again once the counter moves on, no manual cleanup required.
+    ai_draft_seq: dict = st.session_state.setdefault("recurring_gap_ai_draft_seq", {})
 
     with st.container(border=True):
         st.markdown("**Review recurring profile gaps**")
@@ -2876,7 +2931,10 @@ def render_recurring_gap_review_panel() -> None:
             "your profile yet - answer these once here instead of "
             "re-answering the same underlying fact job by job. Nothing is "
             "ever guessed on your behalf: every box below starts empty, "
-            "and leaving one blank changes nothing."
+            "and leaving one blank changes nothing. \"Draft with AI\" can "
+            "propose an answer from your own already-documented profile - "
+            "it never saves on its own, you always review and confirm (or "
+            "discard) it first."
         )
         if not questions:
             if analysis["jobs_with_keywords"] == 0:
@@ -2889,8 +2947,45 @@ def render_recurring_gap_review_panel() -> None:
                 st.markdown("Nothing recurring enough to ask about right now - nice place to be.")
         else:
             st.markdown(f"{len(questions)} real, recurring gap(s) found.")
-            for q in questions:
-                q_key = f"recurring_gap_{abs(hash(q['skill'] + '|' + q['type'])) % 10_000_000}"
+
+            keyed_questions = [
+                (f"recurring_gap_{abs(hash(q['skill'] + '|' + q['type'])) % 10_000_000}", q)
+                for q in questions
+            ]
+            draftall_placeholder = st.empty()
+            if st.button(
+                f"Draft all {len(keyed_questions)} with AI (subscription, $0)", key="recurring_gap_draftall",
+                help=(
+                    "Drafts a candidate answer for every question below from your own "
+                    "profile data, several at once. Not a paid call. Each drafted answer "
+                    "still needs your review and confirmation before it saves - nothing "
+                    "here saves automatically."
+                ),
+            ):
+                to_draft = [(key, q) for key, q in keyed_questions if key not in ai_drafts]
+                if not to_draft:
+                    st.toast("Every question already has a draft pending review below.", icon=":material/info:")
+                else:
+                    draftall_placeholder.markdown(
+                        f":material/hourglass_top: Drafting {len(to_draft)} answer(s) from your profile..."
+                    )
+                    try:
+                        batch_results = draft_gap_answers_concurrently(to_draft, load_profile())
+                    except ReasonerUnavailable as exc:
+                        st.toast(f"Can't draft right now: {exc}", icon=":material/error:")
+                    else:
+                        ai_drafts.update(batch_results)
+                        for drafted_key in batch_results:
+                            ai_draft_seq[drafted_key] = ai_draft_seq.get(drafted_key, 0) + 1
+                        answerable = sum(1 for r in batch_results.values() if r.get("can_answer") and not r.get("error"))
+                        st.toast(
+                            f"Drafted {len(batch_results)} answer(s) ({answerable} with a real match in your "
+                            "profile) - review each below before saving.",
+                            icon=":material/check_circle:",
+                        )
+                        st.rerun()
+
+            for q_key, q in keyed_questions:
                 with st.container(border=True):
                     badge_col, text_col = st.columns([1, 5])
                     with badge_col:
@@ -2900,16 +2995,75 @@ def render_recurring_gap_review_panel() -> None:
                             st.badge(f"{q['job_count']} postings", color="blue")
                     with text_col:
                         st_markdown_raw_text(q["question"])
-                    answer_value = st.text_area(
-                        q["question"], value="", key=q_key, height=68,
-                        label_visibility="collapsed", placeholder="Type your answer, or leave blank to skip...",
-                    )
-                    if answer_value and answer_value.strip():
-                        save_profile_gap_review_answers([{
-                            "skill": q["skill"], "answer": answer_value, "question": q["question"],
-                        }])
-                        st.toast("Saved.", icon=":material/check_circle:")
-                        st.rerun()
+
+                    draft = ai_drafts.get(q_key)
+                    if draft is None:
+                        entry_col, draft_col = st.columns([5, 1])
+                        with entry_col:
+                            answer_value = st.text_area(
+                                q["question"], value="", key=q_key, height=68,
+                                label_visibility="collapsed", placeholder="Type your answer, or leave blank to skip...",
+                            )
+                        with draft_col:
+                            if st.button("Draft with AI", key=f"{q_key}_draftai"):
+                                with st.spinner("Drafting from your profile..."):
+                                    try:
+                                        result = draft_gap_answer(q, load_profile())
+                                    except ReasonerUnavailable as exc:
+                                        st.toast(f"Can't draft right now: {exc}", icon=":material/error:")
+                                    else:
+                                        ai_drafts[q_key] = result
+                                        ai_draft_seq[q_key] = ai_draft_seq.get(q_key, 0) + 1
+                                        st.rerun()
+                        if answer_value and answer_value.strip():
+                            save_profile_gap_review_answers([{
+                                "skill": q["skill"], "answer": answer_value, "question": q["question"],
+                            }])
+                            st.toast("Saved.", icon=":material/check_circle:")
+                            st.rerun()
+                    else:
+                        # Review card - the ONLY path an AI-drafted answer can
+                        # reach save_profile_gap_review_answers() through (see
+                        # this function's own docstring). Never rendered with
+                        # the box above already auto-saving on non-blank text.
+                        if draft.get("error"):
+                            st.markdown(
+                                f":material/error: Couldn't draft this one: {draft['error']} "
+                                "You can still answer it yourself below, or try drafting again."
+                            )
+                        elif not draft.get("can_answer"):
+                            st.markdown(
+                                ":material/info: The AI couldn't confidently answer this from your "
+                                "documented profile - review its note below, edit it, or leave the box "
+                                "blank and discard."
+                            )
+                        else:
+                            st.markdown(
+                                ":material/smart_toy: AI-drafted from your profile - review and edit "
+                                "before saving."
+                            )
+                        draft_seq = ai_draft_seq.get(q_key, 0)
+                        edited_value = st.text_area(
+                            q["question"], value=draft.get("answer", ""), key=f"{q_key}_ai_review_{draft_seq}",
+                            height=68, label_visibility="collapsed",
+                        )
+                        confirm_col, discard_col = st.columns(2)
+                        with confirm_col:
+                            if st.button("Confirm & save", key=f"{q_key}_ai_confirm", type="primary"):
+                                stripped = edited_value.strip()
+                                if not stripped:
+                                    st.toast("Nothing to save - the box is empty.", icon=":material/warning:")
+                                else:
+                                    save_profile_gap_review_answers([{
+                                        "skill": q["skill"], "answer": stripped, "question": q["question"],
+                                    }])
+                                    ai_drafts.pop(q_key, None)
+                                    st.toast("Saved.", icon=":material/check_circle:")
+                                    st.rerun()
+                        with discard_col:
+                            if st.button("Discard draft", key=f"{q_key}_ai_discard"):
+                                ai_drafts.pop(q_key, None)
+                                st.rerun()
 
 
 def render_answered_gap_questions() -> None:
