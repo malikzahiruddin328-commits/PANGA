@@ -5,7 +5,8 @@ button and its bulk "Generate for all N" action. Everything it calls
 generation lock) is already covered by its own test suite elsewhere -
 these tests are about the orchestration this module adds on top: lock
 handling, normalizing generate_documents()'s two different failure
-shapes into one, and generate_for_basket()'s continue-past-failure loop.
+shapes into one, and generate_for_basket()'s concurrent, continue-past-
+failure, early-stop-on-systemic-failure batch behavior.
 """
 
 import tailoring.bulk_generate as bulk_generate
@@ -116,19 +117,170 @@ def test_generate_for_basket_continues_past_a_locked_job(monkeypatch):
         return {"ok": True, "locked": False, "errors": {}}
     monkeypatch.setattr(bulk_generate, "generate_for_job", _fake_generate_for_job)
 
+    # Completion order is no longer guaranteed under concurrency, so this
+    # only checks the set of progress calls and the final results dict -
+    # not a fixed 1,2,3... sequence (see test_generate_for_basket_on_
+    # progress_fires_once_per_job_as_completed_count below for the shape
+    # of the new contract).
     progress_calls = []
     results = bulk_generate.generate_for_basket(
         [job_a, job_b], PROFILE, ["resume"],
-        on_progress=lambda i, total, job: progress_calls.append((i, total, job["job_id"])),
+        on_progress=lambda completed, total, job: progress_calls.append((completed, total, job["job_id"])),
     )
 
     assert results[("linkedin", "a")]["locked"] is True
     assert results[("linkedin", "b")]["ok"] is True
-    assert progress_calls == [(1, 2, "a"), (2, 2, "b")]
+    assert {job_id for _, _, job_id in progress_calls} == {"a", "b"}
+    assert sorted(completed for completed, _, _ in progress_calls) == [1, 2]
+    assert all(total == 2 for _, total, _ in progress_calls)
 
 
 def test_generate_for_basket_empty_basket_returns_empty_results(monkeypatch):
     assert bulk_generate.generate_for_basket([], PROFILE, ["resume"]) == {}
+
+
+def test_generate_for_basket_runs_jobs_with_real_concurrent_overlap(monkeypatch):
+    # Real overlap, not just "the code technically uses a pool" - same
+    # style of check as test_generate_documents_never_exceeds_max_concurrent_
+    # drafts in tests/test_drafting.py.
+    import threading
+    import time
+
+    lock = threading.Lock()
+    concurrent_count = 0
+    max_seen = 0
+
+    def _fake_generate_for_job(job, profile, doc_keys):
+        nonlocal concurrent_count, max_seen
+        with lock:
+            concurrent_count += 1
+            max_seen = max(max_seen, concurrent_count)
+        time.sleep(0.05)
+        with lock:
+            concurrent_count -= 1
+        return {"ok": True, "locked": False, "errors": {}}
+    monkeypatch.setattr(bulk_generate, "generate_for_job", _fake_generate_for_job)
+    monkeypatch.setattr(bulk_generate, "effective_worker_count", lambda target_max, *a, **k: target_max)
+
+    jobs = [{"source": "linkedin", "job_id": str(i), "title": f"Job {i}", "organization": "X"} for i in range(5)]
+
+    results = bulk_generate.generate_for_basket(jobs, PROFILE, ["resume"], max_workers=5)
+
+    assert len(results) == 5
+    assert max_seen > 1
+
+
+def test_generate_for_basket_never_exceeds_the_worker_ceiling(monkeypatch):
+    captured_target_max = {}
+
+    def _fake_effective_worker_count(target_max, *args, **kwargs):
+        captured_target_max["value"] = target_max
+        return target_max
+    monkeypatch.setattr(bulk_generate, "effective_worker_count", _fake_effective_worker_count)
+    monkeypatch.setattr(bulk_generate, "generate_for_job", lambda job, profile, doc_keys: {"ok": True, "locked": False, "errors": {}})
+
+    jobs = [{"source": "linkedin", "job_id": str(i), "title": f"Job {i}", "organization": "X"} for i in range(10)]
+
+    bulk_generate.generate_for_basket(jobs, PROFILE, ["resume"])
+
+    assert captured_target_max["value"] == bulk_generate.BASKET_BULK_GENERATE_MAX_WORKERS
+
+
+def test_generate_for_basket_one_jobs_unexpected_exception_does_not_take_down_the_rest(monkeypatch):
+    job_a = {"source": "linkedin", "job_id": "a", "title": "A", "organization": "X"}
+    job_b = {"source": "linkedin", "job_id": "b", "title": "B", "organization": "Y"}
+
+    def _fake_generate_for_job(job, profile, doc_keys):
+        if job["job_id"] == "a":
+            raise RuntimeError("simulated unexpected failure")
+        return {"ok": True, "locked": False, "errors": {}}
+    monkeypatch.setattr(bulk_generate, "generate_for_job", _fake_generate_for_job)
+
+    results = bulk_generate.generate_for_basket([job_a, job_b], PROFILE, ["resume"])
+
+    assert results[("linkedin", "a")]["ok"] is False
+    assert "generate" in results[("linkedin", "a")]["errors"]
+    assert results[("linkedin", "b")]["ok"] is True
+
+
+def test_generate_for_basket_stops_early_after_first_n_failures(monkeypatch):
+    # Force strictly one-at-a-time execution (max_workers=1) so completion
+    # order is deterministic: job 0, then 1, then 2, then (if not stopped)
+    # 3... The first EARLY_STOP_CHECK_COUNT (3) jobs all fail -> the batch
+    # must stop before job 3 (or any later job) is ever submitted.
+    called_job_ids = []
+
+    def _fake_generate_for_job(job, profile, doc_keys):
+        called_job_ids.append(job["job_id"])
+        return {"ok": False, "locked": False, "errors": {"generate": "boom"}}
+    monkeypatch.setattr(bulk_generate, "generate_for_job", _fake_generate_for_job)
+
+    jobs = [{"source": "linkedin", "job_id": str(i), "title": f"Job {i}", "organization": "X"} for i in range(10)]
+
+    results = bulk_generate.generate_for_basket(jobs, PROFILE, ["resume"], max_workers=1)
+
+    assert called_job_ids == ["0", "1", "2"]  # never reached job 3+
+    assert "_stopped_early" in results
+    stopped = results["_stopped_early"]
+    assert stopped["ran"] == 3
+    assert stopped["total"] == 10
+    assert [j["job_id"] for j in stopped["skipped_jobs"]] == [str(i) for i in range(3, 10)]
+    # The 3 jobs that DID run still have their real per-job results present.
+    for i in range(3):
+        assert results[("linkedin", str(i))]["ok"] is False
+
+
+def test_generate_for_basket_does_not_stop_early_when_a_locked_result_breaks_the_failure_run(monkeypatch):
+    # A "locked" result (another generation already in progress) is not a
+    # genuine failure and must not count toward the early-stop threshold -
+    # otherwise a batch that happens to hit a couple of already-in-progress
+    # jobs would falsely trip the safety check.
+    def _fake_generate_for_job(job, profile, doc_keys):
+        if job["job_id"] == "1":
+            return {"ok": False, "locked": True, "errors": {}}
+        return {"ok": False, "locked": False, "errors": {"generate": "boom"}}
+    monkeypatch.setattr(bulk_generate, "generate_for_job", _fake_generate_for_job)
+
+    jobs = [{"source": "linkedin", "job_id": str(i), "title": f"Job {i}", "organization": "X"} for i in range(5)]
+
+    results = bulk_generate.generate_for_basket(jobs, PROFILE, ["resume"], max_workers=1)
+
+    assert "_stopped_early" not in results
+    assert len(results) == 5
+
+
+def test_generate_for_basket_does_not_stop_early_when_one_of_the_first_three_succeeds(monkeypatch):
+    def _fake_generate_for_job(job, profile, doc_keys):
+        if job["job_id"] == "1":
+            return {"ok": True, "locked": False, "errors": {}}
+        return {"ok": False, "locked": False, "errors": {"generate": "boom"}}
+    monkeypatch.setattr(bulk_generate, "generate_for_job", _fake_generate_for_job)
+
+    jobs = [{"source": "linkedin", "job_id": str(i), "title": f"Job {i}", "organization": "X"} for i in range(5)]
+
+    results = bulk_generate.generate_for_basket(jobs, PROFILE, ["resume"], max_workers=1)
+
+    assert "_stopped_early" not in results
+    assert len(results) == 5
+
+
+def test_generate_for_basket_on_progress_fires_once_per_job_as_completed_count(monkeypatch):
+    monkeypatch.setattr(bulk_generate, "generate_for_job", lambda job, profile, doc_keys: {"ok": True, "locked": False, "errors": {}})
+    jobs = [{"source": "linkedin", "job_id": str(i), "title": f"Job {i}", "organization": "X"} for i in range(4)]
+
+    progress_calls = []
+    bulk_generate.generate_for_basket(
+        jobs, PROFILE, ["resume"],
+        on_progress=lambda completed, total, job: progress_calls.append((completed, total)),
+    )
+
+    # Fires exactly once per job, with a monotonically increasing
+    # completed-count from 1..total (order among jobs isn't fixed, but the
+    # count itself always is - one call per completion, never a gap or
+    # duplicate).
+    assert len(progress_calls) == 4
+    assert sorted(c for c, _ in progress_calls) == [1, 2, 3, 4]
+    assert all(total == 4 for _, total in progress_calls)
 
 
 # --- 2026-08-13 additions (feature/in-app-subscription-qa): on_progress

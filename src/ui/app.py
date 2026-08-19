@@ -1250,14 +1250,30 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                             st.toast("Pick at least one document type first.", icon=":material/warning:")
                         else:
                             with st.container(key="basket_bulk_progress_bar"):
-                                bulk_bar = st.progress(0, text=f"Drafting 1 of {len(ready_jobs)}: {job_label(ready_jobs[0])}...")
+                                bulk_bar = st.progress(0, text=f"Drafting 0 of {len(ready_jobs)}...")
                             st.html(progress_shimmer_css("basket_bulk_progress_bar"))
 
-                            def _update_bulk_progress(i, total, job):
-                                bulk_bar.progress((i - 1) / total, text=f"Drafting {i} of {total}: {job_label(job)}...")
+                            # generate_for_basket() now runs these concurrently
+                            # (2026-08-19, same pattern as "Draft & score all"
+                            # above) - completion order is no longer 1, 2, 3...,
+                            # so `completed` here is a real completed-count, not
+                            # a fixed position; the last job named is whichever
+                            # one just finished, not necessarily the last one
+                            # still running.
+                            def _update_bulk_progress(completed, total, job):
+                                bulk_bar.progress(completed / total, text=f"Drafted {completed} of {total} (just finished: {job_label(job)})...")
 
                             results = generate_for_basket(ready_jobs, load_profile(), doc_keys, on_progress=_update_bulk_progress)
                             bulk_bar.progress(1.0, text=":material/check_circle: Done.")
+                            # "_stopped_early" (2026-08-19 safety check) is
+                            # metadata, not a per-job result - pop it before
+                            # treating the rest of `results` as (source,
+                            # job_id) -> outcome entries, and surface it as
+                            # its own distinct message so a stopped-early
+                            # batch reads as "stopped, N never ran" rather
+                            # than silently looking like a smaller-than-
+                            # requested success.
+                            stopped_early = results.pop("_stopped_early", None)
                             for job_key, r in results.items():
                                 st.session_state["panga_basket_finalbuild_results"][job_key] = {
                                     "ok": bool(r.get("ok")), "locked": bool(r.get("locked")), "errors": r.get("errors") or {},
@@ -1272,7 +1288,15 @@ def render_basket_bar(all_jobs: list[dict]) -> None:
                                 summary += f" {failed} had at least one document fail - see the Results tab for detail."
                             if not_ready_jobs:
                                 summary += f" {len(not_ready_jobs)} skipped (no subscription round yet): {', '.join(job_label(j) for j in not_ready_jobs)}."
-                            st.toast(summary, icon=":material/check_circle:" if not failed else ":material/warning:")
+                            if stopped_early:
+                                skipped_labels = ", ".join(job_label(j) for j in stopped_early["skipped_jobs"])
+                                summary += (
+                                    f" STOPPED EARLY: the first {stopped_early['ran']} jobs all failed, so the "
+                                    f"remaining {len(stopped_early['skipped_jobs'])} job(s) were never started "
+                                    f"(not run, not failed): {skipped_labels}. Check what's going wrong before "
+                                    "retrying the rest."
+                                )
+                            st.toast(summary, icon=":material/warning:" if (failed or stopped_early) else ":material/check_circle:")
                             st.rerun()
                     if not_ready_jobs:
                         st.markdown(
