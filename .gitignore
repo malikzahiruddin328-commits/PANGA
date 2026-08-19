@@ -26,6 +26,10 @@ installers/
 Thumbs.db
 .DS_Store
 
+# run_app.bat's own process-tracking file (2026-08-18 reliability fix) -
+# machine/run-specific, never meaningful to commit.
+panga.pid
+
 # Claude Code local/machine-specific settings (permission grants etc.)
 .claude/settings.local.json
 

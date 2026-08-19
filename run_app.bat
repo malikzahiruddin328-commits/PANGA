@@ -8,11 +8,13 @@ rem STALE Claude-dev-preview process still squatting on 8501 from an
 rem earlier session, holding old cached code, instead of a fresh process
 rem reading the current file on disk. Separate ports means this app's own
 rem launches never collide with (or get shadowed by) a dev-preview server.
-rem Also kill anything already on 8510 first, in case a previous run of
-rem THIS shortcut was left running/hung - guarantees every double-click
-rem starts a genuinely fresh process, not a reused stale one.
-for /f "tokens=5" %%a in ('netstat -aon ^| findstr ":8510" ^| findstr "LISTENING"') do (
-    taskkill /F /PID %%a >nul 2>&1
-)
-
-venv\Scripts\streamlit.exe run src\ui\app.py --server.port 8510 --server.headless false
+rem
+rem Real logic lives in run_app.ps1 (2026-08-18 reliability fix): tracks
+rem the actual PID of the process THIS script starts in panga.pid, so a
+rem restart always targets a known process instead of re-discovering
+rem "whatever's on the port" via netstat/findstr, and verifies the port
+rem actually comes back up before declaring success. Real incident this
+rem fixes: a restart that silently didn't take effect, leaving an hours-
+rem old process serving stale code undetected until someone checked the
+rem port's owning PID by hand.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0run_app.ps1"

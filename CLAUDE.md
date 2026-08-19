@@ -191,7 +191,18 @@ should be caught proactively, not reactively explained to the AI by him.
 
 **Port convention (concrete example of the above):** production is always
 port 8510, launched only via `run_app.bat` (which kills-and-restarts on
-that port - never anything else touches 8510). Dev/test live-verification
+that port - never anything else touches 8510). As of 2026-08-18, the real
+kill-and-restart logic lives in `run_app.ps1` and is PID-file-based
+(`panga.pid`, gitignored) rather than netstat/findstr port-scraping - it
+tracks the actual PID of the process it started, verifies that PID is
+really gone before relaunching, and verifies the new process is actually
+listening on 8510 before declaring success. Real incident this replaced:
+a restart that appeared to succeed (no error) but silently left an hours-
+old process serving stale code - undetected until someone checked the
+port's owning PID by hand. If you ever need to check/kill Panga's
+production process directly rather than through `run_app.bat`, read the
+PID from `panga.pid` first rather than assuming "whatever's on 8510 right
+now is the right one." Dev/test live-verification
 uses one of the named slots in `.claude/launch.json` (8501-8509 range) -
 never invent an ad hoc port. If every slot is in use, stop one (see
 "stop preview servers" below) rather than freelancing a new number -
