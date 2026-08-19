@@ -337,3 +337,142 @@ def test_generate_for_job_no_resume_draft_source_when_resume_not_requested(monke
     bulk_generate.generate_for_job(JOB, PROFILE, ["cover_letter"])
 
     assert upserts[0][1]["resume_draft_source"] is None
+
+
+# --- 2026-08-19 additions: don't redraft a doc_key that already has real,
+# complete output - the "10-job basket, 6 hit the spend cap after the
+# resume succeeded but before the cover letter did" incident. ---
+
+
+ALREADY_BUILT_RESUME_APP_RECORD = {
+    "status": "under review",
+    "resume_draft_source": "paid",
+    "resume_text": "existing real resume text",
+    "resume_ats_score": 77,
+    "resume_ats_rationale": "existing rationale",
+    "resume_ats_next_actions": ["existing action"],
+    "resume_clarifying_questions": [],
+    "strategy_tag_suggestion": "existing-tag",
+    "resume_unconfirmed_claims_ai_reported": [],
+}
+
+
+def test_generate_for_job_with_resume_already_built_only_drafts_the_missing_doc_key(monkeypatch):
+    monkeypatch.setattr(bulk_generate, "try_acquire_generation_lock", lambda source, job_id: True)
+    monkeypatch.setattr(bulk_generate, "release_generation_lock", lambda source, job_id: None)
+    monkeypatch.setattr(bulk_generate, "get_application", lambda source, job_id: dict(ALREADY_BUILT_RESUME_APP_RECORD))
+
+    seen_doc_keys = []
+
+    def _fake_generate_documents(job, profile, doc_keys, existing_resume_text=None, on_progress=None):
+        seen_doc_keys.append(doc_keys)
+        return {"cover_letter": "fresh cover letter text", "_errors": {}}
+    monkeypatch.setattr(bulk_generate, "generate_documents", _fake_generate_documents)
+
+    upserts, syncs = [], []
+    monkeypatch.setattr(bulk_generate, "upsert_application", lambda *a, **k: upserts.append((a, k)))
+    monkeypatch.setattr(bulk_generate, "sync_workspace_documents", lambda *a, **k: syncs.append((a, k)))
+
+    result = bulk_generate.generate_for_job(JOB, PROFILE, ["resume", "cover_letter"])
+
+    assert result == {"ok": True, "locked": False, "errors": {}}
+    # generate_documents() was only ever asked for the missing doc type -
+    # the already-built resume was never sent back through the paid path.
+    assert seen_doc_keys == [["cover_letter"]]
+    # The persisted (merged) result still has real content for BOTH the
+    # reused resume and the freshly drafted cover letter - nothing already-
+    # good was dropped.
+    upsert_kwargs = upserts[0][1]
+    assert upsert_kwargs["resume_text"] == "existing real resume text"
+    assert upsert_kwargs["cover_letter_text"] == "fresh cover letter text"
+    # Resume wasn't freshly drafted this call, so its already-correct
+    # "paid" stamp must be left untouched (None here means "don't touch"),
+    # not redundantly re-stamped.
+    assert upsert_kwargs["resume_draft_source"] is None
+
+
+def test_generate_for_job_everything_already_built_skips_generate_documents_entirely(monkeypatch):
+    monkeypatch.setattr(bulk_generate, "try_acquire_generation_lock", lambda source, job_id: True)
+    monkeypatch.setattr(bulk_generate, "release_generation_lock", lambda source, job_id: None)
+    fully_built = dict(ALREADY_BUILT_RESUME_APP_RECORD)
+    fully_built["cover_letter_text"] = "existing cover letter text"
+    monkeypatch.setattr(bulk_generate, "get_application", lambda source, job_id: fully_built)
+
+    called = []
+    monkeypatch.setattr(bulk_generate, "generate_documents", lambda *a, **k: called.append(1) or {})
+    upserts, syncs = [], []
+    monkeypatch.setattr(bulk_generate, "upsert_application", lambda *a, **k: upserts.append((a, k)))
+    monkeypatch.setattr(bulk_generate, "sync_workspace_documents", lambda *a, **k: syncs.append((a, k)))
+
+    result = bulk_generate.generate_for_job(JOB, PROFILE, ["resume", "cover_letter"])
+
+    assert result == {"ok": True, "locked": False, "errors": {}}
+    assert called == []  # generate_documents() never called - no wasted paid call
+    assert upserts == []  # nothing changed, nothing to persist
+    assert syncs == []
+
+
+def test_generate_for_job_resume_reused_but_cover_letter_drafted_passes_existing_resume_text_through(monkeypatch):
+    # Cross-document consistency contract: when resume is reused (not in
+    # the batch actually sent to generate_documents()), the EXISTING resume
+    # text must still be passed as existing_resume_text so cover_letter can
+    # be checked for factual consistency against it.
+    monkeypatch.setattr(bulk_generate, "try_acquire_generation_lock", lambda source, job_id: True)
+    monkeypatch.setattr(bulk_generate, "release_generation_lock", lambda source, job_id: None)
+    monkeypatch.setattr(bulk_generate, "get_application", lambda source, job_id: dict(ALREADY_BUILT_RESUME_APP_RECORD))
+
+    captured = {}
+
+    def _fake_generate_documents(job, profile, doc_keys, existing_resume_text=None, on_progress=None):
+        captured["doc_keys"] = doc_keys
+        captured["existing_resume_text"] = existing_resume_text
+        return {"cover_letter": "fresh cover letter text", "_errors": {}}
+    monkeypatch.setattr(bulk_generate, "generate_documents", _fake_generate_documents)
+    _patch_persist(monkeypatch, upserts=[], syncs=[])
+    monkeypatch.setattr(bulk_generate, "get_application", lambda source, job_id: dict(ALREADY_BUILT_RESUME_APP_RECORD))
+
+    bulk_generate.generate_for_job(JOB, PROFILE, ["resume", "cover_letter"])
+
+    assert captured["doc_keys"] == ["cover_letter"]
+    assert captured["existing_resume_text"] == "existing real resume text"
+
+
+def test_generate_for_job_normal_case_nothing_already_built_drafts_everything_unchanged(monkeypatch):
+    monkeypatch.setattr(bulk_generate, "try_acquire_generation_lock", lambda source, job_id: True)
+    monkeypatch.setattr(bulk_generate, "release_generation_lock", lambda source, job_id: None)
+    monkeypatch.setattr(bulk_generate, "get_application", lambda source, job_id: {})
+
+    seen_doc_keys = []
+
+    def _fake_generate_documents(job, profile, doc_keys, existing_resume_text=None, on_progress=None):
+        seen_doc_keys.append(doc_keys)
+        assert existing_resume_text is None  # resume IS in this batch
+        return {
+            "resume": {"text": "brand new resume", "ats_score": 90, "ats_rationale": "r", "ats_next_actions": [], "clarifying_questions": [], "suggested_strategy_tag": "tag"},
+            "cover_letter": "brand new cover letter",
+            "_errors": {},
+        }
+    monkeypatch.setattr(bulk_generate, "generate_documents", _fake_generate_documents)
+    upserts, syncs = [], []
+    monkeypatch.setattr(bulk_generate, "upsert_application", lambda *a, **k: upserts.append((a, k)))
+    monkeypatch.setattr(bulk_generate, "sync_workspace_documents", lambda *a, **k: syncs.append((a, k)))
+
+    result = bulk_generate.generate_for_job(JOB, PROFILE, ["resume", "cover_letter"])
+
+    assert result == {"ok": True, "locked": False, "errors": {}}
+    assert seen_doc_keys == [["resume", "cover_letter"]]  # full set drafted, nothing excluded
+    assert upserts[0][1]["resume_text"] == "brand new resume"
+    assert upserts[0][1]["cover_letter_text"] == "brand new cover letter"
+    assert upserts[0][1]["resume_draft_source"] == "paid"
+
+
+def test_already_built_doc_keys_ignores_subscription_only_resume():
+    # A subscription-path-only resume (resume_draft_source == "subscription")
+    # must never count as "already built" for the paid path - it's a
+    # different, $0 mechanism, not a real paid final build.
+    app_record = {"resume_draft_source": "subscription", "resume_text": "free draft text"}
+    assert bulk_generate._already_built_doc_keys(app_record, ["resume"]) == []
+
+
+def test_already_built_doc_keys_treats_unknown_doc_key_as_not_built():
+    assert bulk_generate._already_built_doc_keys({}, ["some_future_doc_type"]) == []

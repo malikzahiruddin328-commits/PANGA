@@ -63,11 +63,60 @@ BASKET_BULK_GENERATE_MAX_WORKERS = 6
 EARLY_STOP_CHECK_COUNT = 3
 
 
+def _already_built_doc_keys(app_record: dict, doc_keys: list[str]) -> list[str]:
+    """Returns the subset of `doc_keys` that `app_record` already has real,
+    complete final-build output for (2026-08-19, the "don't redraft a
+    perfectly good resume just to get a missing cover letter" fix). Field
+    checks are deliberately kept identical to ui/app.py's own
+    _job_already_built() (the basket "mass redo" exclusion check, same
+    day, different worktree) rather than diverging - if the two drift apart
+    a job could read as "already built" in one place and not the other:
+    - resume: resume_draft_source == "paid" (stamped by generate_for_job()
+      below only when a real PAID resume build ran - the free subscription
+      QA loop stamps "subscription" instead, so a subscription-only draft
+      never counts as "built" here and still gets a real paid redraft) AND
+      a non-empty resume_text.
+    - cover_letter / exec_bio / leadership_summary: a non-empty *_text
+      field - these fields are only ever written by this paid final-build
+      path, never the free subscription loop, so presence alone is enough.
+    - apply_answers: a non-empty list.
+    An unrecognized/future doc_key is never treated as already built
+    (conservative - it still gets drafted rather than silently skipped
+    based on a check this function doesn't actually know how to make)."""
+    built = []
+    for key in doc_keys:
+        if key == "resume":
+            if app_record.get("resume_draft_source") == "paid" and (app_record.get("resume_text") or "").strip():
+                built.append(key)
+        elif key in ("cover_letter", "exec_bio", "leadership_summary"):
+            if (app_record.get(f"{key}_text") or "").strip():
+                built.append(key)
+        elif key == "apply_answers":
+            if app_record.get("apply_answers"):
+                built.append(key)
+    return built
+
+
 def generate_for_job(job: dict, profile: dict, doc_keys: list[str], on_progress=None) -> dict:
     """Drafts `doc_keys` for one job and persists the results (upserts the
     application record, syncs the per-application workspace .docx files) -
     the same two calls the Results tab's own inline "Generate documents"
     handler makes after a successful draft.
+
+    Real incident this was written to fix (2026-08-19): a 10-job basket
+    build with "resume" + "cover_letter" both checked hit a daily spend
+    cap partway through - 4 jobs fully succeeded, 6 had their (paid,
+    synchronous, self-correcting) resume succeed but their cover letter
+    fail after. Retrying those 6 with the same two boxes checked - the
+    UI's only option - used to redraft 6 perfectly good, already-paid-for
+    resumes all over again just to get the missing cover letters. Now:
+    any doc_key in `doc_keys` that `app_record` already has real, complete
+    output for (see _already_built_doc_keys() above) is EXCLUDED from what
+    actually gets sent to generate_documents() - only genuinely missing
+    doc types are drafted - and that already-built content is merged back
+    into the persisted result so nothing already-good is ever silently
+    dropped OR wastefully redrafted. If every requested doc_key is already
+    built, generate_documents() is never called at all.
 
     Returns one of:
     - {"ok": True, "errors": {}}
@@ -100,36 +149,94 @@ def generate_for_job(job: dict, profile: dict, doc_keys: list[str], on_progress=
         return {"ok": False, "locked": True, "errors": {}}
     try:
         app_record = get_application(source, job_id) or {}
+        already_built = _already_built_doc_keys(app_record, doc_keys)
+        keys_to_draft = [k for k in doc_keys if k not in already_built]
+
+        if not keys_to_draft:
+            # Every requested doc_key already has real, complete output -
+            # no reason to spend a single paid call, let alone touch the
+            # application record or the workspace .docx files at all.
+            return {"ok": True, "locked": False, "errors": {}}
+
         try:
             drafted = generate_documents(
-                job, profile, doc_keys,
-                existing_resume_text=app_record.get("resume_text") if "resume" not in doc_keys else None,
+                job, profile, keys_to_draft,
+                # Based on keys_to_draft (what's actually being sent), not
+                # the original doc_keys - if "resume" was reused (already
+                # built) but another doc type still needs drafting, this
+                # correctly falls into the "resume not in this batch" case
+                # below and passes the EXISTING resume text through so
+                # cover_letter/exec_bio/leadership_summary can still be
+                # checked for factual consistency against it (see
+                # generate_documents()'s own existing_resume_text
+                # docstring) - the exact cross-document-consistency
+                # contract this fix must not break.
+                existing_resume_text=app_record.get("resume_text") if "resume" not in keys_to_draft else None,
                 on_progress=on_progress,
             )
         except (DraftingNotConfigured, DraftingFailed) as exc:
-            key = doc_keys[0] if len(doc_keys) == 1 else "generate"
+            key = keys_to_draft[0] if len(keys_to_draft) == 1 else "generate"
             return {"ok": False, "locked": False, "errors": {key: str(exc)}}
         except Exception as exc:  # noqa: BLE001 - only reachable for a single-doc_key request, see generate_documents()'s own docstring
-            _report_drafting_failure(job, doc_keys[0], exc)
-            return {"ok": False, "locked": False, "errors": {doc_keys[0]: "Something went wrong while drafting this document. It's been logged - try again in a moment."}}
+            _report_drafting_failure(job, keys_to_draft[0], exc)
+            return {"ok": False, "locked": False, "errors": {keys_to_draft[0]: "Something went wrong while drafting this document. It's been logged - try again in a moment."}}
 
-        resume_draft = drafted.get("resume")
+        # Merge each already-built doc_key's existing content from
+        # app_record back into a copy of `drafted` before persisting -
+        # `drafted` itself only ever has entries for keys_to_draft (what
+        # was actually just generated), so without this the already-good
+        # doc types would read back as "nothing" below. `drafted` itself
+        # (unmerged) is still what's passed to sync_workspace_documents()
+        # further down - reused doc types already have their real .docx on
+        # disk from whenever they WERE built, so there's nothing to
+        # rewrite there, and rewriting it anyway would be wasted I/O (plus
+        # risk tripping the "your on-disk copy differs, backing it up"
+        # logic in dossier.sync_workspace_documents() for no reason).
+        merged = dict(drafted)
+        if "resume" in already_built:
+            merged["resume"] = {
+                "text": app_record.get("resume_text"),
+                "ats_score": app_record.get("resume_ats_score"),
+                "ats_rationale": app_record.get("resume_ats_rationale"),
+                "ats_next_actions": app_record.get("resume_ats_next_actions") or [],
+                "clarifying_questions": app_record.get("resume_clarifying_questions") or [],
+                "suggested_strategy_tag": app_record.get("strategy_tag_suggestion"),
+                "unconfirmed_claims": app_record.get("resume_unconfirmed_claims_ai_reported") or [],
+            }
+        for reused_key in ("cover_letter", "exec_bio", "leadership_summary"):
+            if reused_key in already_built:
+                merged[reused_key] = app_record.get(f"{reused_key}_text")
+        if "apply_answers" in already_built:
+            merged["apply_answers"] = app_record.get("apply_answers")
+
+        resume_draft = merged.get("resume")
         resume_is_scored = isinstance(resume_draft, dict)
         upsert_application(
             source, job_id, status=app_record.get("status", "under review"),
+            # The full originally-requested set, not just keys_to_draft -
+            # documents_requested is meant to reflect the complete desired
+            # selection (see upsert_application()'s own docstring), and an
+            # already-built doc_key is still part of what was requested,
+            # just satisfied from existing content instead of a fresh draft.
             documents_requested=doc_keys,
             resume_text=resume_draft["text"] if resume_is_scored else resume_draft,
-            resume_draft_source="paid" if "resume" in doc_keys else None,
+            # "paid" only when a resume was ACTUALLY freshly drafted this
+            # call (keys_to_draft, not doc_keys) - if resume was reused,
+            # None here means "don't touch" (upsert_application()'s own
+            # None-means-unchanged contract), leaving the already-correct
+            # "paid" stamp exactly as it was rather than re-stamping it
+            # redundantly.
+            resume_draft_source="paid" if "resume" in keys_to_draft else None,
             resume_ats_score=resume_draft["ats_score"] if resume_is_scored else None,
             resume_ats_rationale=resume_draft["ats_rationale"] if resume_is_scored else None,
             resume_ats_next_actions=resume_draft["ats_next_actions"] if resume_is_scored else None,
             resume_clarifying_questions=resume_draft["clarifying_questions"] if resume_is_scored else None,
             suggested_strategy_tag=resume_draft["suggested_strategy_tag"] if resume_is_scored else None,
             resume_unconfirmed_claims_ai_reported=resume_draft.get("unconfirmed_claims", []) if resume_is_scored else None,
-            cover_letter_text=drafted.get("cover_letter"),
-            exec_bio_text=drafted.get("exec_bio"),
-            leadership_summary_text=drafted.get("leadership_summary"),
-            apply_answers=drafted.get("apply_answers"),
+            cover_letter_text=merged.get("cover_letter"),
+            exec_bio_text=merged.get("exec_bio"),
+            leadership_summary_text=merged.get("leadership_summary"),
+            apply_answers=merged.get("apply_answers"),
         )
         sync_workspace_documents(source, job_id, doc_keys, drafted, profile, job)
         errors = drafted.get("_errors") or {}
