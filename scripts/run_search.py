@@ -55,6 +55,7 @@ import yaml  # noqa: E402
 
 from notifications import send_notification  # noqa: E402
 from profile.storage import load_profile  # noqa: E402
+import scoring_gate  # noqa: E402
 from search import aggregators, boards, company_sites, freshness_check, industry_boards, job_sources, job_store, source_activity, usajobs  # noqa: E402
 from tailoring.applications import get_unreviewed_skip_reasons  # noqa: E402
 from llm_client import spend_cap_tripped_today, slowest_call_today  # noqa: E402
@@ -393,7 +394,19 @@ def score_unscored_jobs(profile: dict, prefilter_only: bool = False) -> list[dic
     all - it's just logged as eligible and left with fit_score still
     unset, so a later normal (non-prefilter-only) run still picks it up
     for full scoring. Returns [] in this mode (nothing gets a real
-    fit_score, so there's nothing to notify strong-match on)."""
+    fit_score, so there's nothing to notify strong-match on).
+
+    Scoring-paused gate (2026-08-18, Zahir's explicit ask - see
+    scoring_gate.py's own module docstring): checked FIRST, before even
+    loading jobs, so this function is a true no-op while paused - not
+    "loads and filters everything, then quietly declines to spend." This
+    is deliberately independent of review_status - an accepted job (auto
+    or manual) still doesn't get scored while paused, so a source that
+    auto-accepts (see job_store.add_manual_job()'s review_required
+    default) can never accidentally become a scoring trigger."""
+    if scoring_gate.is_scoring_paused():
+        _log("Scoring is paused (Settings > Scoring) - skipping score_unscored_jobs() entirely.")
+        return []
     jobs = job_store.load_jobs()
     unscored = [
         j for j in jobs

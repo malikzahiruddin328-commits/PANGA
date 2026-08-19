@@ -40,7 +40,7 @@ from tailoring import fit_score_prefilter  # noqa: E402
 PROFILE = {"target_title_framings": [{"summary": "IT/data/cybersecurity executive."}]}
 
 
-def test_prefiltered_job_never_reaches_score_job(isolated_data, monkeypatch):
+def test_prefiltered_job_never_reaches_score_job(scoring_enabled, monkeypatch):
     job_store.save_jobs([
         {"source": "linkedin", "job_id": "1", "title": "Firefighter", "organization": "Big Health"},
     ], review_required=False)
@@ -54,7 +54,7 @@ def test_prefiltered_job_never_reaches_score_job(isolated_data, monkeypatch):
     assert "fit_score" not in jobs[0]  # left exactly as unscored, not dropped or faked
 
 
-def test_prefiltered_job_gets_logged_for_spot_check(isolated_data, monkeypatch):
+def test_prefiltered_job_gets_logged_for_spot_check(scoring_enabled, monkeypatch):
     job_store.save_jobs([
         {"source": "linkedin", "job_id": "1", "title": "Firefighter", "organization": "Big Health"},
     ], review_required=False)
@@ -68,7 +68,7 @@ def test_prefiltered_job_gets_logged_for_spot_check(isolated_data, monkeypatch):
     assert entries[0]["layer"] == "deterministic"
 
 
-def test_non_prefiltered_job_still_gets_scored_normally(isolated_data, monkeypatch):
+def test_non_prefiltered_job_still_gets_scored_normally(scoring_enabled, monkeypatch):
     job_store.save_jobs([
         {"source": "linkedin", "job_id": "2", "title": "VP Information Technology", "organization": "Acme"},
     ], review_required=False)
@@ -83,7 +83,7 @@ def test_non_prefiltered_job_still_gets_scored_normally(isolated_data, monkeypat
     assert entries == []
 
 
-def test_mixed_batch_only_skips_the_prefiltered_ones(isolated_data, monkeypatch):
+def test_mixed_batch_only_skips_the_prefiltered_ones(scoring_enabled, monkeypatch):
     job_store.save_jobs([
         {"source": "linkedin", "job_id": "1", "title": "Firefighter", "organization": "Big Health"},
         {"source": "linkedin", "job_id": "2", "title": "VP Information Technology", "organization": "Acme"},

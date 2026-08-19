@@ -74,6 +74,7 @@ import streamlit as st
 import tomllib
 import yaml
 
+import scoring_gate
 from search.usajobs import search_jobs, USAJobsNotConfigured
 from search.job_store import load_jobs, flag_freshness_check_downgraded, set_review_status, add_to_basket, remove_from_basket
 from search.job_sources import load_job_sources, save_job_sources
@@ -3805,6 +3806,31 @@ if active_tab == "settings":
             else:
                 st.toast("Saved job-alert senders.", icon=":material/check_circle:")
                 st.rerun()
+
+    st.subheader("Scoring")
+    st.markdown(
+        "Controls whether Panga spends real money running `fit_score` on "
+        "jobs missing one - independent of whether a job is accepted for "
+        "review. A job can be auto-accepted (e.g. from a trusted job-alert "
+        "sender) without ever being scored while this is paused. Turning "
+        "this off is a deliberate decision to resume real per-job spend, "
+        "not something any automated process can flip on its own."
+    )
+    scoring_paused_now = scoring_gate.is_scoring_paused()
+    scoring_paused_choice = st.checkbox(
+        "Pause scoring (no fit_score spend, regardless of review status)",
+        value=scoring_paused_now, key="scoring_paused_checkbox",
+    )
+    if st.button("Save scoring setting"):
+        settings["scoring_paused"] = scoring_paused_choice
+        save_settings(settings)
+        st.toast(
+            "Scoring paused - no fit_score spend until you turn this back on."
+            if scoring_paused_choice else
+            "Scoring resumed - unscored accepted jobs will be scored on the next run.",
+            icon=":material/check_circle:",
+        )
+        st.rerun()
 
     st.subheader("Custom title exclusions")
     st.markdown(

@@ -262,26 +262,42 @@ isn't backfilled or guessed at - it saves as-is and picks up the existing
 paste-JD-manually UX (`ui/app.py`'s `render_paste_jd_prompt_before_drafting`)
 the same way any other thin job record does.
 
-**Review gate:** every listing this scan saves goes into the same manual-
-review queue as every other automated source connector
-(`review_status="pending"`, via `add_manual_job(..., review_required=True)`)
-and does not proceed to `fit_score` scoring until Zahir accepts it in the
-Results tab's review UI - per his explicit 2026-08-13 call, "i want all to
-be for manual review i really want to control what goes to step 2." This is
-distinct from Zahir's own "Add a job manually" UI form and any one-off
-manual script call, which stay exempt (`review_required=False`, the
-default) - those are a considered, one-at-a-time human choice already;
-this scan is an unattended automated bulk process even though it reuses
-the same `add_manual_job()` code path. **This was designed and built on
-2026-08-13 (`feature/gmail-alert-review-gate`) but that branch was never
-merged to master** - master silently kept the old hardcoded
-`review_required=False` behavior for this path until a real production
-bug was caught and fixed 2026-08-18 (33 job-alert-digest records had
-already been stamped `review_status="accepted"` without ever being
-reviewed, though none had yet been scored). If this section and the code
-in `src/search/job_store.py`/`scripts/job_alert_scan.py` ever disagree
-again, trust the code and flag it - this is exactly the failure mode that
-let the gap sit live for five days undetected.
+**Review gate vs. scoring gate (redesigned 2026-08-18 - these are two
+separate, independent controls, not one):**
+
+- **Review status** (`review_status`, via `add_manual_job(...,
+  review_required=...)`): a listing from this scan auto-accepts
+  (`review_required=False`, same default as Zahir's own manual paste),
+  because the sender allowlist above (something Zahir explicitly curates
+  in Settings) IS the approval step - a listing only reaches this code at
+  all because he already trusted that sender. A second per-job manual
+  accept click on top of that would be redundant friction, not a real
+  control point.
+- **Whether it gets scored** (`scripts/run_search.py`'s
+  `score_unscored_jobs()`, gated by `src/scoring_gate.py`'s
+  `is_scoring_paused()`, Settings-controlled): completely independent of
+  review_status. An accepted job - auto or manual - is never scored while
+  this flag is on, and turning it off/on is a deliberate Settings action,
+  never implied by review status changing. This is the real, current
+  spend control - see project memory `project_panga_cost_reduction_
+  target` for why scoring is paused right now.
+
+**History (why this isn't the first version of this section):** originally
+(2026-08-07) this scan was fully exempt from review (`review_required=
+False` hardcoded) with no separate scoring control at all - a real
+production bug (33 job-alert-digest records silently bypassing review,
+caught and fixed 2026-08-18) led to a review-gate fix
+(`review_required=True`, matching a 2026-08-13 design that had been built
+but never merged). That fix was itself replaced by the current design a
+few hours later the same night, once it became clear the two real
+problems (jobs skipping review vs. jobs being scored without control)
+needed two separate mechanisms - review status alone was never actually
+capable of stopping scoring, since `score_unscored_jobs()` had no gate of
+its own until `scoring_gate.py` was added. If this section and the code in
+`src/search/job_store.py`/`scripts/job_alert_scan.py`/`src/scoring_gate.py`
+ever disagree, trust the code and flag it - a documented rule and the
+actual code drifting apart is exactly the failure mode that let the
+original review-gate gap sit live for five days undetected.
 
 ## Merging a finished worktree branch into master
 

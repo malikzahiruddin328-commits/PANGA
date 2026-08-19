@@ -27,7 +27,7 @@ from tailoring import fit_score_prefilter  # noqa: E402
 PROFILE = {"target_title_framings": [{"summary": "IT/data/cybersecurity executive."}]}
 
 
-def test_passing_job_never_reaches_score_job_in_prefilter_only_mode(isolated_data, monkeypatch):
+def test_passing_job_never_reaches_score_job_in_prefilter_only_mode(scoring_enabled, monkeypatch):
     job_store.save_jobs([
         {"source": "linkedin", "job_id": "2", "title": "VP Information Technology", "organization": "Acme"},
     ], review_required=False)
@@ -43,7 +43,7 @@ def test_passing_job_never_reaches_score_job_in_prefilter_only_mode(isolated_dat
     assert "fit_score" not in jobs[0]  # left exactly as unscored - still eligible for a later full-scoring run
 
 
-def test_skipped_job_still_logged_in_prefilter_only_mode(isolated_data, monkeypatch):
+def test_skipped_job_still_logged_in_prefilter_only_mode(scoring_enabled, monkeypatch):
     job_store.save_jobs([
         {"source": "linkedin", "job_id": "1", "title": "Firefighter", "organization": "Big Health"},
     ], review_required=False)
@@ -61,7 +61,7 @@ def test_skipped_job_still_logged_in_prefilter_only_mode(isolated_data, monkeypa
     assert "fit_score" not in jobs[0]
 
 
-def test_default_mode_unaffected_by_new_parameter(isolated_data, monkeypatch):
+def test_default_mode_unaffected_by_new_parameter(scoring_enabled, monkeypatch):
     """prefilter_only defaults to False - existing callers (run_search.run()
     without the flag, and any other caller that doesn't pass it) must keep
     calling score_job normally, exactly as before this change."""
@@ -78,7 +78,7 @@ def test_default_mode_unaffected_by_new_parameter(isolated_data, monkeypatch):
     assert result[0]["fit_score"] == 77
 
 
-def test_mixed_batch_in_prefilter_only_mode(isolated_data, monkeypatch):
+def test_mixed_batch_in_prefilter_only_mode(scoring_enabled, monkeypatch):
     job_store.save_jobs([
         {"source": "linkedin", "job_id": "1", "title": "Firefighter", "organization": "Big Health"},
         {"source": "linkedin", "job_id": "2", "title": "VP Information Technology", "organization": "Acme"},

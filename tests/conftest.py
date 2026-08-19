@@ -212,4 +212,24 @@ def isolated_data(tmp_path, monkeypatch):
     # profiles.json.
     monkeypatch.setattr(title_cluster, "SETTINGS_PATH", tmp_path / "settings.yaml")
     monkeypatch.setattr(title_cluster_profiles, "CLUSTER_PROFILES_PATH", tmp_path / "title_cluster_profiles.json")
+    # Scoring-paused gate (2026-08-18) - same shared tmp_path/settings.yaml
+    # as exclusion_filter/title_cluster above, so a test can't read the
+    # real repo settings.yaml's scoring_paused value. The isolated file
+    # doesn't exist by default, so is_scoring_paused() returns its
+    # fail-safe True here exactly like in production - tests that need
+    # scoring to actually run must explicitly opt in via the
+    # scoring_enabled fixture below, not get it for free.
+    import scoring_gate
+    monkeypatch.setattr(scoring_gate, "SETTINGS_PATH", tmp_path / "settings.yaml")
     return tmp_path
+
+
+@pytest.fixture
+def scoring_enabled(isolated_data):
+    """Writes scoring_paused: false into the isolated settings.yaml -
+    opt-in for tests that exercise score_unscored_jobs()'s actual scoring
+    behavior (prefilter wiring, review-gate interaction, etc.), which
+    would otherwise all silently no-op under the new (2026-08-18,
+    fail-safe-paused-by-default) scoring gate."""
+    (isolated_data / "settings.yaml").write_text("scoring_paused: false\n", encoding="utf-8")
+    return isolated_data
