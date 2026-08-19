@@ -183,7 +183,62 @@ def build_already_known_units(profile: dict | None) -> list[str]:
     return units
 
 
-def skill_evidenced_in_text(skill_label: str, units) -> bool:
+def build_units_pattern_index(units) -> list[tuple[str, "re.Pattern"]]:
+    """Precomputed (normalized_text, compiled \\b-bounded pattern) pairs
+    for every unit - a real perf fix (2026-08-18, Profile Gaps tab,
+    paired with normalize_units_once() above and canonical_taxonomy.py's
+    own _taxonomy_index()) for the same repeated-corpus shape:
+    skills_match_any_indexed() below needs both a normalized string AND a
+    compiled pattern per unit, and recomputing (re.escape + re.compile)
+    those fresh on every call - once per missing keyword, dozens of times
+    per real job, against the exact same unchanged units list every
+    time - was real, avoidable work. Build this once per units list,
+    reuse across every query against it."""
+    if isinstance(units, str):
+        units = [units]
+    idx = []
+    for u in units or []:
+        norm = normalize_skill_label(u)
+        if not norm:
+            continue
+        idx.append((norm, re.compile(r"\b" + re.escape(norm) + r"\b")))
+    return idx
+
+
+def skills_match_any_indexed(a: str, index: list[tuple[str, "re.Pattern"]]) -> bool:
+    """True if `a` skills_match()es ANY unit represented in `index` (see
+    build_units_pattern_index()) - exact same match rule as skills_match()
+    itself (normalized equality, or either side found as a real
+    word-boundary phrase within the other), just reusing the index's
+    precomputed normalized text/compiled pattern for the corpus side
+    instead of recomputing it fresh for every query."""
+    norm_a = normalize_skill_label(a)
+    if not norm_a:
+        return False
+    pattern_a = re.compile(r"\b" + re.escape(norm_a) + r"\b")
+    for norm_b, pattern_b in index:
+        if norm_a == norm_b or pattern_b.search(norm_a) or pattern_a.search(norm_b):
+            return True
+    return False
+
+
+def normalize_units_once(units) -> list[str]:
+    """Precomputes normalize_skill_label(unit) for every unit once - a
+    real perf fix (2026-08-18, Profile Gaps tab): skill_evidenced_in_text()
+    used to re-normalize the SAME units list from scratch on every single
+    call, even though a caller like tailoring.drafting._profile_supports_
+    skill() calls it once per missing keyword (up to several dozen times
+    per real job) against the exact same, unchanged units list every time.
+    Pass the result to skill_evidenced_in_text()'s normalized_units param
+    to skip that redundant work - purely a speed optimization, the
+    normalized strings are byte-identical to what a fresh call would
+    compute."""
+    if isinstance(units, str):
+        units = [units]
+    return [normalize_skill_label(u) for u in (units or [])]
+
+
+def skill_evidenced_in_text(skill_label: str, units, normalized_units: list[str] | None = None) -> bool:
     """True if every significant word of skill_label appears as a real
     whole-word-START within some SINGLE unit of `units` (case/punctuation-
     insensitive) - a deterministic check for whether a proposed
@@ -219,15 +274,26 @@ def skill_evidenced_in_text(skill_label: str, units) -> bool:
     narrower, already-solved case and only adds coverage for genuinely
     multi-word, specific labels where a conjunctive within-unit match is
     a reliable signal (e.g. "onshore offshore teams" - see this module's
-    docstring for the real case)."""
+    docstring for the real case).
+
+    normalized_units (2026-08-18, real perf fix): optional precomputed
+    normalize_units_once(units) result - when the same `units` list is
+    about to be checked against many different skill_label values in a
+    row (tailoring.drafting._profile_supports_skill(), called once per
+    missing keyword), pass this in to skip re-normalizing every unit on
+    every call. Defaults to None (normalize fresh from `units`, exactly
+    the prior behavior) so every other/external caller is unaffected."""
     tokens = _significant_tokens(skill_label)
     if len(tokens) < 2:
         return False
-    if isinstance(units, str):
-        units = [units]
+    if normalized_units is not None:
+        candidate_units = normalized_units
+    else:
+        if isinstance(units, str):
+            units = [units]
+        candidate_units = [normalize_skill_label(u) for u in (units or [])]
     stemmed = [_stem(tok) for tok in tokens]
-    for unit in units or []:
-        normalized_unit = normalize_skill_label(unit)
+    for normalized_unit in candidate_units:
         if not normalized_unit:
             continue
         if all(re.search(r"\b" + re.escape(tok), normalized_unit) for tok in stemmed):
