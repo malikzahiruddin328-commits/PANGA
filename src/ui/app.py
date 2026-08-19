@@ -2289,10 +2289,14 @@ def render_paste_jd_prompt_before_drafting(job: dict, app_record: dict) -> None:
         if not pasted_jd.strip():
             st.toast("Paste the job description text first.", icon=":material/warning:")
         else:
-            from search.job_store import update_job_description
+            from search.job_store import add_to_basket, update_job_description
 
             update_job_description(job["source"], job["job_id"], pasted_jd.strip())
             job["description"] = pasted_jd.strip()
+            # Pasting the real JD in by hand means the decision to apply
+            # is already made (Zahir's explicit ask, 2026-08-19) - no
+            # separate "add to basket" click needed on top of this one.
+            add_to_basket(job["source"], job["job_id"])
             # Real gap fixed 2026-08-09 (see this function's own
             # docstring - the Merck job Zahir hit live): once this save
             # flips _job_has_captured_jd_text() to True, the caller's own
@@ -2353,10 +2357,14 @@ def render_paste_jd_prompt(job: dict) -> None:
         if not pasted_jd.strip():
             st.toast("Paste the job description text first.", icon=":material/warning:")
         else:
-            from search.job_store import update_job_description
+            from search.job_store import add_to_basket, update_job_description
 
             update_job_description(job["source"], job["job_id"], pasted_jd.strip())
             job["description"] = pasted_jd.strip()
+            # Same as the proactive paste-JD prompt above - pasting a real
+            # JD in by hand is the decision to apply (Zahir's explicit
+            # ask, 2026-08-19).
+            add_to_basket(job["source"], job["job_id"])
             _regenerate_with_progress(
                 job, job_key, "Rescoring against the pasted description...",
                 "Resume rescored against the pasted description - new ATS score {score}/100.",
@@ -5174,11 +5182,15 @@ elif active_tab == "results":
         )
         manual_source = (manual_source_other or "Other") if manual_source_choice == "Other" else manual_source_choice
         if st.button("Save job", type="primary", disabled=not (manual_title and manual_org and manual_url)):
-            from search.job_store import add_manual_job, update_job_score
+            from search.job_store import add_manual_job, add_to_basket, update_job_score
             job = add_manual_job(
                 title=manual_title, organization=manual_org, location=manual_location,
                 description=manual_description, posting_url=manual_url, source=manual_source,
             )
+            # Pasting a job in by hand is itself a decision to apply
+            # (Zahir's explicit ask, 2026-08-19) - straight to the basket,
+            # same as the other two manual-JD-entry paths below.
+            add_to_basket(job["source"], job["job_id"])
             # A job with no fit_score is hidden by the Results tab regardless
             # of the slider (see the min_score filter above) - without this,
             # a manually-added job would sit invisible until the next daily
