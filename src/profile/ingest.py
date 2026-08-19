@@ -84,6 +84,26 @@ def resume_text() -> str:
     return "\n".join(chunks)
 
 
+def all_documents_text() -> str:
+    """Concatenated raw text of EVERY ingested document, every category -
+    not just category=="resume" the way resume_text() deliberately narrows
+    to. Added 2026-08-19 for the resume+JD-grounded intake redesign
+    (profile.intake_flow), whose spec requires reasoning over "the resume
+    and all supporting docs (full ingestion, not a summary)" - a cover
+    letter, a bio, a project write-up can carry real facts (a specific
+    tool, a program name, a scale detail) the resume itself never
+    mentions, and this flow's whole point is to ground its role/question
+    inference in everything actually on file, not the resume-only subset
+    every earlier flow used. Each document is labeled with its own
+    category/filename so the reasoner can tell what it's reading (e.g. "a
+    cover letter" vs "the resume itself"), not one undifferentiated blob."""
+    chunks = []
+    for entry in load_manifest_result():
+        label = f"=== {entry.get('category') or 'document'}: {entry.get('source_file') or ''} ==="
+        chunks.append(label + "\n" + read_text(PROJECT_ROOT / entry["extracted_to"]))
+    return "\n\n".join(chunks)
+
+
 def remove_document(source_file: str) -> None:
     """Deletes the extracted raw-text file and drops the manifest entry for
     it. Filter-and-resave, not blank-and-resave - matches every other store

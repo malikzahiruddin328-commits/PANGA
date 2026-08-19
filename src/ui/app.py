@@ -124,6 +124,15 @@ from ui.feedback_widget import render_feedback_widget
 from profile.ingest import load_manifest_result, remove_document, ingest_uploaded_document, resume_text as ingested_resume_text
 from profile.storage import load_profile, update_profile_field
 from profile.interview import save_profile_gap_review_answers
+from profile.intake_flow import (
+    DEFAULT_JD_SAMPLE_TARGET,
+    generate_role_examples,
+    save_confirmed_roles,
+    sample_jds_for_confirmed_roles,
+    generate_probing_questions,
+    save_intake_probing_answers,
+    record_intake_completed,
+)
 from skills.gap_frequency_analysis import analyze_recurring_gaps, build_review_questions, DEFAULT_MIN_RECURRENCE
 from tailoring.gap_answer_drafting import draft_gap_answer, draft_gap_answers_concurrently
 try:
@@ -3687,6 +3696,7 @@ TAB_ICONS = {
     "results": ":material/work:",
     "prospector": ":material/travel_explore:",
     "prep": ":material/school:",
+    "intake": ":material/checklist:",
     "gaps": ":material/quiz:",
     "linkedin": ":material/badge:",
     "support": ":material/support_agent:",
@@ -3700,6 +3710,13 @@ TABS = [
     ("results", f"Results ({results_count})"),
     ("prospector", "Prospector"),
     ("prep", f"Interview prep ({prep_in_progress_count})" if prep_in_progress_count else "Interview prep"),
+    # Real, one-time upfront role+JD-grounded intake (2026-08-19 redesign,
+    # feature/resume-jd-intake-redesign) - lives as its own tab, next to
+    # Profile Gaps rather than folded into it, since it's a different real
+    # step (a structured, one-time conversational flow) from Profile Gaps'
+    # ongoing per-job/recurring-gap review. Badge shows "New" until the
+    # candidate has completed at least one real intake round.
+    ("intake", "Intake :material/fiber_new:" if not (load_profile().get("intake_history")) else "Intake"),
     ("gaps", f"Profile gaps ({gaps_count})" if gaps_count else "Profile gaps"),
     ("linkedin", "LinkedIn"),
     ("support", "Support"),
@@ -6951,6 +6968,187 @@ elif active_tab == "prep":
                     record_round_outcome(record["source"], record["job_id"], round_["round_label"], new_outcome, outcome_notes or None)
                     st.toast("Saved.", icon=":material/check_circle:")
                     st.rerun()
+
+elif active_tab == "intake":
+    render_feedback_widget("intake")
+
+    st.header("Intake")
+    st.markdown(
+        "One real, thorough intake, done once - not scattered per-job popups asking the same category of "
+        "thing repeatedly. Confirm your resume/docs are up to date, confirm which roles you're really "
+        "interested in, then answer a small set of real, grounded questions inferred from your documents "
+        "and a sample of real postings for those roles. After this, a specific job posting should almost "
+        "never trigger a brand-new question."
+    )
+
+    intake_profile = load_profile()
+    intake_history = intake_profile.get("intake_history") or []
+    already_confirmed_roles = [r["title"] for r in (intake_profile.get("intake_confirmed_roles") or [])]
+
+    # Visible todo/progress list (Zahir's explicit reference: Claude's own
+    # "Design" planning-tool interaction model - a structured checklist
+    # tracking where this one continuous flow currently stands, not a
+    # silent multi-step form).
+    step = st.session_state.get("intake_step", 1)
+    todo_cols = st.columns(4)
+    todo_labels = [
+        (1, "1. Confirm roles"),
+        (2, "2. Sample real postings"),
+        (3, "3. Answer grounded questions"),
+        (4, "4. Done"),
+    ]
+    for col, (n, label) in zip(todo_cols, todo_labels):
+        with col:
+            if n < step:
+                st.markdown(f":material/check_circle: {label}")
+            elif n == step:
+                st.markdown(f"**:material/radio_button_checked: {label}**")
+            else:
+                st.markdown(f":material/radio_button_unchecked: :gray[{label}]")
+    st.divider()
+
+    if intake_history:
+        with st.expander(f"Past intake rounds ({len(intake_history)})"):
+            for record in reversed(intake_history):
+                st.markdown(
+                    f"- {record['date'][:10]} - confirmed: {', '.join(record['confirmed_roles']) or '(none)'} "
+                    f"- {record['questions_saved']} fact(s) saved"
+                )
+
+    manifest = load_manifest_result()
+    if not manifest:
+        st.warning(
+            "No documents ingested yet - upload your resume (and any supporting documents) in Settings "
+            "before starting intake, so this flow has real material to reason over."
+        )
+    else:
+        st.markdown(f"{len(manifest)} document(s) on file, full text will be used (not a summary).")
+
+    # --- Step 1: role confirmation ---
+    st.subheader("Step 1 - Confirm the roles you're really interested in")
+    if already_confirmed_roles:
+        st.markdown("Already confirmed: " + ", ".join(already_confirmed_roles))
+
+    if st.button("Propose example roles from my resume", disabled=not manifest, key="intake_gen_roles_btn"):
+        with st.spinner("Reading your resume and documents, proposing real example roles..."):
+            try:
+                st.session_state["intake_role_examples"] = generate_role_examples(intake_profile)
+            except ReasonerUnavailable as exc:
+                st.error(f"Reasoner unavailable: {exc}")
+            except RuntimeError as exc:
+                st.error(f"Couldn't generate role examples: {exc}")
+            else:
+                st.session_state["intake_step"] = 1
+                st.rerun()
+
+    role_examples = st.session_state.get("intake_role_examples")
+    if role_examples:
+        st.markdown("Does each of these apply to you? Confirming/rejecting also tells us your real sector preference.")
+        decisions = {}
+        for i, example in enumerate(role_examples):
+            cols = st.columns([3, 1])
+            with cols[0]:
+                st.markdown(f"**{example['title']}**")
+                if example.get("why"):
+                    st.markdown(example["why"])
+            with cols[1]:
+                decisions[example["title"]] = st.radio(
+                    "Applies?", ["Yes", "No", "Skip"], index=2, horizontal=True,
+                    key=f"intake_role_decision_{i}", label_visibility="collapsed",
+                )
+        custom_roles_text = st.text_area(
+            "Any other roles you're targeting that aren't listed above? (one per line)",
+            key="intake_custom_roles",
+        )
+        if st.button("Confirm roles and continue", type="primary", key="intake_confirm_roles_btn"):
+            confirmed = [t for t, d in decisions.items() if d == "Yes"]
+            rejected = [t for t, d in decisions.items() if d == "No"]
+            confirmed += [line.strip() for line in custom_roles_text.splitlines() if line.strip()]
+            if not confirmed and not already_confirmed_roles:
+                st.error("Confirm at least one role (or add your own) before continuing.")
+            else:
+                save_confirmed_roles(confirmed, rejected)
+                st.session_state["intake_step"] = 2
+                st.session_state.pop("intake_role_examples", None)
+                st.toast(f"Confirmed {len(confirmed)} role(s).", icon=":material/check_circle:")
+                st.rerun()
+
+    # --- Step 2: JD sampling ---
+    current_profile_roles = [r["title"] for r in (load_profile().get("intake_confirmed_roles") or [])]
+    if current_profile_roles:
+        st.subheader("Step 2 - Sample real postings for your confirmed roles")
+        st.markdown(f"Confirmed roles: {', '.join(current_profile_roles)}")
+        if st.button("Pull real job description samples", key="intake_sample_jds_btn"):
+            with st.spinner(f"Pulling up to {DEFAULT_JD_SAMPLE_TARGET} real postings per confirmed role..."):
+                st.session_state["intake_jd_samples"] = sample_jds_for_confirmed_roles(current_profile_roles)
+            st.session_state["intake_step"] = 3
+            st.rerun()
+
+        jd_samples = st.session_state.get("intake_jd_samples")
+        if jd_samples:
+            for role, samples in jd_samples.items():
+                thin = sum(1 for s in samples if s.get("thin_text"))
+                st.markdown(f"- **{role}**: {len(samples)} real posting(s) sampled" + (f" ({thin} with limited/no full text)" if thin else ""))
+
+    # --- Step 3: grounded probing questions ---
+    jd_samples = st.session_state.get("intake_jd_samples")
+    if jd_samples:
+        st.subheader("Step 3 - Answer real, grounded questions")
+        st.markdown(
+            "Each question is inferred from your documents and the real postings above - confirm, edit, "
+            "or clear the proposed answer."
+        )
+        if st.button("Generate grounded questions", key="intake_gen_questions_btn"):
+            with st.spinner("Reasoning over your documents, confirmed roles, and the sampled postings..."):
+                try:
+                    st.session_state["intake_questions"] = generate_probing_questions(
+                        load_profile(), current_profile_roles, jd_samples,
+                    )
+                except ReasonerUnavailable as exc:
+                    st.error(f"Reasoner unavailable: {exc}")
+                except RuntimeError as exc:
+                    st.error(f"Couldn't generate questions: {exc}")
+                else:
+                    st.rerun()
+
+        intake_questions = st.session_state.get("intake_questions")
+        if intake_questions is not None:
+            if not intake_questions:
+                st.markdown("No real gaps found - your documents already evidence what these postings look for.")
+            answers = {}
+            for i, q in enumerate(intake_questions):
+                st.markdown(f"**{q['question']}**")
+                st.markdown(f"Confidence in inferred answer: {q['confidence']}")
+                answers[i] = st.text_area(
+                    "Your answer (edit or clear if the inference is wrong)",
+                    value=q.get("inferred_answer", ""), key=f"intake_answer_{i}",
+                )
+                st.divider()
+
+            if st.button("Save my confirmed answers and finish intake", type="primary", key="intake_save_answers_btn"):
+                answered = [
+                    {"skill": q["skill"], "question": q["question"], "answer": answers[i]}
+                    for i, q in enumerate(intake_questions)
+                ]
+                saved_count = save_intake_probing_answers(answered)
+                current_profile = load_profile()
+                rejected_titles = [r["title"] for r in (current_profile.get("intake_rejected_roles") or [])]
+                jd_sample_counts = {role: len(samples) for role, samples in jd_samples.items()}
+                record_intake_completed(current_profile_roles, rejected_titles, jd_sample_counts, saved_count)
+                st.session_state["intake_step"] = 4
+                for key in ("intake_jd_samples", "intake_questions"):
+                    st.session_state.pop(key, None)
+                st.toast(f"Intake complete - saved {saved_count} confirmed fact(s).", icon=":material/check_circle:")
+                st.rerun()
+
+    if step == 4 and not st.session_state.get("intake_jd_samples") and not st.session_state.get("intake_questions"):
+        st.success(
+            "Intake complete. Per-job questions will now check against everything confirmed here before "
+            "asking again."
+        )
+        if st.button("Start another intake round", key="intake_restart_btn"):
+            st.session_state["intake_step"] = 1
+            st.rerun()
 
 elif active_tab == "gaps":
     render_feedback_widget("gaps")
