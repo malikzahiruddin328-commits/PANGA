@@ -2329,8 +2329,27 @@ def render_paste_jd_prompt_before_drafting(job: dict, app_record: dict) -> None:
     # Merck job Zahir hit live): once real text is saved, render the same
     # Analyze Fit score card/open-questions display shown elsewhere in the
     # app, rather than leaving the user with nothing but a toast.
+    #
+    # Real cost incident (2026-08-19, live production, Zahir watching it
+    # happen): _analyze_fit_with_auto_gap_scan() doesn't just compute a
+    # score - it auto-fires request_additional_gap_questions(), a REAL
+    # PAID Anthropic API call, unconditionally on every render once a JD
+    # is saved (gated only by "has this exact resume version already been
+    # scanned," not by any explicit user action). Simply pasting and
+    # saving a JD - "just save," Zahir's own words - was silently billing
+    # against the account. The auto-fire was a deliberate joint design
+    # (2026-08-09, confirmed with General, to surface gaps before a first
+    # draft rather than only after) but Zahir explicitly reversed that
+    # call here once he saw the real cost consequence live - see this
+    # function's git history for the incident. Using the plain
+    # deterministic analyze_fit_before_drafting() instead
+    # (score_resume_against_keywords - local keyword matching, no network
+    # call, no cost) keeps the free score card intact; the paid free-form
+    # gap scan is still available, just opt-in via the existing manual
+    # "Answer more questions" button (render_analyze_fit_section already
+    # wires that in) rather than firing automatically.
     if (job.get("description") or "").strip():
-        analysis = _analyze_fit_with_auto_gap_scan(job, load_profile(), app_record)
+        analysis = _analyze_fit_before_drafting(job, load_profile(), app_record)
         # show_generate_actions=False: this renders directly above the
         # "Documents for this application" checkbox+Generate flow below
         # (which already covers resume among 5 doc types for a job
